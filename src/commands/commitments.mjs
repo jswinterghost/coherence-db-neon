@@ -1,4 +1,5 @@
-// Canonical journal commitment builders matching migrations/002_invariants_and_triggers.sql byte for byte.
+// Canonical journal commitment builders matching migrations/002_invariants_and_triggers.sql
+// and migrations/005_bob_ledger_and_statements.sql byte for byte across all 30 child business tables.
 import {
   canonicalJson,
   compareUtf8Bytes,
@@ -15,6 +16,10 @@ export const BUSINESS_TABLES = [
   'input_changes',
   'approvals_files',
   'approval_rows',
+  'decision_commits',
+  'decisions',
+  'generated_overlays',
+  'review_queue_items',
   'runs',
   'step_requests',
   'cancel_requests',
@@ -22,6 +27,13 @@ export const BUSINESS_TABLES = [
   'artifacts',
   'review_saves',
   'emit_confirmations',
+  'statement_batches',
+  'statement_agency_lines',
+  'statement_upline_lines',
+  'run_materializations',
+  'bob_policies',
+  'bob_policy_financials',
+  'coherent_ledger_rows',
   'carries',
   'abandonments',
   'imported_files',
@@ -30,6 +42,29 @@ export const BUSINESS_TABLES = [
 
 function hashLines(lines) {
   return sha256Hex(lines.join(''));
+}
+
+export function formatIsoDate(val) {
+  if (val == null || val === '') return null;
+  if (val instanceof Date) return val.toISOString().slice(0, 10);
+  return String(val).slice(0, 10);
+}
+
+export function formatMoney2(val) {
+  if (val == null || val === '') return null;
+  const s = String(val).trim();
+  const m = /^([+-])?(\d+)(?:\.(\d+))?$/.exec(s);
+  if (!m) throw new TypeError(`Invalid money value: ${s}`);
+  const sign = m[1] === '-' ? '-' : '';
+  const whole = m[2].replace(/^0+(?=\d)/, '');
+  const frac = (m[3] || '').padEnd(2, '0');
+  if (frac.length > 2) throw new TypeError(`Money value exceeds 2 decimal places: ${s}`);
+  if (whole === '0' && frac === '00') return '0.00';
+  return `${sign}${whole}.${frac}`;
+}
+
+function nullableInt(val) {
+  return val == null || val === '' ? null : Number(val);
 }
 
 export function hashCompanyMetaTable(rows) {
@@ -68,16 +103,19 @@ export function hashEngineVersionsTable(rows) {
     r.id,
     r.label,
     r.coherenceCommit ?? r.coherence_commit,
+    r.engineKind ?? r.engine_kind ?? 'legacy_sealed',
+    r.upstreamCommit ?? r.upstream_commit ?? null,
+    r.patchDiffSha256 ?? r.patch_diff_sha256 ?? null,
     r.gitBundleSha256 ?? r.git_bundle_sha256,
     r.codeManifestSha256 ?? r.code_manifest_sha256,
     r.pythonLockSha256 ?? r.python_lock_sha256,
     r.pythonWheelsSha256 ?? r.python_wheels_sha256,
-    r.webLockSha256 ?? r.web_lock_sha256,
-    r.webPackagesSha256 ?? r.web_packages_sha256,
+    r.webLockSha256 ?? r.web_lock_sha256 ?? null,
+    r.webPackagesSha256 ?? r.web_packages_sha256 ?? null,
     r.wrapperBundleSha256 ?? r.wrapper_bundle_sha256,
     r.nusearCommit ?? r.nusear_commit,
-    r.companyEmitSha256 ?? r.company_emit_sha256,
-    r.pagesLawSha256 ?? r.pages_law_sha256,
+    r.companyEmitSha256 ?? r.company_emit_sha256 ?? null,
+    r.pagesLawSha256 ?? r.pages_law_sha256 ?? null,
     r.overlayCheckSha256 ?? r.overlay_check_sha256,
     r.toolchain,
     r.containerDigest ?? r.container_digest ?? null,
@@ -137,19 +175,6 @@ export function hashApprovalsFilesTable(rows) {
   ])}\n`));
 }
 
-export function hashArtifactsTable(rows) {
-  const sorted = [...rows].sort((a, b) => (
-    compareUtf8Bytes(a.attemptEventId ?? a.attempt_event_id, b.attemptEventId ?? b.attempt_event_id)
-    || compareUtf8Bytes(a.relPath ?? a.rel_path, b.relPath ?? b.rel_path)
-  ));
-  return hashLines(sorted.map((r) => `${canonicalJson([
-    r.relPath ?? r.rel_path,
-    r.artifactKind ?? r.artifact_kind,
-    r.storeKind ?? r.store_kind,
-    r.fileSha256 ?? r.file_sha256,
-  ])}\n`));
-}
-
 export function hashApprovalRowsTable(rows) {
   const sorted = [...rows].sort((a, b) => (
     compareUtf8Bytes(
@@ -178,15 +203,127 @@ export function hashApprovalRowsTable(rows) {
   ])}\n`));
 }
 
+function decisionRowArray(r) {
+  return [
+    r.id,
+    Number(r.rowOrder ?? r.row_order),
+    r.runId ?? r.run_id ?? null,
+    r.reviewSaveId ?? r.review_save_id ?? null,
+    r.surface ?? null,
+    r.recordId ?? r.record_id,
+    r.replacesDecisionId ?? r.replaces_decision_id ?? null,
+    r.disposition,
+    r.agent ?? null,
+    r.agency ?? null,
+    r.policy ?? null,
+    r.book ?? null,
+    r.month ?? null,
+    r.status ?? null,
+    r.note ?? null,
+    r.approvedAmount ?? r.approved_amount ?? null,
+    r.approvedAgency ?? r.approved_agency ?? null,
+    r.approvedAgent ?? r.approved_agent ?? null,
+    r.approvedAgencyFrom ?? r.approved_agency_from ?? null,
+    r.approvedAgentFrom ?? r.approved_agent_from ?? null,
+    r.decidedBy ?? r.decided_by,
+    r.actingFor ?? r.acting_for ?? null,
+    formatTimestampUtcUs(r.decidedAt ?? r.decided_at),
+    r.committedAtRaw ?? r.committed_at_raw ?? null,
+    Boolean(r.imported),
+  ];
+}
+
+export function hashDecisions(rows) {
+  const sorted = [...rows].sort((a, b) => Number(a.rowOrder ?? a.row_order) - Number(b.rowOrder ?? b.row_order));
+  return hashLines(sorted.map((r) => `${canonicalJson(decisionRowArray(r))}\n`));
+}
+
+export function hashDecisionCommitsTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.id,
+    r.parentCommitId ?? r.parent_commit_id ?? null,
+    r.commitKind ?? r.commit_kind,
+    r.headerContract ?? r.header_contract ?? 'v2',
+    Number(r.addedDecisionCount ?? r.added_decision_count),
+    Number(r.cumulativeDecisionCount ?? r.cumulative_decision_count),
+    r.addedDecisionsSha256 ?? r.added_decisions_sha256,
+    Boolean(r.imported),
+    (r.originalAt ?? r.original_at) ? formatTimestampUtcUs(r.originalAt ?? r.original_at) : null,
+  ])}\n`));
+}
+
+export function hashDecisionsTable(rows) {
+  const sorted = [...rows].sort((a, b) => (
+    compareUtf8Bytes(a.decisionCommitId ?? a.decision_commit_id, b.decisionCommitId ?? b.decision_commit_id)
+    || Number(a.rowOrder ?? a.row_order) - Number(b.rowOrder ?? b.row_order)
+  ));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.decisionCommitId ?? r.decision_commit_id,
+    ...decisionRowArray(r),
+  ])}\n`));
+}
+
+export function hashGeneratedOverlaysTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.id,
+    r.decisionCommitId ?? r.decision_commit_id,
+    r.runId ?? r.run_id,
+    r.purpose,
+    r.attemptEventId ?? r.attempt_event_id ?? null,
+    r.headerContract ?? r.header_contract,
+    Number(r.rowCount ?? r.row_count),
+    r.storeKind ?? r.store_kind ?? 'company_data',
+    r.fileSha256 ?? r.file_sha256,
+  ])}\n`));
+}
+
+export function hashReviewQueueItemsTable(rows) {
+  const sorted = [...rows].sort((a, b) => (
+    compareUtf8Bytes(a.attemptEventId ?? a.attempt_event_id, b.attemptEventId ?? b.attempt_event_id)
+    || Number(a.itemOrder ?? a.item_order) - Number(b.itemOrder ?? b.item_order)
+  ));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.attemptEventId ?? r.attempt_event_id,
+    Number(r.itemOrder ?? r.item_order),
+    r.runId ?? r.run_id,
+    r.surface,
+    r.recordId ?? r.record_id,
+    r.caseKind ?? r.case_kind ?? null,
+    r.subtype ?? null,
+    r.entity ?? null,
+    r.npn ?? null,
+    r.amount ?? null,
+    r.entityFrom ?? r.entity_from ?? null,
+    r.npnFrom ?? r.npn_from ?? null,
+    Boolean(r.needsReconfirm ?? r.needs_reconfirm),
+  ])}\n`));
+}
+
+export function hashArtifactsTable(rows) {
+  const sorted = [...rows].sort((a, b) => (
+    compareUtf8Bytes(a.attemptEventId ?? a.attempt_event_id, b.attemptEventId ?? b.attempt_event_id)
+    || compareUtf8Bytes(a.relPath ?? a.rel_path, b.relPath ?? b.rel_path)
+  ));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.relPath ?? r.rel_path,
+    r.artifactKind ?? r.artifact_kind,
+    r.storeKind ?? r.store_kind,
+    r.fileSha256 ?? r.file_sha256,
+  ])}\n`));
+}
+
 export function hashRunsTable(rows) {
   const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
   return hashLines(sorted.map((r) => `${canonicalJson([
     r.id,
-    r.statementDate ?? r.statement_date,
+    formatIsoDate(r.statementDate ?? r.statement_date),
     Number(r.folderNumber ?? r.folder_number),
     r.origin,
     r.inputVersionId ?? r.input_version_id,
     r.priorApprovalsSha256 ?? r.prior_approvals_sha256 ?? null,
+    r.priorDecisionCommitId ?? r.prior_decision_commit_id ?? null,
     r.engineVersionId ?? r.engine_version_id ?? null,
     r.emitMode ?? r.emit_mode,
     r.emitDisplay ?? r.emit_display ?? null,
@@ -216,9 +353,10 @@ export function hashCarriesTable(rows) {
   return hashLines(sorted.map((r) => `${canonicalJson([
     r.id,
     r.runId ?? r.run_id,
-    r.statementDate ?? r.statement_date,
+    formatIsoDate(r.statementDate ?? r.statement_date),
     r.carryKind ?? r.carry_kind,
-    r.fileSha256 ?? r.file_sha256,
+    r.fileSha256 ?? r.file_sha256 ?? null,
+    r.carriedDecisionCommitId ?? r.carried_decision_commit_id ?? null,
     r.publishedInputVersionId ?? r.published_input_version_id ?? null,
     Boolean(r.nothingNew ?? r.nothing_new),
     r.typedPhrase ?? r.typed_phrase,
@@ -252,7 +390,8 @@ export function hashReviewSavesTable(rows) {
     r.runId ?? r.run_id,
     r.surface,
     r.attemptEventId ?? r.attempt_event_id,
-    r.approvalsFileSha256 ?? r.approvals_file_sha256,
+    r.approvalsFileSha256 ?? r.approvals_file_sha256 ?? null,
+    r.decisionCommitId ?? r.decision_commit_id ?? null,
     Boolean(r.imported),
     (r.originalAt ?? r.original_at) ? formatTimestampUtcUs(r.originalAt ?? r.original_at) : null,
     r.submissionId ?? r.submission_id ?? null,
@@ -284,6 +423,372 @@ export function hashStepAttemptEventsTable(rows) {
     r.logFileSha256 ?? r.log_file_sha256 ?? null,
     (r.artifactCount ?? r.artifact_count) == null ? null : Number(r.artifactCount ?? r.artifact_count),
     r.artifactsSha256 ?? r.artifacts_sha256 ?? null,
+  ])}\n`));
+}
+
+function statementAgencyLineArray(r) {
+  return [
+    Number(r.lineNo ?? r.line_no),
+    formatIsoDate(r.statementDate ?? r.statement_date),
+    r.entryKind ?? r.entry_kind,
+    r.runAction ?? r.run_action,
+    r.entity,
+    r.writingNpn ?? r.writing_npn ?? null,
+    r.writingAgent ?? r.writing_agent ?? null,
+    r.recordId ?? r.record_id,
+    r.reversalOf ?? r.reversal_of ?? null,
+    r.correctsRecordId ?? r.corrects_record_id ?? null,
+    r.sourceFile ?? r.source_file,
+    r.sheetName ?? r.sheet_name ?? null,
+    Number(r.sourceRowNo ?? r.source_row_no),
+    r.srcType ?? r.src_type ?? null,
+    r.carrier ?? null,
+    r.mbi ?? null,
+    r.member ?? null,
+    r.externalPolicyId ?? r.external_policy_id ?? null,
+    nullableInt(r.policyId ?? r.policy_id),
+    nullableInt(r.txId ?? r.tx_id),
+    r.planType ?? r.plan_type ?? null,
+    r.simplePlanType ?? r.simple_plan_type ?? null,
+    r.state ?? null,
+    formatIsoDate(r.submissionDate ?? r.submission_date),
+    formatIsoDate(r.originEffective ?? r.origin_effective),
+    formatIsoDate(r.effectiveDate ?? r.effective_date),
+    formatIsoDate(r.terminationDate ?? r.termination_date),
+    formatIsoDate(r.earnedDate ?? r.earned_date),
+    formatIsoDate(r.paymentDate ?? r.payment_date),
+    formatIsoDate(r.postedStatementDate ?? r.posted_statement_date),
+    r.revenueType ?? r.revenue_type ?? null,
+    formatMoney2(r.grossComm ?? r.gross_comm),
+    formatMoney2(r.amount),
+    r.reason ?? null,
+    r.notes ?? null,
+  ];
+}
+
+function statementUplineLineArray(r) {
+  return [
+    Number(r.lineNo ?? r.line_no),
+    formatIsoDate(r.statementDate ?? r.statement_date),
+    r.entryKind ?? r.entry_kind,
+    r.runAction ?? r.run_action,
+    r.sourceEntity ?? r.source_entity,
+    Boolean(r.markedSent ?? r.marked_sent ?? true),
+    r.writingNpn ?? r.writing_npn ?? null,
+    r.writingAgent ?? r.writing_agent ?? null,
+    r.recordId ?? r.record_id,
+    r.reversalOf ?? r.reversal_of ?? null,
+    r.correctsRecordId ?? r.corrects_record_id ?? null,
+    r.sourceFile ?? r.source_file,
+    r.sheetName ?? r.sheet_name ?? null,
+    Number(r.sourceRowNo ?? r.source_row_no),
+    r.srcType ?? r.src_type ?? null,
+    r.carrier ?? null,
+    r.mbi ?? null,
+    r.member ?? null,
+    r.externalPolicyId ?? r.external_policy_id ?? null,
+    nullableInt(r.policyId ?? r.policy_id),
+    nullableInt(r.txId ?? r.tx_id),
+    r.planType ?? r.plan_type ?? null,
+    r.simplePlanType ?? r.simple_plan_type ?? null,
+    r.state ?? null,
+    formatIsoDate(r.submissionDate ?? r.submission_date),
+    formatIsoDate(r.originEffective ?? r.origin_effective),
+    formatIsoDate(r.effectiveDate ?? r.effective_date),
+    formatIsoDate(r.terminationDate ?? r.termination_date),
+    formatIsoDate(r.earnedDate ?? r.earned_date),
+    formatIsoDate(r.paymentDate ?? r.payment_date),
+    formatIsoDate(r.postedStatementDate ?? r.posted_statement_date),
+    r.revenueType ?? r.revenue_type ?? null,
+    formatMoney2(r.grossComm ?? r.gross_comm),
+    formatMoney2(r.amount),
+    r.reason ?? null,
+    r.notes ?? null,
+  ];
+}
+
+export function hashStatementAgencyLines(rows) {
+  const sorted = [...rows].sort((a, b) => Number(a.lineNo ?? a.line_no) - Number(b.lineNo ?? b.line_no));
+  return hashLines(sorted.map((r) => `${canonicalJson(statementAgencyLineArray(r))}\n`));
+}
+
+export function hashStatementUplineLines(rows) {
+  const sorted = [...rows].sort((a, b) => Number(a.lineNo ?? a.line_no) - Number(b.lineNo ?? b.line_no));
+  return hashLines(sorted.map((r) => `${canonicalJson(statementUplineLineArray(r))}\n`));
+}
+
+export function hashStatementBatchesTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.id,
+    r.batchKind ?? r.batch_kind,
+    formatIsoDate(r.statementDate ?? r.statement_date),
+    r.runId ?? r.run_id ?? null,
+    r.attemptEventId ?? r.attempt_event_id ?? null,
+    r.sourceFileName ?? r.source_file_name ?? null,
+    r.sourceFileSha256 ?? r.source_file_sha256 ?? null,
+    r.reason,
+    Number(r.agencyLineCount ?? r.agency_line_count),
+    r.agencyLinesSha256 ?? r.agency_lines_sha256,
+    formatMoney2(r.agencyNetTotal ?? r.agency_net_total),
+    Number(r.uplineLineCount ?? r.upline_line_count),
+    r.uplineLinesSha256 ?? r.upline_lines_sha256,
+    formatMoney2(r.uplineNetTotal ?? r.upline_net_total),
+  ])}\n`));
+}
+
+export function hashStatementAgencyLinesTable(rows) {
+  const sorted = [...rows].sort((a, b) => (
+    compareUtf8Bytes(a.batchId ?? a.batch_id, b.batchId ?? b.batch_id)
+    || Number(a.lineNo ?? a.line_no) - Number(b.lineNo ?? b.line_no)
+  ));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.batchId ?? r.batch_id,
+    ...statementAgencyLineArray(r),
+  ])}\n`));
+}
+
+export function hashStatementUplineLinesTable(rows) {
+  const sorted = [...rows].sort((a, b) => (
+    compareUtf8Bytes(a.batchId ?? a.batch_id, b.batchId ?? b.batch_id)
+    || Number(a.lineNo ?? a.line_no) - Number(b.lineNo ?? b.line_no)
+  ));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.batchId ?? r.batch_id,
+    ...statementUplineLineArray(r),
+  ])}\n`));
+}
+
+export function hashBobRows(policies, financials) {
+  const finByPid = new Map(financials.map((f) => [Number(f.policyId ?? f.policy_id), f]));
+  const sorted = [...policies].sort((a, b) => Number(a.policyId ?? a.policy_id) - Number(b.policyId ?? b.policy_id));
+  return hashLines(sorted.map((bp) => {
+    const pid = Number(bp.policyId ?? bp.policy_id);
+    const bpf = finByPid.get(pid) || {};
+    return `${canonicalJson([
+      pid,
+      bp.externalPolicyId ?? bp.external_policy_id ?? null,
+      bp.carrierPolicyNumber ?? bp.carrier_policy_number ?? null,
+      bp.crmPolicyNumber ?? bp.crm_policy_number ?? null,
+      bp.carrier ?? null,
+      bp.planType ?? bp.plan_type ?? null,
+      bp.planName ?? bp.plan_name ?? null,
+      bp.simplePlanType ?? bp.simple_plan_type ?? null,
+      bp.mbi ?? null,
+      bp.member ?? null,
+      bp.dob ?? null,
+      bp.phone ?? null,
+      bp.email ?? null,
+      bp.address ?? null,
+      bp.county ?? null,
+      bp.state ?? null,
+      formatIsoDate(bp.submissionDate ?? bp.submission_date),
+      formatIsoDate(bp.originEffective ?? bp.origin_effective),
+      formatIsoDate(bp.effectiveDate ?? bp.effective_date),
+      formatIsoDate(bp.terminationDate ?? bp.termination_date),
+      bp.writingNpn ?? bp.writing_npn ?? null,
+      bp.writingAgent ?? bp.writing_agent ?? null,
+      bp.entity,
+      bp.status ?? null,
+      bp.coherentStatus ?? bp.coherent_status ?? null,
+      formatMoney2(bpf.amount),
+      formatMoney2(bpf.uplineAmount ?? bpf.upline_amount),
+      bpf.enrollmentCode ?? bpf.enrollment_code ?? null,
+      formatIsoDate(bpf.minDate ?? bpf.min_date),
+      formatIsoDate(bpf.anchorDate ?? bpf.anchor_date),
+      bpf.agencyId ?? bpf.agency_id ?? null,
+      bpf.conflicts ?? null,
+      bpf.spineSource ?? bpf.spine_source ?? null,
+      nullableInt(bpf.confidenceLevel ?? bpf.confidence_level),
+      bpf.coherentTrajectory ?? bpf.coherent_trajectory ?? null,
+    ])}\n`;
+  }));
+}
+
+export function hashLedgerRows(rows) {
+  const sorted = [...rows].sort((a, b) => Number(a.txId ?? a.tx_id) - Number(b.txId ?? b.tx_id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    Number(r.txId ?? r.tx_id),
+    r.recordId ?? r.record_id,
+    r.externalPolicyId ?? r.external_policy_id ?? null,
+    nullableInt(r.policyId ?? r.policy_id),
+    r.statementName ?? r.statement_name ?? null,
+    r.srcType ?? r.src_type,
+    r.carrier ?? null,
+    r.mbi ?? null,
+    r.member ?? null,
+    r.state ?? null,
+    r.planType ?? r.plan_type ?? null,
+    r.simplePlanType ?? r.simple_plan_type ?? null,
+    formatIsoDate(r.submissionDate ?? r.submission_date),
+    formatIsoDate(r.originEffective ?? r.origin_effective),
+    formatIsoDate(r.effectiveDate ?? r.effective_date),
+    formatIsoDate(r.terminationDate ?? r.termination_date),
+    formatIsoDate(r.earnedDate ?? r.earned_date),
+    formatIsoDate(r.paymentDate ?? r.payment_date),
+    formatIsoDate(r.statementDate ?? r.statement_date),
+    formatIsoDate(r.minDate ?? r.min_date),
+    formatMoney2(r.grossComm ?? r.gross_comm),
+    r.revenueType ?? r.revenue_type ?? null,
+    formatMoney2(r.overrideAmount ?? r.override_amount),
+    formatMoney2(r.commissionAmount ?? r.commission_amount),
+    formatMoney2(r.hraAmount ?? r.hra_amount),
+    formatMoney2(r.feeAmount ?? r.fee_amount),
+    formatMoney2(r.otherAmount ?? r.other_amount),
+    formatMoney2(r.downlineAmount ?? r.downline_amount),
+    formatMoney2(r.uplineAmount ?? r.upline_amount),
+    r.writingNpn ?? r.writing_npn ?? null,
+    r.writingAgent ?? r.writing_agent ?? null,
+    r.entity,
+    r.payeeNpn ?? r.payee_npn ?? null,
+    r.agencyId ?? r.agency_id ?? null,
+    r.status ?? null,
+    r.policyStatus ?? r.policy_status ?? null,
+    Boolean(r.cbobC ?? r.cbob_c),
+    Boolean(r.cbobS ?? r.cbob_s),
+    Boolean(r.sf),
+    r.notes ?? null,
+    r.coherentNotes ?? r.coherent_notes ?? null,
+    r.sheetName ?? r.sheet_name ?? null,
+    nullableInt(r.sourceRowNo ?? r.source_row_no),
+  ])}\n`));
+}
+
+export function hashRunMaterializationsTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(
+    a.attemptEventId ?? a.attempt_event_id,
+    b.attemptEventId ?? b.attempt_event_id,
+  ));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.attemptEventId ?? r.attempt_event_id,
+    r.runId ?? r.run_id,
+    formatIsoDate(r.statementDate ?? r.statement_date),
+    r.reconciliationMode ?? r.reconciliation_mode ?? 'strict_entity_ledger',
+    Number(r.bobRowCount ?? r.bob_row_count),
+    r.bobRowsSha256 ?? r.bob_rows_sha256,
+    formatMoney2(r.bobDownlineTotal ?? r.bob_downline_total),
+    formatMoney2(r.bobUplineTotal ?? r.bob_upline_total),
+    Number(r.ledgerRowCount ?? r.ledger_row_count),
+    r.ledgerRowsSha256 ?? r.ledger_rows_sha256,
+    formatMoney2(r.ledgerGrossTotal ?? r.ledger_gross_total),
+    formatMoney2(r.ledgerDownlineTotal ?? r.ledger_downline_total),
+    formatMoney2(r.ledgerUplineTotal ?? r.ledger_upline_total),
+    r.statementBatchId ?? r.statement_batch_id,
+    r.corpusTail ?? r.corpus_tail ?? null,
+    formatIsoDate(r.agencyStart ?? r.agency_start),
+  ])}\n`));
+}
+
+export function hashBobPoliciesTable(rows) {
+  const sorted = [...rows].sort((a, b) => (
+    compareUtf8Bytes(a.attemptEventId ?? a.attempt_event_id, b.attemptEventId ?? b.attempt_event_id)
+    || Number(a.policyId ?? a.policy_id) - Number(b.policyId ?? b.policy_id)
+  ));
+  return hashLines(sorted.map((bp) => `${canonicalJson([
+    bp.attemptEventId ?? bp.attempt_event_id,
+    Number(bp.policyId ?? bp.policy_id),
+    bp.runId ?? bp.run_id,
+    bp.externalPolicyId ?? bp.external_policy_id ?? null,
+    bp.carrierPolicyNumber ?? bp.carrier_policy_number ?? null,
+    bp.crmPolicyNumber ?? bp.crm_policy_number ?? null,
+    bp.carrier ?? null,
+    bp.planType ?? bp.plan_type ?? null,
+    bp.planName ?? bp.plan_name ?? null,
+    bp.simplePlanType ?? bp.simple_plan_type ?? null,
+    bp.mbi ?? null,
+    bp.member ?? null,
+    bp.dob ?? null,
+    bp.phone ?? null,
+    bp.email ?? null,
+    bp.address ?? null,
+    bp.county ?? null,
+    bp.state ?? null,
+    formatIsoDate(bp.submissionDate ?? bp.submission_date),
+    formatIsoDate(bp.originEffective ?? bp.origin_effective),
+    formatIsoDate(bp.effectiveDate ?? bp.effective_date),
+    formatIsoDate(bp.terminationDate ?? bp.termination_date),
+    bp.writingNpn ?? bp.writing_npn ?? null,
+    bp.writingAgent ?? bp.writing_agent ?? null,
+    bp.entity,
+    bp.status ?? null,
+    bp.coherentStatus ?? bp.coherent_status ?? null,
+  ])}\n`));
+}
+
+export function hashBobPolicyFinancialsTable(rows) {
+  const sorted = [...rows].sort((a, b) => (
+    compareUtf8Bytes(a.attemptEventId ?? a.attempt_event_id, b.attemptEventId ?? b.attempt_event_id)
+    || Number(a.policyId ?? a.policy_id) - Number(b.policyId ?? b.policy_id)
+  ));
+  return hashLines(sorted.map((bpf) => `${canonicalJson([
+    bpf.attemptEventId ?? bpf.attempt_event_id,
+    Number(bpf.policyId ?? bpf.policy_id),
+    bpf.entity,
+    bpf.writingNpn ?? bpf.writing_npn ?? null,
+    formatMoney2(bpf.amount),
+    formatMoney2(bpf.uplineAmount ?? bpf.upline_amount),
+    bpf.enrollmentCode ?? bpf.enrollment_code ?? null,
+    formatIsoDate(bpf.minDate ?? bpf.min_date),
+    formatIsoDate(bpf.anchorDate ?? bpf.anchor_date),
+    bpf.agencyId ?? bpf.agency_id ?? null,
+    bpf.conflicts ?? null,
+    bpf.spineSource ?? bpf.spine_source ?? null,
+    nullableInt(bpf.confidenceLevel ?? bpf.confidence_level),
+    bpf.coherentTrajectory ?? bpf.coherent_trajectory ?? null,
+  ])}\n`));
+}
+
+export function hashCoherentLedgerRowsTable(rows) {
+  const sorted = [...rows].sort((a, b) => (
+    compareUtf8Bytes(a.attemptEventId ?? a.attempt_event_id, b.attemptEventId ?? b.attempt_event_id)
+    || Number(a.txId ?? a.tx_id) - Number(b.txId ?? b.tx_id)
+  ));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.attemptEventId ?? r.attempt_event_id,
+    Number(r.txId ?? r.tx_id),
+    r.runId ?? r.run_id,
+    r.recordId ?? r.record_id,
+    r.externalPolicyId ?? r.external_policy_id ?? null,
+    nullableInt(r.policyId ?? r.policy_id),
+    r.statementName ?? r.statement_name ?? null,
+    r.srcType ?? r.src_type,
+    r.carrier ?? null,
+    r.mbi ?? null,
+    r.member ?? null,
+    r.state ?? null,
+    r.planType ?? r.plan_type ?? null,
+    r.simplePlanType ?? r.simple_plan_type ?? null,
+    formatIsoDate(r.submissionDate ?? r.submission_date),
+    formatIsoDate(r.originEffective ?? r.origin_effective),
+    formatIsoDate(r.effectiveDate ?? r.effective_date),
+    formatIsoDate(r.terminationDate ?? r.termination_date),
+    formatIsoDate(r.earnedDate ?? r.earned_date),
+    formatIsoDate(r.paymentDate ?? r.payment_date),
+    formatIsoDate(r.statementDate ?? r.statement_date),
+    formatIsoDate(r.minDate ?? r.min_date),
+    formatMoney2(r.grossComm ?? r.gross_comm),
+    r.revenueType ?? r.revenue_type ?? null,
+    formatMoney2(r.overrideAmount ?? r.override_amount),
+    formatMoney2(r.commissionAmount ?? r.commission_amount),
+    formatMoney2(r.hraAmount ?? r.hra_amount),
+    formatMoney2(r.feeAmount ?? r.fee_amount),
+    formatMoney2(r.otherAmount ?? r.other_amount),
+    formatMoney2(r.downlineAmount ?? r.downline_amount),
+    formatMoney2(r.uplineAmount ?? r.upline_amount),
+    r.writingNpn ?? r.writing_npn ?? null,
+    r.writingAgent ?? r.writing_agent ?? null,
+    r.entity,
+    r.payeeNpn ?? r.payee_npn ?? null,
+    r.agencyId ?? r.agency_id ?? null,
+    r.status ?? null,
+    r.policyStatus ?? r.policy_status ?? null,
+    Boolean(r.cbobC ?? r.cbob_c),
+    Boolean(r.cbobS ?? r.cbob_s),
+    Boolean(r.sf),
+    r.notes ?? null,
+    r.coherentNotes ?? r.coherent_notes ?? null,
+    r.sheetName ?? r.sheet_name ?? null,
+    nullableInt(r.sourceRowNo ?? r.source_row_no),
   ])}\n`));
 }
 
@@ -322,6 +827,10 @@ const TABLE_HASHERS = {
   input_changes: hashInputChangesTable,
   approvals_files: hashApprovalsFilesTable,
   approval_rows: hashApprovalRowsTable,
+  decision_commits: hashDecisionCommitsTable,
+  decisions: hashDecisionsTable,
+  generated_overlays: hashGeneratedOverlaysTable,
+  review_queue_items: hashReviewQueueItemsTable,
   runs: hashRunsTable,
   step_requests: hashStepRequestsTable,
   cancel_requests: hashCancelRequestsTable,
@@ -329,6 +838,13 @@ const TABLE_HASHERS = {
   artifacts: hashArtifactsTable,
   review_saves: hashReviewSavesTable,
   emit_confirmations: hashEmitConfirmationsTable,
+  statement_batches: hashStatementBatchesTable,
+  statement_agency_lines: hashStatementAgencyLinesTable,
+  statement_upline_lines: hashStatementUplineLinesTable,
+  run_materializations: hashRunMaterializationsTable,
+  bob_policies: hashBobPoliciesTable,
+  bob_policy_financials: hashBobPolicyFinancialsTable,
+  coherent_ledger_rows: hashCoherentLedgerRowsTable,
   carries: hashCarriesTable,
   abandonments: hashAbandonmentsTable,
   imported_files: hashImportedFilesTable,

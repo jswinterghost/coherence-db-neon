@@ -1,5 +1,5 @@
 <!-- GENERATED FILE: DO NOT EDIT BY HAND. -->
-<!-- Source: src/state-machine/coherence-machines.mjs | Checksum: 225bd7666ec8c9ca231870fbc86247a692dfdd927c6fd9f43bbfdebf1848b532 -->
+<!-- Source: src/state-machine/coherence-machines.mjs | Checksum: 8d8a8e031342af24bd35aebf98d8abe193b689dade2f8d51eaa7d65560466068 -->
 
 # Coherence State Machines
 
@@ -7,7 +7,7 @@ Generated directly from `src/state-machine/coherence-machines.mjs` using the reu
 
 | Machine | ID | States | Transitions | Guards | Spec SHA-256 |
 |---|---|---|---|---|---|
-| Run Lifecycle (Derived Stages) | `coherence-run-stage` | 11 | 18 | 16 | `5b773ce28cf212ba` |
+| Run Lifecycle (Derived Stages) | `coherence-run-stage` | 11 | 18 | 17 | `23c6101b401c6634` |
 | Step Attempt Lifecycle | `coherence-step-attempt` | 7 | 6 | 10 | `0b4c38c3b5037486` |
 
 ---
@@ -16,7 +16,7 @@ Generated directly from `src/state-machine/coherence-machines.mjs` using the reu
 
 The 11 derived stages of a Coherence run (computed from immutable events by `coherence.run_stage(run_id, as_of_seq)` and never stored as mutable state). Every guard is enforced directly inside PostgreSQL triggers.
 
-- Version: `1.0.0` | Storage: derived (never stored) | Spec SHA-256: `5b773ce28cf212ba`
+- Version: `1.0.0` | Storage: derived (never stored) | Spec SHA-256: `23c6101b401c6634`
 
 ### States
 
@@ -43,9 +43,9 @@ The 11 derived stages of a Coherence run (computed from immutable events by `coh
 | `worker_starts_step` | worker starts non-Emit step | `preparing` | `running a step` | `worker` | `worker_holds_slot` | record started event for assign/attribute/bible/adjust |
 | `worker_starts_emit` | worker starts Emit | `emitting` | `emitting` | `worker` | `worker_holds_slot` | record started event for emit |
 | `step_finishes_continue` | assign or attribute finishes | `running a step` | `preparing` | `worker` | `same_starter_slot_no_end` | record finished event with artifacts; request next step (attribute or bible) |
-| `step_finishes_bible` | bible finishes | `running a step` | `waiting for Bible` | `worker` | `same_starter_slot_no_end` | record finished event for bible; pause for human Bible review |
-| `step_finishes_adjust` | adjust finishes | `running a step` | `waiting for Adjust` | `worker` | `same_starter_slot_no_end` | record finished event for adjust; pause for human Adjust review |
-| `step_finishes_emit` | emit finishes | `emitting` | `done` | `worker` | `same_starter_slot_no_end` | record finished event for emit with statements and archived outputs |
+| `step_finishes_bible` | bible finishes | `running a step` | `waiting for Bible` | `worker` | `same_starter_slot_no_end` | record finished event for bible with review_queue_items and generated_overlays; pause for human Bible review |
+| `step_finishes_adjust` | adjust finishes | `running a step` | `waiting for Adjust` | `worker` | `same_starter_slot_no_end` | record finished event for adjust with review_queue_items and generated_overlays; pause for human Adjust review |
+| `step_finishes_emit` | emit finishes | `emitting` | `done` | `worker` | `same_starter_slot_no_end`, `emit_conservation_verified` | record finished event for emit with materialized Book of Business, Coherent Ledger, and conservation-verified statement tables |
 | `step_fails` | step fails | `running a step`, `emitting` | `failed` | `worker` | `same_starter_slot_no_end` | record failed event with log |
 | `worker_lost` | worker lost | `running a step`, `emitting` | `interrupted` | `worker` | `slot_free_or_other_holder_no_end` | record interrupted event |
 | `cancel` | cancel (typed) | `running a step`, `emitting` | `cancelled` | `owner`, `nusear_staff`, `worker` | `open_attempt_and_typed_cancel`, `same_starter_slot_no_end` | record cancel_request; stop engine process group; record cancelled event |
@@ -55,7 +55,7 @@ The 11 derived stages of a Coherence run (computed from immutable events by `coh
 | `retry_non_emit` | retry (assign..adjust) | `failed`, `interrupted`, `cancelled` | `preparing` | `owner`, `nusear_staff` | `no_open_request_not_abandoned`, `retry_guards` | supersede later attempts if any; request step (reason=retry) |
 | `retry_emit` | retry (emit) | `failed`, `interrupted`, `cancelled` | `emitting` | `owner`, `nusear_staff` | `no_open_request_not_abandoned`, `retry_guards` | request emit (reason=retry) keeping original emit_confirmation |
 | `record_as_sent` | record as sent (typed) | `done` | `done` | `owner` | `carry_sent_guards` | record sent carry; publish next standing input version adding Sent/statements_<date>.csv |
-| `carry_approvals` | carry approvals (typed) | `done` | `done` | `owner` | `carry_approvals_guards` | record approvals carry; publish next standing input version with Overlay/overlay.csv (or nothing_new=true) |
+| `carry_approvals` | carry decisions or approvals (typed) | `done` | `done` | `owner` | `carry_approvals_guards` | record decisions carry advancing standing decision head (or legacy approvals carry updating Overlay/overlay.csv) |
 | `abandon` | abandon (typed, when no attempt is running) | `preparing`, `waiting for Bible`, `waiting for Adjust`, `ready to create statements`, `emitting`, `done`, `failed`, `interrupted`, `cancelled` | `abandoned` | `owner` | `abandon_guards` | record abandonment; delete review drafts |
 
 ### Guards and Database Enforcement
@@ -70,13 +70,14 @@ The 11 derived stages of a Coherence run (computed from immutable events by `coh
 | `open_attempt_and_typed_cancel` | Run has an open attempt and cancel carries the typed phrase `"cancel <date>"`. | table `coherence.cancel_requests`; trigger `trg_02_cancel_requests_before` |
 | `no_open_request_not_abandoned` | No open step request, no open attempt, and run is not abandoned. | table `coherence.review_saves`; trigger `trg_02_review_saves_before` |
 | `no_adjust_save_for_current_adjust` | No Adjust review has been saved for Adjust's current non-superseded attempt. | table `coherence.review_saves`; trigger `trg_02_review_saves_before` |
-| `overlay_extends_frozen_prior` | Coherence overlay check passed and file begins with the run's frozen prior approvals. | table `coherence.review_saves`; trigger `trg_02_review_saves_before` |
+| `overlay_extends_frozen_prior` | Saved decision commit or approvals file extends the run's frozen prior decisions, passes replacement-chain verification, and covers all review queue items. | table `coherence.review_saves`; triggers `trg_02_review_saves_before`, `trg_review_saves_verify_deferred` |
 | `no_emit_confirmed_for_current_adjust` | No Emit confirmation exists for Adjust's current attempt. | table `coherence.review_saves`; trigger `trg_02_review_saves_before` |
-| `overlay_extends_bible_save` | Adjust approvals file begins with this run's saved Bible review. | table `coherence.review_saves`; trigger `trg_02_review_saves_before` |
+| `overlay_extends_bible_save` | Adjust decision commit or approvals file extends this run's saved Bible review and includes fresh decisions for every reconfirmation item. | table `coherence.review_saves`; triggers `trg_02_review_saves_before`, `trg_review_saves_verify_deferred` |
+| `emit_conservation_verified` | Materialized Book of Business, Coherent Ledger, and cumulative entity statements tie to the exact cent at COMMIT with at most one materialization per run. | table `coherence.run_materializations`; triggers `trg_02_run_materializations_before`, `trg_run_materializations_verify_deferred` |
 | `emit_typed_phrase_and_newest_save` | Typed phrase is `"create statements for <date>"`, names this run's newest Adjust save, and no review submission is waiting. | table `coherence.emit_confirmations`; triggers `trg_02_emit_confirmations_before`, `trg_emit_confirmations_verify_deferred` |
 | `retry_guards` | A person asks to retry a failed, interrupted, or cancelled step; later attempts are superseded; Emit retry keeps its valid confirmation. | table `coherence.step_requests`; trigger `trg_02_step_requests_before` |
 | `carry_sent_guards` | Run is `app` or `company_import` in stage `done`; file matches this run's finished Emit statement; at most one sent statement per date; typed phrase `"sent <date>"`. | table `coherence.carries`; trigger `trg_02_carries_before`; indexes `coherence.carries_one_sent_per_date` |
-| `carry_approvals_guards` | Run is `app` or `company_import` in stage `done`; file matches this run's finished Emit `emits/overlay.csv`; extends current standing approvals file; typed phrase `"carry <date>"`. | table `coherence.carries`; trigger `trg_02_carries_before` |
+| `carry_approvals_guards` | Run is `app` or `company_import` in stage `done`; carried decision commit (or emitted overlay) extends the standing head; typed phrase `"carry <date>"`. | table `coherence.carries`; trigger `trg_02_carries_before` |
 | `abandon_guards` | No open attempt (when stage is `emitting`, allowed only while queued before `emit` starts), no review submission waiting, nothing carried, non-imported run, typed phrase `"abandon <date>"`, and non-empty reason. | table `coherence.abandonments`; triggers `trg_02_abandonments_before`, `trg_03_abandonments_delete_drafts` |
 
 ### State Diagram
@@ -112,7 +113,7 @@ stateDiagram-v2
   interrupted --> emitting: retry (emit)
   cancelled --> emitting: retry (emit)
   done --> done: record as sent (typed)
-  done --> done: carry approvals (typed)
+  done --> done: carry decisions or approvals (typed)
   preparing --> abandoned: abandon (typed, when no attempt is running)
   waiting_for_Bible --> abandoned: abandon (typed, when no attempt is running)
   waiting_for_Adjust --> abandoned: abandon (typed, when no attempt is running)

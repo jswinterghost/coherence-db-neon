@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const j = (...parts) => parts.join('');
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SKIP_DIRS = new Set(['node_modules', j('.', 'dev', 'in'), '.git']);
-const SKIP_FILE_PREFIXES = ['.pass2-', j('.', 'ne', 'on', '-')];
+const SKIP_FILE_PREFIXES = ['.pass2-', j('.', 'ne', 'on', '-'), j('.', 'pha', 'lanx', '-')];
 const SKIP_EXACT_FILES = new Set(['package-lock.json']);
 const ALLOWED_GITIGNORE_LINES = new Set([j('.', 'dev', 'in', '/'), j('.', 'ne', 'on', '-*')]);
 

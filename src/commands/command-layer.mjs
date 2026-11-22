@@ -2,6 +2,7 @@
 // command-key idempotency, expected_journal_seq concurrency, SERIALIZABLE isolation, batched inserts,
 // and journal commitments.
 import { randomUUID } from 'node:crypto';
+import { LIVE_DISPOSITIONS, POLICY_STATUSES } from '../decisions/overlay-generator.mjs';
 import {
   canonicalInputEntriesText,
   computeRequestFingerprint,
@@ -13,10 +14,18 @@ import {
 } from '../util/crypto.mjs';
 import { assertValidRelPath, findPathClashes, isValidIsoDate, normalizeMacKey } from '../util/csv.mjs';
 import { AppError, sanitizeErrorMessage } from '../util/redact.mjs';
+import { formatCents, parseCents, prepareEmitMaterialization } from '../worker/emit-materializer.mjs';
 import { assertCanWrite } from './authz.mjs';
-import { buildCommitments } from './commitments.mjs';
+import {
+  buildCommitments,
+  hashDecisions,
+  hashStatementAgencyLines,
+  hashStatementUplineLines,
+} from './commitments.mjs';
 
 const BATCH_SIZE = 2000;
+const POLICY_STATUS_SET = new Set(POLICY_STATUSES);
+const MONEY_RE = /^-?[0-9]+\.[0-9]{2}$/;
 
 function mapPgError(error) {
   if (error instanceof AppError) return error;
@@ -185,6 +194,483 @@ async function insertApprovalRowsBatch(tx, rows, journalSeq) {
       ],
     );
   }
+}
+
+async function insertDecisionsBatch(tx, rows, journalSeq) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    await tx.query(
+      `INSERT INTO coherence.decisions (
+         id, decision_commit_id, row_order, run_id, review_save_id, surface, record_id,
+         replaces_decision_id, disposition, agent, agency, policy, book, month, status, note,
+         approved_amount, approved_agency, approved_agent, approved_agency_from, approved_agent_from,
+         decided_by, acting_for, decided_at, committed_at_raw, imported, journal_seq
+       )
+       SELECT id, dcid, ro, rid, rsid, surf, reck,
+              rep, disp, ag, agy, pol, bk, mo, st, nt,
+              aa, aagy, aag, aagyf, aagf,
+              dby, af, dat, craw, imp, $27
+       FROM unnest(
+         $1::uuid[], $2::uuid[], $3::integer[], $4::uuid[], $5::uuid[], $6::text[], $7::text[],
+         $8::uuid[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[], $15::text[], $16::text[],
+         $17::text[], $18::text[], $19::text[], $20::text[], $21::text[],
+         $22::text[], $23::text[], $24::timestamptz[], $25::text[], $26::boolean[]
+       ) AS t(
+         id, dcid, ro, rid, rsid, surf, reck,
+         rep, disp, ag, agy, pol, bk, mo, st, nt,
+         aa, aagy, aag, aagyf, aagf,
+         dby, af, dat, craw, imp
+       )`,
+      [
+        chunk.map((r) => r.id),
+        chunk.map((r) => r.decisionCommitId ?? r.decision_commit_id),
+        chunk.map((r) => Number(r.rowOrder ?? r.row_order)),
+        chunk.map((r) => r.runId ?? r.run_id ?? null),
+        chunk.map((r) => r.reviewSaveId ?? r.review_save_id ?? null),
+        chunk.map((r) => r.surface ?? null),
+        chunk.map((r) => r.recordId ?? r.record_id),
+        chunk.map((r) => r.replacesDecisionId ?? r.replaces_decision_id ?? null),
+        chunk.map((r) => r.disposition),
+        chunk.map((r) => r.agent ?? null),
+        chunk.map((r) => r.agency ?? null),
+        chunk.map((r) => r.policy ?? null),
+        chunk.map((r) => r.book ?? null),
+        chunk.map((r) => r.month ?? null),
+        chunk.map((r) => r.status ?? null),
+        chunk.map((r) => r.note ?? null),
+        chunk.map((r) => r.approvedAmount ?? r.approved_amount ?? null),
+        chunk.map((r) => r.approvedAgency ?? r.approved_agency ?? null),
+        chunk.map((r) => r.approvedAgent ?? r.approved_agent ?? null),
+        chunk.map((r) => r.approvedAgencyFrom ?? r.approved_agency_from ?? null),
+        chunk.map((r) => r.approvedAgentFrom ?? r.approved_agent_from ?? null),
+        chunk.map((r) => r.decidedBy ?? r.decided_by),
+        chunk.map((r) => r.actingFor ?? r.acting_for ?? null),
+        chunk.map((r) => formatTimestampUtcUs(r.decidedAt ?? r.decided_at)),
+        chunk.map((r) => r.committedAtRaw ?? r.committed_at_raw ?? null),
+        chunk.map((r) => Boolean(r.imported)),
+        String(journalSeq),
+      ],
+    );
+  }
+}
+
+async function insertReviewQueueItemsBatch(tx, rows, journalSeq) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    await tx.query(
+      `INSERT INTO coherence.review_queue_items (
+         attempt_event_id, item_order, run_id, surface, record_id,
+         case_kind, subtype, entity, npn, amount, entity_from, npn_from, needs_reconfirm, journal_seq
+       )
+       SELECT ae, io, rid, surf, reck, ck, sub, ent, npn, amt, ef, nf, nr, $14
+       FROM unnest(
+         $1::uuid[], $2::integer[], $3::uuid[], $4::text[], $5::text[],
+         $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::boolean[]
+       ) AS t(ae, io, rid, surf, reck, ck, sub, ent, npn, amt, ef, nf, nr)`,
+      [
+        chunk.map((r) => r.attemptEventId ?? r.attempt_event_id),
+        chunk.map((r) => Number(r.itemOrder ?? r.item_order)),
+        chunk.map((r) => r.runId ?? r.run_id),
+        chunk.map((r) => r.surface),
+        chunk.map((r) => r.recordId ?? r.record_id),
+        chunk.map((r) => r.caseKind ?? r.case_kind ?? null),
+        chunk.map((r) => r.subtype ?? null),
+        chunk.map((r) => r.entity ?? null),
+        chunk.map((r) => r.npn ?? null),
+        chunk.map((r) => r.amount ?? null),
+        chunk.map((r) => r.entityFrom ?? r.entity_from ?? null),
+        chunk.map((r) => r.npnFrom ?? r.npn_from ?? null),
+        chunk.map((r) => Boolean(r.needsReconfirm ?? r.needs_reconfirm)),
+        String(journalSeq),
+      ],
+    );
+  }
+}
+
+async function insertStatementAgencyLinesBatch(tx, rows, journalSeq) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    await tx.query(
+      `INSERT INTO coherence.statement_agency_lines (
+         batch_id, line_no, statement_date, entry_kind, run_action, entity,
+         writing_npn, writing_agent, record_id, reversal_of, corrects_record_id,
+         source_file, sheet_name, source_row_no, src_type, carrier, mbi, member,
+         external_policy_id, policy_id, tx_id, plan_type, simple_plan_type, state,
+         submission_date, origin_effective, effective_date, termination_date,
+         earned_date, payment_date, posted_statement_date, revenue_type,
+         gross_comm, amount, reason, notes, journal_seq
+       )
+       SELECT bid, lno, sd, ek, ra, ent, wnpn, wag, rid, rev, cor,
+              sf, sh, srn, st, car, mbi, mem,
+              epid, pid, tid, pt, spt, ste,
+              subd, oeff, effd, termd,
+              earnd, payd, psd, revt,
+              gc, amt, rsn, nts, $37
+       FROM unnest(
+         $1::uuid[], $2::integer[], $3::date[], $4::text[], $5::text[], $6::text[],
+         $7::text[], $8::text[], $9::text[], $10::text[], $11::text[],
+         $12::text[], $13::text[], $14::integer[], $15::text[], $16::text[], $17::text[], $18::text[],
+         $19::text[], $20::integer[], $21::integer[], $22::text[], $23::text[], $24::text[],
+         $25::date[], $26::date[], $27::date[], $28::date[],
+         $29::date[], $30::date[], $31::date[], $32::text[],
+         $33::numeric(14,2)[], $34::numeric(14,2)[], $35::text[], $36::text[]
+       ) AS t(
+         bid, lno, sd, ek, ra, ent, wnpn, wag, rid, rev, cor,
+         sf, sh, srn, st, car, mbi, mem,
+         epid, pid, tid, pt, spt, ste,
+         subd, oeff, effd, termd,
+         earnd, payd, psd, revt,
+         gc, amt, rsn, nts
+       )`,
+      [
+        chunk.map((r) => r.batchId ?? r.batch_id),
+        chunk.map((r) => Number(r.lineNo ?? r.line_no)),
+        chunk.map((r) => r.statementDate ?? r.statement_date),
+        chunk.map((r) => r.entryKind ?? r.entry_kind),
+        chunk.map((r) => r.runAction ?? r.run_action),
+        chunk.map((r) => r.entity),
+        chunk.map((r) => r.writingNpn ?? r.writing_npn ?? null),
+        chunk.map((r) => r.writingAgent ?? r.writing_agent ?? null),
+        chunk.map((r) => r.recordId ?? r.record_id),
+        chunk.map((r) => r.reversalOf ?? r.reversal_of ?? null),
+        chunk.map((r) => r.correctsRecordId ?? r.corrects_record_id ?? null),
+        chunk.map((r) => r.sourceFile ?? r.source_file),
+        chunk.map((r) => r.sheetName ?? r.sheet_name ?? null),
+        chunk.map((r) => Number(r.sourceRowNo ?? r.source_row_no)),
+        chunk.map((r) => r.srcType ?? r.src_type ?? null),
+        chunk.map((r) => r.carrier ?? null),
+        chunk.map((r) => r.mbi ?? null),
+        chunk.map((r) => r.member ?? null),
+        chunk.map((r) => r.externalPolicyId ?? r.external_policy_id ?? null),
+        chunk.map((r) => (r.policyId ?? r.policy_id) ?? null),
+        chunk.map((r) => (r.txId ?? r.tx_id) ?? null),
+        chunk.map((r) => r.planType ?? r.plan_type ?? null),
+        chunk.map((r) => r.simplePlanType ?? r.simple_plan_type ?? null),
+        chunk.map((r) => r.state ?? null),
+        chunk.map((r) => r.submissionDate ?? r.submission_date ?? null),
+        chunk.map((r) => r.originEffective ?? r.origin_effective ?? null),
+        chunk.map((r) => r.effectiveDate ?? r.effective_date ?? null),
+        chunk.map((r) => r.terminationDate ?? r.termination_date ?? null),
+        chunk.map((r) => r.earnedDate ?? r.earned_date ?? null),
+        chunk.map((r) => r.paymentDate ?? r.payment_date ?? null),
+        chunk.map((r) => r.postedStatementDate ?? r.posted_statement_date ?? null),
+        chunk.map((r) => r.revenueType ?? r.revenue_type ?? null),
+        chunk.map((r) => r.grossComm ?? r.gross_comm),
+        chunk.map((r) => r.amount),
+        chunk.map((r) => r.reason ?? null),
+        chunk.map((r) => r.notes ?? null),
+        String(journalSeq),
+      ],
+    );
+  }
+}
+
+async function insertStatementUplineLinesBatch(tx, rows, journalSeq) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    await tx.query(
+      `INSERT INTO coherence.statement_upline_lines (
+         batch_id, line_no, statement_date, entry_kind, run_action, source_entity, marked_sent,
+         writing_npn, writing_agent, record_id, reversal_of, corrects_record_id,
+         source_file, sheet_name, source_row_no, src_type, carrier, mbi, member,
+         external_policy_id, policy_id, tx_id, plan_type, simple_plan_type, state,
+         submission_date, origin_effective, effective_date, termination_date,
+         earned_date, payment_date, posted_statement_date, revenue_type,
+         gross_comm, amount, reason, notes, journal_seq
+       )
+       SELECT bid, lno, sd, ek, ra, sent, msent, wnpn, wag, rid, rev, cor,
+              sf, sh, srn, st, car, mbi, mem,
+              epid, pid, tid, pt, spt, ste,
+              subd, oeff, effd, termd,
+              earnd, payd, psd, revt,
+              gc, amt, rsn, nts, $38
+       FROM unnest(
+         $1::uuid[], $2::integer[], $3::date[], $4::text[], $5::text[], $6::text[], $7::boolean[],
+         $8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
+         $13::text[], $14::text[], $15::integer[], $16::text[], $17::text[], $18::text[], $19::text[],
+         $20::text[], $21::integer[], $22::integer[], $23::text[], $24::text[], $25::text[],
+         $26::date[], $27::date[], $28::date[], $29::date[],
+         $30::date[], $31::date[], $32::date[], $33::text[],
+         $34::numeric(14,2)[], $35::numeric(14,2)[], $36::text[], $37::text[]
+       ) AS t(
+         bid, lno, sd, ek, ra, sent, msent, wnpn, wag, rid, rev, cor,
+         sf, sh, srn, st, car, mbi, mem,
+         epid, pid, tid, pt, spt, ste,
+         subd, oeff, effd, termd,
+         earnd, payd, psd, revt,
+         gc, amt, rsn, nts
+       )`,
+      [
+        chunk.map((r) => r.batchId ?? r.batch_id),
+        chunk.map((r) => Number(r.lineNo ?? r.line_no)),
+        chunk.map((r) => r.statementDate ?? r.statement_date),
+        chunk.map((r) => r.entryKind ?? r.entry_kind),
+        chunk.map((r) => r.runAction ?? r.run_action),
+        chunk.map((r) => r.sourceEntity ?? r.source_entity),
+        chunk.map((r) => Boolean(r.markedSent ?? r.marked_sent ?? true)),
+        chunk.map((r) => r.writingNpn ?? r.writing_npn ?? null),
+        chunk.map((r) => r.writingAgent ?? r.writing_agent ?? null),
+        chunk.map((r) => r.recordId ?? r.record_id),
+        chunk.map((r) => r.reversalOf ?? r.reversal_of ?? null),
+        chunk.map((r) => r.correctsRecordId ?? r.corrects_record_id ?? null),
+        chunk.map((r) => r.sourceFile ?? r.source_file),
+        chunk.map((r) => r.sheetName ?? r.sheet_name ?? null),
+        chunk.map((r) => Number(r.sourceRowNo ?? r.source_row_no)),
+        chunk.map((r) => r.srcType ?? r.src_type ?? null),
+        chunk.map((r) => r.carrier ?? null),
+        chunk.map((r) => r.mbi ?? null),
+        chunk.map((r) => r.member ?? null),
+        chunk.map((r) => r.externalPolicyId ?? r.external_policy_id ?? null),
+        chunk.map((r) => (r.policyId ?? r.policy_id) ?? null),
+        chunk.map((r) => (r.txId ?? r.tx_id) ?? null),
+        chunk.map((r) => r.planType ?? r.plan_type ?? null),
+        chunk.map((r) => r.simplePlanType ?? r.simple_plan_type ?? null),
+        chunk.map((r) => r.state ?? null),
+        chunk.map((r) => r.submissionDate ?? r.submission_date ?? null),
+        chunk.map((r) => r.originEffective ?? r.origin_effective ?? null),
+        chunk.map((r) => r.effectiveDate ?? r.effective_date ?? null),
+        chunk.map((r) => r.terminationDate ?? r.termination_date ?? null),
+        chunk.map((r) => r.earnedDate ?? r.earned_date ?? null),
+        chunk.map((r) => r.paymentDate ?? r.payment_date ?? null),
+        chunk.map((r) => r.postedStatementDate ?? r.posted_statement_date ?? null),
+        chunk.map((r) => r.revenueType ?? r.revenue_type ?? null),
+        chunk.map((r) => r.grossComm ?? r.gross_comm),
+        chunk.map((r) => r.amount),
+        chunk.map((r) => r.reason ?? null),
+        chunk.map((r) => r.notes ?? null),
+        String(journalSeq),
+      ],
+    );
+  }
+}
+
+async function insertBobPoliciesBatch(tx, rows, journalSeq) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    await tx.query(
+      `INSERT INTO coherence.bob_policies (
+         attempt_event_id, policy_id, run_id, external_policy_id, carrier_policy_number, crm_policy_number,
+         carrier, plan_type, plan_name, simple_plan_type, mbi, member, dob, phone, email, address, county, state,
+         submission_date, origin_effective, effective_date, termination_date,
+         writing_npn, writing_agent, entity, status, coherent_status, journal_seq
+       )
+       SELECT ae, pid, rid, epid, cpn, crm, car, pt, pn, spt, mbi, mem, dob, ph, em, addr, cty, ste,
+              subd, oeff, effd, termd, wnpn, wag, ent, st, cst, $28
+       FROM unnest(
+         $1::uuid[], $2::integer[], $3::uuid[], $4::text[], $5::text[], $6::text[],
+         $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[],
+         $19::date[], $20::date[], $21::date[], $22::date[],
+         $23::text[], $24::text[], $25::text[], $26::text[], $27::text[]
+       ) AS t(
+         ae, pid, rid, epid, cpn, crm, car, pt, pn, spt, mbi, mem, dob, ph, em, addr, cty, ste,
+         subd, oeff, effd, termd, wnpn, wag, ent, st, cst
+       )`,
+      [
+        chunk.map((r) => r.attemptEventId ?? r.attempt_event_id),
+        chunk.map((r) => Number(r.policyId ?? r.policy_id)),
+        chunk.map((r) => r.runId ?? r.run_id),
+        chunk.map((r) => r.externalPolicyId ?? r.external_policy_id ?? null),
+        chunk.map((r) => r.carrierPolicyNumber ?? r.carrier_policy_number ?? null),
+        chunk.map((r) => r.crmPolicyNumber ?? r.crm_policy_number ?? null),
+        chunk.map((r) => r.carrier ?? null),
+        chunk.map((r) => r.planType ?? r.plan_type ?? null),
+        chunk.map((r) => r.planName ?? r.plan_name ?? null),
+        chunk.map((r) => r.simplePlanType ?? r.simple_plan_type ?? null),
+        chunk.map((r) => r.mbi ?? null),
+        chunk.map((r) => r.member ?? null),
+        chunk.map((r) => r.dob ?? null),
+        chunk.map((r) => r.phone ?? null),
+        chunk.map((r) => r.email ?? null),
+        chunk.map((r) => r.address ?? null),
+        chunk.map((r) => r.county ?? null),
+        chunk.map((r) => r.state ?? null),
+        chunk.map((r) => r.submissionDate ?? r.submission_date ?? null),
+        chunk.map((r) => r.originEffective ?? r.origin_effective ?? null),
+        chunk.map((r) => r.effectiveDate ?? r.effective_date ?? null),
+        chunk.map((r) => r.terminationDate ?? r.termination_date ?? null),
+        chunk.map((r) => r.writingNpn ?? r.writing_npn ?? null),
+        chunk.map((r) => r.writingAgent ?? r.writing_agent ?? null),
+        chunk.map((r) => r.entity),
+        chunk.map((r) => r.status ?? null),
+        chunk.map((r) => r.coherentStatus ?? r.coherent_status ?? null),
+        String(journalSeq),
+      ],
+    );
+  }
+}
+
+async function insertBobPolicyFinancialsBatch(tx, rows, journalSeq) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    await tx.query(
+      `INSERT INTO coherence.bob_policy_financials (
+         attempt_event_id, policy_id, entity, writing_npn, amount, upline_amount,
+         enrollment_code, min_date, anchor_date, agency_id, conflicts,
+         spine_source, confidence_level, coherent_trajectory, journal_seq
+       )
+       SELECT ae, pid, ent, wnpn, amt, uamt, ec, md, ad, aid, conf, ss, cl, ct, $15
+       FROM unnest(
+         $1::uuid[], $2::integer[], $3::text[], $4::text[], $5::numeric(14,2)[], $6::numeric(14,2)[],
+         $7::text[], $8::date[], $9::date[], $10::text[], $11::text[],
+         $12::text[], $13::smallint[], $14::jsonb[]
+       ) AS t(ae, pid, ent, wnpn, amt, uamt, ec, md, ad, aid, conf, ss, cl, ct)`,
+      [
+        chunk.map((r) => r.attemptEventId ?? r.attempt_event_id),
+        chunk.map((r) => Number(r.policyId ?? r.policy_id)),
+        chunk.map((r) => r.entity),
+        chunk.map((r) => r.writingNpn ?? r.writing_npn ?? null),
+        chunk.map((r) => r.amount ?? null),
+        chunk.map((r) => r.uplineAmount ?? r.upline_amount ?? null),
+        chunk.map((r) => r.enrollmentCode ?? r.enrollment_code ?? null),
+        chunk.map((r) => r.minDate ?? r.min_date ?? null),
+        chunk.map((r) => r.anchorDate ?? r.anchor_date ?? null),
+        chunk.map((r) => r.agencyId ?? r.agency_id ?? null),
+        chunk.map((r) => r.conflicts ?? null),
+        chunk.map((r) => r.spineSource ?? r.spine_source ?? null),
+        chunk.map((r) => (r.confidenceLevel ?? r.confidence_level) ?? null),
+        chunk.map((r) => ((r.coherentTrajectory ?? r.coherent_trajectory) != null ? JSON.stringify(r.coherentTrajectory ?? r.coherent_trajectory) : null)),
+        String(journalSeq),
+      ],
+    );
+  }
+}
+
+async function insertCoherentLedgerRowsBatch(tx, rows, journalSeq) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    await tx.query(
+      `INSERT INTO coherence.coherent_ledger_rows (
+         attempt_event_id, tx_id, run_id, record_id, external_policy_id, policy_id,
+         statement_name, src_type, carrier, mbi, member, state, plan_type, simple_plan_type,
+         submission_date, origin_effective, effective_date, termination_date,
+         earned_date, payment_date, statement_date, min_date,
+         gross_comm, revenue_type, override_amount, commission_amount, hra_amount, fee_amount, other_amount,
+         downline_amount, upline_amount, writing_npn, writing_agent, entity, payee_npn, agency_id,
+         status, policy_status, cbob_c, cbob_s, sf, notes, coherent_notes, sheet_name, source_row_no, journal_seq
+       )
+       SELECT ae, tid, rid, reck, epid, pid,
+              sn, st, car, mbi, mem, ste, pt, spt,
+              subd, oeff, effd, termd,
+              earnd, payd, std, md,
+              gc, revt, oa, ca, ha, fa, otha,
+              da, ua, wnpn, wag, ent, pnpn, aid,
+              stat, pstat, cc, cs, sff, nts, cnts, sh, srn, $46
+       FROM unnest(
+         $1::uuid[], $2::integer[], $3::uuid[], $4::text[], $5::text[], $6::integer[],
+         $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
+         $15::date[], $16::date[], $17::date[], $18::date[],
+         $19::date[], $20::date[], $21::date[], $22::date[],
+         $23::numeric(14,2)[], $24::text[], $25::numeric(14,2)[], $26::numeric(14,2)[], $27::numeric(14,2)[], $28::numeric(14,2)[], $29::numeric(14,2)[],
+         $30::numeric(14,2)[], $31::numeric(14,2)[], $32::text[], $33::text[], $34::text[], $35::text[], $36::text[],
+         $37::text[], $38::text[], $39::boolean[], $40::boolean[], $41::boolean[], $42::text[], $43::text[], $44::text[], $45::integer[]
+       ) AS t(
+         ae, tid, rid, reck, epid, pid,
+         sn, st, car, mbi, mem, ste, pt, spt,
+         subd, oeff, effd, termd,
+         earnd, payd, std, md,
+         gc, revt, oa, ca, ha, fa, otha,
+         da, ua, wnpn, wag, ent, pnpn, aid,
+         stat, pstat, cc, cs, sff, nts, cnts, sh, srn
+       )`,
+      [
+        chunk.map((r) => r.attemptEventId ?? r.attempt_event_id),
+        chunk.map((r) => Number(r.txId ?? r.tx_id)),
+        chunk.map((r) => r.runId ?? r.run_id),
+        chunk.map((r) => r.recordId ?? r.record_id),
+        chunk.map((r) => r.externalPolicyId ?? r.external_policy_id ?? null),
+        chunk.map((r) => (r.policyId ?? r.policy_id) ?? null),
+        chunk.map((r) => r.statementName ?? r.statement_name ?? null),
+        chunk.map((r) => r.srcType ?? r.src_type),
+        chunk.map((r) => r.carrier ?? null),
+        chunk.map((r) => r.mbi ?? null),
+        chunk.map((r) => r.member ?? null),
+        chunk.map((r) => r.state ?? null),
+        chunk.map((r) => r.planType ?? r.plan_type ?? null),
+        chunk.map((r) => r.simplePlanType ?? r.simple_plan_type ?? null),
+        chunk.map((r) => r.submissionDate ?? r.submission_date ?? null),
+        chunk.map((r) => r.originEffective ?? r.origin_effective ?? null),
+        chunk.map((r) => r.effectiveDate ?? r.effective_date ?? null),
+        chunk.map((r) => r.terminationDate ?? r.termination_date ?? null),
+        chunk.map((r) => r.earnedDate ?? r.earned_date ?? null),
+        chunk.map((r) => r.paymentDate ?? r.payment_date ?? null),
+        chunk.map((r) => r.statementDate ?? r.statement_date ?? null),
+        chunk.map((r) => r.minDate ?? r.min_date ?? null),
+        chunk.map((r) => r.grossComm ?? r.gross_comm),
+        chunk.map((r) => r.revenueType ?? r.revenue_type ?? null),
+        chunk.map((r) => r.overrideAmount ?? r.override_amount ?? null),
+        chunk.map((r) => r.commissionAmount ?? r.commission_amount ?? null),
+        chunk.map((r) => r.hraAmount ?? r.hra_amount ?? null),
+        chunk.map((r) => r.feeAmount ?? r.fee_amount ?? null),
+        chunk.map((r) => r.otherAmount ?? r.other_amount ?? null),
+        chunk.map((r) => r.downlineAmount ?? r.downline_amount),
+        chunk.map((r) => r.uplineAmount ?? r.upline_amount),
+        chunk.map((r) => r.writingNpn ?? r.writing_npn ?? null),
+        chunk.map((r) => r.writingAgent ?? r.writing_agent ?? null),
+        chunk.map((r) => r.entity),
+        chunk.map((r) => r.payeeNpn ?? r.payee_npn ?? null),
+        chunk.map((r) => r.agencyId ?? r.agency_id ?? null),
+        chunk.map((r) => r.status ?? null),
+        chunk.map((r) => r.policyStatus ?? r.policy_status ?? null),
+        chunk.map((r) => Boolean(r.cbobC ?? r.cbob_c)),
+        chunk.map((r) => Boolean(r.cbobS ?? r.cbob_s)),
+        chunk.map((r) => Boolean(r.sf)),
+        chunk.map((r) => r.notes ?? null),
+        chunk.map((r) => r.coherentNotes ?? r.coherent_notes ?? null),
+        chunk.map((r) => r.sheetName ?? r.sheet_name ?? null),
+        chunk.map((r) => (r.sourceRowNo ?? r.source_row_no) ?? null),
+        String(journalSeq),
+      ],
+    );
+  }
+}
+
+async function insertMaterializationPayload(tx, mat, journalSeq) {
+  const sb = mat.statementBatch;
+  await tx.query(
+    `INSERT INTO coherence.statement_batches (
+       id, batch_kind, statement_date, run_id, attempt_event_id,
+       source_file_name, source_store_kind, source_file_sha256, reason,
+       agency_line_count, agency_lines_sha256, agency_net_total,
+       upline_line_count, upline_lines_sha256, upline_net_total, journal_seq
+     ) VALUES (
+       $1::uuid, $2, $3::date, $4::uuid, $5::uuid,
+       $6, $7, $8, $9,
+       $10, $11, $12::numeric(14,2),
+       $13, $14, $15::numeric(14,2), $16
+     )`,
+    [
+      sb.id, sb.batchKind, sb.statementDate, sb.runId ?? null, sb.attemptEventId ?? null,
+      sb.sourceFileName ?? null, sb.sourceFileSha256 ? 'company_data' : null, sb.sourceFileSha256 ?? null, sb.reason,
+      sb.agencyLineCount, sb.agencyLinesSha256, sb.agencyNetTotal,
+      sb.uplineLineCount, sb.uplineLinesSha256, sb.uplineNetTotal, String(journalSeq),
+    ],
+  );
+  if (mat.agencyLines.length) await insertStatementAgencyLinesBatch(tx, mat.agencyLines, journalSeq);
+  if (mat.uplineLines.length) await insertStatementUplineLinesBatch(tx, mat.uplineLines, journalSeq);
+
+  const rm = mat.runMaterialization;
+  await tx.query(
+    `INSERT INTO coherence.run_materializations (
+       attempt_event_id, run_id, statement_date, reconciliation_mode,
+       bob_row_count, bob_rows_sha256, bob_downline_total, bob_upline_total,
+       ledger_row_count, ledger_rows_sha256, ledger_gross_total, ledger_downline_total, ledger_upline_total,
+       statement_batch_id, corpus_tail, agency_start, journal_seq
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::date, $4,
+       $5, $6, $7::numeric(14,2), $8::numeric(14,2),
+       $9, $10, $11::numeric(14,2), $12::numeric(14,2), $13::numeric(14,2),
+       $14::uuid, $15, $16::date, $17
+     )`,
+    [
+      rm.attemptEventId, rm.runId, rm.statementDate, rm.reconciliationMode,
+      rm.bobRowCount, rm.bobRowsSha256, rm.bobDownlineTotal, rm.bobUplineTotal,
+      rm.ledgerRowCount, rm.ledgerRowsSha256, rm.ledgerGrossTotal, rm.ledgerDownlineTotal, rm.ledgerUplineTotal,
+      rm.statementBatchId, rm.corpusTail ?? null, rm.agencyStart ?? null, String(journalSeq),
+    ],
+  );
+  if (mat.bobPolicies.length) await insertBobPoliciesBatch(tx, mat.bobPolicies, journalSeq);
+  if (mat.bobFinancials.length) await insertBobPolicyFinancialsBatch(tx, mat.bobFinancials, journalSeq);
+  if (mat.ledgerRows.length) await insertCoherentLedgerRowsBatch(tx, mat.ledgerRows, journalSeq);
 }
 
 /**
@@ -443,31 +929,40 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     id = randomUUID(),
     label,
     coherenceCommit,
+    engineKind = 'legacy_sealed',
+    upstreamCommit = null,
+    patchDiff = null,
     gitBundle,
     codeManifest,
     pythonLock,
     pythonWheels,
-    webLock,
-    webPackages,
+    webLock = null,
+    webPackages = null,
     wrapperBundle,
     nusearCommit,
-    companyEmitSha256,
-    pagesLawSha256,
+    companyEmitSha256 = null,
+    pagesLawSha256 = null,
     overlayCheckSha256,
     toolchain,
     containerDigest = null,
     extraCodeFiles = [],
   }) {
-    const allCodeFiles = [gitBundle, codeManifest, pythonLock, pythonWheels, webLock, webPackages, wrapperBundle, ...extraCodeFiles];
+    const allCodeFiles = [
+      gitBundle, codeManifest, pythonLock, pythonWheels,
+      webLock, webPackages, wrapperBundle, patchDiff,
+      ...extraCodeFiles,
+    ].filter(Boolean);
     for (const f of allCodeFiles) {
       if ((f.storeKind ?? f.store_kind) !== 'nusear_code') {
         throw new AppError('Engine version files must live solely in Nusear code store.', 403, 'CODE_IN_DATA_STORE_FORBIDDEN');
       }
     }
     const payload = {
-      label, coherenceCommit, gitBundleSha256: gitBundle.sha256, codeManifestSha256: codeManifest.sha256,
+      label, coherenceCommit, engineKind, upstreamCommit,
+      patchDiffSha256: patchDiff?.sha256 ?? null,
+      gitBundleSha256: gitBundle.sha256, codeManifestSha256: codeManifest.sha256,
       pythonLockSha256: pythonLock.sha256, pythonWheelsSha256: pythonWheels.sha256,
-      webLockSha256: webLock.sha256, webPackagesSha256: webPackages.sha256,
+      webLockSha256: webLock?.sha256 ?? null, webPackagesSha256: webPackages?.sha256 ?? null,
       wrapperBundleSha256: wrapperBundle.sha256, nusearCommit,
       companyEmitSha256, pagesLawSha256, overlayCheckSha256, toolchain, containerDigest,
     };
@@ -480,25 +975,25 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         const newFiles = await filterNewStoredFiles(tx, allCodeFiles);
         const engineRow = { id, ...payload };
         const commitments = buildCommitments({ stored_files: newFiles, engine_versions: [engineRow] });
-        const body = { engineVersion: engineRow, result: { engineVersionId: id, label }, commitments };
+        const body = { engineVersion: engineRow, result: { engineVersionId: id, label, engineKind }, commitments };
         const je = await writeJournal(body);
         if (newFiles.length) await insertStoredFilesBatch(tx, newFiles, je.journalSeq);
         await tx.query(
           `INSERT INTO coherence.engine_versions (
-             id, label, coherence_commit, store_kind,
+             id, label, coherence_commit, engine_kind, upstream_commit, patch_diff_sha256, store_kind,
              git_bundle_sha256, code_manifest_sha256, python_lock_sha256, python_wheels_sha256,
              web_lock_sha256, web_packages_sha256, wrapper_bundle_sha256,
              nusear_commit, company_emit_sha256, pages_law_sha256, overlay_check_sha256,
              toolchain, container_digest, journal_seq
            ) VALUES (
-             $1::uuid, $2, $3, 'nusear_code',
-             $4, $5, $6, $7, $8, $9, $10,
-             $11, $12, $13, $14, $15::jsonb, $16, $17
+             $1::uuid, $2, $3, $4, $5, $6, 'nusear_code',
+             $7, $8, $9, $10, $11, $12, $13,
+             $14, $15, $16, $17, $18::jsonb, $19, $20
            )`,
           [
-            id, label, coherenceCommit,
+            id, label, coherenceCommit, engineKind, upstreamCommit, patchDiff?.sha256 ?? null,
             gitBundle.sha256, codeManifest.sha256, pythonLock.sha256, pythonWheels.sha256,
-            webLock.sha256, webPackages.sha256, wrapperBundle.sha256,
+            webLock?.sha256 ?? null, webPackages?.sha256 ?? null, wrapperBundle.sha256,
             nusearCommit, companyEmitSha256, pagesLawSha256, overlayCheckSha256,
             JSON.stringify(toolchain), containerDigest, String(je.journalSeq),
           ],
@@ -680,6 +1175,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     statementDate,
     origin = 'app',
     inputVersionId = null,
+    priorDecisionCommitId = null,
     engineVersionId,
     emitMode = null,
     emitDisplay = null,
@@ -693,7 +1189,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       throw new AppError('statementDate must be a valid ISO date (YYYY-MM-DD).', 400, 'INVALID_DATE');
     }
     const payload = {
-      statementDate, origin, inputVersionId, engineVersionId,
+      statementDate, origin, inputVersionId, priorDecisionCommitId, engineVersionId,
       emitMode, emitDisplay, emitKeep, emitNoManager, replaysRunId, comparedRunId, rerunReason,
     };
     return executeJournalCommand({
@@ -747,6 +1243,12 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         );
         const priorApprovalsSha256 = ovRes.rows[0]?.file_sha256 ?? null;
 
+        let resolvedPriorDecisionCommitId = priorDecisionCommitId;
+        if (!resolvedPriorDecisionCommitId && !priorApprovalsSha256 && (origin === 'app' || origin === 'trial')) {
+          const headRes = await tx.query('SELECT coherence.standing_decision_head_as_of(NULL) AS id');
+          resolvedPriorDecisionCommitId = headRes.rows[0]?.id ?? null;
+        }
+
         let folderNumber = 1;
         if (origin === 'app' || origin === 'trial') {
           const fnRes = await tx.query(
@@ -763,6 +1265,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           origin,
           inputVersionId: resolvedInputId,
           priorApprovalsSha256,
+          priorDecisionCommitId: resolvedPriorDecisionCommitId,
           engineVersionId,
           emitMode: mode,
           emitDisplay: display,
@@ -784,7 +1287,14 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         const body = {
           run: runRow,
           stepRequest: reqRow,
-          result: { runId, stepRequestId: requestId, statementDate, folderNumber, origin },
+          result: {
+            runId,
+            stepRequestId: requestId,
+            statementDate,
+            folderNumber,
+            origin,
+            priorDecisionCommitId: resolvedPriorDecisionCommitId,
+          },
           commitments,
         };
         const je = await writeJournal(body);
@@ -792,16 +1302,16 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         await tx.query(
           `INSERT INTO coherence.runs (
              id, statement_date, folder_number, origin, input_version_id, prior_approvals_sha256,
-             engine_version_id, emit_mode, emit_display, emit_keep, emit_no_manager,
+             prior_decision_commit_id, engine_version_id, emit_mode, emit_display, emit_keep, emit_no_manager,
              replays_run_id, compared_run_id, rerun_reason, source_folder, journal_seq
            ) VALUES (
              $1::uuid, $2::date, $3, $4, $5::uuid, $6,
-             $7::uuid, $8, $9, $10::text[], $11::text[],
-             $12::uuid, $13::uuid, $14, NULL, $15
+             $7::uuid, $8::uuid, $9, $10, $11::text[], $12::text[],
+             $13::uuid, $14::uuid, $15, NULL, $16
            )`,
           [
             runId, statementDate, folderNumber, origin, resolvedInputId, priorApprovalsSha256,
-            engineVersionId, mode, display, keep, noManager,
+            resolvedPriorDecisionCommitId, engineVersionId, mode, display, keep, noManager,
             replaysRunId, comparedRunId, rerunReason, String(je.journalSeq),
           ],
         );
@@ -866,6 +1376,9 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     logFile = null,
     artifacts = [],
     storedFiles = [],
+    queueItems = [],
+    generatedOverlays = [],
+    emitMaterializationInput = null,
     continueToNextStep = (step === 'assign' || step === 'attribute'),
   }) {
     if (!client) throw new AppError('finishStepAttempt must run on the worker\'s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
@@ -876,6 +1389,32 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       storeKind: a.storeKind ?? a.store_kind,
       fileSha256: a.fileSha256 ?? a.file_sha256,
     }));
+    const normalizedQueueItems = queueItems.map((q, idx) => ({
+      attemptEventId: eventId,
+      itemOrder: Number(q.itemOrder ?? q.item_order ?? (idx + 1)),
+      runId,
+      surface: q.surface ?? step,
+      recordId: q.recordId ?? q.record_id,
+      caseKind: q.caseKind ?? q.case_kind ?? q.case ?? null,
+      subtype: q.subtype ?? null,
+      entity: q.entity ?? null,
+      npn: q.npn ?? null,
+      amount: q.amount ?? null,
+      entityFrom: q.entityFrom ?? q.entity_from ?? null,
+      npnFrom: q.npnFrom ?? q.npn_from ?? null,
+      needsReconfirm: Boolean(q.needsReconfirm ?? q.needs_reconfirm),
+    }));
+    const normalizedGenOverlays = generatedOverlays.map((g) => ({
+      id: g.id || randomUUID(),
+      decisionCommitId: g.decisionCommitId ?? g.decision_commit_id,
+      runId,
+      purpose: g.purpose,
+      attemptEventId: eventId,
+      headerContract: g.headerContract ?? g.header_contract,
+      rowCount: Number(g.rowCount ?? g.row_count),
+      storeKind: 'company_data',
+      fileSha256: g.fileSha256 ?? g.file_sha256,
+    }));
     const artifactsSha256 = hashArtifacts(normalizedArtifacts);
     const nextStep = continueToNextStep
       ? (step === 'assign' ? 'attribute' : step === 'attribute' ? 'bible' : null)
@@ -883,6 +1422,9 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     const payload = {
       runId, step, attemptNo, born, logFileSha256: logFile?.sha256 ?? null,
       artifactCount: normalizedArtifacts.length, artifactsSha256, nextStep,
+      queueItemCount: normalizedQueueItems.length,
+      generatedOverlayCount: normalizedGenOverlays.length,
+      hasEmitMaterialization: Boolean(emitMaterializationInput),
     };
 
     return executeJournalCommand({
@@ -894,6 +1436,15 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       buildAndWrite: async (tx, writeJournal) => {
         const allFiles = logFile ? [...storedFiles, logFile] : storedFiles;
         const newFiles = await filterNewStoredFiles(tx, allFiles);
+        let mat = null;
+        if (emitMaterializationInput && step === 'emit') {
+          mat = await prepareEmitMaterialization({
+            db: tx,
+            runId,
+            attemptEventId: eventId,
+            ...emitMaterializationInput,
+          });
+        }
         const evRow = {
           id: eventId, runId, step, attemptNo, eventKind: 'finished',
           stepRequestId: null, cancelRequestId: null, born,
@@ -907,12 +1458,32 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           stored_files: newFiles,
           step_attempt_events: [evRow],
           artifacts: normalizedArtifacts,
+          review_queue_items: normalizedQueueItems,
+          generated_overlays: normalizedGenOverlays,
           step_requests: nextReqRows,
+          ...(mat ? {
+            statement_batches: [mat.statementBatch],
+            statement_agency_lines: mat.agencyLines,
+            statement_upline_lines: mat.uplineLines,
+            run_materializations: [mat.runMaterialization],
+            bob_policies: mat.bobPolicies,
+            bob_policy_financials: mat.bobFinancials,
+            coherent_ledger_rows: mat.ledgerRows,
+          } : {}),
         });
         const body = {
           attemptEvent: { ...evRow, census },
           nextRequest: nextReqRows[0] ?? null,
-          result: { attemptEventId: eventId, runId, step, attemptNo, nextStep, nextRequestId: nextStep ? nextRequestId : null },
+          result: {
+            attemptEventId: eventId,
+            runId,
+            step,
+            attemptNo,
+            nextStep,
+            nextRequestId: nextStep ? nextRequestId : null,
+            materialized: Boolean(mat),
+            statementBatchId: mat ? mat.statementBatch.id : null,
+          },
           commitments,
         };
         const je = await writeJournal(body);
@@ -933,6 +1504,19 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           ],
         );
         if (normalizedArtifacts.length) await insertArtifactsBatch(tx, normalizedArtifacts, je.journalSeq);
+        if (normalizedQueueItems.length) await insertReviewQueueItemsBatch(tx, normalizedQueueItems, je.journalSeq);
+        for (const g of normalizedGenOverlays) {
+          await tx.query(
+            `INSERT INTO coherence.generated_overlays (
+               id, decision_commit_id, run_id, purpose, attempt_event_id,
+               header_contract, row_count, store_kind, file_sha256, journal_seq
+             ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, 'company_data', $8, $9)`,
+            [g.id, g.decisionCommitId, g.runId, g.purpose, g.attemptEventId, g.headerContract, g.rowCount, g.fileSha256, String(je.journalSeq)],
+          );
+        }
+        if (mat) {
+          await insertMaterializationPayload(tx, mat, je.journalSeq);
+        }
         if (nextStep) {
           await tx.query(
             `INSERT INTO coherence.step_requests (id, run_id, step, reason, emit_confirmation_id, journal_seq)
@@ -2112,11 +2696,965 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     });
   }
 
+  function normalizeLiveDecisionInput(raw, index) {
+    if (!raw || typeof raw !== 'object') {
+      throw new AppError(`Decision at position ${index + 1} must be an object.`, 400, 'INVALID_DECISION');
+    }
+    const recordId = String(raw.recordId ?? raw.record_id ?? '');
+    if (!recordId) throw new AppError(`Decision at position ${index + 1} requires a recordId.`, 400, 'INVALID_DECISION');
+    const disposition = String(raw.disposition ?? '').trim();
+    if (!LIVE_DISPOSITIONS.includes(disposition)) {
+      throw new AppError(`Live decision disposition must be CONFIRM or CORRECT.`, 400, 'INVALID_DECISION');
+    }
+    const normOpt = (v) => (v == null || v === '' ? null : String(v));
+    const policy = normOpt(raw.policy);
+    const month = normOpt(raw.month);
+    if (policy !== null || month !== null) {
+      throw new AppError('Live decisions cannot set legacy policy or month columns.', 400, 'INVALID_DECISION');
+    }
+    const agent = normOpt(raw.agent);
+    const agency = normOpt(raw.agency);
+    const book = normOpt(raw.book);
+    const status = normOpt(raw.status);
+    if (status !== null && !POLICY_STATUS_SET.has(status)) {
+      throw new AppError(`Invalid policy status value on decision ${index + 1}.`, 400, 'INVALID_DECISION');
+    }
+    if (disposition === 'CONFIRM' && (agent !== null || agency !== null || book !== null || status !== null)) {
+      throw new AppError('CONFIRM decisions cannot carry agent, agency, book, or status edits.', 400, 'INVALID_DECISION');
+    }
+    if (disposition === 'CORRECT' && agent === null && agency === null && book === null && status === null) {
+      throw new AppError('CORRECT decisions must specify at least one of agent, agency, book, or status.', 400, 'INVALID_DECISION');
+    }
+    const approvedAmount = normOpt(raw.approvedAmount ?? raw.approved_amount);
+    if (approvedAmount !== null && !MONEY_RE.test(approvedAmount)) {
+      throw new AppError('approvedAmount must be formatted to two decimal places.', 400, 'INVALID_DECISION');
+    }
+    return {
+      id: raw.id || randomUUID(),
+      recordId,
+      disposition,
+      agent,
+      agency,
+      policy: null,
+      book,
+      month: null,
+      status,
+      note: normOpt(raw.note),
+      approvedAmount,
+      approvedAgency: normOpt(raw.approvedAgency ?? raw.approved_agency),
+      approvedAgent: normOpt(raw.approvedAgent ?? raw.approved_agent),
+      approvedAgencyFrom: normOpt(raw.approvedAgencyFrom ?? raw.approved_agency_from),
+      approvedAgentFrom: normOpt(raw.approvedAgentFrom ?? raw.approved_agent_from),
+      committedAtRaw: normOpt(raw.committedAtRaw ?? raw.committed_at_raw ?? raw.committed_at ?? raw.committedAt),
+      decidedAt: raw.decidedAt ?? raw.decided_at ?? null,
+    };
+  }
+
+  async function recordDecisionBaseline({
+    actor,
+    commandKey,
+    decisionCommitId = randomUUID(),
+    parentCommitId = null,
+    commitKind = 'historical_baseline',
+    headerContract = 'v2',
+    imported = true,
+    originalAt = null,
+    decisions = [],
+  }) {
+    if (!['historical_baseline', 'historical_overlay'].includes(commitKind)) {
+      throw new AppError('Baseline commitKind must be historical_baseline or historical_overlay.', 400, 'INVALID_COMMIT_KIND');
+    }
+    if (!['v1', 'v2'].includes(headerContract)) {
+      throw new AppError('headerContract must be v1 or v2.', 400, 'INVALID_HEADER_CONTRACT');
+    }
+    if (!Array.isArray(decisions)) {
+      throw new AppError('decisions must be an array.', 400, 'INVALID_DECISIONS');
+    }
+    const payload = { parentCommitId, commitKind, headerContract, imported: Boolean(imported), originalAt, decisionCount: decisions.length };
+    return executeJournalCommand({
+      actor,
+      commandKind: 'record_decision_baseline',
+      commandKey,
+      payload,
+      buildAndWrite: async (tx, writeJournal) => {
+        let parentCumulative = 0;
+        const headByKey = new Map();
+        if (parentCommitId) {
+          const pRes = await tx.query(
+            'SELECT cumulative_decision_count FROM coherence.decision_commits WHERE id = $1::uuid',
+            [parentCommitId],
+          );
+          if (pRes.rows.length === 0) throw new AppError('Parent decision commit not found.', 404, 'DECISION_COMMIT_NOT_FOUND');
+          parentCumulative = Number(pRes.rows[0].cumulative_decision_count);
+          const keys = [...new Set(decisions.map((d) => String(d.recordId ?? d.record_id ?? '')).filter(Boolean))];
+          if (keys.length > 0) {
+            const curRes = await tx.query(
+              'SELECT record_id, id FROM coherence.decisions_current($1::uuid) WHERE record_id = ANY($2::text[])',
+              [parentCommitId, keys],
+            );
+            for (const row of curRes.rows) headByKey.set(row.record_id, row.id);
+          }
+        }
+
+        const nowIso = formatTimestampUtcUs(new Date());
+        const normOpt = (v) => (v == null || v === '' ? null : String(v));
+        const decisionRows = decisions.map((d, idx) => {
+          const id = d.id || randomUUID();
+          const recordId = String(d.recordId ?? d.record_id ?? '');
+          if (!recordId) throw new AppError(`Baseline decision ${idx + 1} requires recordId.`, 400, 'INVALID_DECISION');
+          const replacesDecisionId = headByKey.get(recordId) ?? null;
+          headByKey.set(recordId, id);
+          const committedAtRaw = normOpt(d.committedAtRaw ?? d.committed_at_raw ?? d.committed_at ?? d.committedAt);
+          const decidedAt = d.decidedAt ?? d.decided_at ?? committedAtRaw ?? originalAt ?? nowIso;
+          return {
+            id,
+            decisionCommitId,
+            rowOrder: idx + 1,
+            runId: d.runId ?? d.run_id ?? null,
+            reviewSaveId: null,
+            surface: d.surface ?? null,
+            recordId,
+            replacesDecisionId,
+            disposition: String(d.disposition ?? 'CONFIRM'),
+            agent: normOpt(d.agent),
+            agency: normOpt(d.agency),
+            policy: normOpt(d.policy),
+            book: normOpt(d.book),
+            month: normOpt(d.month),
+            status: normOpt(d.status),
+            note: normOpt(d.note),
+            approvedAmount: headerContract === 'v1' ? null : normOpt(d.approvedAmount ?? d.approved_amount),
+            approvedAgency: headerContract === 'v1' ? null : normOpt(d.approvedAgency ?? d.approved_agency),
+            approvedAgent: headerContract === 'v1' ? null : normOpt(d.approvedAgent ?? d.approved_agent),
+            approvedAgencyFrom: headerContract === 'v1' ? null : normOpt(d.approvedAgencyFrom ?? d.approved_agency_from),
+            approvedAgentFrom: headerContract === 'v1' ? null : normOpt(d.approvedAgentFrom ?? d.approved_agent_from),
+            decidedBy: String(d.decidedBy ?? d.decided_by ?? actor.id),
+            actingFor: normOpt(d.actingFor ?? d.acting_for ?? actor.actingFor),
+            decidedAt: formatTimestampUtcUs(decidedAt),
+            committedAtRaw,
+            imported: Boolean(imported),
+          };
+        });
+
+        const addedDecisionsSha256 = hashDecisions(decisionRows);
+        const cumulativeDecisionCount = parentCumulative + decisionRows.length;
+        const commitRow = {
+          id: decisionCommitId,
+          parentCommitId,
+          commitKind,
+          headerContract,
+          addedDecisionCount: decisionRows.length,
+          cumulativeDecisionCount,
+          addedDecisionsSha256,
+          imported: Boolean(imported),
+          originalAt: originalAt ? formatTimestampUtcUs(originalAt) : null,
+        };
+        const commitments = buildCommitments({
+          decision_commits: [commitRow],
+          decisions: decisionRows,
+        });
+        const body = {
+          decisionCommit: commitRow,
+          result: {
+            decisionCommitId,
+            addedDecisionCount: decisionRows.length,
+            cumulativeDecisionCount,
+            addedDecisionsSha256,
+          },
+          commitments,
+        };
+        const je = await writeJournal(body);
+
+        await tx.query(
+          `INSERT INTO coherence.decision_commits (
+             id, parent_commit_id, commit_kind, header_contract,
+             added_decision_count, cumulative_decision_count, added_decisions_sha256,
+             imported, original_at, journal_seq
+           ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9::timestamptz, $10)`,
+          [
+            decisionCommitId, parentCommitId, commitKind, headerContract,
+            decisionRows.length, cumulativeDecisionCount, addedDecisionsSha256,
+            Boolean(imported), commitRow.originalAt, String(je.journalSeq),
+          ],
+        );
+        if (decisionRows.length) await insertDecisionsBatch(tx, decisionRows, je.journalSeq);
+        return { ...je, body, result: body.result };
+      },
+    });
+  }
+
+  /**
+   * Synchronous review save: writes new or changed decisions in one SERIALIZABLE transaction,
+   * verifies actor permissions (refusing View-As), rejects stale expectedJournalSeq or duplicate saves,
+   * maintains the database-verified replaces_decision_id chain, deletes review drafts, and queues Adjust on Bible save.
+   */
+  async function saveReviewDecisions({
+    actor,
+    commandKey,
+    expectedJournalSeq,
+    runId,
+    surface,
+    decisions = [],
+    decisionCommitId = randomUUID(),
+    reviewSaveId = randomUUID(),
+    adjustRequestId = randomUUID(),
+    headerContract = 'v2',
+  }) {
+    if (!['bible', 'adjust'].includes(surface)) {
+      throw new AppError('Review surface must be bible or adjust.', 400, 'INVALID_SURFACE');
+    }
+    if (expectedJournalSeq === null || expectedJournalSeq === undefined
+        || !Number.isInteger(Number(expectedJournalSeq)) || Number(expectedJournalSeq) < 0) {
+      throw new AppError('Saving a review requires a valid expectedJournalSeq.', 400, 'MISSING_JOURNAL_SEQ');
+    }
+    if (!Array.isArray(decisions)) {
+      throw new AppError('decisions must be an array.', 400, 'INVALID_DECISIONS');
+    }
+    if (headerContract !== 'v2') {
+      throw new AppError('Live review saves must use the v2 decision contract.', 400, 'INVALID_HEADER_CONTRACT');
+    }
+
+    const normalizedInputs = decisions.map(normalizeLiveDecisionInput);
+    const seenKeys = new Set();
+    for (const d of normalizedInputs) {
+      if (seenKeys.has(d.recordId)) {
+        throw new AppError('A live review save cannot include the same decision key more than once.', 409, 'DUPLICATE_DECISION_KEY');
+      }
+      seenKeys.add(d.recordId);
+    }
+
+    const payload = {
+      runId,
+      surface,
+      expectedJournalSeq: Number(expectedJournalSeq),
+      decisions: normalizedInputs.map((d) => ({
+        recordId: d.recordId,
+        disposition: d.disposition,
+        agent: d.agent,
+        agency: d.agency,
+        book: d.book,
+        status: d.status,
+        note: d.note,
+        approvedAmount: d.approvedAmount,
+        approvedAgency: d.approvedAgency,
+        approvedAgent: d.approvedAgent,
+        approvedAgencyFrom: d.approvedAgencyFrom,
+        approvedAgentFrom: d.approvedAgentFrom,
+      })),
+    };
+
+    return executeJournalCommand({
+      actor,
+      commandKind: 'save_review_decisions',
+      commandKey,
+      payload,
+      expectedJournalSeq: Number(expectedJournalSeq),
+      scopeRunId: runId,
+      buildAndWrite: async (tx, writeJournal) => {
+        const runRes = await tx.query(
+          'SELECT id, prior_decision_commit_id FROM coherence.runs WHERE id = $1::uuid',
+          [runId],
+        );
+        if (runRes.rows.length === 0) throw new AppError('Run not found.', 404, 'RUN_NOT_FOUND');
+        const runRow = runRes.rows[0];
+
+        const attemptRes = await tx.query(
+          'SELECT coherence.current_finished_attempt($1::uuid, $2) AS ev_id',
+          [runId, surface],
+        );
+        const attemptEventId = attemptRes.rows[0]?.ev_id;
+        if (!attemptEventId) {
+          throw new AppError(`No current finished ${surface} attempt exists for this run.`, 409, 'NO_FINISHED_ATTEMPT');
+        }
+
+        const priorSameAttemptRes = await tx.query(
+          `SELECT id, decision_commit_id
+           FROM coherence.review_saves
+           WHERE run_id = $1::uuid AND surface = $2 AND attempt_event_id = $3::uuid
+             AND decision_commit_id IS NOT NULL
+           ORDER BY journal_seq DESC
+           LIMIT 1`,
+          [runId, surface, attemptEventId],
+        );
+        const priorSameAttempt = priorSameAttemptRes.rows[0] || null;
+
+        if (priorSameAttempt && normalizedInputs.length === 0) {
+          throw new AppError('Duplicate review save refused: no new or changed decisions for this attempt.', 409, 'DUPLICATE_REVIEW_SAVE');
+        }
+
+        let parentCommitId = null;
+        if (priorSameAttempt) {
+          parentCommitId = priorSameAttempt.decision_commit_id;
+        } else if (surface === 'bible') {
+          parentCommitId = runRow.prior_decision_commit_id ?? null;
+        } else {
+          const bibleSaveRes = await tx.query(
+            `SELECT decision_commit_id
+             FROM coherence.review_saves
+             WHERE run_id = $1::uuid AND surface = 'bible'
+               AND attempt_event_id = coherence.current_finished_attempt($1::uuid, 'bible')
+               AND decision_commit_id IS NOT NULL
+             ORDER BY journal_seq DESC
+             LIMIT 1`,
+            [runId],
+          );
+          if (bibleSaveRes.rows.length === 0) {
+            throw new AppError('Adjust review requires a saved Bible decision commit first.', 409, 'MISSING_BIBLE_SAVE');
+          }
+          parentCommitId = bibleSaveRes.rows[0].decision_commit_id;
+        }
+
+        let parentCumulative = 0;
+        const headByKey = new Map();
+        if (parentCommitId) {
+          const pRes = await tx.query(
+            'SELECT cumulative_decision_count FROM coherence.decision_commits WHERE id = $1::uuid',
+            [parentCommitId],
+          );
+          if (pRes.rows.length === 0) throw new AppError('Parent decision commit not found.', 404, 'DECISION_COMMIT_NOT_FOUND');
+          parentCumulative = Number(pRes.rows[0].cumulative_decision_count);
+          if (normalizedInputs.length > 0) {
+            const curRes = await tx.query(
+              `SELECT id, record_id, disposition, agent, agency, book, status, note,
+                      approved_amount, approved_agency, approved_agent,
+                      approved_agency_from, approved_agent_from
+               FROM coherence.decisions_current($1::uuid)
+               WHERE record_id = ANY($2::text[])`,
+              [parentCommitId, normalizedInputs.map((d) => d.recordId)],
+            );
+            for (const row of curRes.rows) headByKey.set(row.record_id, row);
+          }
+        }
+
+        if (priorSameAttempt && normalizedInputs.length > 0) {
+          const allUnchanged = normalizedInputs.every((d) => {
+            const prev = headByKey.get(d.recordId);
+            if (!prev) return false;
+            return (
+              prev.disposition === d.disposition
+              && (prev.agent ?? null) === d.agent
+              && (prev.agency ?? null) === d.agency
+              && (prev.book ?? null) === d.book
+              && (prev.status ?? null) === d.status
+              && (prev.note ?? null) === d.note
+              && (prev.approved_amount ?? null) === d.approvedAmount
+              && (prev.approved_agency ?? null) === d.approvedAgency
+              && (prev.approved_agent ?? null) === d.approvedAgent
+              && (prev.approved_agency_from ?? null) === d.approvedAgencyFrom
+              && (prev.approved_agent_from ?? null) === d.approvedAgentFrom
+            );
+          });
+          if (allUnchanged) {
+            throw new AppError('Duplicate review save refused: submitted decisions are identical to the current saved review.', 409, 'DUPLICATE_REVIEW_SAVE');
+          }
+        }
+
+        const decidedNow = formatTimestampUtcUs(new Date());
+        const decisionRows = normalizedInputs.map((d, idx) => {
+          const prev = headByKey.get(d.recordId);
+          const ts = d.decidedAt ? formatTimestampUtcUs(d.decidedAt) : decidedNow;
+          return {
+            id: d.id,
+            decisionCommitId,
+            rowOrder: idx + 1,
+            runId,
+            reviewSaveId,
+            surface,
+            recordId: d.recordId,
+            replacesDecisionId: prev ? prev.id : null,
+            disposition: d.disposition,
+            agent: d.agent,
+            agency: d.agency,
+            policy: null,
+            book: d.book,
+            month: null,
+            status: d.status,
+            note: d.note,
+            approvedAmount: d.approvedAmount,
+            approvedAgency: d.approvedAgency,
+            approvedAgent: d.approvedAgent,
+            approvedAgencyFrom: d.approvedAgencyFrom,
+            approvedAgentFrom: d.approvedAgentFrom,
+            decidedBy: actor.id,
+            actingFor: actor.actingFor ?? null,
+            decidedAt: ts,
+            committedAtRaw: d.committedAtRaw ?? ts,
+            imported: false,
+          };
+        });
+
+        const supersededRows = [];
+        const nextRequests = [];
+        if (surface === 'bible') {
+          const adjRes = await tx.query(
+            `SELECT id, attempt_no FROM coherence.step_attempt_events
+             WHERE id = coherence.current_finished_attempt($1::uuid, 'adjust')`,
+            [runId],
+          );
+          if (adjRes.rows.length > 0) {
+            supersededRows.push({
+              id: randomUUID(),
+              runId,
+              step: 'adjust',
+              attemptNo: Number(adjRes.rows[0].attempt_no),
+              eventKind: 'superseded',
+              stepRequestId: null,
+              cancelRequestId: null,
+              born: null,
+              logFileSha256: null,
+              artifactCount: null,
+              artifactsSha256: null,
+            });
+          }
+          nextRequests.push({
+            id: adjustRequestId,
+            runId,
+            step: 'adjust',
+            reason: 'bible_saved',
+            emitConfirmationId: null,
+          });
+        }
+
+        const addedDecisionsSha256 = hashDecisions(decisionRows);
+        const cumulativeDecisionCount = parentCumulative + decisionRows.length;
+        const commitRow = {
+          id: decisionCommitId,
+          parentCommitId,
+          commitKind: 'review_save',
+          headerContract,
+          addedDecisionCount: decisionRows.length,
+          cumulativeDecisionCount,
+          addedDecisionsSha256,
+          imported: false,
+          originalAt: null,
+        };
+        const saveRow = {
+          id: reviewSaveId,
+          runId,
+          surface,
+          attemptEventId,
+          approvalsFileSha256: null,
+          decisionCommitId,
+          imported: false,
+          originalAt: null,
+          submissionId: null,
+        };
+        const commitments = buildCommitments({
+          decision_commits: [commitRow],
+          review_saves: [saveRow],
+          decisions: decisionRows,
+          step_attempt_events: supersededRows,
+          step_requests: nextRequests,
+        });
+        const body = {
+          decisionCommit: commitRow,
+          reviewSave: saveRow,
+          addedDecisionCount: decisionRows.length,
+          adjustRequestId: nextRequests[0]?.id ?? null,
+          result: {
+            reviewSaveId,
+            decisionCommitId,
+            runId,
+            surface,
+            addedDecisionCount: decisionRows.length,
+            cumulativeDecisionCount,
+            adjustRequestId: nextRequests[0]?.id ?? null,
+          },
+          commitments,
+        };
+
+        const je = await writeJournal(body);
+
+        await tx.query(
+          `INSERT INTO coherence.decision_commits (
+             id, parent_commit_id, commit_kind, header_contract,
+             added_decision_count, cumulative_decision_count, added_decisions_sha256,
+             imported, original_at, journal_seq
+           ) VALUES ($1::uuid, $2::uuid, 'review_save', $3, $4, $5, $6, false, NULL, $7)`,
+          [
+            decisionCommitId, parentCommitId, headerContract,
+            decisionRows.length, cumulativeDecisionCount, addedDecisionsSha256,
+            String(je.journalSeq),
+          ],
+        );
+
+        await tx.query(
+          `INSERT INTO coherence.review_saves (
+             id, run_id, surface, attempt_event_id, approvals_file_sha256, decision_commit_id,
+             imported, original_at, submission_id, journal_seq
+           ) VALUES ($1::uuid, $2::uuid, $3, $4::uuid, NULL, $5::uuid, false, NULL, NULL, $6)`,
+          [reviewSaveId, runId, surface, attemptEventId, decisionCommitId, String(je.journalSeq)],
+        );
+
+        if (decisionRows.length) await insertDecisionsBatch(tx, decisionRows, je.journalSeq);
+
+        for (const s of supersededRows) {
+          await tx.query(
+            `INSERT INTO coherence.step_attempt_events (id, run_id, step, attempt_no, event_kind, journal_seq)
+             VALUES ($1::uuid, $2::uuid, $3, $4, 'superseded', $5)`,
+            [s.id, s.runId, s.step, s.attemptNo, String(je.journalSeq)],
+          );
+        }
+
+        for (const req of nextRequests) {
+          await tx.query(
+            `INSERT INTO coherence.step_requests (id, run_id, step, reason, emit_confirmation_id, journal_seq)
+             VALUES ($1::uuid, $2::uuid, $3, $4, NULL, $5)`,
+            [req.id, req.runId, req.step, req.reason, String(je.journalSeq)],
+          );
+        }
+
+        return { ...je, body, result: body.result };
+      },
+    });
+  }
+
+  async function recordGeneratedOverlay({
+    actor,
+    commandKey,
+    overlayId = randomUUID(),
+    decisionCommitId,
+    runId,
+    purpose,
+    attemptEventId = null,
+    headerContract = 'v2',
+    rowCount,
+    storedFile,
+  }) {
+    if (!storedFile || (storedFile.storeKind ?? storedFile.store_kind) !== 'company_data') {
+      throw new AppError('Generated overlay must be stored in company_data.', 403, 'INVALID_STORE');
+    }
+    const payload = { decisionCommitId, runId, purpose, attemptEventId, headerContract, rowCount: Number(rowCount), fileSha256: storedFile.sha256 };
+    return executeJournalCommand({
+      actor,
+      commandKind: 'record_generated_overlay',
+      commandKey,
+      payload,
+      buildAndWrite: async (tx, writeJournal) => {
+        const newFiles = await filterNewStoredFiles(tx, [storedFile]);
+        const row = {
+          id: overlayId,
+          decisionCommitId,
+          runId,
+          purpose,
+          attemptEventId,
+          headerContract,
+          rowCount: Number(rowCount),
+          storeKind: 'company_data',
+          fileSha256: storedFile.sha256,
+        };
+        const commitments = buildCommitments({ stored_files: newFiles, generated_overlays: [row] });
+        const body = { generatedOverlay: row, result: { overlayId, decisionCommitId, fileSha256: storedFile.sha256 }, commitments };
+        const je = await writeJournal(body);
+        if (newFiles.length) await insertStoredFilesBatch(tx, newFiles, je.journalSeq);
+        await tx.query(
+          `INSERT INTO coherence.generated_overlays (
+             id, decision_commit_id, run_id, purpose, attempt_event_id,
+             header_contract, row_count, store_kind, file_sha256, journal_seq
+           ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, 'company_data', $8, $9)`,
+          [overlayId, decisionCommitId, runId, purpose, attemptEventId, headerContract, Number(rowCount), storedFile.sha256, String(je.journalSeq)],
+        );
+        return { ...je, body, result: body.result };
+      },
+    });
+  }
+
+  async function carryDecisions({
+    actor,
+    commandKey,
+    expectedJournalSeq = null,
+    carryId = randomUUID(),
+    runId,
+    typedPhrase,
+    receiptFileSha256 = null,
+  }) {
+    const payload = { runId, typedPhrase, receiptFileSha256 };
+    return executeJournalCommand({
+      actor,
+      commandKind: 'carry_decisions',
+      commandKey,
+      payload,
+      expectedJournalSeq,
+      scopeRunId: runId,
+      buildAndWrite: async (tx, writeJournal) => {
+        const runRes = await tx.query(
+          `SELECT id, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date, prior_decision_commit_id
+           FROM coherence.runs WHERE id = $1::uuid`,
+          [runId],
+        );
+        if (runRes.rows.length === 0) throw new AppError('Run not found.', 404, 'RUN_NOT_FOUND');
+        const { statement_date: statementDate, prior_decision_commit_id: priorCommitId } = runRes.rows[0];
+
+        let carriedCommitId = null;
+        for (const surf of ['adjust', 'bible']) {
+          const sRes = await tx.query(
+            `SELECT decision_commit_id FROM coherence.review_saves
+             WHERE run_id = $1::uuid AND surface = $2
+               AND attempt_event_id = coherence.current_finished_attempt($1::uuid, $2)
+               AND decision_commit_id IS NOT NULL
+             ORDER BY journal_seq DESC LIMIT 1`,
+            [runId, surf],
+          );
+          if (sRes.rows.length > 0) {
+            carriedCommitId = sRes.rows[0].decision_commit_id;
+            break;
+          }
+        }
+        carriedCommitId = carriedCommitId || priorCommitId;
+        if (!carriedCommitId) {
+          throw new AppError('Run has no decision commit to carry forward.', 409, 'MISSING_DECISION_COMMIT');
+        }
+
+        const standingRes = await tx.query('SELECT coherence.standing_decision_head_as_of(NULL) AS head');
+        const standingHead = standingRes.rows[0]?.head ?? null;
+        const nothingNew = Boolean(standingHead && standingHead === carriedCommitId);
+
+        const carryRow = {
+          id: carryId,
+          runId,
+          statementDate,
+          carryKind: 'decisions',
+          fileSha256: receiptFileSha256 ?? null,
+          carriedDecisionCommitId: carriedCommitId,
+          publishedInputVersionId: null,
+          nothingNew,
+          typedPhrase,
+        };
+        const commitments = buildCommitments({ carries: [carryRow] });
+        const body = {
+          carry: carryRow,
+          result: { carryId, statementDate, carriedDecisionCommitId: carriedCommitId, nothingNew },
+          commitments,
+        };
+        const je = await writeJournal(body);
+
+        await tx.query(
+          `INSERT INTO coherence.carries (
+             id, run_id, statement_date, carry_kind, store_kind, file_sha256,
+             carried_decision_commit_id, published_input_version_id, nothing_new, typed_phrase, journal_seq
+           ) VALUES ($1::uuid, $2::uuid, $3::date, 'decisions', $4, $5, $6::uuid, NULL, $7, $8, $9)`,
+          [
+            carryId, runId, statementDate,
+            receiptFileSha256 ? 'company_data' : null, receiptFileSha256 ?? null,
+            carriedCommitId, nothingNew, typedPhrase, String(je.journalSeq),
+          ],
+        );
+        return { ...je, body, result: body.result };
+      },
+    });
+  }
+
+  async function recordStatementBatch({
+    actor,
+    commandKey,
+    batchId = randomUUID(),
+    batchKind,
+    statementDate,
+    sourceFileName = null,
+    sourceFile = null,
+    reason,
+    agencyLines = [],
+    uplineLines = [],
+  }) {
+    if (!['historical_sent', 'method_correction'].includes(batchKind)) {
+      throw new AppError('Standalone statement batchKind must be historical_sent or method_correction.', 400, 'INVALID_BATCH_KIND');
+    }
+    if (!isValidIsoDate(statementDate)) {
+      throw new AppError('statementDate must be a valid ISO date.', 400, 'INVALID_DATE');
+    }
+    let agNet = 0n;
+    const normAgency = agencyLines.map((l, idx) => {
+      const amtCents = parseCents(l.amount);
+      const grossCents = parseCents(l.grossComm ?? l.gross_comm ?? l.amount);
+      agNet += amtCents;
+      return {
+        ...l,
+        batchId,
+        lineNo: Number(l.lineNo ?? l.line_no ?? (idx + 1)),
+        statementDate,
+        entryKind: l.entryKind ?? l.entry_kind ?? (batchKind === 'method_correction' ? 'method_correction' : 'historical_sent'),
+        runAction: l.runAction ?? l.run_action ?? (batchKind === 'method_correction' ? 'CORRECTION' : 'SENT'),
+        sourceFile: l.sourceFile ?? l.source_file ?? sourceFileName ?? `${batchKind}_${statementDate}`,
+        sourceRowNo: Number(l.sourceRowNo ?? l.source_row_no ?? (idx + 1)),
+        grossComm: formatCents(grossCents),
+        amount: formatCents(amtCents),
+      };
+    });
+    let upNet = 0n;
+    const normUpline = uplineLines.map((l, idx) => {
+      const amtCents = parseCents(l.amount);
+      const grossCents = parseCents(l.grossComm ?? l.gross_comm ?? l.amount);
+      upNet += amtCents;
+      return {
+        ...l,
+        batchId,
+        lineNo: Number(l.lineNo ?? l.line_no ?? (idx + 1)),
+        statementDate,
+        entryKind: l.entryKind ?? l.entry_kind ?? (batchKind === 'method_correction' ? 'method_correction' : 'historical_upline_derived'),
+        runAction: l.runAction ?? l.run_action ?? (batchKind === 'method_correction' ? 'CORRECTION' : 'SENT'),
+        sourceEntity: l.sourceEntity ?? l.source_entity ?? l.entity,
+        markedSent: l.markedSent ?? l.marked_sent ?? false,
+        sourceFile: l.sourceFile ?? l.source_file ?? sourceFileName ?? `${batchKind}_${statementDate}`,
+        sourceRowNo: Number(l.sourceRowNo ?? l.source_row_no ?? (idx + 1)),
+        grossComm: formatCents(grossCents),
+        amount: formatCents(amtCents),
+      };
+    });
+    const agencyLinesSha256 = hashStatementAgencyLines(normAgency);
+    const uplineLinesSha256 = hashStatementUplineLines(normUpline);
+    const batchRow = {
+      id: batchId,
+      batchKind,
+      statementDate,
+      runId: null,
+      attemptEventId: null,
+      sourceFileName,
+      sourceFileSha256: sourceFile?.sha256 ?? null,
+      reason,
+      agencyLineCount: normAgency.length,
+      agencyLinesSha256,
+      agencyNetTotal: formatCents(agNet),
+      uplineLineCount: normUpline.length,
+      uplineLinesSha256,
+      uplineNetTotal: formatCents(upNet),
+    };
+    const payload = { batchKind, statementDate, sourceFileName, sourceFileSha256: sourceFile?.sha256 ?? null, reason, agencyLinesSha256, uplineLinesSha256 };
+    return executeJournalCommand({
+      actor,
+      commandKind: 'record_statement_batch',
+      commandKey,
+      payload,
+      buildAndWrite: async (tx, writeJournal) => {
+        const newFiles = sourceFile ? await filterNewStoredFiles(tx, [sourceFile]) : [];
+        const commitments = buildCommitments({
+          stored_files: newFiles,
+          statement_batches: [batchRow],
+          statement_agency_lines: normAgency,
+          statement_upline_lines: normUpline,
+        });
+        const body = {
+          statementBatch: batchRow,
+          result: { batchId, agencyLineCount: normAgency.length, uplineLineCount: normUpline.length },
+          commitments,
+        };
+        const je = await writeJournal(body);
+        if (newFiles.length) await insertStoredFilesBatch(tx, newFiles, je.journalSeq);
+        await tx.query(
+          `INSERT INTO coherence.statement_batches (
+             id, batch_kind, statement_date, run_id, attempt_event_id,
+             source_file_name, source_store_kind, source_file_sha256, reason,
+             agency_line_count, agency_lines_sha256, agency_net_total,
+             upline_line_count, upline_lines_sha256, upline_net_total, journal_seq
+           ) VALUES (
+             $1::uuid, $2, $3::date, NULL, NULL,
+             $4, $5, $6, $7,
+             $8, $9, $10::numeric(14,2),
+             $11, $12, $13::numeric(14,2), $14
+           )`,
+          [
+            batchId, batchKind, statementDate,
+            sourceFileName, sourceFile ? 'company_data' : null, sourceFile?.sha256 ?? null, reason,
+            normAgency.length, agencyLinesSha256, batchRow.agencyNetTotal,
+            normUpline.length, uplineLinesSha256, batchRow.uplineNetTotal, String(je.journalSeq),
+          ],
+        );
+        if (normAgency.length) await insertStatementAgencyLinesBatch(tx, normAgency, je.journalSeq);
+        if (normUpline.length) await insertStatementUplineLinesBatch(tx, normUpline, je.journalSeq);
+        return { ...je, body, result: body.result };
+      },
+    });
+  }
+
+  /**
+   * Loads a finished Emit run's canonical_bob.csv, coherent_ledger.csv, and statements_YYYYMMDD.csv
+   * (plus optional emit_metadata.json and working/tx.csv) into the normalized PostgreSQL tables in one
+   * SERIALIZABLE transaction, verifying every total ties and refusing any second load of the same run.
+   */
+  async function materializeEmit({
+    actor,
+    commandKey,
+    runId,
+    attemptEventId = null,
+    canonicalBobCsv = null,
+    coherentLedgerCsv = null,
+    statementsCsv = null,
+    emitMetadataJson = null,
+    workingTxCsv = null,
+    statementsFileName = null,
+    statementsFileSha256 = null,
+    statementBatchId = randomUUID(),
+    reconciliationMode = 'strict_entity_ledger',
+    columnMap = {},
+  }) {
+    const payload = {
+      runId,
+      attemptEventId,
+      reconciliationMode,
+      statementsFileName,
+      statementsFileSha256,
+    };
+    return executeJournalCommand({
+      actor,
+      commandKind: 'materialize_emit',
+      commandKey,
+      payload,
+      buildAndWrite: async (tx, writeJournal) => {
+        const alreadyRes = await tx.query(
+          'SELECT attempt_event_id FROM coherence.run_materializations WHERE run_id = $1::uuid',
+          [runId],
+        );
+        if (alreadyRes.rows.length > 0) {
+          throw new AppError('This run has already been materialized; a second load is refused.', 409, 'ALREADY_MATERIALIZED');
+        }
+
+        const runRes = await tx.query(
+          `SELECT id, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date,
+                  pg_catalog.to_char(statement_date, 'YYYYMMDD') AS stamp
+           FROM coherence.runs WHERE id = $1::uuid`,
+          [runId],
+        );
+        if (runRes.rows.length === 0) throw new AppError('Run not found.', 404, 'RUN_NOT_FOUND');
+        const { statement_date: statementDate, stamp } = runRes.rows[0];
+
+        let resolvedAttemptId = attemptEventId;
+        if (!resolvedAttemptId) {
+          const evRes = await tx.query("SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev_id", [runId]);
+          resolvedAttemptId = evRes.rows[0]?.ev_id ?? null;
+        }
+        if (!resolvedAttemptId) {
+          throw new AppError('Cannot materialize Emit: run has no finished emit attempt.', 409, 'EMIT_NOT_FINISHED');
+        }
+
+        const readArtifactText = async (relCandidates) => {
+          if (!stores?.dataStore) return null;
+          for (const rel of relCandidates) {
+            const artRes = await tx.query(
+              `SELECT a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
+               FROM coherence.artifacts a
+               JOIN coherence.stored_files sf ON sf.store_kind = a.store_kind AND sf.sha256 = a.file_sha256
+               WHERE a.attempt_event_id = $1::uuid AND a.rel_path = $2 AND a.store_kind = 'company_data'`,
+              [resolvedAttemptId, rel],
+            );
+            if (artRes.rows.length > 0) {
+              const row = artRes.rows[0];
+              const bytes = await stores.dataStore.readVerified(row.file_sha256, {
+                byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
+              });
+              return { text: bytes.toString('utf8'), sha256: row.file_sha256, relPath: rel };
+            }
+          }
+          return null;
+        };
+
+        const defaultStmtRel = `emits/statements_${stamp}.csv`;
+        const bobLoaded = canonicalBobCsv != null ? { text: canonicalBobCsv } : await readArtifactText(['emits/canonical_bob.csv']);
+        const ledLoaded = coherentLedgerCsv != null ? { text: coherentLedgerCsv } : await readArtifactText(['emits/coherent_ledger.csv']);
+        const stmtLoaded = statementsCsv != null ? { text: statementsCsv, sha256: statementsFileSha256 } : await readArtifactText([defaultStmtRel]);
+        const metaLoaded = emitMetadataJson != null ? { text: emitMetadataJson } : await readArtifactText(['emits/emit_metadata.json', 'emits/policy_status_meta.json']);
+
+        if (!bobLoaded || !ledLoaded || !stmtLoaded) {
+          throw new AppError('Emit materialization requires canonical_bob.csv, coherent_ledger.csv, and statements file.', 422, 'MISSING_EMIT_FILES');
+        }
+
+        let resolvedWorkingTx = workingTxCsv;
+        if (resolvedWorkingTx == null && stores?.dataStore) {
+          const txArtRes = await tx.query(
+            `SELECT a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
+             FROM coherence.artifacts a
+             JOIN coherence.stored_files sf ON sf.store_kind = a.store_kind AND sf.sha256 = a.file_sha256
+             WHERE a.attempt_event_id IN (
+               coherence.current_finished_attempt($1::uuid, 'attribute'),
+               coherence.current_finished_attempt($1::uuid, 'assign')
+             ) AND a.rel_path = 'working/tx.csv' AND a.store_kind = 'company_data'
+             ORDER BY a.journal_seq DESC LIMIT 1`,
+            [runId],
+          );
+          if (txArtRes.rows.length > 0) {
+            const row = txArtRes.rows[0];
+            const bytes = await stores.dataStore.readVerified(row.file_sha256, {
+              byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
+            }).catch(() => null);
+            if (bytes) resolvedWorkingTx = bytes.toString('utf8');
+          }
+        }
+
+        let resolvedStmtSha = stmtLoaded.sha256 ?? statementsFileSha256 ?? null;
+        if (!resolvedStmtSha) {
+          const stmtArtRes = await tx.query(
+            `SELECT file_sha256 FROM coherence.artifacts
+             WHERE attempt_event_id = $1::uuid AND rel_path = $2 AND store_kind = 'company_data'`,
+            [resolvedAttemptId, defaultStmtRel],
+          );
+          resolvedStmtSha = stmtArtRes.rows[0]?.file_sha256 ?? null;
+        }
+
+        const mat = await prepareEmitMaterialization({
+          db: tx,
+          runId,
+          attemptEventId: resolvedAttemptId,
+          statementDate,
+          canonicalBobCsv: bobLoaded.text,
+          coherentLedgerCsv: ledLoaded.text,
+          statementsCsv: stmtLoaded.text,
+          emitMetadataJson: metaLoaded?.text ?? null,
+          workingTxCsv: resolvedWorkingTx,
+          statementsFileName: statementsFileName || `statements_${stamp}.csv`,
+          statementsFileSha256: resolvedStmtSha,
+          statementBatchId,
+          reconciliationMode,
+          columnMap,
+        });
+
+        const commitments = buildCommitments({
+          statement_batches: [mat.statementBatch],
+          statement_agency_lines: mat.agencyLines,
+          statement_upline_lines: mat.uplineLines,
+          run_materializations: [mat.runMaterialization],
+          bob_policies: mat.bobPolicies,
+          bob_policy_financials: mat.bobFinancials,
+          coherent_ledger_rows: mat.ledgerRows,
+        });
+        const body = {
+          runMaterialization: {
+            attemptEventId: resolvedAttemptId,
+            runId,
+            statementDate,
+            bobRowCount: mat.runMaterialization.bobRowCount,
+            ledgerRowCount: mat.runMaterialization.ledgerRowCount,
+            ledgerGrossTotal: mat.runMaterialization.ledgerGrossTotal,
+            ledgerDownlineTotal: mat.runMaterialization.ledgerDownlineTotal,
+            ledgerUplineTotal: mat.runMaterialization.ledgerUplineTotal,
+            statementBatchId: mat.statementBatch.id,
+          },
+          result: {
+            attemptEventId: resolvedAttemptId,
+            runId,
+            statementDate,
+            statementBatchId: mat.statementBatch.id,
+            bobRowCount: mat.runMaterialization.bobRowCount,
+            ledgerRowCount: mat.runMaterialization.ledgerRowCount,
+            agencyLineCount: mat.agencyLines.length,
+            uplineLineCount: mat.uplineLines.length,
+            ledgerGrossTotal: mat.runMaterialization.ledgerGrossTotal,
+            ledgerDownlineTotal: mat.runMaterialization.ledgerDownlineTotal,
+            ledgerUplineTotal: mat.runMaterialization.ledgerUplineTotal,
+          },
+          commitments,
+        };
+
+        const je = await writeJournal(body);
+        await insertMaterializationPayload(tx, mat, je.journalSeq);
+        return { ...je, body, result: body.result };
+      },
+    });
+  }
+
   return {
     initCompany,
     registerStoredFiles,
     registerEngineVersion,
     registerApprovalsFile,
+    recordDecisionBaseline,
     publishInputVersion,
     launchRun,
     startStepAttempt,
@@ -2129,12 +3667,17 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     submitReview,
     acceptReviewSubmission,
     rejectReviewSubmission,
+    saveReviewDecisions,
+    recordGeneratedOverlay,
     saveReviewDraft,
     getReviewDraft,
     expireOldDrafts,
     confirmEmit,
     carrySent,
     carryApprovals,
+    carryDecisions,
+    recordStatementBatch,
+    materializeEmit,
     abandonRun,
     importHistoricalRun,
     importStandaloneFiles,

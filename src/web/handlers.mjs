@@ -301,7 +301,8 @@ export function createWebHandlers({
     const seqCap = limitSeq != null ? String(limitSeq) : '9223372036854775807';
     const runRes = await pool.query(
       `SELECT r.id, pg_catalog.to_char(r.statement_date, 'YYYY-MM-DD') AS statement_date,
-              r.folder_number, r.origin, r.input_version_id, r.prior_approvals_sha256, r.engine_version_id,
+              r.folder_number, r.origin, r.input_version_id, r.prior_approvals_sha256,
+              r.prior_decision_commit_id, r.engine_version_id,
               r.emit_mode, r.emit_display, r.emit_keep, r.emit_no_manager,
               r.replays_run_id, r.compared_run_id, r.rerun_reason, r.source_folder, r.journal_seq,
               coherence.run_stage(r.id, $3::bigint) AS stage,
@@ -329,11 +330,14 @@ export function createWebHandlers({
         [runId, seqCap],
       ),
       pool.query(
-        `SELECT rs.id, rs.surface, rs.attempt_event_id, rs.approvals_file_sha256, rs.imported, rs.original_at,
-                rs.journal_seq, je.recorded_at, je.actor, je.acting_for, af.row_count, af.header_kind
+        `SELECT rs.id, rs.surface, rs.attempt_event_id, rs.approvals_file_sha256, rs.decision_commit_id,
+                rs.imported, rs.original_at, rs.journal_seq, je.recorded_at, je.actor, je.acting_for,
+                COALESCE(dc.cumulative_decision_count, af.row_count) AS row_count,
+                COALESCE(dc.header_contract, af.header_kind) AS header_kind
          FROM coherence.review_saves rs
          JOIN coherence.journal_entries je ON je.seq = rs.journal_seq
-         JOIN coherence.approvals_files af ON af.file_sha256 = rs.approvals_file_sha256
+         LEFT JOIN coherence.approvals_files af ON af.file_sha256 = rs.approvals_file_sha256
+         LEFT JOIN coherence.decision_commits dc ON dc.id = rs.decision_commit_id
          WHERE rs.run_id = $1::uuid AND rs.journal_seq <= $2::bigint
          ORDER BY rs.journal_seq ASC`,
         [runId, seqCap],
@@ -497,18 +501,22 @@ export function createWebHandlers({
     const attemptNo = Number(attRes.rows[0].attempt_no);
 
     const artRes = await pool.query(
-      `SELECT a.store_kind, a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
+      `SELECT a.rel_path, a.store_kind, a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
        FROM coherence.artifacts a
        JOIN coherence.stored_files sf ON sf.store_kind = a.store_kind AND sf.sha256 = a.file_sha256
-       WHERE a.attempt_event_id = $1::uuid AND a.rel_path = $2`,
-      [evId, `${surface}.html`],
+       WHERE a.attempt_event_id = $1::uuid AND a.rel_path IN ($2, $3)
+       ORDER BY CASE WHEN a.rel_path = $2 THEN 1 ELSE 2 END
+       LIMIT 1`,
+      [evId, `${surface}.json`, `${surface}.html`],
     );
     if (artRes.rows.length === 0) throw new AppError(`No ${surface} review config is available.`, 404, 'REVIEW_CONFIG_MISSING');
     const art = artRes.rows[0];
-    const htmlBytes = await stores.readVerified(art.store_kind, art.file_sha256, {
+    const rawBytes = await stores.readVerified(art.store_kind, art.file_sha256, {
       byteSize: Number(art.byte_size), md5B64: art.md5_b64, crc32cB64: art.crc32c_b64,
     });
-    const config = extractReviewConfigJson(htmlBytes.toString('utf8'), surface, statementDate);
+    const config = art.rel_path.endsWith('.json')
+      ? JSON.parse(rawBytes.toString('utf8'))
+      : extractReviewConfigJson(rawBytes.toString('utf8'), surface, statementDate);
     return { runId, surface, attemptNo, config };
   }
 
@@ -696,6 +704,59 @@ export function createWebHandlers({
     };
   }
 
+  async function getDecisionKeyHistory(actor, recordId) {
+    assertCanRead(actor, 'approvals', { companySlug });
+    if (typeof recordId !== 'string' || !recordId.length) {
+      throw new AppError('recordId is required.', 400, 'MISSING_RECORD_ID');
+    }
+    const res = await pool.query(
+      `SELECT d.id, d.decision_commit_id, d.row_order, d.run_id, d.review_save_id, d.surface,
+              d.record_id, d.replaces_decision_id, d.disposition, d.agent, d.agency,
+              d.policy, d.book, d.month, d.status, d.note,
+              d.approved_amount, d.approved_agency, d.approved_agent,
+              d.approved_agency_from, d.approved_agent_from,
+              d.decided_by, d.acting_for, d.decided_at, d.committed_at_raw, d.imported,
+              d.journal_seq, je.recorded_at
+       FROM coherence.decisions d
+       JOIN coherence.journal_entries je ON je.seq = d.journal_seq
+       WHERE d.record_id = $1
+       ORDER BY d.journal_seq ASC, d.row_order ASC`,
+      [recordId],
+    );
+    return {
+      recordId,
+      history: res.rows.map((r) => ({
+        id: r.id,
+        decisionCommitId: r.decision_commit_id,
+        rowOrder: Number(r.row_order),
+        replacesDecisionId: r.replaces_decision_id,
+        disposition: r.disposition,
+        agent: r.agent,
+        agency: r.agency,
+        policy: r.policy,
+        book: r.book,
+        month: r.month,
+        status: r.status,
+        note: r.note,
+        approvedAmount: r.approved_amount,
+        approvedAgency: r.approved_agency,
+        approvedAgent: r.approved_agent,
+        approvedAgencyFrom: r.approved_agency_from,
+        approvedAgentFrom: r.approved_agent_from,
+        decidedBy: r.decided_by,
+        actingFor: r.acting_for ?? null,
+        decidedAt: formatTimestampUtcUs(r.decided_at),
+        committedAt: r.committed_at_raw ?? formatTimestampUtcUs(r.decided_at),
+        imported: r.imported,
+        runId: r.run_id,
+        reviewSaveId: r.review_save_id,
+        surface: r.surface,
+        journalSeq: Number(r.journal_seq),
+        recordedAt: formatTimestampUtcUs(r.recorded_at),
+      })),
+    };
+  }
+
   async function listChecks(actor, { kind = null, runId = null } = {}) {
     assertCanRead(actor, 'checks', { companySlug });
     const conditions = [];
@@ -793,12 +854,15 @@ export function createWebHandlers({
     saveReviewDraft: (actor, runId, surface, body) => commands.saveReviewDraft({ actor, runId, surface, ...body }),
     submitReview: (actor, runId, surface, { commandKey, expectedJournalSeq, csvBytes }) =>
       commands.submitReview({ actor, commandKey, expectedJournalSeq, runId, surface, csvBytes }),
+    saveReviewDecisions: (actor, runId, surface, body) =>
+      commands.saveReviewDecisions({ actor, runId, surface, ...body }),
     getReviewSubmission,
     confirmEmit: (actor, runId, body) => commands.confirmEmit({ actor, runId, ...body }),
     listRunOutputs,
     getRunOutputFile,
     carrySent: (actor, runId, body) => commands.carrySent({ actor, runId, ...body }),
     carryApprovals: (actor, runId, body) => commands.carryApprovals({ actor, runId, ...body }),
+    carryDecisions: (actor, runId, body) => commands.carryDecisions({ actor, runId, ...body }),
     requestCancel: (actor, runId, body) => commands.requestCancel({ actor, runId, ...body }),
     requestRetry: (actor, runId, body) => commands.requestRetry({ actor, runId, ...body }),
     abandonRun: (actor, runId, body) => commands.abandonRun({ actor, runId, ...body }),
@@ -806,6 +870,7 @@ export function createWebHandlers({
     getHistoryAsOf,
     getRunJournal,
     getApprovalKeyHistory,
+    getDecisionKeyHistory,
     listChecks,
     getCheckDetail,
     runVerificationCheck,

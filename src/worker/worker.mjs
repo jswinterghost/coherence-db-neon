@@ -4,6 +4,7 @@ import { cp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AppError, createSafeLogger, sanitizeErrorMessage } from '../util/redact.mjs';
+import { parseCsvObjects } from './emit-materializer.mjs';
 import { buildAttemptWorkspace, listFilesRecursive, verifyFrozenInputUnchanged } from './folder-builder.mjs';
 import { buildStepArgs, DEFAULT_STEP_TIMEOUT_MS, runCoherenceProcess, runOverlayCheck } from './engine-runner.mjs';
 import { reconcileInterruptedAttempts } from './reconciler.mjs';
@@ -12,8 +13,8 @@ import { acquireRunningSlot } from './slot.mjs';
 const STEP_ARTIFACT_FILTERS = {
   assign: (rel) => rel === 'run.json' || rel.startsWith('working/'),
   attribute: (rel) => rel === 'run.json' || rel.startsWith('working/'),
-  bible: (rel) => rel === 'run.json' || rel === 'bible.csv' || rel === 'bible.html',
-  adjust: (rel) => rel === 'run.json' || rel === 'adjust.csv' || rel === 'adjust.html',
+  bible: (rel) => rel === 'run.json' || rel === 'bible.csv' || rel === 'bible.html' || rel === 'bible.json',
+  adjust: (rel) => rel === 'run.json' || rel === 'adjust.csv' || rel === 'adjust.html' || rel === 'adjust.json',
   emit: (rel) => rel === 'run.json' || rel === 'company_manifest.json' || rel.startsWith('emits/'),
 };
 
@@ -211,8 +212,8 @@ export function createEngineWorker({
     const reqRes = await slot.runExclusive((client) => client.query(
       `SELECT sr.id AS req_id, sr.run_id, sr.step, sr.reason, sr.emit_confirmation_id,
               pg_catalog.to_char(r.statement_date, 'YYYY-MM-DD') AS statement_date,
-              r.origin, r.input_version_id, r.prior_approvals_sha256, r.engine_version_id,
-              r.emit_mode, r.emit_display, r.emit_keep, r.emit_no_manager, r.replays_run_id
+              r.origin, r.input_version_id, r.prior_approvals_sha256, r.prior_decision_commit_id,
+              r.engine_version_id, r.emit_mode, r.emit_display, r.emit_keep, r.emit_no_manager, r.replays_run_id
        FROM coherence.step_requests sr
        JOIN coherence.runs r ON r.id = sr.run_id
        WHERE NOT EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = sr.run_id)
@@ -228,6 +229,7 @@ export function createEngineWorker({
       origin: req.origin,
       input_version_id: req.input_version_id,
       prior_approvals_sha256: req.prior_approvals_sha256,
+      prior_decision_commit_id: req.prior_decision_commit_id,
       engine_version_id: req.engine_version_id,
       emit_mode: req.emit_mode,
       emit_display: req.emit_display,
@@ -275,6 +277,7 @@ export function createEngineWorker({
         emitKeep: run.emit_keep,
         emitNoManager: run.emit_no_manager,
         companyEmitPath: workspace.engineRuntime.companyEmitPath,
+        engineKind: workspace.engineRuntime.engineKind,
       });
 
       const checkCancelled = async () => {
@@ -379,17 +382,98 @@ export function createEngineWorker({
 
       const artifacts = [];
       const storedFiles = [];
+      const artifactBytesByPath = new Map();
       for (const relPath of stepRelPaths) {
         slot.assertHeld();
         const bytes = await readFile(join(workspace.runDir, ...relPath.split('/')));
         const promoted = await stores.promoteArtifact(relPath, bytes, { checksPassed: true, signal: slot.signal });
         storedFiles.push(promoted);
+        artifactBytesByPath.set(relPath, { bytes, promoted });
         artifacts.push({
           relPath,
           artifactKind: promoted.artifactKind,
           storeKind: promoted.storeKind,
           fileSha256: promoted.sha256,
         });
+      }
+
+      const generatedOverlays = [];
+      for (const gen of workspace.generatedOverlays || []) {
+        if (!gen.decisionCommitId) continue;
+        slot.assertHeld();
+        const promoted = await stores.dataStore.promoteBytes(gen.bytes, {
+          relPath: 'overlay.csv',
+          checksPassed: true,
+          signal: slot.signal,
+        });
+        storedFiles.push(promoted);
+        generatedOverlays.push({
+          decisionCommitId: gen.decisionCommitId,
+          purpose: gen.purpose,
+          headerContract: gen.headerContract,
+          rowCount: gen.rowCount,
+          fileSha256: promoted.sha256,
+        });
+      }
+
+      const queueItems = [];
+      if (req.step === 'bible' || req.step === 'adjust') {
+        const csvEntry = artifactBytesByPath.get(`${req.step}.csv`);
+        const jsonEntry = artifactBytesByPath.get(`${req.step}.json`);
+        let reconfirmMap = {};
+        if (jsonEntry) {
+          try {
+            const parsedCfg = JSON.parse(jsonEntry.bytes.toString('utf8'));
+            if (parsedCfg?.reconfirm && typeof parsedCfg.reconfirm === 'object') {
+              reconfirmMap = parsedCfg.reconfirm;
+            }
+          } catch {
+            reconfirmMap = {};
+          }
+        }
+        if (csvEntry) {
+          const parsedQueue = parseCsvObjects(csvEntry.bytes, `${req.step}.csv`);
+          parsedQueue.rows.forEach((row, idx) => {
+            if (!row.record_id) return;
+            queueItems.push({
+              itemOrder: idx + 1,
+              surface: req.step,
+              recordId: row.record_id,
+              caseKind: row.case || row.case_kind || null,
+              subtype: row.subtype || null,
+              entity: row.entity || null,
+              npn: row.npn || null,
+              amount: row.amount || null,
+              entityFrom: row.entity_from || null,
+              npnFrom: row.npn_from || null,
+              needsReconfirm: Boolean(reconfirmMap[row.record_id]),
+            });
+          });
+        }
+      }
+
+      let emitMaterializationInput = null;
+      if (req.step === 'emit') {
+        const stamp = run.statement_date.replaceAll('-', '');
+        const bobEntry = artifactBytesByPath.get('emits/canonical_bob.csv');
+        const ledEntry = artifactBytesByPath.get('emits/coherent_ledger.csv');
+        const stmtRel = `emits/statements_${stamp}.csv`;
+        const stmtEntry = artifactBytesByPath.get(stmtRel);
+        if (bobEntry && ledEntry && stmtEntry) {
+          const metaEntry = artifactBytesByPath.get('emits/emit_metadata.json')
+            || artifactBytesByPath.get('emits/policy_status_meta.json');
+          const workingTxCsv = await readFile(join(workspace.runDir, 'working', 'tx.csv'), 'utf8').catch(() => null);
+          emitMaterializationInput = {
+            statementDate: run.statement_date,
+            canonicalBobCsv: bobEntry.bytes.toString('utf8'),
+            coherentLedgerCsv: ledEntry.bytes.toString('utf8'),
+            statementsCsv: stmtEntry.bytes.toString('utf8'),
+            emitMetadataJson: metaEntry ? metaEntry.bytes.toString('utf8') : null,
+            workingTxCsv,
+            statementsFileName: `statements_${stamp}.csv`,
+            statementsFileSha256: stmtEntry.promoted.sha256,
+          };
+        }
       }
 
       if (typeof onBeforeFinish === 'function') {
@@ -416,6 +500,9 @@ export function createEngineWorker({
         logFile: logStored,
         artifacts,
         storedFiles,
+        queueItems,
+        generatedOverlays,
+        emitMaterializationInput,
       }));
       logger.info('step_finished', { runId: run.id, step: req.step, attemptNo, artifacts: artifacts.length, journalSeq: finished.journalSeq });
       return { action: 'step_finished', runId: run.id, step: req.step, attemptNo, journalSeq: finished.journalSeq, nextStep: finished.result.nextStep };

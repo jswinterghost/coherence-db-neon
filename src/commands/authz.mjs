@@ -23,10 +23,12 @@ const RUN_COHERENCE_COMMANDS = new Set([
   'request_retry',
   'request_cancel',
   'submit_review',
+  'save_review_decisions',
   'save_review_draft',
   'confirm_emit',
   'carry_sent',
   'carry_approvals',
+  'carry_decisions',
   'abandon_run',
   'publish_input_version',
   'include_staging_file',
@@ -36,11 +38,21 @@ const OWNER_TYPED_COMMANDS = new Set([
   'abandon_run',
   'carry_sent',
   'carry_approvals',
+  'carry_decisions',
   'confirm_emit',
   'register_engine_version',
   'init_company',
   'import_historical_run',
   'import_standalone_files',
+  'record_decision_baseline',
+  'record_statement_batch',
+]);
+
+const WORKER_OR_OWNER_COMMANDS = new Set([
+  'record_check',
+  'register_stored_files',
+  'record_generated_overlay',
+  'materialize_emit',
 ]);
 
 const COMPANY_ADMIN_GRANTABLE_AREAS = new Set(['inputs', 'runs', 'outputs']);
@@ -73,7 +85,7 @@ export function assertCanWrite(actor, commandKind, { companySlug } = {}) {
   }
 
   if (actor.kind === ACTOR_KINDS.WORKER) {
-    if (commandKind === 'record_check' || commandKind === 'register_stored_files') return;
+    if (WORKER_OR_OWNER_COMMANDS.has(commandKind)) return;
     throw new AppError('The worker service identity cannot execute human decision commands.', 403, 'HUMAN_ONLY');
   }
 

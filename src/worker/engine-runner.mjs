@@ -32,8 +32,8 @@ export function buildCoherenceEnv(workspaceDir, extraEnv = {}) {
   };
 }
 
-export function buildStepArgs({ step, statementDate, emitMode = 'coherence', emitDisplay = null, emitKeep = [], emitNoManager = [], companyEmitPath = null }) {
-  if (step !== 'emit' || emitMode === 'coherence') {
+export function buildStepArgs({ step, statementDate, emitMode = 'coherence', emitDisplay = null, emitKeep = [], emitNoManager = [], companyEmitPath = null, engineKind = 'legacy_sealed' }) {
+  if (step !== 'emit' || emitMode === 'coherence' || engineKind !== 'legacy_sealed') {
     return ['-m', STEP_MODULES[step], statementDate];
   }
   if (!companyEmitPath) {

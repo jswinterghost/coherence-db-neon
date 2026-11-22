@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'n
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
+import { generateOverlayCsv } from '../decisions/overlay-generator.mjs';
 import { fingerprintBytes, sha256Hex } from '../util/crypto.mjs';
 import { assertValidRelPath } from '../util/csv.mjs';
 import { AppError } from '../util/redact.mjs';
@@ -109,8 +110,13 @@ export async function defaultMaterializeEngine({
     await writeFile(target, buf, { mode: 0o600 });
     return target;
   };
-  const companyEmitPath = await verifyAndWrite('company_emit.py', engineVersion.company_emit_sha256);
-  await verifyAndWrite('pages_law.py', engineVersion.pages_law_sha256);
+  const isLegacyEngine = (engineVersion.engine_kind || 'legacy_sealed') === 'legacy_sealed';
+  const companyEmitPath = engineVersion.company_emit_sha256
+    ? await verifyAndWrite('company_emit.py', engineVersion.company_emit_sha256)
+    : (isLegacyEngine ? await verifyAndWrite('company_emit.py', engineVersion.company_emit_sha256) : null);
+  if (engineVersion.pages_law_sha256 || isLegacyEngine) {
+    await verifyAndWrite('pages_law.py', engineVersion.pages_law_sha256);
+  }
   const overlayCheckPath = await verifyAndWrite('coherence_overlay_check.py', engineVersion.overlay_check_sha256);
 
   if (installWebDeps) {
@@ -302,6 +308,19 @@ export async function buildAttemptWorkspace({
     const runDir = join(workspaceDir, 'runs', run.statement_date);
 
     let expectedInputHashes;
+    const generatedOverlays = [];
+    const writePriorOverlayIfNeeded = async (inputDir) => {
+      if (!run.prior_decision_commit_id) return;
+      const hasPriorEntry = [...expectedInputHashes.keys()].some((p) => p.toLowerCase() === 'overlay/overlay.csv');
+      if (hasPriorEntry) return;
+      const gen = await generateOverlayCsv(db, { decisionCommitId: run.prior_decision_commit_id });
+      const target = join(inputDir, 'Overlay', 'overlay.csv');
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      await writeFile(target, gen.bytes, { mode: 0o600 });
+      expectedInputHashes.set('Overlay/overlay.csv', gen.fingerprint.sha256);
+      generatedOverlays.push({ purpose: 'prior_input', ...gen });
+    };
+
     if (step === 'assign') {
       // Assign copies workspace/input -> workspace/runs/<date>/input
       expectedInputHashes = await materializeInputEntries({
@@ -311,6 +330,7 @@ export async function buildAttemptWorkspace({
         dataStore: stores.dataStore,
         signal,
       });
+      await writePriorOverlayIfNeeded(join(workspaceDir, 'input'));
     } else {
       // Steps after assign read exclusively inside runs/<date>/.
       await mkdir(runDir, { recursive: true, mode: 0o700 });
@@ -321,6 +341,7 @@ export async function buildAttemptWorkspace({
         dataStore: stores.dataStore,
         signal,
       });
+      await writePriorOverlayIfNeeded(join(runDir, 'input'));
 
       const restoreSteps = step === 'attribute'
         ? ['assign']
@@ -396,9 +417,9 @@ export async function buildAttemptWorkspace({
 
       if (step === 'adjust' || step === 'review_adjust') {
         const saveRes = await db.query(
-          `SELECT rs.approvals_file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
+          `SELECT rs.approvals_file_sha256, rs.decision_commit_id, sf.byte_size, sf.md5_b64, sf.crc32c_b64
            FROM coherence.review_saves rs
-           JOIN coherence.stored_files sf ON sf.store_kind = 'company_data' AND sf.sha256 = rs.approvals_file_sha256
+           LEFT JOIN coherence.stored_files sf ON sf.store_kind = 'company_data' AND sf.sha256 = rs.approvals_file_sha256
            WHERE rs.run_id = $1::uuid AND rs.surface = 'bible'
              AND rs.attempt_event_id = coherence.current_finished_attempt($1::uuid, 'bible')
            ORDER BY rs.journal_seq DESC LIMIT 1`,
@@ -406,16 +427,22 @@ export async function buildAttemptWorkspace({
         );
         if (saveRes.rows.length > 0) {
           const row = saveRes.rows[0];
-          const bytes = await stores.dataStore.readVerified(row.approvals_file_sha256, {
-            byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
-          }, { signal });
-          await writeFile(join(runDir, 'overlay.csv'), bytes, { mode: 0o600 });
+          if (row.decision_commit_id) {
+            const gen = await generateOverlayCsv(db, { decisionCommitId: row.decision_commit_id });
+            await writeFile(join(runDir, 'overlay.csv'), gen.bytes, { mode: 0o600 });
+            generatedOverlays.push({ purpose: 'bible_review', ...gen });
+          } else {
+            const bytes = await stores.dataStore.readVerified(row.approvals_file_sha256, {
+              byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
+            }, { signal });
+            await writeFile(join(runDir, 'overlay.csv'), bytes, { mode: 0o600 });
+          }
         }
       } else if (step === 'emit') {
         const saveRes = await db.query(
-          `SELECT rs.approvals_file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
+          `SELECT rs.approvals_file_sha256, rs.decision_commit_id, sf.byte_size, sf.md5_b64, sf.crc32c_b64
            FROM coherence.review_saves rs
-           JOIN coherence.stored_files sf ON sf.store_kind = 'company_data' AND sf.sha256 = rs.approvals_file_sha256
+           LEFT JOIN coherence.stored_files sf ON sf.store_kind = 'company_data' AND sf.sha256 = rs.approvals_file_sha256
            WHERE rs.run_id = $1::uuid AND rs.surface = 'adjust'
              AND rs.attempt_event_id = coherence.current_finished_attempt($1::uuid, 'adjust')
            ORDER BY rs.journal_seq DESC LIMIT 1`,
@@ -423,10 +450,16 @@ export async function buildAttemptWorkspace({
         );
         if (saveRes.rows.length > 0) {
           const row = saveRes.rows[0];
-          const bytes = await stores.dataStore.readVerified(row.approvals_file_sha256, {
-            byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
-          }, { signal });
-          await writeFile(join(runDir, 'overlay.csv'), bytes, { mode: 0o600 });
+          if (row.decision_commit_id) {
+            const gen = await generateOverlayCsv(db, { decisionCommitId: row.decision_commit_id });
+            await writeFile(join(runDir, 'overlay.csv'), gen.bytes, { mode: 0o600 });
+            generatedOverlays.push({ purpose: 'adjust_review', ...gen });
+          } else {
+            const bytes = await stores.dataStore.readVerified(row.approvals_file_sha256, {
+              byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
+            }, { signal });
+            await writeFile(join(runDir, 'overlay.csv'), bytes, { mode: 0o600 });
+          }
         }
       }
 
@@ -448,7 +481,7 @@ export async function buildAttemptWorkspace({
       }
     }
 
-    return { outerDir, workspaceDir, runDir, engineRuntime, expectedInputHashes, cleanup };
+    return { outerDir, workspaceDir, runDir, engineRuntime: { ...engineRuntime, engineKind: engineVersion.engine_kind || 'legacy_sealed' }, expectedInputHashes, generatedOverlays, cleanup };
   } catch (err) {
     await cleanup();
     throw err;

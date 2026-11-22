@@ -20,7 +20,15 @@ import { checkReviewAppDrift } from '../src/web/drift-check.mjs';
 import { createWebHandlers } from '../src/web/handlers.mjs';
 import { createCoherenceRouter } from '../src/web/router.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
-import { createMockEngineMaterializer, makeOverlayCsv, sampleApprovalRow, seedEngineVersion, seedStandingInput } from './helpers/fixtures.mjs';
+import {
+  createDataOnlyMockEngineMaterializer,
+  createMockEngineMaterializer,
+  makeOverlayCsv,
+  sampleApprovalRow,
+  seedEngineCopyVersion,
+  seedEngineVersion,
+  seedStandingInput,
+} from './helpers/fixtures.mjs';
 import { checkPgAvailable, createTestEnv } from './helpers/test-db.mjs';
 
 const pgCheck = await checkPgAvailable();
@@ -310,4 +318,104 @@ test('Layer 5 [Review App Drift Check]: verifies via readSourceFile hook, detect
   const drifted = await checkReviewAppDrift({ provenance, nusearUiRoot: join(dir, 'nusear'), readSourceFile });
   assert.equal(drifted.passed, false);
   assert.ok(drifted.problems.some((p) => p.includes('drifted')));
+});
+
+test('Layer 5 [JSON Review API & Decision History]: serves bible.json/adjust.json configs, commits POST .../review/:surface/save synchronously, refuses View-As/stale/GET history, and returns replacesDecisionId chain', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'beacon', displayName: 'Beacon' });
+  t.after(() => env.cleanup());
+
+  const { engineVersionId } = await seedEngineCopyVersion(env);
+  await seedStandingInput(env, { commandKey: 'web-dec-standing' });
+  const worker = env.registerWorker(createEngineWorker({
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
+    stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: null }),
+    tempBaseDir: env.tempDir,
+  }));
+
+  const launch = await env.commands.launchRun({
+    actor: env.ownerActor, commandKey: 'web-dec-launch', statementDate: '2026-10-31', engineVersionId,
+  });
+  const runId = launch.result.runId;
+  for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
+
+  const handlers = createWebHandlers({ pool: env.pool, companySlug: env.companySlug, stores: env.stores, commands: env.commands });
+  let currentActor = env.ownerActor;
+  const router = createCoherenceRouter({
+    handlersByCompany: new Map([[env.companySlug, handlers]]),
+    authenticate: async () => currentActor,
+  });
+  const server = createServer((req, res) => { void router(req, res); });
+  await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const reqJson = async (path, opts = {}) => {
+    const res = await fetch(`${baseUrl}${path}`, opts);
+    return { status: res.status, body: await res.json() };
+  };
+
+  // Reads bible.json from company_data with zero HTML files
+  const cfg = await reqJson(`/api/coherence/beacon/runs/${runId}/review/bible/config`);
+  assert.equal(cfg.status, 200);
+  assert.equal(cfg.body.config.surface, 'bible');
+  assert.equal(cfg.body.config.queue.length, 2);
+
+  const detail = await reqJson(`/api/coherence/beacon/runs/${runId}`);
+  const seq = detail.body.latestJournalSeq;
+
+  // View-As refuses POST /review/bible/save with 403
+  currentActor = { id: 'test-owner', kind: 'owner', viewingAs: { id: 'viewer', kind: 'recipient' } };
+  const vaRes = await reqJson(`/api/coherence/beacon/runs/${runId}/review/bible/save`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      commandKey: 'web-va-save',
+      expectedJournalSeq: seq,
+      decisions: cfg.body.config.queue.map((q) => ({ recordId: q.record_id, disposition: 'CONFIRM' })),
+    }),
+  });
+  assert.equal(vaRes.status, 403);
+
+  // Owner commits Bible decisions synchronously
+  currentActor = env.ownerActor;
+  const save1 = await reqJson(`/api/coherence/beacon/runs/${runId}/review/bible/save`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      commandKey: 'web-bible-save-1',
+      expectedJournalSeq: seq,
+      decisions: [
+        { recordId: cfg.body.config.queue[0].record_id, disposition: 'CONFIRM', note: 'first' },
+        { recordId: cfg.body.config.queue[1].record_id, disposition: 'CONFIRM', note: 'first' },
+      ],
+    }),
+  });
+  assert.equal(save1.status, 201);
+  assert.ok(save1.body.result.decisionCommitId);
+
+  // Stale save with old seq returns 409
+  const stale = await reqJson(`/api/coherence/beacon/runs/${runId}/review/bible/save`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      commandKey: 'web-bible-save-stale',
+      expectedJournalSeq: seq,
+      decisions: [{ recordId: cfg.body.config.queue[0].record_id, disposition: 'CORRECT', agency: 'Beacon' }],
+    }),
+  });
+  assert.equal(stale.status, 409);
+
+  // GET /decisions/history returns 405; query param recordId returns 400; POST returns chain
+  assert.equal((await reqJson('/api/coherence/beacon/decisions/history')).status, 405);
+  assert.equal((await reqJson('/api/coherence/beacon/decisions/history?recordId=policy:carrier_a:C-101')).status, 400);
+
+  const hist = await reqJson('/api/coherence/beacon/decisions/history', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ recordId: cfg.body.config.queue[0].record_id }),
+  });
+  assert.equal(hist.status, 200);
+  assert.equal(hist.body.history.length, 1);
+  assert.equal(hist.body.history[0].replacesDecisionId, null);
+  assert.equal(hist.body.history[0].note, 'first');
 });

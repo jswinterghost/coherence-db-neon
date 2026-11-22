@@ -148,6 +148,9 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
           if (method === 'PUT' && action === 'draft') {
             return sendJson(res, 200, await h.saveReviewDraft(actor, runId, surface, await readJsonBody(req)));
           }
+          if (method === 'POST' && action === 'save') {
+            return sendJson(res, 201, await h.saveReviewDecisions(actor, runId, surface, await readJsonBody(req)));
+          }
           if (method === 'POST' && action === 'submit') {
             const commandKey = req.headers?.['x-command-key'] || q('commandKey') || '';
             const expectedJournalSeq = req.headers?.['x-expected-journal-seq'] ?? q('expectedJournalSeq');
@@ -178,6 +181,9 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
         if (method === 'POST' && parts.length === 4 && parts[2] === 'carry' && parts[3] === 'approvals') {
           return sendJson(res, 201, await h.carryApprovals(actor, runId, await readJsonBody(req)));
         }
+        if (method === 'POST' && parts.length === 4 && parts[2] === 'carry' && parts[3] === 'decisions') {
+          return sendJson(res, 201, await h.carryDecisions(actor, runId, await readJsonBody(req)));
+        }
         if (method === 'POST' && parts.length === 3 && parts[2] === 'cancel') {
           return sendJson(res, 202, await h.requestCancel(actor, runId, await readJsonBody(req)));
         }
@@ -199,6 +205,13 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
           return sendJson(res, 200, await h.getApprovalKeyHistory(actor, body.recordId), { acceptsGzip });
         }
         throw new AppError('Approval key history requires POST with a JSON body so record ids stay out of URLs.', 405, 'METHOD_NOT_ALLOWED');
+      }
+      if (parts[0] === 'decisions' && parts[1] === 'history' && parts.length === 2) {
+        if (method === 'POST') {
+          const body = await readJsonBody(req);
+          return sendJson(res, 200, await h.getDecisionKeyHistory(actor, body.recordId), { acceptsGzip });
+        }
+        throw new AppError('Decision key history requires POST with a JSON body so record ids stay out of URLs.', 405, 'METHOD_NOT_ALLOWED');
       }
 
       if (parts[0] === 'checks') {

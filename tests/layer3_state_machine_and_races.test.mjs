@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { verifyObjects } from '../src/commands/journal-export.mjs';
+import { verifyChain, verifyCommitments, verifyObjects } from '../src/commands/journal-export.mjs';
 import { createClient } from '../src/db/pg-client.mjs';
 import {
   deriveRunStage,
@@ -21,7 +21,15 @@ import { killProcessGroup, runCoherenceProcess } from '../src/worker/engine-runn
 import { reconcileInterruptedAttempts } from '../src/worker/reconciler.mjs';
 import { acquireRunningSlot } from '../src/worker/slot.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
-import { createMockEngineMaterializer, makeOverlayCsv, sampleApprovalRow, seedEngineVersion, seedStandingInput } from './helpers/fixtures.mjs';
+import {
+  createDataOnlyMockEngineMaterializer,
+  createMockEngineMaterializer,
+  makeOverlayCsv,
+  sampleApprovalRow,
+  seedEngineCopyVersion,
+  seedEngineVersion,
+  seedStandingInput,
+} from './helpers/fixtures.mjs';
 import { checkPgAvailable, createTestEnv } from './helpers/test-db.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -646,4 +654,270 @@ test('Layer 3 [Cancel, Timeout & Process Group Safety]: typed cancel stops grand
   if (killTimer) clearTimeout(killTimer);
   assert.ok(killReported.includes('EPERM'));
   assert.ok(killLogs.some((l) => l.includes('process_group_kill_failed')));
+});
+
+test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind registration, stale/duplicate/race save refusals, queue coverage & reconfirm guards, generated overlays, auto Emit materialization, and S-8 carryDecisions', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  // 1. engine_kind = 'engine_copy' succeeds without node/pnpm/webLock while legacy_sealed still requires them
+  const { engineVersionId } = await seedEngineCopyVersion(env);
+  const copyRow = (await env.pool.query('SELECT engine_kind, upstream_commit, patch_diff_sha256, web_lock_sha256 FROM coherence.engine_versions WHERE id = $1::uuid', [engineVersionId])).rows[0];
+  assert.equal(copyRow.engine_kind, 'engine_copy');
+  assert.equal(copyRow.upstream_commit, '809c6ea');
+  assert.ok(copyRow.patch_diff_sha256);
+  assert.equal(copyRow.web_lock_sha256, null);
+
+  const codePromo = (rel, txt) => env.codeStore.promoteBytes(Buffer.from(txt, 'utf8'), { relPath: rel, checksPassed: true });
+  await assert.rejects(
+    async () => env.commands.registerEngineVersion({
+      actor: env.ownerActor,
+      commandKey: 'legacy-missing-web',
+      label: 'legacy-bad',
+      coherenceCommit: '809c6ea',
+      engineKind: 'legacy_sealed',
+      gitBundle: await codePromo('engine/b.bundle', 'b'),
+      codeManifest: await codePromo('engine/m.json', '{}'),
+      pythonLock: await codePromo('engine/u.lock', 'v=1'),
+      pythonWheels: await codePromo('engine/w.tar', 'w'),
+      wrapperBundle: await codePromo('engine/wr.json', '{}'),
+      nusearCommit: 'abc1234',
+      overlayCheckSha256: '0'.repeat(64),
+      toolchain: { os: 'Darwin', os_version: '24', arch: 'arm64', python: '3.12', uv: '0.5', tz: 'America/New_York', lang: 'en_US.UTF-8', lc_all: 'en_US.UTF-8', pythonutf8: '1' },
+    }),
+    /check constraint|toolchain|kind_requirements/i,
+  );
+
+  // 2. Seed standing inputs + standing decision baseline (with an old decision for the Adjust reconfirm key)
+  await seedStandingInput(env, { commandKey: 'sync-standing-input' });
+  const reconfKey = 'carrier_a~direct~PAT SAMPLE~100.00~2026-10';
+  const baseDec = await env.commands.recordDecisionBaseline({
+    actor: env.ownerActor,
+    commandKey: 'sync-baseline',
+    commitKind: 'historical_baseline',
+    decisions: [{
+      recordId: reconfKey,
+      disposition: 'CONFIRM',
+      approvedAmount: '90.00',
+      approvedAgency: 'Beacon',
+      approvedAgent: '11111111',
+      committedAtRaw: '2026-09-30T15:00:00.000000Z',
+    }],
+  });
+
+  const worker = env.registerWorker(createEngineWorker({
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
+    stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: reconfKey }),
+    tempBaseDir: env.tempDir,
+  }));
+
+  // Launch Run 1 (auto-inherits standing prior_decision_commit_id) and Run 2 (for S-8 carry check later)
+  const l1 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'sync-l1', statementDate: '2026-10-31', engineVersionId });
+  const run1Id = l1.result.runId;
+  assert.equal(l1.result.priorDecisionCommitId, baseDec.result.decisionCommitId);
+
+  for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
+  assert.equal((await env.pool.query('SELECT stage FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].stage, 'waiting for Bible');
+
+  // Verify review_queue_items populated automatically when bible finished
+  const bibleQ = (await env.pool.query("SELECT record_id FROM coherence.review_queue_items WHERE run_id = $1::uuid AND surface = 'bible' ORDER BY item_order", [run1Id])).rows;
+  assert.equal(bibleQ.length, 2);
+
+  let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
+
+  // Incomplete Bible save (missing 1 of 2 queue items) refused by PostgreSQL
+  await assert.rejects(
+    () => env.commands.saveReviewDecisions({
+      actor: env.ownerActor, commandKey: 'sync-bible-incomplete', expectedJournalSeq: seq,
+      runId: run1Id, surface: 'bible',
+      decisions: [{ recordId: bibleQ[0].record_id, disposition: 'CONFIRM' }],
+    }),
+    /queue item\(s\) have no committed decision/i,
+  );
+
+  // Stale expectedJournalSeq refused with 409 STALE_JOURNAL_POSITION
+  await assert.rejects(
+    () => env.commands.saveReviewDecisions({
+      actor: env.ownerActor, commandKey: 'sync-bible-stale', expectedJournalSeq: seq - 1,
+      runId: run1Id, surface: 'bible',
+      decisions: bibleQ.map((q) => ({ recordId: q.record_id, disposition: 'CONFIRM' })),
+    }),
+    (err) => err?.status === 409 && err?.code === 'STALE_JOURNAL_POSITION',
+  );
+
+  // Concurrent race of two Bible saves at the same expectedJournalSeq -> exactly one succeeds, one fails
+  const [raceA, raceB] = await Promise.allSettled([
+    env.commands.saveReviewDecisions({
+      actor: env.ownerActor, commandKey: 'sync-bible-race-1', expectedJournalSeq: seq,
+      runId: run1Id, surface: 'bible',
+      decisions: [
+        { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: 'tab-1' },
+        { recordId: bibleQ[1].record_id, disposition: 'CONFIRM', note: 'tab-1' },
+      ],
+    }),
+    env.commands.saveReviewDecisions({
+      actor: env.ownerActor, commandKey: 'sync-bible-race-2', expectedJournalSeq: seq,
+      runId: run1Id, surface: 'bible',
+      decisions: [
+        { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: 'tab-2' },
+        { recordId: bibleQ[1].record_id, disposition: 'CONFIRM', note: 'tab-2' },
+      ],
+    }),
+  ]);
+  assert.equal([raceA, raceB].filter((r) => r.status === 'fulfilled').length, 1);
+  assert.equal([raceA, raceB].filter((r) => r.status === 'rejected').length, 1);
+  const winnerKey = raceA.status === 'fulfilled' ? 'sync-bible-race-1' : 'sync-bible-race-2';
+  const winnerNote = raceA.status === 'fulfilled' ? 'tab-1' : 'tab-2';
+  const winnerRes = raceA.status === 'fulfilled' ? raceA.value : raceB.value;
+
+  // Idempotent resend with same commandKey + identical payload succeeds without duplicating rows
+  const idemRes = await env.commands.saveReviewDecisions({
+    actor: env.ownerActor, commandKey: winnerKey, expectedJournalSeq: seq,
+    runId: run1Id, surface: 'bible',
+    decisions: [
+      { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: winnerNote },
+      { recordId: bibleQ[1].record_id, disposition: 'CONFIRM', note: winnerNote },
+    ],
+  });
+  assert.equal(idemRes.idempotent, true);
+  assert.equal(idemRes.result.reviewSaveId, winnerRes.result.reviewSaveId);
+
+  // Command key reuse with different payload refused with 409 COMMAND_KEY_CONFLICT
+  await assert.rejects(
+    () => env.commands.saveReviewDecisions({
+      actor: env.ownerActor, commandKey: winnerKey, expectedJournalSeq: seq,
+      runId: run1Id, surface: 'bible',
+      decisions: [
+        { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: 'changed' },
+        { recordId: bibleQ[1].record_id, disposition: 'CONFIRM', note: 'changed' },
+      ],
+    }),
+    (err) => err?.status === 409 && err?.code === 'COMMAND_KEY_CONFLICT',
+  );
+
+  // Worker executes adjust using deterministically generated overlay.csv (recording generated_overlays receipt)
+  assert.equal((await worker.runOnce()).action, 'step_finished');
+  assert.equal((await env.pool.query('SELECT stage FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].stage, 'waiting for Adjust');
+  const genOvCount = (await env.pool.query("SELECT COUNT(*)::int AS n FROM coherence.generated_overlays WHERE run_id = $1::uuid AND purpose = 'bible_review'", [run1Id])).rows[0].n;
+  assert.equal(genOvCount, 1);
+
+  seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
+
+  // Duplicate Bible re-save with identical decisions refused with 409 DUPLICATE_REVIEW_SAVE
+  await assert.rejects(
+    () => env.commands.saveReviewDecisions({
+      actor: env.ownerActor, commandKey: 'sync-bible-dup-noop', expectedJournalSeq: seq,
+      runId: run1Id, surface: 'bible',
+      decisions: [
+        { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: winnerNote },
+        { recordId: bibleQ[1].record_id, disposition: 'CONFIRM', note: winnerNote },
+      ],
+    }),
+    (err) => err?.status === 409 && err?.code === 'DUPLICATE_REVIEW_SAVE',
+  );
+
+  // Changed Bible re-save while waiting for Adjust supersedes Adjust attempt 1 and triggers Adjust attempt 2
+  await env.commands.saveReviewDecisions({
+    actor: env.ownerActor, commandKey: 'sync-bible-revise', expectedJournalSeq: seq,
+    runId: run1Id, surface: 'bible',
+    decisions: [{ recordId: bibleQ[0].record_id, disposition: 'CORRECT', agency: 'Beacon', status: 'ACTIVE_PAYING', note: 'updated bible' }],
+  });
+  const adj2Step = await worker.runOnce();
+  assert.equal(adj2Step.action, 'step_finished');
+  assert.equal(adj2Step.attemptNo, 2);
+
+  // Adjust reconfirmation guard: omitting fresh decision for needs_reconfirm item refused even though prior baseline has it!
+  seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
+  await assert.rejects(
+    () => env.commands.saveReviewDecisions({
+      actor: env.ownerActor, commandKey: 'sync-adj-no-reconfirm', expectedJournalSeq: seq,
+      runId: run1Id, surface: 'adjust',
+      decisions: [{ recordId: 'carrier_b~direct~CASEY MOCK~250.00~2026-10', disposition: 'CONFIRM' }],
+    }),
+    /reconfirmation item\(s\) lack a fresh decision in this run/i,
+  );
+
+  // Valid Adjust save with fresh decision on reconfirm item + new item
+  const adjSave = await env.commands.saveReviewDecisions({
+    actor: env.ownerActor, commandKey: 'sync-adj-valid', expectedJournalSeq: seq,
+    runId: run1Id, surface: 'adjust',
+    decisions: [
+      { recordId: reconfKey, disposition: 'CONFIRM', approvedAmount: '100.00', approvedAgency: 'Beacon', approvedAgent: '11111111' },
+      { recordId: 'carrier_b~direct~CASEY MOCK~250.00~2026-10', disposition: 'CONFIRM', approvedAmount: '250.00', approvedAgency: 'Harbor', approvedAgent: '33333333' },
+    ],
+  });
+  assert.equal((await env.pool.query('SELECT stage FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].stage, 'ready to create statements');
+
+  // Confirm Emit + CR-1 (Adjust save refused after Emit confirmation)
+  seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
+  await env.commands.confirmEmit({
+    actor: env.ownerActor, commandKey: 'sync-confirm-emit', expectedJournalSeq: seq,
+    runId: run1Id, adjustReviewSaveId: adjSave.result.reviewSaveId, typedPhrase: 'create statements for 2026-10-31',
+  });
+  const emitStep = await worker.runOnce();
+  assert.equal(emitStep.action, 'step_finished');
+  assert.equal((await env.pool.query('SELECT stage FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].stage, 'done');
+
+  // Verify automatic Emit materialization populated BoB, Ledger, and Statements atomically with zero HTML artifacts!
+  const htmlCount = (await env.pool.query("SELECT COUNT(*)::int AS n FROM coherence.artifacts WHERE rel_path LIKE '%.html'")).rows[0].n;
+  assert.equal(htmlCount, 0, 'data-only engine copy must produce zero HTML artifacts');
+  const matRow = (await env.pool.query('SELECT bob_row_count, ledger_row_count, ledger_gross_total FROM coherence.run_materializations WHERE run_id = $1::uuid', [run1Id])).rows[0];
+  assert.equal(matRow.bob_row_count, 3);
+  assert.equal(matRow.ledger_row_count, 4);
+  assert.equal(matRow.ledger_gross_total, '525.00');
+
+  // Carry decisions forward: advances standing decision head without adding a new input_versions row
+  const ivCountBefore = (await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.input_versions')).rows[0].n;
+  const carry1 = await env.commands.carryDecisions({
+    actor: env.ownerActor, commandKey: 'sync-carry-dec-1', runId: run1Id, typedPhrase: 'carry 2026-10-31',
+  });
+  assert.equal(carry1.result.nothingNew, false);
+  assert.equal(carry1.result.carriedDecisionCommitId, adjSave.result.decisionCommitId);
+  assert.equal((await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.input_versions')).rows[0].n, ivCountBefore);
+  assert.equal((await env.pool.query('SELECT coherence.standing_decision_head_as_of(NULL) AS h')).rows[0].h, adjSave.result.decisionCommitId);
+
+  // Second carryDecisions on same commit marks nothing_new = true
+  const carry2 = await env.commands.carryDecisions({
+    actor: env.ownerActor, commandKey: 'sync-carry-dec-2', runId: run1Id, typedPhrase: 'carry 2026-10-31',
+  });
+  assert.equal(carry2.result.nothingNew, true);
+
+  // S-8 out-of-order decision carry refusal: a run branching off baseDec cannot overwrite the newer standing head!
+  const lOld = await env.commands.launchRun({
+    actor: env.ownerActor, commandKey: 'sync-launch-old', statementDate: '2026-11-15',
+    priorDecisionCommitId: baseDec.result.decisionCommitId, engineVersionId,
+  });
+  const oldRunId = lOld.result.runId;
+  for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
+  seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [oldRunId])).rows[0].latest_journal_seq);
+  await env.commands.saveReviewDecisions({
+    actor: env.ownerActor, commandKey: 'sync-old-bible', expectedJournalSeq: seq, runId: oldRunId, surface: 'bible',
+    decisions: bibleQ.map((q) => ({ recordId: q.record_id, disposition: 'CONFIRM', note: 'divergent' })),
+  });
+  assert.equal((await worker.runOnce()).action, 'step_finished');
+  seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [oldRunId])).rows[0].latest_journal_seq);
+  const oldAdj = await env.commands.saveReviewDecisions({
+    actor: env.ownerActor, commandKey: 'sync-old-adj', expectedJournalSeq: seq, runId: oldRunId, surface: 'adjust',
+    decisions: [
+      { recordId: reconfKey, disposition: 'CONFIRM', approvedAmount: '100.00', approvedAgency: 'Beacon', approvedAgent: '11111111' },
+      { recordId: 'carrier_b~direct~CASEY MOCK~250.00~2026-10', disposition: 'CONFIRM', approvedAmount: '250.00', approvedAgency: 'Harbor', approvedAgent: '33333333' },
+    ],
+  });
+  seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [oldRunId])).rows[0].latest_journal_seq);
+  await env.commands.confirmEmit({
+    actor: env.ownerActor, commandKey: 'sync-old-emit', expectedJournalSeq: seq, runId: oldRunId,
+    adjustReviewSaveId: oldAdj.result.reviewSaveId, typedPhrase: 'create statements for 2026-11-15',
+  });
+  assert.equal((await worker.runOnce()).action, 'step_finished');
+
+  await assert.rejects(
+    () => env.commands.carryDecisions({
+      actor: env.ownerActor, commandKey: 'sync-carry-s8-refuse', runId: oldRunId, typedPhrase: 'carry 2026-11-15',
+    }),
+    /does not extend the standing decision head/i,
+  );
+
+  assert.equal((await verifyChain(env.pool)).passed, true);
+  assert.equal((await verifyCommitments(env.pool)).passed, true);
 });

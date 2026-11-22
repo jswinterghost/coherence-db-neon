@@ -26,7 +26,16 @@ import { createWebHandlers } from '../src/web/handlers.mjs';
 import { createCoherenceRouter } from '../src/web/router.mjs';
 import { buildAttemptWorkspace, defaultMaterializeEngine } from '../src/worker/folder-builder.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
-import { createMockEngineMaterializer, makeOverlayCsv, sampleApprovalRow, seedEngineVersion, seedStandingInput } from './helpers/fixtures.mjs';
+import {
+  buildSyntheticEmitDataset,
+  createDataOnlyMockEngineMaterializer,
+  createMockEngineMaterializer,
+  makeOverlayCsv,
+  sampleApprovalRow,
+  seedEngineCopyVersion,
+  seedEngineVersion,
+  seedStandingInput,
+} from './helpers/fixtures.mjs';
 import { checkPgAvailable, createTestEnv } from './helpers/test-db.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -532,7 +541,7 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
 
   const dbCfg = await verifyDatabaseConfigInvariants(env.pool);
   assert.equal(dbCfg.passed, true, `Database config audit failed:\n${dbCfg.problems.join('\n')}`);
-  assert.equal(dbCfg.checkedBusinessTables, 20);
+  assert.equal(dbCfg.checkedBusinessTables, 31);
   assert.ok(dbCfg.checkedFunctions >= 40);
 
   const client = env.registerClient(await createClient(env.pgConfig));
@@ -598,4 +607,212 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
   assert.ok(badCsql.problems.some((p) => /requireSsl/i.test(p)));
   assert.ok(badCsql.problems.some((p) => /authorizedNetworks/i.test(p)));
   assert.ok(badCsql.problems.some((p) => /pgaudit\.log_parameter/i.test(p)));
+});
+
+test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline/financial walls, security_barrier side-channel defense across all 5 scoped roles, and View-As refusal on review saves', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const { engineVersionId } = await seedEngineCopyVersion(env);
+  await seedStandingInput(env, { commandKey: 'rls-standing' });
+
+  const worker = env.registerWorker(createEngineWorker({
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
+    stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: null }),
+    tempBaseDir: env.tempDir,
+  }));
+
+  // Complete Run 1 (2026-10-31) with Acme, Beacon (NPN 11111111 + 22222222 both named "Sam Seller"), and Harbor, then record as sent
+  const l1 = await env.commands.launchRun({
+    actor: env.ownerActor, commandKey: 'rls-launch-1', statementDate: '2026-10-31', engineVersionId,
+  });
+  const run1Id = l1.result.runId;
+  for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
+  let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
+
+  // View-As MUST refuse saveReviewDecisions, carryDecisions, recordDecisionBaseline, recordStatementBatch, and materializeEmit
+  const viewAsOwner = { id: 'test-owner', kind: 'owner', viewingAs: { id: 'beacon-mgr', kind: 'recipient' } };
+  await assert.rejects(
+    () => env.commands.saveReviewDecisions({
+      actor: viewAsOwner, commandKey: 'va-save', expectedJournalSeq: seq, runId: run1Id, surface: 'bible',
+      decisions: [{ recordId: 'policy:carrier_a:C-101#effective:2026-10-01', disposition: 'CONFIRM' }],
+    }),
+    (err) => err?.status === 403 && err?.code === 'VIEW_AS_READ_ONLY',
+  );
+  await assert.rejects(
+    () => env.commands.carryDecisions({ actor: viewAsOwner, commandKey: 'va-carry-dec', runId: run1Id, typedPhrase: 'carry 2026-10-31' }),
+    (err) => err?.status === 403 && err?.code === 'VIEW_AS_READ_ONLY',
+  );
+  await assert.rejects(
+    () => env.commands.recordDecisionBaseline({ actor: viewAsOwner, commandKey: 'va-base', decisions: [] }),
+    (err) => err?.status === 403 && err?.code === 'VIEW_AS_READ_ONLY',
+  );
+  await assert.rejects(
+    () => env.commands.materializeEmit({ actor: viewAsOwner, commandKey: 'va-mat', runId: run1Id }),
+    (err) => err?.status === 403 && err?.code === 'VIEW_AS_READ_ONLY',
+  );
+
+  await env.commands.saveReviewDecisions({
+    actor: env.ownerActor, commandKey: 'rls-bible-1', expectedJournalSeq: seq, runId: run1Id, surface: 'bible',
+    decisions: [
+      { recordId: 'policy:carrier_a:C-101#effective:2026-10-01', disposition: 'CONFIRM' },
+      { recordId: 'policy:carrier_b:C-201#effective:2026-10-01', disposition: 'CONFIRM' },
+    ],
+  });
+  assert.equal((await worker.runOnce()).action, 'step_finished');
+  seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
+  const adj1 = await env.commands.saveReviewDecisions({
+    actor: env.ownerActor, commandKey: 'rls-adj-1', expectedJournalSeq: seq, runId: run1Id, surface: 'adjust',
+    decisions: [
+      { recordId: 'carrier_a~direct~PAT SAMPLE~100.00~2026-10', disposition: 'CONFIRM' },
+      { recordId: 'carrier_b~direct~CASEY MOCK~250.00~2026-10', disposition: 'CONFIRM' },
+    ],
+  });
+  seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
+  await env.commands.confirmEmit({
+    actor: env.ownerActor, commandKey: 'rls-emit-1', expectedJournalSeq: seq, runId: run1Id,
+    adjustReviewSaveId: adj1.result.reviewSaveId, typedPhrase: 'create statements for 2026-10-31',
+  });
+  assert.equal((await worker.runOnce()).action, 'step_finished');
+
+  // Before carrySent, agency_manager must see ZERO statement lines (unsent run stays outside official statements)
+  const runScoped = async (role, settings, fn) => {
+    const c = await env.pool.connect();
+    try {
+      await c.query('BEGIN TRANSACTION READ ONLY');
+      await c.query(`SET LOCAL ROLE ${role}`);
+      for (const [k, v] of Object.entries(settings)) {
+        await c.query('SELECT pg_catalog.set_config($1, $2, true)', [k, v]);
+      }
+      const res = await fn(c);
+      await c.query('COMMIT');
+      return res;
+    } catch (err) {
+      await c.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      c.release();
+    }
+  };
+
+  const unsentCount = await runScoped('coherence_agency_manager_ro', { 'app.allowed_entities': 'Beacon' }, async (c) => (
+    (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.agency_statement_lines')).rows[0].n
+  ));
+  assert.equal(unsentCount, 0, 'unsent run emission must stay hidden from downline agencies until carrySent');
+
+  // Record Run 1 as sent
+  await env.commands.carrySent({ actor: env.ownerActor, commandKey: 'rls-sent-1', runId: run1Id, typedPhrase: 'sent 2026-10-31' });
+
+  // 1. coherence_agency_manager_ro: sees ONLY Beacon, 0 rows when unset, 42501 on upline/ledger/upline_amount/journal, safe under division-by-zero side-channel
+  await runScoped('coherence_agency_manager_ro', { 'app.allowed_entities': 'Beacon' }, async (c) => {
+    const bob = (await c.query('SELECT entity, policy_id, amount FROM coherence_views.agency_bob ORDER BY policy_id')).rows;
+    assert.equal(bob.length, 2);
+    assert.ok(bob.every((r) => r.entity === 'Beacon'));
+    const lines = (await c.query('SELECT entity, amount FROM coherence_views.agency_statement_lines')).rows;
+    assert.equal(lines.length, 2);
+    assert.ok(lines.every((r) => r.entity === 'Beacon'));
+    const totals = (await c.query('SELECT entity, net_amount FROM coherence_views.agency_statement_totals')).rows;
+    assert.equal(totals.length, 1);
+    assert.equal(totals[0].net_amount, '200.00');
+
+    // Side-channel security_barrier check: Harbor rows must never reach user WHERE expression
+    const sideChannel = (await c.query(
+      "SELECT COUNT(*)::int AS n FROM coherence_views.agency_statement_lines WHERE 1 / CASE WHEN entity = 'Harbor' THEN 0 ELSE 1 END = 1",
+    )).rows[0].n;
+    assert.equal(sideChannel, 2);
+  });
+
+  // Fail-closed when app.allowed_entities is unset
+  const agUnset = await runScoped('coherence_agency_manager_ro', {}, async (c) => (
+    (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.agency_statement_lines')).rows[0].n
+  ));
+  assert.equal(agUnset, 0, 'agency manager must see 0 rows when app.allowed_entities is unset');
+
+  for (const forbiddenSql of [
+    'SELECT * FROM coherence.statement_upline_lines',
+    'SELECT * FROM coherence.coherent_ledger_rows',
+    'SELECT upline_amount FROM coherence.bob_policy_financials',
+    'SELECT * FROM coherence.decisions',
+    'SELECT * FROM coherence.journal_entries',
+  ]) {
+    await assert.rejects(
+      () => runScoped('coherence_agency_manager_ro', { 'app.allowed_entities': 'Beacon' }, (c) => c.query(forbiddenSql)),
+      (err) => err?.code === '42501',
+      `coherence_agency_manager_ro must get 42501 on: ${forbiddenSql}`,
+    );
+  }
+
+  // 2. coherence_agent_ro: strictly scoped by NPN (distinguishes same-name agents 11111111 vs 22222222) and zero dollars
+  await runScoped('coherence_agent_ro', { 'app.allowed_entities': 'Beacon', 'app.actor_npn': '11111111' }, async (c) => {
+    const bob = (await c.query('SELECT policy_id, writing_npn, writing_agent FROM coherence_views.agent_bob')).rows;
+    assert.equal(bob.length, 1);
+    assert.equal(bob[0].writing_npn, '11111111');
+    const act = (await c.query('SELECT entity, writing_npn FROM coherence_views.agent_statement_activity')).rows;
+    assert.equal(act.length, 1);
+    assert.equal(act[0].writing_npn, '11111111');
+  });
+  const agtUnset = await runScoped('coherence_agent_ro', { 'app.allowed_entities': 'Beacon' }, async (c) => (
+    (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.agent_bob')).rows[0].n
+  ));
+  assert.equal(agtUnset, 0, 'agent must see 0 rows when app.actor_npn is unset');
+
+  for (const forbiddenSql of [
+    'SELECT * FROM coherence.bob_policy_financials',
+    'SELECT amount FROM coherence.statement_agency_lines',
+    'SELECT gross_comm FROM coherence.statement_agency_lines',
+    'SELECT * FROM coherence.statement_upline_lines',
+    'SELECT * FROM coherence.coherent_ledger_rows',
+  ]) {
+    await assert.rejects(
+      () => runScoped('coherence_agent_ro', { 'app.allowed_entities': 'Beacon', 'app.actor_npn': '11111111' }, (c) => c.query(forbiddenSql)),
+      (err) => err?.code === '42501',
+      `coherence_agent_ro must get 42501 on: ${forbiddenSql}`,
+    );
+  }
+
+  // 3. coherence_retention_ro: scoped to Harbor, zero dollar access
+  await runScoped('coherence_retention_ro', { 'app.allowed_entities': 'Harbor' }, async (c) => {
+    const bob = (await c.query('SELECT entity FROM coherence_views.retention_bob')).rows;
+    assert.equal(bob.length, 1);
+    assert.equal(bob[0].entity, 'Harbor');
+  });
+  await assert.rejects(
+    () => runScoped('coherence_retention_ro', { 'app.allowed_entities': 'Harbor' }, (c) => c.query('SELECT amount FROM coherence.statement_agency_lines')),
+    (err) => err?.code === '42501',
+  );
+
+  // 4. coherence_entity_manager_ro: full BoB, ledger, all entities + Acme Upline, reconciliation view, zero journal/decision access
+  await runScoped('coherence_entity_manager_ro', { 'app.access_tier': 'entity_manager' }, async (c) => {
+    const bob = (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.v_canonical_bob')).rows[0].n;
+    assert.equal(bob, 3);
+    const recon = (await c.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [run1Id])).rows;
+    assert.equal(recon.length, 4);
+    assert.ok(recon.every((r) => r.reconciled && r.variance === '0.00'));
+  });
+  const emUnset = await runScoped('coherence_entity_manager_ro', {}, async (c) => (
+    (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.v_canonical_bob')).rows[0].n
+  ));
+  assert.equal(emUnset, 0, 'entity manager must see 0 rows when app.access_tier is unset');
+  await assert.rejects(
+    () => runScoped('coherence_entity_manager_ro', { 'app.access_tier': 'entity_manager' }, (c) => c.query('SELECT * FROM coherence.journal_entries')),
+    (err) => err?.code === '42501',
+  );
+
+  // 5. coherence_investor_ro: BoB only, zero ledger or statement access
+  await runScoped('coherence_investor_ro', { 'app.access_tier': 'investor' }, async (c) => {
+    const bob = (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.investor_bob')).rows[0].n;
+    assert.equal(bob, 3);
+  });
+  for (const forbiddenSql of [
+    'SELECT * FROM coherence.coherent_ledger_rows',
+    'SELECT * FROM coherence.statement_agency_lines',
+    'SELECT * FROM coherence.statement_upline_lines',
+  ]) {
+    await assert.rejects(
+      () => runScoped('coherence_investor_ro', { 'app.access_tier': 'investor' }, (c) => c.query(forbiddenSql)),
+      (err) => err?.code === '42501',
+      `coherence_investor_ro must get 42501 on: ${forbiddenSql}`,
+    );
+  }
 });

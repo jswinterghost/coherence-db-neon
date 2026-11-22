@@ -15,6 +15,10 @@ export const ALL_BUSINESS_TABLES = Object.freeze([
   'input_changes',
   'approvals_files',
   'approval_rows',
+  'decision_commits',
+  'decisions',
+  'generated_overlays',
+  'review_queue_items',
   'runs',
   'step_requests',
   'cancel_requests',
@@ -22,10 +26,33 @@ export const ALL_BUSINESS_TABLES = Object.freeze([
   'artifacts',
   'review_saves',
   'emit_confirmations',
+  'statement_batches',
+  'statement_agency_lines',
+  'statement_upline_lines',
+  'run_materializations',
+  'bob_policies',
+  'bob_policy_financials',
+  'coherent_ledger_rows',
   'carries',
   'abandonments',
   'imported_files',
   'checks',
+]);
+
+export const SCOPED_RECIPIENT_ROLES = Object.freeze([
+  'coherence_entity_manager_ro',
+  'coherence_agency_manager_ro',
+  'coherence_agent_ro',
+  'coherence_retention_ro',
+  'coherence_investor_ro',
+]);
+
+export const RLS_PROTECTED_TABLES = Object.freeze([
+  'bob_policies',
+  'bob_policy_financials',
+  'statement_agency_lines',
+  'statement_upline_lines',
+  'coherent_ledger_rows',
 ]);
 
 const FORBIDDEN_BUSINESS_PRIVS = Object.freeze(['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']);
@@ -279,10 +306,51 @@ export async function verifyDatabaseConfigInvariants(pool) {
 
   const schemaPub = await pool.query(
     `SELECT pg_catalog.has_schema_privilege('public', 'coherence', 'USAGE') AS usage,
-            pg_catalog.has_schema_privilege('public', 'coherence', 'CREATE') AS create`,
+            pg_catalog.has_schema_privilege('public', 'coherence', 'CREATE') AS create,
+            pg_catalog.has_schema_privilege('public', 'coherence_views', 'USAGE') AS views_usage,
+            pg_catalog.has_schema_privilege('public', 'coherence_views', 'CREATE') AS views_create`,
   );
   if (schemaPub.rows[0].usage || schemaPub.rows[0].create) {
     problems.push('PUBLIC must have zero privileges on schema coherence');
+  }
+  if (schemaPub.rows[0].views_usage || schemaPub.rows[0].views_create) {
+    problems.push('PUBLIC must have zero privileges on schema coherence_views');
+  }
+
+  for (const roleName of SCOPED_RECIPIENT_ROLES) {
+    const roleRes = await pool.query(
+      'SELECT rolname, rolinherit, rolbypassrls, rolcanlogin FROM pg_catalog.pg_roles WHERE rolname = $1',
+      [roleName],
+    );
+    if (roleRes.rows.length === 0) {
+      problems.push(`Missing scoped read-only role ${roleName}`);
+      continue;
+    }
+    const r = roleRes.rows[0];
+    if (r.rolbypassrls) problems.push(`Scoped role ${roleName} must have NOBYPASSRLS`);
+    if (r.rolinherit) problems.push(`Scoped role ${roleName} must have NOINHERIT`);
+    for (const internalTbl of ['journal_entries', 'decision_commits', 'decisions', 'engine_versions', 'stored_files', 'input_versions', 'input_entries']) {
+      const privRes = await pool.query(
+        "SELECT pg_catalog.has_table_privilege($1, $2, 'SELECT') AS sel, pg_catalog.has_table_privilege($1, $2, 'INSERT') AS ins",
+        [roleName, `coherence.${internalTbl}`],
+      );
+      if (privRes.rows[0].sel || privRes.rows[0].ins) {
+        problems.push(`Scoped role ${roleName} must not have access to coherence.${internalTbl}`);
+      }
+    }
+  }
+
+  for (const rlsTbl of RLS_PROTECTED_TABLES) {
+    const rlsRes = await pool.query(
+      `SELECT c.relrowsecurity, c.relforcerowsecurity
+       FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'coherence' AND c.relname = $1`,
+      [rlsTbl],
+    );
+    if (rlsRes.rows.length === 0 || !rlsRes.rows[0].relrowsecurity || !rlsRes.rows[0].relforcerowsecurity) {
+      problems.push(`Table coherence.${rlsTbl} must have ENABLE + FORCE ROW LEVEL SECURITY`);
+    }
   }
 
   const trigRes = await pool.query(
@@ -321,22 +389,22 @@ export async function verifyDatabaseConfigInvariants(pool) {
   }
 
   const fnRes = await pool.query(
-    `SELECT p.oid, p.proname, p.proconfig, pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec
+    `SELECT p.oid, n.nspname, p.proname, p.proconfig, pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec
      FROM pg_catalog.pg_proc p
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-     WHERE n.nspname = 'coherence'
-     ORDER BY p.proname`,
+     WHERE n.nspname IN ('coherence', 'coherence_views')
+     ORDER BY n.nspname, p.proname`,
   );
   if (fnRes.rows.length === 0) {
-    problems.push('No functions found in schema coherence');
+    problems.push('No functions found in schemas coherence / coherence_views');
   }
   for (const fn of fnRes.rows) {
     const cfg = Array.isArray(fn.proconfig) ? fn.proconfig : [];
     if (!cfg.includes('search_path=pg_catalog')) {
-      problems.push(`Function coherence.${fn.proname} does not pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
+      problems.push(`Function ${fn.nspname}.${fn.proname} does not pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
     }
     if (fn.pub_exec) {
-      problems.push(`PUBLIC has EXECUTE privilege on coherence.${fn.proname}`);
+      problems.push(`PUBLIC has EXECUTE privilege on ${fn.nspname}.${fn.proname}`);
     }
   }
 

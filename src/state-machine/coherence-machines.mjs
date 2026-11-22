@@ -382,11 +382,11 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => !ctx.hasAdjustSaveForCurrentAdjust,
     },
     overlay_extends_frozen_prior: {
-      description: 'Coherence overlay check passed and file begins with the run\'s frozen prior approvals.',
+      description: 'Saved decision commit or approvals file extends the run\'s frozen prior decisions, passes replacement-chain verification, and covers all review queue items.',
       dbEnforcement: {
         table: 'coherence.review_saves',
-        trigger: 'trg_02_review_saves_before',
-        function: 'coherence.approvals_extends',
+        triggers: ['trg_02_review_saves_before', 'trg_review_saves_verify_deferred'],
+        functions: ['coherence.decision_commit_extends', 'coherence.approvals_extends'],
       },
       evaluate: (ctx) => Boolean(ctx.overlayCheckPassed && ctx.extendsFrozenPrior),
     },
@@ -399,13 +399,21 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => !ctx.hasEmitConfirmedForCurrentAdjust,
     },
     overlay_extends_bible_save: {
-      description: 'Adjust approvals file begins with this run\'s saved Bible review.',
+      description: 'Adjust decision commit or approvals file extends this run\'s saved Bible review and includes fresh decisions for every reconfirmation item.',
       dbEnforcement: {
         table: 'coherence.review_saves',
-        trigger: 'trg_02_review_saves_before',
-        function: 'coherence.approvals_extends',
+        triggers: ['trg_02_review_saves_before', 'trg_review_saves_verify_deferred'],
+        functions: ['coherence.decision_commit_extends', 'coherence.approvals_extends'],
       },
       evaluate: (ctx) => Boolean(ctx.extendsBibleSave),
+    },
+    emit_conservation_verified: {
+      description: 'Materialized Book of Business, Coherent Ledger, and cumulative entity statements tie to the exact cent at COMMIT with at most one materialization per run.',
+      dbEnforcement: {
+        table: 'coherence.run_materializations',
+        triggers: ['trg_02_run_materializations_before', 'trg_run_materializations_verify_deferred'],
+      },
+      evaluate: (ctx) => ctx.conservationVerified !== false,
     },
     emit_typed_phrase_and_newest_save: {
       description: 'Typed phrase is `"create statements for <date>"`, names this run\'s newest Adjust save, and no review submission is waiting.',
@@ -433,11 +441,11 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => Boolean(ctx.carriableOrigin && ctx.matchesEmitStatement && !ctx.hasSentStatementForDate && ctx.typedPhraseValid),
     },
     carry_approvals_guards: {
-      description: 'Run is `app` or `company_import` in stage `done`; file matches this run\'s finished Emit `emits/overlay.csv`; extends current standing approvals file; typed phrase `"carry <date>"`.',
+      description: 'Run is `app` or `company_import` in stage `done`; carried decision commit (or emitted overlay) extends the standing head; typed phrase `"carry <date>"`.',
       dbEnforcement: {
         table: 'coherence.carries',
         trigger: 'trg_02_carries_before',
-        function: 'coherence.approvals_extends',
+        functions: ['coherence.decision_commit_extends', 'coherence.approvals_extends'],
       },
       evaluate: (ctx) => Boolean(ctx.carriableOrigin && ctx.matchesEmitOverlay && ctx.extendsStandingOverlay && ctx.typedPhraseValid),
     },
@@ -498,7 +506,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       from: ['running a step'],
       to: 'waiting for Bible',
       guards: ['same_starter_slot_no_end'],
-      effects: ['record finished event for bible', 'pause for human Bible review'],
+      effects: ['record finished event for bible with review_queue_items and generated_overlays', 'pause for human Bible review'],
     },
     {
       id: 'step_finishes_adjust',
@@ -507,7 +515,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       from: ['running a step'],
       to: 'waiting for Adjust',
       guards: ['same_starter_slot_no_end'],
-      effects: ['record finished event for adjust', 'pause for human Adjust review'],
+      effects: ['record finished event for adjust with review_queue_items and generated_overlays', 'pause for human Adjust review'],
     },
     {
       id: 'step_finishes_emit',
@@ -515,8 +523,8 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       actorKinds: ['worker'],
       from: ['emitting'],
       to: 'done',
-      guards: ['same_starter_slot_no_end'],
-      effects: ['record finished event for emit with statements and archived outputs'],
+      guards: ['same_starter_slot_no_end', 'emit_conservation_verified'],
+      effects: ['record finished event for emit with materialized Book of Business, Coherent Ledger, and conservation-verified statement tables'],
     },
     {
       id: 'step_fails',
@@ -605,12 +613,12 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     {
       id: 'carry_approvals',
-      action: 'carry approvals (typed)',
+      action: 'carry decisions or approvals (typed)',
       actorKinds: ['owner'],
       from: ['done'],
       to: 'done',
       guards: ['carry_approvals_guards'],
-      effects: ['record approvals carry', 'publish next standing input version with Overlay/overlay.csv (or nothing_new=true)'],
+      effects: ['record decisions carry advancing standing decision head (or legacy approvals carry updating Overlay/overlay.csv)'],
     },
     {
       id: 'abandon',
