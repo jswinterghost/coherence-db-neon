@@ -1,16 +1,9 @@
-// Configuration assertion checks (R3.1, R9.1, R11 audits, R14.4):
-// - PostgreSQL roles & least-privilege grants
-// - Every append-only trigger present and ENABLE ALWAYS
-// - Fixed search_path = pg_catalog on every function in schema coherence
-// - Local pg_hba.conf has zero `trust` (or legacy cleartext/md5) lines
-// - Cloud SQL instance configuration matches R3.1 / R14.4 security checklist
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const DEFAULT_CLOUDSQL_CONFIG_PATH = resolve(REPO_ROOT, 'config', 'cloudsql-instance.json');
-export const DEFAULT_LOCAL_PG_HBA_PATH = '/opt/homebrew/var/postgresql@17/pg_hba.conf';
 
 export const ALL_BUSINESS_TABLES = Object.freeze([
   'journal_entries',
@@ -81,7 +74,25 @@ export function parsePgHbaConf(text) {
   return rules;
 }
 
-export async function verifyPgHbaFile(filePath = process.env.COHERENCE_PG_HBA_PATH || DEFAULT_LOCAL_PG_HBA_PATH) {
+export async function verifyPgHbaFile(pathOrOptions = {}) {
+  let filePath = null;
+  if (typeof pathOrOptions === 'string' && pathOrOptions.length > 0) {
+    filePath = pathOrOptions;
+  } else if (pathOrOptions && typeof pathOrOptions === 'object') {
+    if (pathOrOptions.filePath) {
+      filePath = pathOrOptions.filePath;
+    } else if (pathOrOptions.pool) {
+      const res = await pathOrOptions.pool.query('SHOW hba_file');
+      filePath = res.rows[0]?.hba_file || null;
+    }
+  }
+  if (!filePath && process.env.COHERENCE_PG_HBA_PATH) {
+    filePath = process.env.COHERENCE_PG_HBA_PATH;
+  }
+  if (!filePath) {
+    throw new Error('verifyPgHbaFile requires an explicit filePath, a PostgreSQL pool (for SHOW hba_file), or COHERENCE_PG_HBA_PATH.');
+  }
+
   const text = await readFile(filePath, 'utf8');
   const rules = parsePgHbaConf(text);
   const problems = [];
@@ -112,17 +123,17 @@ export function validateCloudSqlConfig(config) {
     return { passed: false, problems: ['Cloud SQL config must be a JSON object.'] };
   }
   if (config.databaseVersion !== 'POSTGRES_17') {
-    problems.push(`databaseVersion must be POSTGRES_17 (R3.1), got ${config.databaseVersion}`);
+    problems.push(`databaseVersion must be POSTGRES_17, got ${config.databaseVersion}`);
   }
   const ip = config.ipConfiguration || {};
   if (ip.requireSsl !== true) {
-    problems.push('ipConfiguration.requireSsl must be true (R14.4: TLS required)');
+    problems.push('ipConfiguration.requireSsl must be true (TLS required)');
   }
   if (ip.sslMode !== 'ENCRYPTED_ONLY') {
-    problems.push(`ipConfiguration.sslMode must be ENCRYPTED_ONLY (R14.4), got ${ip.sslMode}`);
+    problems.push(`ipConfiguration.sslMode must be ENCRYPTED_ONLY, got ${ip.sslMode}`);
   }
   if (!Array.isArray(ip.authorizedNetworks) || ip.authorizedNetworks.length !== 0) {
-    problems.push('ipConfiguration.authorizedNetworks must be empty (R14.4: no direct authorized networks)');
+    problems.push('ipConfiguration.authorizedNetworks must be empty (no direct authorized networks)');
   }
   if (ip.ipv4Enabled !== false) {
     problems.push('ipConfiguration.ipv4Enabled must be false (no direct public TCP connections)');
@@ -130,36 +141,36 @@ export function validateCloudSqlConfig(config) {
 
   const proto = config.connectionProtocol || {};
   if (proto.connector !== 'cloud-sql-connector') {
-    problems.push(`connectionProtocol.connector must be cloud-sql-connector (R14.4), got ${proto.connector}`);
+    problems.push(`connectionProtocol.connector must be cloud-sql-connector, got ${proto.connector}`);
   }
   if (proto.dedicatedServiceAccount !== true) {
-    problems.push('connectionProtocol.dedicatedServiceAccount must be true (R14.4)');
+    problems.push('connectionProtocol.dedicatedServiceAccount must be true');
   }
   if (proto.passwordAuthAllowed !== false) {
-    problems.push('connectionProtocol.passwordAuthAllowed must be false (R14.4: IAM auth, no passwords)');
+    problems.push('connectionProtocol.passwordAuthAllowed must be false (IAM authentication only)');
   }
 
   const flags = config.databaseFlags || {};
   if (flags['cloudsql.iam_authentication'] !== 'on') {
-    problems.push('databaseFlags["cloudsql.iam_authentication"] must be "on" (R14.4)');
+    problems.push('databaseFlags["cloudsql.iam_authentication"] must be "on"');
   }
   if (flags['cloudsql.enable_pgaudit'] !== 'on') {
-    problems.push('databaseFlags["cloudsql.enable_pgaudit"] must be "on" (R14.4)');
+    problems.push('databaseFlags["cloudsql.enable_pgaudit"] must be "on"');
   }
   if (flags['pgaudit.log_parameter'] !== 'off') {
-    problems.push('databaseFlags["pgaudit.log_parameter"] must be "off" so SQL parameter values/PHI are never logged (R14.3, R14.4)');
+    problems.push('databaseFlags["pgaudit.log_parameter"] must be "off" so SQL parameter values are never logged');
   }
   if (flags['log_connections'] !== 'on') {
-    problems.push('databaseFlags["log_connections"] must be "on" (R14.4)');
+    problems.push('databaseFlags["log_connections"] must be "on"');
   }
   if (flags['log_disconnections'] !== 'on') {
-    problems.push('databaseFlags["log_disconnections"] must be "on" (R14.4)');
+    problems.push('databaseFlags["log_disconnections"] must be "on"');
   }
   if (flags['log_parameter_max_length'] !== '0') {
-    problems.push('databaseFlags["log_parameter_max_length"] must be "0" so bind values never appear in logs (R14.3, R14.4)');
+    problems.push('databaseFlags["log_parameter_max_length"] must be "0" so bind values never appear in logs');
   }
   if (flags['log_parameter_max_length_on_error'] !== '0') {
-    problems.push('databaseFlags["log_parameter_max_length_on_error"] must be "0" so bind values never appear in error logs (R14.3, R14.4)');
+    problems.push('databaseFlags["log_parameter_max_length_on_error"] must be "0" so bind values never appear in error logs');
   }
   if (flags['log_statement'] && flags['log_statement'] !== 'none') {
     problems.push('databaseFlags["log_statement"] should be "none" (use pgaudit with log_parameter=off instead)');
@@ -180,20 +191,12 @@ export async function verifyCloudSqlConfigFile(filePath = DEFAULT_CLOUDSQL_CONFI
   return { filePath, ...validateCloudSqlConfig(parsed), config: parsed };
 }
 
-/**
- * Verifies live PostgreSQL 17 configuration invariants on a migrated database:
- * 1. Roles & grants (least privilege: coherence_app/worker only SELECT+INSERT on business tables; PUBLIC none).
- * 2. Append-only triggers present and ENABLE ALWAYS (tgenabled = 'A') on all 20 business tables.
- * 3. Every function in schema `coherence` pins `SET search_path = pg_catalog`.
- */
 export async function verifyDatabaseConfigInvariants(pool) {
   const problems = [];
 
-  // 1. Roles & grants on all 20 business tables
   for (const tbl of ALL_BUSINESS_TABLES) {
     const fq = `coherence.${tbl}`;
 
-    // coherence_app: SELECT & INSERT only
     const appRes = await pool.query(
       `SELECT
          pg_catalog.has_table_privilege('coherence_app', $1, 'SELECT') AS sel,
@@ -211,7 +214,6 @@ export async function verifyDatabaseConfigInvariants(pool) {
       if (a[k]) problems.push(`coherence_app has forbidden privilege ${label} on ${fq}`);
     }
 
-    // coherence_worker: SELECT & INSERT only on business tables
     const wrkRes = await pool.query(
       `SELECT
          pg_catalog.has_table_privilege('coherence_worker', $1, 'SELECT') AS sel,
@@ -229,7 +231,6 @@ export async function verifyDatabaseConfigInvariants(pool) {
       if (w[k]) problems.push(`coherence_worker has forbidden privilege ${label} on ${fq}`);
     }
 
-    // coherence_readonly: SELECT only
     const roRes = await pool.query(
       `SELECT
          pg_catalog.has_table_privilege('coherence_readonly', $1, 'SELECT') AS sel,
@@ -245,7 +246,6 @@ export async function verifyDatabaseConfigInvariants(pool) {
       if (ro[k]) problems.push(`coherence_readonly has forbidden privilege ${label} on ${fq}`);
     }
 
-    // PUBLIC: ZERO privileges on business tables
     const pubRes = await pool.query(
       `SELECT
          pg_catalog.has_table_privilege('public', $1, 'SELECT') AS sel,
@@ -261,7 +261,6 @@ export async function verifyDatabaseConfigInvariants(pool) {
     }
   }
 
-  // Operational table privileges: coherence_app cannot UPDATE/DELETE/TRUNCATE review_submissions
   const subPrivRes = await pool.query(
     `SELECT
        pg_catalog.has_table_privilege('coherence_app', 'coherence.review_submissions', 'UPDATE') AS app_upd,
@@ -278,7 +277,6 @@ export async function verifyDatabaseConfigInvariants(pool) {
     problems.push('coherence_worker must not have DELETE or TRUNCATE on coherence.review_submissions');
   }
 
-  // PUBLIC must have zero privileges on schema coherence
   const schemaPub = await pool.query(
     `SELECT pg_catalog.has_schema_privilege('public', 'coherence', 'USAGE') AS usage,
             pg_catalog.has_schema_privilege('public', 'coherence', 'CREATE') AS create`,
@@ -287,7 +285,6 @@ export async function verifyDatabaseConfigInvariants(pool) {
     problems.push('PUBLIC must have zero privileges on schema coherence');
   }
 
-  // 2. Append-only triggers present and ENABLE ALWAYS (tgenabled = 'A') on all 20 business tables
   const trigRes = await pool.query(
     `SELECT c.relname AS table_name,
             t.tgname AS trigger_name,
@@ -323,7 +320,6 @@ export async function verifyDatabaseConfigInvariants(pool) {
     }
   }
 
-  // 3. Fixed search_path = pg_catalog on EVERY function in schema coherence
   const fnRes = await pool.query(
     `SELECT p.oid, p.proname, p.proconfig, pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec
      FROM pg_catalog.pg_proc p

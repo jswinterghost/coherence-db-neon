@@ -1,4 +1,4 @@
-// RFC 4180 CSV helpers and exact path validation (R5.6: never trim or silently normalize paths).
+// RFC 4180 CSV helpers and exact relative-path validation (never trim or silently normalize paths).
 
 export function parseCsv(text) {
   const clean = String(text ?? '').replace(/^\uFEFF/, '');
@@ -53,8 +53,8 @@ export function normalizeMacKey(relPath) {
 }
 
 /**
- * Validates a relative path without trimming spaces (R5.6: "All BOB/Molina " is a real folder name).
- * Rejects absolute paths, backslashes, NUL/control chars, empty segments, "." and "..".
+ * Validates a relative POSIX path without trimming spaces, because trailing spaces in folder or file names are significant.
+ * Rejects absolute paths, backslashes, control characters, empty segments, ".", and "..".
  */
 export function assertValidRelPath(relPath, label = 'path') {
   if (typeof relPath !== 'string' || relPath.length === 0) {
@@ -76,8 +76,8 @@ export function assertValidRelPath(relPath, label = 'path') {
 }
 
 /**
- * Checks a set of relative paths for Mac case/Unicode collisions and file-folder clashes (R6.4).
- * Preserves exact paths without trimming.
+ * Checks a set of relative paths for case-insensitive or Unicode NFC/NFD collisions and file-folder clashes
+ * while preserving exact paths without trimming.
  */
 export function findPathClashes(paths) {
   const files = new Map();

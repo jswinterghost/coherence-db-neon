@@ -32,6 +32,21 @@ function hashLines(lines) {
   return sha256Hex(lines.join(''));
 }
 
+export function hashCompanyMetaTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(
+    a.companySlug ?? a.company_slug ?? a.slug,
+    b.companySlug ?? b.company_slug ?? b.slug,
+  ));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.companySlug ?? r.company_slug ?? r.slug,
+    r.displayName ?? r.display_name,
+    r.defaultEmitMode ?? r.default_emit_mode,
+    r.defaultEmitDisplay ?? r.default_emit_display ?? null,
+    r.defaultEmitKeep ?? r.default_emit_keep ?? [],
+    r.defaultEmitNoManager ?? r.default_emit_no_manager ?? [],
+  ])}\n`));
+}
+
 export function hashStoredFilesTable(rows) {
   const sorted = [...rows].sort((a, b) => (
     compareUtf8Bytes(a.storeKind ?? a.store_kind, b.storeKind ?? b.store_kind)
@@ -44,6 +59,44 @@ export function hashStoredFilesTable(rows) {
     r.md5B64 ?? r.md5_b64,
     r.crc32cB64 ?? r.crc32c_b64,
     r.objectName ?? r.object_name,
+  ])}\n`));
+}
+
+export function hashEngineVersionsTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.id,
+    r.label,
+    r.coherenceCommit ?? r.coherence_commit,
+    r.gitBundleSha256 ?? r.git_bundle_sha256,
+    r.codeManifestSha256 ?? r.code_manifest_sha256,
+    r.pythonLockSha256 ?? r.python_lock_sha256,
+    r.pythonWheelsSha256 ?? r.python_wheels_sha256,
+    r.webLockSha256 ?? r.web_lock_sha256,
+    r.webPackagesSha256 ?? r.web_packages_sha256,
+    r.wrapperBundleSha256 ?? r.wrapper_bundle_sha256,
+    r.nusearCommit ?? r.nusear_commit,
+    r.companyEmitSha256 ?? r.company_emit_sha256,
+    r.pagesLawSha256 ?? r.pages_law_sha256,
+    r.overlayCheckSha256 ?? r.overlay_check_sha256,
+    r.toolchain,
+    r.containerDigest ?? r.container_digest ?? null,
+  ])}\n`));
+}
+
+export function hashInputVersionsTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.id,
+    r.lineKind ?? r.line_kind,
+    r.parentId ?? r.parent_id ?? null,
+    r.sourceKind ?? r.source_kind,
+    r.reason,
+    Number(r.entryCount ?? r.entry_count),
+    r.entriesSha256 ?? r.entries_sha256,
+    r.entriesListFileSha256 ?? r.entries_list_file_sha256 ?? null,
+    Number(r.changeCount ?? r.change_count),
+    r.changesSha256 ?? r.changes_sha256,
   ])}\n`));
 }
 
@@ -69,6 +122,18 @@ export function hashInputChangesTable(rows) {
     r.oldRelPath ?? r.old_rel_path ?? null,
     r.fileSha256 ?? r.file_sha256 ?? null,
     r.prevFileSha256 ?? r.prev_file_sha256 ?? null,
+  ])}\n`));
+}
+
+export function hashApprovalsFilesTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.fileSha256 ?? a.file_sha256, b.fileSha256 ?? b.file_sha256));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.fileSha256 ?? r.file_sha256,
+    r.headerKind ?? r.header_kind,
+    Number(r.rowCount ?? r.row_count),
+    r.extendsSha256 ?? r.extends_sha256 ?? null,
+    Number(r.sharedRowCount ?? r.shared_row_count ?? 0),
+    r.addedRowsSha256 ?? r.added_rows_sha256,
   ])}\n`));
 }
 
@@ -131,6 +196,18 @@ export function hashRunsTable(rows) {
     r.comparedRunId ?? r.compared_run_id ?? null,
     r.rerunReason ?? r.rerun_reason ?? null,
     r.sourceFolder ?? r.source_folder ?? null,
+  ])}\n`));
+}
+
+export function hashCancelRequestsTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.id,
+    r.runId ?? r.run_id,
+    r.step,
+    Number(r.attemptNo ?? r.attempt_no),
+    r.typedPhrase ?? r.typed_phrase,
+    r.reason ?? '',
   ])}\n`));
 }
 
@@ -210,24 +287,54 @@ export function hashStepAttemptEventsTable(rows) {
   ])}\n`));
 }
 
+export function hashImportedFilesTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.id,
+    r.area,
+    r.relPath ?? r.rel_path,
+    r.artifactKind ?? r.artifact_kind ?? 'data',
+    r.storeKind ?? r.store_kind ?? 'company_data',
+    r.fileSha256 ?? r.file_sha256,
+    (r.originalAt ?? r.original_at) ? formatTimestampUtcUs(r.originalAt ?? r.original_at) : null,
+    r.metadata ?? {},
+  ])}\n`));
+}
+
+export function hashChecksTable(rows) {
+  const sorted = [...rows].sort((a, b) => compareUtf8Bytes(a.id, b.id));
+  return hashLines(sorted.map((r) => `${canonicalJson([
+    r.id,
+    r.checkKind ?? r.check_kind,
+    r.runId ?? r.run_id ?? null,
+    r.comparedRunId ?? r.compared_run_id ?? null,
+    Boolean(r.passed),
+    r.report,
+  ])}\n`));
+}
+
 const TABLE_HASHERS = {
+  company_meta: hashCompanyMetaTable,
   stored_files: hashStoredFilesTable,
+  engine_versions: hashEngineVersionsTable,
+  input_versions: hashInputVersionsTable,
   input_entries: hashInputEntriesTable,
   input_changes: hashInputChangesTable,
-  artifacts: hashArtifactsTable,
+  approvals_files: hashApprovalsFilesTable,
   approval_rows: hashApprovalRowsTable,
   runs: hashRunsTable,
+  step_requests: hashStepRequestsTable,
+  cancel_requests: hashCancelRequestsTable,
+  step_attempt_events: hashStepAttemptEventsTable,
+  artifacts: hashArtifactsTable,
+  review_saves: hashReviewSavesTable,
+  emit_confirmations: hashEmitConfirmationsTable,
   carries: hashCarriesTable,
   abandonments: hashAbandonmentsTable,
-  emit_confirmations: hashEmitConfirmationsTable,
-  review_saves: hashReviewSavesTable,
-  step_requests: hashStepRequestsTable,
-  step_attempt_events: hashStepAttemptEventsTable,
+  imported_files: hashImportedFilesTable,
+  checks: hashChecksTable,
 };
 
-/**
- * Builds the `commitments` object embedded into journal_entries.body from the exact rows being written.
- */
 export function buildCommitments(tables = {}) {
   const counts = {};
   const hashes = {};

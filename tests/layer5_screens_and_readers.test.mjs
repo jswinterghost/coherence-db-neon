@@ -1,21 +1,16 @@
-// ============================================================================
-// LAYER 5: THE SCREENS AND DOWNSTREAM READERS
-// Protects: downstream tools, agent/house feeds, and user-facing server screens
-// — preventing trial or abandoned runs from surfacing to production tools,
-// preventing dollar columns from leaking to selling agents, enforcing recipient
-// bundle scopes and non-sandboxed CSP data headers, keeping viewer.html on
-// Nusear's server only, and detecting review-app drift against Coherence.
-// ============================================================================
+// Layer 5: protects downstream readers, signed agent feeds, ambiguity checks on entity bundles,
+// refusal of removed per-recipient bundle paths, non-sandboxed data headers, server-only viewer parsing,
+// and review-app drift detection.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  AGENT_BOOK_COLUMNS,
-  createDatabaseClearpathFeed,
   createDatabaseCoherenceReader,
+  createSignedAgentFeedReader,
+  DEFAULT_AGENT_BOOK_COLUMNS,
   HOUSE_FEATURES,
   signRequest,
 } from '../src/readers/downstream-reader.mjs';
@@ -38,47 +33,44 @@ async function runFullCompletedRun(env, worker, { date, origin = 'app', engineVe
   for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
 
   let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
-  const bibleRows = [row0, sampleApprovalRow({ record_id: `policy:aetna:B-${date}#effective:2026-01-01` })];
+  const bibleRows = [row0, sampleApprovalRow({ record_id: `policy:carrier_a:B-${date}#effective:2026-01-01` })];
   await env.commands.submitReview({ actor: env.ownerActor, commandKey: `b-${runId}`, expectedJournalSeq: seq, runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv(bibleRows), 'utf8') });
   assert.equal((await worker.runOnce()).action, 'review_accepted');
-  assert.equal((await worker.runOnce()).action, 'step_finished'); // adjust
+  assert.equal((await worker.runOnce()).action, 'step_finished');
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
-  const adjRows = [...bibleRows, sampleApprovalRow({ record_id: `aetna~direct~A-${date}~100.00~2026-11` })];
+  const adjRows = [...bibleRows, sampleApprovalRow({ record_id: `carrier_a~direct~A-${date}~100.00~2026-11` })];
   await env.commands.submitReview({ actor: env.ownerActor, commandKey: `a-${runId}`, expectedJournalSeq: seq, runId, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv(adjRows), 'utf8') });
   const adjAcc = await worker.runOnce();
   assert.equal(adjAcc.action, 'review_accepted');
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await env.commands.confirmEmit({ actor: env.ownerActor, commandKey: `e-${runId}`, expectedJournalSeq: seq, runId, adjustReviewSaveId: adjAcc.reviewSaveId, typedPhrase: `create statements for ${date}` });
-  assert.equal((await worker.runOnce()).action, 'step_finished'); // emit
+  assert.equal((await worker.runOnce()).action, 'step_finished');
   return runId;
 }
 
-test('Layer 5 [R15]: downstream reader selects only newest finished non-abandoned app/company_import run, and Clearpath feed strips dollar columns and checks HMAC', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 5 [Downstream Readers & Signed Feed]: selects newest finished non-abandoned app/company_import run, strips dollar columns, checks HMAC, and rejects ambiguous entity bundles', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createTestEnv();
   t.after(() => env.cleanup());
 
   const { engineVersionId } = await seedEngineVersion(env);
-  const row0 = sampleApprovalRow({ record_id: 'policy:aetna:PRIOR#effective:2026-01-01' });
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:PRIOR#effective:2026-01-01' });
   await seedStandingInput(env, { withPriorOverlay: { version: 'v2', rows: [row0], csv: makeOverlayCsv([row0]) } });
 
   const worker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: 'phalanx', stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
   }));
 
-  // 1. Finished app run on 2026-11-20
   await runFullCompletedRun(env, worker, { date: '2026-11-20', origin: 'app', engineVersionId, row0 });
-  // 2. Newer finished TRIAL run on 2026-11-21 -> MUST BE IGNORED!
   await runFullCompletedRun(env, worker, { date: '2026-11-21', origin: 'trial', engineVersionId, row0 });
-  // 3. Newer finished ABANDONED app run on 2026-11-22 -> MUST BE IGNORED!
   const abandonedId = await runFullCompletedRun(env, worker, { date: '2026-11-22', origin: 'app', engineVersionId, row0 });
   await env.commands.abandonRun({
     actor: env.ownerActor, commandKey: 'abandon-1122', runId: abandonedId, typedPhrase: 'abandon 2026-11-22', reason: 'bad run',
   });
 
-  const reader = createDatabaseCoherenceReader({ pool: env.pool, stores: env.stores, entity: 'Phalanx' });
+  const reader = createDatabaseCoherenceReader({ pool: env.pool, stores: env.stores, entity: 'Acme' });
   const sum = await reader.summary();
   assert.equal(sum.available, true);
   assert.equal(sum.run, '2026-11-20');
@@ -86,44 +78,72 @@ test('Layer 5 [R15]: downstream reader selects only newest finished non-abandone
 
   const bobFile = await reader.file('data/canonical_bob.csv', false);
   assert.ok(bobFile.body.toString('utf8').includes('Test Member'));
+  const ledgerFile = await reader.file('data/coherent_ledger.csv', false);
+  assert.ok(ledgerFile.body.toString('utf8').includes('100.00'));
   await assert.rejects(() => reader.file('viewer.html', false), /not part of the run/i);
 
-  // Clearpath feed: HMAC + replay check + no-dollar AGENT_BOOK_COLUMNS filter
   const secret = 's'.repeat(40);
-  const feed = createDatabaseClearpathFeed({ pool: env.pool, stores: env.stores, entity: 'Phalanx', secret });
-  const sig = signRequest(secret, 'GET', '/feeds/clearpath/agent-book?name=Jane+Agent');
-  assert.equal(feed.verify('GET', '/feeds/clearpath/agent-book?name=Jane+Agent', sig), true);
-  assert.equal(feed.verify('GET', '/feeds/clearpath/agent-book?name=Jane+Agent', sig), false, 'replayed nonce must be refused');
+  const feed = createSignedAgentFeedReader({ pool: env.pool, stores: env.stores, entity: 'Acme', secret });
+  const sig = signRequest(secret, 'GET', '/feeds/acme/agent-book?name=Jane+Agent');
+  assert.equal(feed.verify('GET', '/feeds/acme/agent-book?name=Jane+Agent', sig), true);
+  assert.equal(feed.verify('GET', '/feeds/acme/agent-book?name=Jane+Agent', sig), false, 'replayed nonce must be refused');
 
   const agentBook = await feed.agentBook('Jane Agent');
   assert.equal(agentBook.eligible, true);
   assert.equal(agentBook.run, '2026-11-20');
   const [header] = parseCsv(agentBook.csv);
-  assert.ok(!header.includes('amount'), 'selling agent amount column MUST be stripped');
-  assert.ok(!header.includes('gross_comm'), 'gross_comm MUST be stripped');
-  for (const col of header) assert.ok(AGENT_BOOK_COLUMNS.includes(col));
+  assert.ok(!header.includes('amount'), 'selling agent amount column must be stripped');
+  assert.ok(!header.includes('gross_comm'), 'gross_comm must be stripped');
+  for (const col of header) assert.ok(DEFAULT_AGENT_BOOK_COLUMNS.includes(col));
   assert.ok(!agentBook.viewer.defaultVisible.BOB.bob.includes('amount'));
   assert.equal(agentBook.viewer.defaultFilters.BOB.bob.amount, undefined);
 
   const houseSum = await feed.houseSummary();
   assert.equal(houseSum.available, true);
   for (const f of Object.keys(houseSum.viewer.features)) assert.ok(HOUSE_FEATURES.includes(f));
+
+  const envAmbig = await createTestEnv({ companySlug: 'beacon', displayName: 'Beacon' });
+  t.after(() => envAmbig.cleanup());
+  const mkViewer = (name) => Buffer.from(
+    `<!doctype html><head><script>window.__VIEWER_CONFIG__=${JSON.stringify({ name: 'Entity Manager', title: name, statementDate: '2026-11-21', role: 'ENTITY_MANAGER', features: { CANONICAL_BOB: { canonical_bob: 'data/canonical_bob.csv' } } })};</script></head>`,
+    'utf8',
+  );
+  const vA = await envAmbig.stores.promoteArtifact('emits/bundles/entity-managers/EntityA/viewer.html', mkViewer('EntityA'), { checksPassed: true });
+  const vB = await envAmbig.stores.promoteArtifact('emits/bundles/entity-managers/EntityB/viewer.html', mkViewer('EntityB'), { checksPassed: true });
+  const dummyInput = await envAmbig.dataStore.promoteBytes(Buffer.from('k\n1\n'), { relPath: 'a.csv', checksPassed: true });
+  await envAmbig.commands.importHistoricalRun({
+    actor: envAmbig.ownerActor,
+    commandKey: 'ambig-entity-bundles',
+    run: { origin: 'company_import', statementDate: '2026-11-21', sourceFolder: 'company-workspaces/beacon/2026-11-21/runs/2026-11-21', emitMode: 'coherence' },
+    inputVersion: { reason: 'test' },
+    inputEntries: [{ relPath: 'a.csv', fileSha256: dummyInput.sha256 }],
+    stepAttempts: [{
+      step: 'emit',
+      attemptNo: 1,
+      artifacts: [
+        { relPath: vA.relPath, artifactKind: vA.artifactKind, storeKind: vA.storeKind, fileSha256: vA.sha256 },
+        { relPath: vB.relPath, artifactKind: vB.artifactKind, storeKind: vB.storeKind, fileSha256: vB.sha256 },
+      ],
+    }],
+    storedFiles: [dummyInput, vA, vB],
+  });
+  const ambigReader = createDatabaseCoherenceReader({ pool: envAmbig.pool, stores: envAmbig.stores, entity: 'UnmatchedEntity' });
+  await assert.rejects(() => ambigReader.summary(), (err) => err?.code === 'AMBIGUOUS_ENTITY_BUNDLE');
 });
 
-test('Layer 5 [R16, R4, R14.2 & R11 sandboxed viewer audit]: web endpoints, History as-of, recipient bundle scoping, and non-sandboxed headers', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 5 [Web Screens & Dropped Viewers]: web endpoints, History as-of, non-sandboxed headers, and refusal of removed per-recipient bundle paths', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createTestEnv();
   t.after(() => env.cleanup());
 
   const { engineVersionId } = await seedEngineVersion(env);
-  const row0 = sampleApprovalRow({ record_id: 'policy:aetna:PRIOR#effective:2026-01-01' });
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:PRIOR#effective:2026-01-01' });
   await seedStandingInput(env, { withPriorOverlay: { version: 'v2', rows: [row0], csv: makeOverlayCsv([row0]) } });
 
   const worker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: 'phalanx', stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
   }));
 
-  // Stage a file to test R16.1 "Include in calculations"
   const stagedBytes = Buffer.from('col\nnew-month\n', 'utf8');
   const stagedPromoted = await env.dataStore.promoteBytes(stagedBytes, { relPath: 'staging/new_stmt.csv', checksPassed: true });
   await env.commands.importStandaloneFiles({
@@ -138,31 +158,31 @@ test('Layer 5 [R16, R4, R14.2 & R11 sandboxed viewer audit]: web endpoints, Hist
   for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
   const seqAtBible = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
 
-  const bibleRows = [row0, sampleApprovalRow({ record_id: 'policy:aetna:P10001#effective:2026-01-01', note: 'web-bible' })];
+  const bibleRows = [row0, sampleApprovalRow({ record_id: 'policy:carrier_a:P10001#effective:2026-01-01', note: 'web-bible' })];
   await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'web-b', expectedJournalSeq: seqAtBible, runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv(bibleRows), 'utf8') });
   assert.equal((await worker.runOnce()).action, 'review_accepted');
-  assert.equal((await worker.runOnce()).action, 'step_finished'); // adjust
+  assert.equal((await worker.runOnce()).action, 'step_finished');
   const seqAtAdjust = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
 
-  const adjRows = [...bibleRows, sampleApprovalRow({ record_id: 'aetna~direct~P10001~100.00~2026-11', note: 'web-adj' })];
+  const adjRows = [...bibleRows, sampleApprovalRow({ record_id: 'carrier_a~direct~P10001~100.00~2026-11', note: 'web-adj' })];
   await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'web-a', expectedJournalSeq: seqAtAdjust, runId, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv(adjRows), 'utf8') });
   const adjAcc = await worker.runOnce();
   assert.equal(adjAcc.action, 'review_accepted');
 
   const seqReady = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await env.commands.confirmEmit({ actor: env.ownerActor, commandKey: 'web-e', expectedJournalSeq: seqReady, runId, adjustReviewSaveId: adjAcc.reviewSaveId, typedPhrase: 'create statements for 2026-11-21' });
-  assert.equal((await worker.runOnce()).action, 'step_finished'); // emit
+  assert.equal((await worker.runOnce()).action, 'step_finished');
 
-  const handlers = createWebHandlers({ pool: env.pool, companySlug: 'phalanx', stores: env.stores, commands: env.commands, entity: 'Phalanx' });
+  const handlers = createWebHandlers({ pool: env.pool, companySlug: env.companySlug, stores: env.stores, commands: env.commands });
   let currentActor = env.ownerActor;
   const router = createCoherenceRouter({
-    handlersByCompany: new Map([['phalanx', handlers]]),
+    handlersByCompany: new Map([[env.companySlug, handlers]]),
     authenticate: async () => currentActor,
   });
 
   const server = createServer((req, res) => { void router(req, res); });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+  await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
 
   const reqJson = async (path, opts = {}) => {
@@ -170,11 +190,10 @@ test('Layer 5 [R16, R4, R14.2 & R11 sandboxed viewer audit]: web endpoints, Hist
     return { status: res.status, headers: res.headers, body: await res.json() };
   };
 
-  // 1. R16.1 Staging + Include in calculations
-  const staging = await reqJson('/api/coherence/phalanx/inputs/staging');
+  const staging = await reqJson('/api/coherence/acme/inputs/staging');
   assert.equal(staging.status, 200);
   assert.equal(staging.body.files.length, 1);
-  const incRes = await reqJson('/api/coherence/phalanx/inputs/include', {
+  const incRes = await reqJson('/api/coherence/acme/inputs/include', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -186,33 +205,33 @@ test('Layer 5 [R16, R4, R14.2 & R11 sandboxed viewer audit]: web endpoints, Hist
   });
   assert.equal(incRes.status, 201);
 
-  // 2. R16.2 Review config returns JSON only (owner), outputs refuses viewer.html
-  const revCfg = await reqJson(`/api/coherence/phalanx/runs/${runId}/review/bible/config`);
+  const revCfg = await reqJson(`/api/coherence/acme/runs/${runId}/review/bible/config`);
   assert.equal(revCfg.status, 200);
   assert.equal(revCfg.body.surface, 'bible');
   assert.equal(revCfg.body.config.stamped, true);
-  assert.equal((await reqJson(`/api/coherence/phalanx/runs/${runId}/outputs/file?path=emits/bundles/entity-managers/Phalanx/viewer.html`)).status, 403);
+  const csp = revCfg.headers.get('content-security-policy') || '';
+  assert.ok(!csp.includes('sandbox'), 'responses must never set a sandbox CSP that blocks signed-in data fetches');
+  assert.equal(revCfg.headers.get('cache-control'), 'private, no-store');
+  assert.equal((await reqJson(`/api/coherence/acme/runs/${runId}/outputs/file?path=emits/bundles/entity-managers/Acme/viewer.html`)).status, 403);
 
-  // 3. R16.3 History "as of", run journal, and approval key history (POST JSON body only)
-  const asOf = await reqJson(`/api/coherence/phalanx/history/as-of?seq=${seqAtBible}`);
+  const asOf = await reqJson(`/api/coherence/acme/history/as-of?seq=${seqAtBible}`);
   assert.equal(asOf.status, 200);
   assert.equal(asOf.body.runs.find((r) => r.id === runId).stage, 'waiting for Bible');
 
-  const runJournal = await reqJson(`/api/coherence/phalanx/runs/${runId}/journal`);
+  const runJournal = await reqJson(`/api/coherence/acme/runs/${runId}/journal`);
   assert.equal(runJournal.status, 200);
   assert.ok(runJournal.body.entries.length >= 6);
 
-  const keyHist = await reqJson('/api/coherence/phalanx/approvals/history', {
+  const keyHist = await reqJson('/api/coherence/acme/approvals/history', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ recordId: 'policy:aetna:P10001#effective:2026-01-01' }),
+    body: JSON.stringify({ recordId: 'policy:carrier_a:P10001#effective:2026-01-01' }),
   });
   assert.equal(keyHist.status, 200);
   assert.equal(keyHist.body.history.length, 1);
   assert.equal(keyHist.body.history[0].note, 'web-bible');
 
-  // 4. R16.4 On-demand checks endpoint
-  const chainChk = await reqJson('/api/coherence/phalanx/checks/run', {
+  const chainChk = await reqJson('/api/coherence/acme/checks/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ commandKey: 'chk-chain-web', checkKind: 'chain' }),
@@ -220,37 +239,22 @@ test('Layer 5 [R16, R4, R14.2 & R11 sandboxed viewer audit]: web endpoints, Hist
   assert.equal(chainChk.status, 201);
   assert.equal(chainChk.body.passed, true);
 
-  // 5. R16.5 & R4.4 & R14.2 & R11 sandboxed viewer audit: Recipient bundle access
-  currentActor = {
-    id: 'jane-agent',
-    kind: 'recipient',
-    company: 'phalanx',
-    recipientRole: 'SELLING_AGENT',
-    recipientName: 'Jane Agent',
-    recipientScope: { npns: ['12345678'], entities: ['Phalanx'] },
-  };
-  assert.equal((await reqJson(`/api/coherence/phalanx/runs/${runId}/journal`)).status, 403);
-  assert.equal((await reqJson('/api/coherence/phalanx/inputs/versions')).status, 403);
-  assert.equal((await reqJson('/api/coherence/phalanx/approvals/history', { method: 'POST', body: JSON.stringify({ recordId: 'x' }) })).status, 403);
+  for (const path of [
+    '/api/coherence/acme/bundles',
+    '/api/coherence/acme/bundles/config?output=selling-agents/Acme/jane-agent',
+    '/api/coherence/acme/bundles/file?output=selling-agents/Acme/jane-agent&path=data/bob.csv',
+  ]) {
+    assert.equal((await reqJson(path)).status, 404, `removed bundle route ${path} must be refused with 404`);
+  }
 
-  const bundles = await reqJson('/api/coherence/phalanx/bundles');
-  assert.equal(bundles.status, 200);
-  assert.equal(bundles.body.bundles.length, 1);
-  assert.equal(bundles.body.bundles[0].output, 'selling-agents/Phalanx/jane-agent');
-  assert.equal((await reqJson('/api/coherence/phalanx/bundles/config?output=entity-managers/Phalanx')).status, 403);
-
-  const ownCfg = await reqJson('/api/coherence/phalanx/bundles/config?output=selling-agents/Phalanx/jane-agent');
-  assert.equal(ownCfg.status, 200);
-  const csp = ownCfg.headers.get('content-security-policy') || '';
-  assert.ok(!csp.includes('sandbox'), 'bundle response must NEVER set a sandbox CSP that blocks CoherenceScreen data fetches (R11)');
-  assert.equal(ownCfg.headers.get('cache-control'), 'private, no-store');
-
-  const ownCsvRes = await fetch(`${baseUrl}/api/coherence/phalanx/bundles/file?output=selling-agents/Phalanx/jane-agent&path=${encodeURIComponent(ownCfg.body.viewer.features.BOB.bob)}`);
-  assert.equal(ownCsvRes.status, 200);
-  assert.ok((await ownCsvRes.text()).includes('Test Member'));
+  currentActor = { id: 'jane-agent', kind: 'recipient', company: 'acme' };
+  assert.equal((await reqJson(`/api/coherence/acme/runs/${runId}/journal`)).status, 403);
+  assert.equal((await reqJson('/api/coherence/acme/inputs/versions')).status, 403);
+  assert.equal((await reqJson('/api/coherence/acme/approvals/history', { method: 'POST', body: JSON.stringify({ recordId: 'x' }) })).status, 403);
+  assert.equal((await reqJson('/api/coherence/acme/bundles')).status, 404);
 });
 
-test('Layer 5 [R16.2]: review app drift check against Coherence web/src/adjust passes on clean copy and detects drift', async (t) => {
+test('Layer 5 [Review App Drift Check]: verifies via readSourceFile hook, detects copy drift, fails closed on unreadable source or missing tag, and supports explicit offline mode', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'coherence-drift-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
 
@@ -266,12 +270,44 @@ test('Layer 5 [R16.2]: review app drift check against Coherence web/src/adjust p
     records: [{ source: 'web/src/adjust/queue.ts', copy: 'src/adjust/queue.ts', sourceSha256: srcHash, copySha256: srcHash, adaptation: 'None' }],
   };
 
-  const clean = await checkReviewAppDrift({ provenance, nusearUiRoot: join(dir, 'nusear'), sourceDir: join(dir, 'coherence') });
+  const seenCalls = [];
+  const readSourceFile = async (tag, relPath) => {
+    seenCalls.push([tag, relPath]);
+    return readFile(join(dir, 'coherence', ...relPath.split('/')));
+  };
+
+  const clean = await checkReviewAppDrift({ provenance, nusearUiRoot: join(dir, 'nusear'), readSourceFile });
   assert.equal(clean.passed, true);
+  assert.equal(clean.sourceVerified, true);
   assert.equal(clean.checkedCopies, 1);
+  assert.deepEqual(seenCalls, [['v2.2.5', 'web/src/adjust/queue.ts']]);
+
+  const badRepo = await checkReviewAppDrift({
+    provenance,
+    nusearUiRoot: join(dir, 'nusear'),
+    coherenceRepo: join(dir, 'nonexistent-repo'),
+  });
+  assert.equal(badRepo.passed, false);
+  assert.equal(badRepo.sourceVerified, false);
+  assert.ok(badRepo.problems.some((p) => p.includes('Unable to read Coherence source')));
+
+  const missingTag = await checkReviewAppDrift({
+    provenance: { records: provenance.records },
+    nusearUiRoot: join(dir, 'nusear'),
+    coherenceRepo: dir,
+  });
+  assert.equal(missingTag.passed, false);
+
+  const offlineOnly = await checkReviewAppDrift({
+    provenance,
+    nusearUiRoot: join(dir, 'nusear'),
+    allowOfflineCopyOnly: true,
+  });
+  assert.equal(offlineOnly.passed, true);
+  assert.equal(offlineOnly.sourceVerified, false);
 
   await writeFile(join(dir, 'nusear', 'src', 'adjust', 'queue.ts'), 'export const REVIEW_CONTRACT = 2;\n', 'utf8');
-  const drifted = await checkReviewAppDrift({ provenance, nusearUiRoot: join(dir, 'nusear'), sourceDir: join(dir, 'coherence') });
+  const drifted = await checkReviewAppDrift({ provenance, nusearUiRoot: join(dir, 'nusear'), readSourceFile });
   assert.equal(drifted.passed, false);
   assert.ok(drifted.problems.some((p) => p.includes('drifted')));
 });

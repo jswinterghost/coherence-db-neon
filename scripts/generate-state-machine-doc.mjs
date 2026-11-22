@@ -1,4 +1,3 @@
-// Generates (or verifies with --check) STATE_MACHINE.md from src/state-machine/coherence-machines.mjs.
 import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

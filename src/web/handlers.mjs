@@ -1,10 +1,9 @@
-// Server-side web handlers for all Coherence screens (R16, R4, R14.2, R14.3, R11).
-// No front-end HTML or code-bearing files are ever served to clients; bundles serve JSON config + signed-in CSV data.
+// Server-side web handlers for Coherence screens: no front-end HTML or code-bearing files
+// are ever returned; review endpoints serve JSON config only and outputs serve data files only.
 import { basename } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { assertCanRead, assertCanWrite } from '../commands/authz.mjs';
 import { verifyChain, verifyCommitments, verifyObjects } from '../commands/journal-export.mjs';
-import { createDatabaseCoherenceReader } from '../readers/downstream-reader.mjs';
 import { isCodeBearingPath } from '../storage/artifact-policy.mjs';
 import { formatTimestampUtcUs } from '../util/crypto.mjs';
 import { assertValidRelPath } from '../util/csv.mjs';
@@ -34,12 +33,8 @@ export function createWebHandlers({
   companySlug,
   stores,
   commands,
-  entity = '',
-  display = '',
   driftCheckConfig = null,
 }) {
-  const reader = createDatabaseCoherenceReader({ pool, stores, entity: entity || display || companySlug, display });
-
   async function resolveAsOfSeq({ asOfSeq = null, asOf = null } = {}) {
     if (asOfSeq != null && asOfSeq !== '') {
       const n = Number(asOfSeq);
@@ -57,8 +52,6 @@ export function createWebHandlers({
     }
     return null;
   }
-
-  // ---- R16.1 Inputs ----
 
   async function listInputVersions(actor, { asOfSeq = null, asOf = null } = {}) {
     assertCanRead(actor, 'inputs', { companySlug });
@@ -205,7 +198,7 @@ export function createWebHandlers({
   async function includeStagingFile(actor, { commandKey, expectedJournalSeq, stagingFileSha256, targetRelPath, reason }) {
     assertCanWrite(actor, 'include_staging_file', { companySlug });
     assertValidRelPath(targetRelPath, 'targetRelPath');
-    if (!reason || !String(reason).trim()) throw new AppError('A reason is required to include a file in calculations (R16.1).', 400, 'MISSING_REASON');
+    if (!reason || !String(reason).trim()) throw new AppError('A reason is required to include a file in calculations.', 400, 'MISSING_REASON');
 
     const stagedRes = await pool.query(
       `SELECT f.file_sha256 FROM coherence.imported_files f
@@ -247,8 +240,6 @@ export function createWebHandlers({
       detectRenames: false,
     });
   }
-
-  // ---- R16.2 Runs ----
 
   async function listRuns(actor, { asOfSeq = null, asOf = null } = {}) {
     assertCanRead(actor, 'runs', { companySlug });
@@ -442,6 +433,7 @@ export function createWebHandlers({
       emitConfirmations: confirmsRes.rows.map((c) => ({
         id: c.id,
         adjustReviewSaveId: c.adjust_review_save_id,
+        typedPhrase: c.typed_phrase,
         journalSeq: Number(c.journal_seq),
         recordedAt: formatTimestampUtcUs(c.recorded_at),
         actor: c.actor,
@@ -485,8 +477,8 @@ export function createWebHandlers({
   }
 
   /**
-   * Extracts ONLY the JSON review configuration from bible.html / adjust.html in Nusear's code store (R14.2, R16.2).
-   * Never returns compiled HTML/JS code to clients.
+   * Extracts only the JSON review configuration from bible.html or adjust.html in Nusear's code store;
+   * never returns HTML or script bytes to clients.
    */
   async function getReviewConfig(actor, runId, surface) {
     assertCanRead(actor, 'approvals', { companySlug });
@@ -544,7 +536,7 @@ export function createWebHandlers({
   }
 
   async function listRunOutputs(actor, runId) {
-    assertCanRead(actor, 'runs', { companySlug });
+    assertCanRead(actor, 'outputs', { companySlug });
     const evRes = await pool.query("SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev_id", [runId]);
     const evId = evRes.rows[0]?.ev_id;
     if (!evId) return { available: false, files: [] };
@@ -570,10 +562,10 @@ export function createWebHandlers({
   }
 
   async function getRunOutputFile(actor, runId, relPath, acceptsGzip = false) {
-    assertCanRead(actor, 'runs', { companySlug });
+    assertCanRead(actor, 'outputs', { companySlug });
     assertValidRelPath(relPath, 'output path');
     if (isCodeBearingPath(relPath)) {
-      throw new AppError('Code-bearing files cannot be downloaded from output endpoints (R1.6, R14.2).', 403, 'CODE_FILE_FORBIDDEN');
+      throw new AppError('Code-bearing files cannot be downloaded from output endpoints.', 403, 'CODE_FILE_FORBIDDEN');
     }
     const evRes = await pool.query("SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev_id", [runId]);
     const evId = evRes.rows[0]?.ev_id;
@@ -592,8 +584,6 @@ export function createWebHandlers({
     });
     return { name: basename(relPath), body: acceptsGzip ? gzipSync(bytes) : bytes, gzip: Boolean(acceptsGzip) };
   }
-
-  // ---- R16.3 History ("as of", run journal, approval key history) ----
 
   async function getHistoryAsOf(actor, { asOfSeq = null, asOf = null } = {}) {
     assertCanRead(actor, 'journal', { companySlug });
@@ -706,8 +696,6 @@ export function createWebHandlers({
     };
   }
 
-  // ---- R16.4 Checks ----
-
   async function listChecks(actor, { kind = null, runId = null } = {}) {
     assertCanRead(actor, 'checks', { companySlug });
     const conditions = [];
@@ -781,33 +769,6 @@ export function createWebHandlers({
     return { ...recorded, checkKind, passed: report.passed, report };
   }
 
-  // ---- R16.5 Bundles (scope checked on server, no sandboxed viewer) ----
-
-  async function listBundles(actor, { runId = null, asOfSeq = null, asOf = null } = {}) {
-    assertCanRead(actor, 'bundles', { companySlug });
-    const seq = await resolveAsOfSeq({ asOfSeq, asOf });
-    return reader.listAccessibleBundles(actor, { runId, asOfSeq: seq });
-  }
-
-  async function getBundleConfig(actor, { output, runId = null, asOfSeq = null, asOf = null } = {}) {
-    assertCanRead(actor, 'bundles', { companySlug });
-    if (!output) throw new AppError('Bundle output path is required.', 400, 'MISSING_BUNDLE_OUTPUT');
-    const seq = await resolveAsOfSeq({ asOfSeq, asOf });
-    return reader.getBundleConfig(actor, output, { runId, asOfSeq: seq });
-  }
-
-  async function getBundleFile(actor, { output, path, acceptsGzip = false, runId = null, asOfSeq = null, asOf = null } = {}) {
-    assertCanRead(actor, 'bundles', { companySlug });
-    if (!output || !path) throw new AppError('Bundle output and file path are required.', 400, 'MISSING_PARAMS');
-    if (isCodeBearingPath(path)) {
-      throw new AppError('Code-bearing files cannot be served from bundle endpoints (R1.6, R14.2).', 403, 'CODE_FILE_FORBIDDEN');
-    }
-    const seq = await resolveAsOfSeq({ asOfSeq, asOf });
-    return reader.getBundleFile(actor, output, path, acceptsGzip, { runId, asOfSeq: seq });
-  }
-
-  // ---- R16.2 Review App Drift Check ----
-
   async function getReviewDriftStatus(actor) {
     assertCanRead(actor, 'journal', { companySlug });
     if (!driftCheckConfig) return { configured: false, passed: true, checkedCopies: 0, problems: [] };
@@ -815,13 +776,11 @@ export function createWebHandlers({
   }
 
   return {
-    // Inputs
     listInputVersions,
     getInputVersionDetail,
     listStagingFiles,
     includeStagingFile,
     publishInputVersion: (actor, body) => commands.publishInputVersion({ actor, ...body }),
-    // Runs & commands
     listRuns,
     getRunDetail,
     launchRun: (actor, body) => commands.launchRun({ actor, ...body }),
@@ -844,17 +803,11 @@ export function createWebHandlers({
     requestRetry: (actor, runId, body) => commands.requestRetry({ actor, runId, ...body }),
     abandonRun: (actor, runId, body) => commands.abandonRun({ actor, runId, ...body }),
     getReviewDriftStatus,
-    // History
     getHistoryAsOf,
     getRunJournal,
     getApprovalKeyHistory,
-    // Checks
     listChecks,
     getCheckDetail,
     runVerificationCheck,
-    // Bundles
-    listBundles,
-    getBundleConfig,
-    getBundleFile,
   };
 }

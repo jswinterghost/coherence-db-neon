@@ -1,4 +1,3 @@
-// Daily journal export, exact database rebuild, and independent chain / commitments / objects verifiers (R6.21, R9.2, R10.12).
 import {
   computeJournalHash,
   formatTimestampUtcUs,
@@ -35,8 +34,8 @@ function formatDateCol(val) {
 }
 
 /**
- * Exports the entire company journal as deterministic NDJSON lines (one entry per line, seq 1..N)
- * with every business row attached to each journal entry (R10.12).
+ * Exports the company journal as deterministic NDJSON (one line per seq 1..N)
+ * including all child business rows attached to each entry.
  */
 export async function exportJournalNdjson(pool) {
   const entriesRes = await pool.query(
@@ -110,9 +109,8 @@ export async function exportJournalNdjson(pool) {
 }
 
 /**
- * Rebuilds an empty migrated company database from a journal NDJSON export,
- * supplying exact seq, recorded_at, prev_hash, and entry_hash so PostgreSQL verifies EVERY hash
- * and EVERY commitment as it replays (R9.2, R10.12).
+ * Rebuilds an empty migrated database from a journal NDJSON export, supplying exact seq, recorded_at,
+ * prev_hash, and entry_hash so database triggers verify every hash and commitment.
  */
 export async function rebuildFromJournalExport(pool, ndjsonText) {
   const lines = String(ndjsonText || '').split('\n').filter((line) => line.trim().length > 0);
@@ -146,7 +144,6 @@ export async function rebuildFromJournalExport(pool, ndjsonText) {
 
       await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
       try {
-        // Pass explicit seq, recorded_at, prev_hash, entry_hash -> DB trigger VERIFIES exact equality!
         await client.query(
           `INSERT INTO coherence.journal_entries (
              seq, recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
@@ -387,9 +384,6 @@ export async function rebuildFromJournalExport(pool, ndjsonText) {
   }
 }
 
-/**
- * R6.21 `chain` check: independently verifies gapless seq, monotonic timestamps, prev_hash links, and recomputed SHA-256 hashes.
- */
 export async function verifyChain(pool) {
   const res = await pool.query(
     `SELECT seq, coherence.format_utc_us(recorded_at) AS recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
@@ -426,9 +420,6 @@ export async function verifyChain(pool) {
   return { passed: problems.length === 0, entries: res.rows.length, headHash: expectedPrevHash, problems };
 }
 
-/**
- * R6.21 `commitments` check: independently verifies every journal entry's declared table counts and canonical hashes.
- */
 export async function verifyCommitments(pool) {
   const entriesRes = await pool.query('SELECT seq, body FROM coherence.journal_entries ORDER BY seq ASC');
   const problems = [];
@@ -457,6 +448,11 @@ export async function verifyCommitments(pool) {
                       CASE WHEN original_at IS NULL THEN NULL ELSE coherence.format_utc_us(original_at) END AS original_at,
                       submission_id
                FROM coherence.review_saves WHERE journal_seq = $1`;
+      } else if (tbl === 'imported_files') {
+        sql = `SELECT id, area, rel_path, artifact_kind, store_kind, file_sha256,
+                      CASE WHEN original_at IS NULL THEN NULL ELSE coherence.format_utc_us(original_at) END AS original_at,
+                      metadata
+               FROM coherence.imported_files WHERE journal_seq = $1`;
       }
       const res = await pool.query(sql, [String(seq)]);
       if (res.rows.length > 0) tables[tbl] = res.rows;
@@ -476,10 +472,6 @@ export async function verifyCommitments(pool) {
   return { passed: problems.length === 0, checkedEntries: entriesRes.rows.length, problems };
 }
 
-/**
- * R6.21 `objects` check: verifies every stored_files record against the two stores and proves
- * zero engine or code-bearing files live in company_data.
- */
 export async function verifyObjects(pool, stores, { deep = false } = {}) {
   const res = await pool.query(
     'SELECT store_kind, sha256, byte_size, md5_b64, crc32c_b64, object_name FROM coherence.stored_files ORDER BY store_kind, sha256',
@@ -497,7 +489,6 @@ export async function verifyObjects(pool, stores, { deep = false } = {}) {
     if (!check.ok) problems.push(`${row.store_kind}/${row.sha256}: ${check.reason}`);
   }
 
-  // Verify no code-bearing artifact references company_data
   const badArts = await pool.query(
     `SELECT attempt_event_id, rel_path, artifact_kind, store_kind
      FROM coherence.artifacts

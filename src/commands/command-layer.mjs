@@ -1,6 +1,6 @@
-// The command layer: every business change passes through here (R4, R8, R9, R10).
-// Enforces authorization, View-As refusal, command_key idempotency, expected_journal_seq concurrency,
-// SERIALIZABLE isolation, batched inserts, and cryptographic journal commitments.
+// Single write chokepoint for all business mutations: enforces authorization, View-As refusal,
+// command-key idempotency, expected_journal_seq concurrency, SERIALIZABLE isolation, batched inserts,
+// and journal commitments.
 import { randomUUID } from 'node:crypto';
 import {
   canonicalInputEntriesText,
@@ -33,7 +33,6 @@ function mapPgError(error) {
 
 async function filterNewStoredFiles(tx, files) {
   if (!files || files.length === 0) return [];
-  // Deduplicate by (storeKind, sha256) within batch first
   const byKey = new Map();
   for (const f of files) {
     const storeKind = f.storeKind ?? f.store_kind;
@@ -189,8 +188,8 @@ async function insertApprovalRowsBatch(tx, rows, journalSeq) {
 }
 
 /**
- * Computes exact input_changes between parent entries and next entries, respecting explicit renames
- * and auto-detecting byte-identical renames when `detectRenames` is true (R6.5, R11 misdated files).
+ * Computes input_changes between parent and next entries, honoring explicit renames
+ * and optionally detecting byte-identical renames so file history is preserved across renames.
  */
 export function diffInputEntries(parentEntries, nextEntries, { explicitRenames = [], detectRenames = true } = {}) {
   const parentMap = new Map(parentEntries.map((e) => [e.relPath ?? e.rel_path, e.fileSha256 ?? e.file_sha256]));
@@ -206,7 +205,7 @@ export function diffInputEntries(parentEntries, nextEntries, { explicitRenames =
     const oldSha = parentMap.get(oldPath);
     const newSha = nextMap.get(newPath);
     if (!oldSha || !newSha || oldSha !== newSha) {
-      throw new AppError(`Rename from ${oldPath} to ${newPath} must move the exact same bytes (R6.5).`, 400, 'INVALID_RENAME');
+      throw new AppError(`Rename from ${oldPath} to ${newPath} must move the exact same bytes.`, 400, 'INVALID_RENAME');
     }
     changes.push({ changeKind: 'renamed', relPath: newPath, oldRelPath: oldPath, fileSha256: newSha, prevFileSha256: null });
     handledOld.add(oldPath);
@@ -271,7 +270,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
   }) {
     assertCanWrite(actor, commandKind, { companySlug });
     if (typeof commandKey !== 'string' || commandKey.length === 0 || commandKey.length > 200) {
-      throw new AppError('Every command must carry a non-empty commandKey (R10.6).', 400, 'MISSING_COMMAND_KEY');
+      throw new AppError('Every command must carry a non-empty commandKey.', 400, 'MISSING_COMMAND_KEY');
     }
 
     const actingFor = actor.actingFor ?? null;
@@ -291,7 +290,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       try {
         await tx.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
 
-        // 1. R10.6 idempotency check
         const existingRes = await tx.query(
           `SELECT seq, command_kind, actor, acting_for, request_sha256, body, recorded_at, entry_hash
            FROM coherence.journal_entries
@@ -317,13 +315,12 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             };
           }
           throw new AppError(
-            'This command key was already used for a different request (kind, actor, acting_for, or content) (R10.6).',
+            'This command key was already used for a different request (kind, actor, acting_for, or content).',
             409,
             'COMMAND_KEY_CONFLICT',
           );
         }
 
-        // 2. R10.5 optimistic concurrency check on expected_journal_seq
         if (expectedJournalSeq !== null && expectedJournalSeq !== undefined) {
           const expected = Number(expectedJournalSeq);
           if (!Number.isInteger(expected) || expected < 0) {
@@ -338,7 +335,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             const runSeqRes = await tx.query('SELECT coherence.run_latest_journal_seq($1::uuid) AS latest', [scopeRunId]);
             const runLatest = Number(runSeqRes.rows[0].latest);
             if (runLatest > expected) {
-              throw new AppError('This run changed since the screen loaded; reload and try again (R10.5).', 409, 'STALE_JOURNAL_POSITION');
+              throw new AppError('This run changed since the screen loaded; reload and try again.', 409, 'STALE_JOURNAL_POSITION');
             }
           }
           if (scopeStandingLine) {
@@ -347,15 +344,14 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
                FROM coherence.input_versions WHERE line_kind = 'standing'`,
             );
             if (Number(standRes.rows[0].latest) > expected) {
-              throw new AppError('The standing input changed since the screen loaded; reload and try again (R10.5).', 409, 'STALE_JOURNAL_POSITION');
+              throw new AppError('The standing input changed since the screen loaded; reload and try again.', 409, 'STALE_JOURNAL_POSITION');
             }
           }
           if (strictGlobalSeq && currentMax > expected) {
-            throw new AppError('Database state changed since the screen loaded; reload and try again (R10.5).', 409, 'STALE_JOURNAL_POSITION');
+            throw new AppError('Database state changed since the screen loaded; reload and try again.', 409, 'STALE_JOURNAL_POSITION');
           }
         }
 
-        // 3. Build plan and insert journal entry + child rows atomically
         const { journalSeq, recordedAt, entryHash, body, result } = await buildAndWrite(tx, async (entryBody) => {
           const jRes = await tx.query(
             `INSERT INTO coherence.journal_entries (actor, acting_for, command_kind, command_key, request_sha256, body)
@@ -390,8 +386,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     }
     throw new AppError('Command could not complete due to concurrent updates; retry.', 409, 'SERIALIZATION_FAILURE');
   }
-
-  // ---- Individual Commands ----
 
   async function initCompany({
     actor,
@@ -467,7 +461,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     const allCodeFiles = [gitBundle, codeManifest, pythonLock, pythonWheels, webLock, webPackages, wrapperBundle, ...extraCodeFiles];
     for (const f of allCodeFiles) {
       if ((f.storeKind ?? f.store_kind) !== 'nusear_code') {
-        throw new AppError('Engine version files must live solely in Nusear code store (R6.6, R9.7).', 403, 'CODE_IN_DATA_STORE_FORBIDDEN');
+        throw new AppError('Engine version files must live solely in Nusear code store.', 403, 'CODE_IN_DATA_STORE_FORBIDDEN');
       }
     }
     const payload = {
@@ -593,7 +587,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     for (const e of entries) assertValidRelPath(e.relPath ?? e.rel_path, 'input entry path');
     const clashes = findPathClashes(entries.map((e) => e.relPath ?? e.rel_path));
     if (clashes.length > 0) {
-      throw new AppError(`Input version contains conflicting paths (${clashes[0].kind}) (R6.4, DS-2).`, 409, 'PATH_CLASH');
+      throw new AppError(`Input version contains conflicting paths (${clashes[0].kind}).`, 409, 'PATH_CLASH');
     }
 
     let entriesListStoredFile = null;
@@ -710,7 +704,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       expectedJournalSeq,
       scopeStandingLine: origin === 'app' || origin === 'trial',
       buildAndWrite: async (tx, writeJournal) => {
-        // Resolve inputVersionId (latest standing for app/trial unless specified; replayed run's snapshot for replay)
         let resolvedInputId = inputVersionId;
         if (origin === 'replay' && replaysRunId && !resolvedInputId) {
           const rep = await tx.query('SELECT input_version_id FROM coherence.runs WHERE id = $1::uuid', [replaysRunId]);
@@ -724,7 +717,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           resolvedInputId = latest.rows[0].id;
         }
 
-        // Resolve Emit defaults from company_meta when omitted
         let mode = emitMode;
         let display = emitDisplay;
         let keep = emitKeep;
@@ -748,7 +740,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           noManager = [];
         }
 
-        // Look up prior_approvals_sha256 from input_entries
         const ovRes = await tx.query(
           `SELECT file_sha256 FROM coherence.input_entries
            WHERE input_version_id = $1::uuid AND mac_key = 'overlay/overlay.csv'`,
@@ -756,7 +747,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         );
         const priorApprovalsSha256 = ovRes.rows[0]?.file_sha256 ?? null;
 
-        // Compute folder_number
         let folderNumber = 1;
         if (origin === 'app' || origin === 'trial') {
           const fnRes = await tx.query(
@@ -1093,7 +1083,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       expectedJournalSeq,
       scopeRunId: runId,
       buildAndWrite: async (tx, writeJournal) => {
-        // Supersede any non-superseded ended attempts of steps strictly after `step`
         const laterRes = await tx.query(
           `SELECT e.step, e.attempt_no
            FROM coherence.step_attempt_events e
@@ -1134,7 +1123,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             [runId],
           );
           if (confirmRes.rows.length === 0) {
-            throw new AppError('Emit retry requires an existing Emit confirmation for the current Adjust review (R6.8, R8).', 409, 'MISSING_EMIT_CONFIRMATION');
+            throw new AppError('Emit retry requires an existing Emit confirmation for the current Adjust review.', 409, 'MISSING_EMIT_CONFIRMATION');
           }
           emitConfirmationId = confirmRes.rows[0].id;
         }
@@ -1170,8 +1159,8 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
   }
 
   /**
-   * R10.7: Non-blocking web submission of a review file.
-   * Validates actor, run, and expectedJournalSeq; stages bytes OUTSIDE objects/<sha256>; inserts pending review_submissions row.
+   * Non-blocking review submission: validates actor, run, and expectedJournalSeq, stages unverified
+   * bytes outside objects/<sha256>, and queues a pending review_submissions row for the worker.
    */
   async function submitReview({ actor, commandKey, expectedJournalSeq, runId, surface, csvBytes, submissionId = randomUUID() }) {
     assertCanWrite(actor, 'submit_review', { companySlug });
@@ -1179,10 +1168,10 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       throw new AppError('Review surface must be bible or adjust.', 400, 'INVALID_SURFACE');
     }
     if (typeof commandKey !== 'string' || !commandKey.length) {
-      throw new AppError('Review submission requires commandKey (R10.6).', 400, 'MISSING_COMMAND_KEY');
+      throw new AppError('Review submission requires commandKey.', 400, 'MISSING_COMMAND_KEY');
     }
     if (!Number.isInteger(Number(expectedJournalSeq)) || Number(expectedJournalSeq) < 0) {
-      throw new AppError('Review submission requires expectedJournalSeq (R10.5).', 400, 'MISSING_JOURNAL_SEQ');
+      throw new AppError('Review submission requires expectedJournalSeq.', 400, 'MISSING_JOURNAL_SEQ');
     }
     const buf = Buffer.isBuffer(csvBytes) ? csvBytes : Buffer.from(String(csvBytes ?? ''), 'utf8');
     if (buf.length === 0) throw new AppError('Review file cannot be empty.', 400, 'EMPTY_REVIEW');
@@ -1200,7 +1189,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     const tx = await pool.connect();
     try {
       await tx.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-      // Idempotency check on review_submissions.command_key
       const exRes = await tx.query(
         `SELECT id, run_id, surface, staged_sha256, status, review_save_id, result_journal_seq, result_message,
                 actor, acting_for, request_sha256
@@ -1220,13 +1208,12 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             resultMessage: ex.result_message,
           };
         }
-        throw new AppError('Command key already used with a different review submission (R10.6).', 409, 'COMMAND_KEY_CONFLICT');
+        throw new AppError('Command key already used with a different review submission.', 409, 'COMMAND_KEY_CONFLICT');
       }
 
-      // Check expectedJournalSeq against current run position
       const runSeqRes = await tx.query('SELECT coherence.run_latest_journal_seq($1::uuid) AS latest', [runId]);
       if (Number(runSeqRes.rows[0].latest) > Number(expectedJournalSeq)) {
-        throw new AppError('This run changed since the review page loaded; reload before saving (R10.5).', 409, 'STALE_JOURNAL_POSITION');
+        throw new AppError('This run changed since the review page loaded; reload before saving.', 409, 'STALE_JOURNAL_POSITION');
       }
 
       await tx.query(
@@ -1250,7 +1237,8 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
   }
 
   /**
-   * Worker-only acceptance of a checked review submission in ONE transaction (R10.7).
+   * Finalizes a worker-checked review submission atomically in one SERIALIZABLE transaction
+   * on the worker's slot connection.
    */
   async function acceptReviewSubmission({
     client,
@@ -1285,10 +1273,10 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         };
       }
 
-      // Re-verify optimistic concurrency (R10.5) inside the serializable acceptance tx
+      // Re-verify expected_journal_seq inside the acceptance transaction to reject runs modified while queued.
       const runSeqRes = await tx.query('SELECT coherence.run_latest_journal_seq($1::uuid) AS latest', [sub.run_id]);
       if (Number(runSeqRes.rows[0].latest) > Number(sub.expected_journal_seq)) {
-        throw new AppError('This run changed while the review submission was waiting (R10.5).', 409, 'STALE_JOURNAL_POSITION');
+        throw new AppError('This run changed while the review submission was waiting.', 409, 'STALE_JOURNAL_POSITION');
       }
 
       const attemptRes = await tx.query(
@@ -1300,7 +1288,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         throw new AppError(`No current finished ${sub.surface} attempt exists for this run.`, 409, 'NO_FINISHED_ATTEMPT');
       }
 
-      // Check whether approvals_file already exists
       const afExists = await tx.query('SELECT file_sha256 FROM coherence.approvals_files WHERE file_sha256 = $1', [storedFile.sha256]);
       const needAf = afExists.rows.length === 0;
       const newFiles = await filterNewStoredFiles(tx, [storedFile]);
@@ -1313,7 +1300,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         : [];
       const addedRowsSha256 = needAf ? hashApprovalRows(normalizedRows) : null;
 
-      // If surface === 'bible', check if there is a current finished adjust attempt to supersede
       const supersededRows = [];
       const nextRequests = [];
       if (sub.surface === 'bible') {
@@ -1358,7 +1344,16 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       };
       const commitments = buildCommitments({
         stored_files: newFiles,
-        approvals_files: needAf ? [{ fileSha256: storedFile.sha256 }] : [],
+        approvals_files: needAf
+          ? [{
+            fileSha256: storedFile.sha256,
+            headerKind,
+            rowCount,
+            extendsSha256,
+            sharedRowCount,
+            addedRowsSha256,
+          }]
+          : [],
         approval_rows: normalizedRows,
         review_saves: [saveRow],
         step_attempt_events: supersededRows,
@@ -1591,7 +1586,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         const { statement_date: statementDate, stamp } = runRes.rows[0];
         const emitEvRes = await tx.query("SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev_id", [runId]);
         const emitEvId = emitEvRes.rows[0]?.ev_id;
-        if (!emitEvId) throw new AppError('Run has not finished Emit (R8).', 409, 'EMIT_NOT_FINISHED');
+        if (!emitEvId) throw new AppError('Run has not finished Emit.', 409, 'EMIT_NOT_FINISHED');
 
         const relArtifact = `emits/statements_${stamp}.csv`;
         const artRes = await tx.query(
@@ -1692,7 +1687,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         const { statement_date: statementDate } = runRes.rows[0];
         const emitEvRes = await tx.query("SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev_id", [runId]);
         const emitEvId = emitEvRes.rows[0]?.ev_id;
-        if (!emitEvId) throw new AppError('Run has not finished Emit (R8).', 409, 'EMIT_NOT_FINISHED');
+        if (!emitEvId) throw new AppError('Run has not finished Emit.', 409, 'EMIT_NOT_FINISHED');
 
         const artRes = await tx.query(
           "SELECT file_sha256 FROM coherence.artifacts WHERE attempt_event_id = $1::uuid AND rel_path = 'emits/overlay.csv'",
@@ -1841,7 +1836,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       commandKey,
       payload,
       buildAndWrite: async (tx, writeJournal) => {
-        // Idempotent check by (origin, source_folder)
         const exRun = await tx.query(
           'SELECT id FROM coherence.runs WHERE origin = $1 AND source_folder = $2',
           [run.origin, run.sourceFolder],
@@ -1855,7 +1849,6 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
 
         const newFiles = await filterNewStoredFiles(tx, storedFiles);
 
-        // Filter out already-registered approvals_files
         const afToInsert = [];
         const arToInsert = [];
         const seenAf = new Set();
@@ -2065,7 +2058,16 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             [f.area, f.relPath, f.fileSha256],
           );
           if (ex.rows.length === 0) {
-            toInsert.push({ id: f.id || randomUUID(), ...f });
+            toInsert.push({
+              id: f.id || randomUUID(),
+              area: f.area,
+              relPath: f.relPath,
+              artifactKind: f.artifactKind || 'data',
+              storeKind: f.storeKind || 'company_data',
+              fileSha256: f.fileSha256,
+              originalAt: f.originalAt ?? null,
+              metadata: f.metadata || {},
+            });
           }
         }
         const commitments = buildCommitments({ stored_files: newStored, imported_files: toInsert });

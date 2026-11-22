@@ -1,4 +1,3 @@
-// Runs `node --check` on every .mjs file in this repository before tests execute.
 import { execFileSync } from 'node:child_process';
 import { readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';

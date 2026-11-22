@@ -1,10 +1,12 @@
-// Comparison of two run folders and proof checks (R11 EYES on runs, R13.1-R13.4).
-// Always compares inputs file-by-file by SHA-256 FIRST, then whole trees with mode-specific allowed differences.
+// Compares two run folders: verifies input/ file by file by SHA-256 first, then compares the output
+// tree or substance tables under mode-specific rules.
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { extractViewerConfig } from '../readers/downstream-reader.mjs';
 import { fingerprintBytes, sha256Hex } from '../util/crypto.mjs';
 import { parseCsv, toCsv } from '../util/csv.mjs';
+import { AppError } from '../util/redact.mjs';
 import { listFilesRecursive, rebuildRunFolderFromDb } from '../worker/folder-builder.mjs';
 
 const ADJUST_STAMP_START = '<script>window.__ADJUST_CONFIG__=';
@@ -85,10 +87,11 @@ function normalizeReviewHtmlForTrial(html) {
   return { shell, config: cfg };
 }
 
-/**
- * R13.4 Clearpath-vs-Mac entity mapping: maps every entity column value except InsureItAll to Clearpath.
- */
-export function mapEntitiesToClearpathCsv(text) {
+export function mapEntitiesCsv(text, { targetEntity, preserveEntities = [] } = {}) {
+  if (!targetEntity || typeof targetEntity !== 'string') {
+    throw new AppError('entityMapping.targetEntity is required for entity-mapped CSV comparison.', 400, 'INVALID_ENTITY_MAPPING');
+  }
+  const preserveSet = new Set(preserveEntities);
   const rows = parseCsv(text);
   if (rows.length === 0) return '';
   const header = rows[0];
@@ -99,24 +102,33 @@ export function mapEntitiesToClearpathCsv(text) {
   const mapped = rows.slice(1).map((row) => row.map((cell, idx) => {
     if (!entityCols.includes(idx)) return cell;
     const trimmed = String(cell ?? '').trim();
-    if (!trimmed || trimmed === 'InsureItAll') return cell;
-    return 'Clearpath';
+    if (!trimmed || preserveSet.has(trimmed)) return cell;
+    return targetEntity;
   }));
   return toCsv([header, ...mapped]);
 }
 
-function classifyAllowedDiff(relPath, leftBytes, rightBytes, mode) {
+function canonicalizeSubstanceCsv(bytes, entityMapping = null) {
+  const text = bytes.toString('utf8');
+  if (entityMapping?.targetEntity) {
+    return mapEntitiesCsv(text, entityMapping);
+  }
+  const rows = parseCsv(text);
+  return rows.length === 0 ? '' : toCsv(rows);
+}
+
+function classifyAllowedDiff(relPath, leftBytes, rightBytes, mode, entityMapping = null) {
   if (mode === 'storage') return null;
 
   if (relPath === 'run.json') {
     try {
-      const allowBornDiff = mode === 'trial' || mode === 'clearpath_vs_mac';
+      const allowBornDiff = mode === 'trial' || mode === 'entity_mapped';
       const l = normalizeRunJson(leftBytes.toString('utf8'), { allowBornDiff });
       const r = normalizeRunJson(rightBytes.toString('utf8'), { allowBornDiff });
       if (JSON.stringify(l) === JSON.stringify(r)) {
         return allowBornDiff ? 'run.json times/birth only' : 'run.json step at/seconds only';
       }
-    } catch { /* fall through as unexpected diff */ }
+    } catch { /* Parse errors fail closed: treat file as an unexpected diff. */ }
     return null;
   }
 
@@ -128,7 +140,7 @@ function classifyAllowedDiff(relPath, leftBytes, rightBytes, mode) {
         if (l.shell === r.shell && JSON.stringify(l.config) === JSON.stringify(r.config)) {
           return 'review page runBorn/checksum/committed_at/unidentified keys only';
         }
-      } catch { /* unexpected */ }
+      } catch {}
       return null;
     }
     if (relPath === 'overlay.csv' || relPath === 'emits/overlay.csv' || relPath === 'emits/adjustments.csv') {
@@ -136,7 +148,7 @@ function classifyAllowedDiff(relPath, leftBytes, rightBytes, mode) {
         const l = normalizeCsvForTrial(leftBytes.toString('utf8'), { stripCommittedAt: true, normalizeUnidentified: true });
         const r = normalizeCsvForTrial(rightBytes.toString('utf8'), { stripCommittedAt: true, normalizeUnidentified: true });
         if (l === r) return 'approvals committed_at/unidentified keys only';
-      } catch { /* unexpected */ }
+      } catch {}
       return null;
     }
     if (relPath === 'bible.csv' || relPath === 'adjust.csv') {
@@ -144,34 +156,184 @@ function classifyAllowedDiff(relPath, leftBytes, rightBytes, mode) {
         const l = normalizeCsvForTrial(leftBytes.toString('utf8'), { stripCommittedAt: false, normalizeUnidentified: true });
         const r = normalizeCsvForTrial(rightBytes.toString('utf8'), { stripCommittedAt: false, normalizeUnidentified: true });
         if (l === r) return 'unidentified Bible keys only';
-      } catch { /* unexpected */ }
+      } catch {}
       return null;
     }
   }
 
-  if (mode === 'clearpath_vs_mac' && relPath.endsWith('.csv') && !relPath.startsWith('emits/bundles/')) {
+  if (mode === 'entity_mapped' && relPath.endsWith('.csv') && !relPath.startsWith('emits/bundles/')) {
     try {
-      const l = mapEntitiesToClearpathCsv(leftBytes.toString('utf8'));
-      const r = mapEntitiesToClearpathCsv(rightBytes.toString('utf8'));
-      if (l === r) return 'entities mapped to Clearpath (except InsureItAll)';
-    } catch { /* unexpected */ }
+      const l = mapEntitiesCsv(leftBytes.toString('utf8'), entityMapping);
+      const r = mapEntitiesCsv(rightBytes.toString('utf8'), entityMapping);
+      if (l === r) return `entities mapped to ${entityMapping.targetEntity}`;
+    } catch {}
     return null;
   }
 
   return null;
 }
 
+function verifyManifestBundles(sideMap, manifestEntry) {
+  if (!manifestEntry) {
+    return { passed: false, declaredBundles: 0, missingBundles: [], missingBundleFiles: [], reason: 'company_manifest.json missing from run' };
+  }
+  const manifestList = JSON.parse(manifestEntry.bytes.toString('utf8'));
+  const missingBundles = [];
+  const missingBundleFiles = [];
+
+  for (const bundle of manifestList) {
+    const prefix = `emits/bundles/${bundle.output}/`;
+    const viewerKey = `${prefix}viewer.html`;
+    const requiredFiles = new Set();
+
+    if (Array.isArray(bundle.files)) {
+      for (const rel of bundle.files) requiredFiles.add(rel);
+    }
+
+    const viewerEntry = sideMap.get(viewerKey);
+    if (viewerEntry) {
+      try {
+        const cfg = extractViewerConfig(viewerEntry.bytes.toString('utf8'));
+        for (const tables of Object.values(cfg.features || {})) {
+          for (const rel of Object.values(tables || {})) {
+            if (typeof rel === 'string') requiredFiles.add(rel);
+          }
+        }
+      } catch {
+        missingBundleFiles.push({ bundle: bundle.output, file: 'viewer.html', reason: 'invalid viewer config' });
+      }
+    }
+
+    const sideKeys = [...sideMap.keys()].filter((k) => k.startsWith(prefix));
+    if (sideKeys.length === 0) {
+      missingBundles.push(bundle.output);
+      continue;
+    }
+
+    if (requiredFiles.size === 0 && !viewerEntry) {
+      const hasDataCsv = sideKeys.some((k) => k.endsWith('.csv'));
+      if (!hasDataCsv) missingBundles.push(bundle.output);
+      continue;
+    }
+
+    for (const rel of requiredFiles) {
+      const fullKey = `${prefix}${rel}`;
+      if (!sideMap.has(fullKey)) {
+        missingBundleFiles.push({ bundle: bundle.output, file: rel, reason: 'missing required bundle file' });
+      }
+    }
+  }
+
+  return {
+    passed: missingBundles.length === 0 && missingBundleFiles.length === 0,
+    declaredBundles: manifestList.length,
+    missingBundles,
+    missingBundleFiles,
+  };
+}
+
+function discoverSubstanceTables(sideMap, { entity = null } = {}) {
+  const keys = [...sideMap.keys()].sort();
+  const pickEntityManagerPrefix = () => {
+    const prefixes = new Set();
+    for (const k of keys) {
+      const m = /^(emits\/bundles\/entity-managers\/[^/]+\/)/.exec(k);
+      if (m) prefixes.add(m[1]);
+    }
+    const list = [...prefixes].sort();
+    if (list.length === 0) return null;
+    if (entity) {
+      const exact = `emits/bundles/entity-managers/${entity}/`;
+      if (prefixes.has(exact)) return exact;
+    }
+    if (list.length === 1) return list[0];
+    throw new AppError(
+      'Multiple entity-manager bundles exist in run; pass target entity for substance comparison.',
+      409,
+      'AMBIGUOUS_ENTITY_BUNDLE',
+    );
+  };
+
+  const emPrefix = pickEntityManagerPrefix();
+  let viewerCfg = null;
+  if (emPrefix && sideMap.has(`${emPrefix}viewer.html`)) {
+    try {
+      viewerCfg = extractViewerConfig(sideMap.get(`${emPrefix}viewer.html`).bytes.toString('utf8'));
+    } catch {
+      viewerCfg = null;
+    }
+  }
+
+  const tables = new Map();
+
+  // Canonical Book of Business
+  if (sideMap.has('emits/canonical_bob.csv')) {
+    tables.set('canonical_bob', sideMap.get('emits/canonical_bob.csv'));
+  } else if (emPrefix && viewerCfg?.features?.CANONICAL_BOB) {
+    const entries = Object.entries(viewerCfg.features.CANONICAL_BOB);
+    for (const [tblKey, rel] of entries) {
+      const full = `${emPrefix}${rel}`;
+      if (sideMap.has(full)) {
+        tables.set(entries.length === 1 ? 'canonical_bob' : `canonical_bob/${tblKey}`, sideMap.get(full));
+      }
+    }
+  } else if (emPrefix && sideMap.has(`${emPrefix}data/canonical_bob.csv`)) {
+    tables.set('canonical_bob', sideMap.get(`${emPrefix}data/canonical_bob.csv`));
+  }
+
+  // Coherent Ledger
+  if (sideMap.has('emits/coherent_ledger.csv')) {
+    tables.set('coherent_ledger', sideMap.get('emits/coherent_ledger.csv'));
+  } else if (emPrefix && viewerCfg?.features?.COHERENT_LEDGER) {
+    const entries = Object.entries(viewerCfg.features.COHERENT_LEDGER);
+    for (const [tblKey, rel] of entries) {
+      const full = `${emPrefix}${rel}`;
+      if (sideMap.has(full)) {
+        tables.set(entries.length === 1 ? 'coherent_ledger' : `coherent_ledger/${tblKey}`, sideMap.get(full));
+      }
+    }
+  } else if (emPrefix && sideMap.has(`${emPrefix}data/coherent_ledger.csv`)) {
+    tables.set('coherent_ledger', sideMap.get(`${emPrefix}data/coherent_ledger.csv`));
+  }
+
+  // Statements per entity (when present on a run)
+  for (const k of keys) {
+    if (k.startsWith('emits/entity_statements/') && k.endsWith('.csv')) {
+      const name = k.slice('emits/entity_statements/'.length);
+      tables.set(`entity_statements/${name}`, sideMap.get(k));
+    } else if (emPrefix && k.startsWith(`${emPrefix}data/entity_statements/`) && k.endsWith('.csv')) {
+      const name = k.slice(`${emPrefix}data/entity_statements/`.length);
+      tables.set(`entity_statements/${name}`, sideMap.get(k));
+    }
+  }
+  if (emPrefix && viewerCfg?.features?.ENTITY_STATEMENTS) {
+    for (const [tblKey, rel] of Object.entries(viewerCfg.features.ENTITY_STATEMENTS)) {
+      const full = `${emPrefix}${rel}`;
+      if (sideMap.has(full)) {
+        tables.set(`entity_statements/${tblKey}`, sideMap.get(full));
+      }
+    }
+  }
+
+  return tables;
+}
+
 /**
- * Compares two run folders on disk (R13, R11 EYES on runs).
- * Always compares input/ file-by-file by SHA-256 first, then the remaining output tree.
- * mode: 'storage' | 'replay' | 'shadow' | 'trial' | 'clearpath_vs_mac'
+ * Compares two run folders on disk, checking input/ by SHA-256 before the output tree or substance tables.
+ * Supported modes: 'storage', 'replay', 'shadow', 'trial', 'entity_mapped', 'substance'.
  */
 export async function compareRunFolders(leftDir, rightDir, {
   mode = 'replay',
+  entityMapping = null,
+  entity = null,
   includeDsStore = (mode === 'storage'),
   leftLabel = leftDir,
   rightLabel = rightDir,
 } = {}) {
+  if (mode === 'entity_mapped' && !entityMapping?.targetEntity) {
+    throw new AppError('entity_mapped mode requires entityMapping.targetEntity from company configuration.', 400, 'INVALID_ENTITY_MAPPING');
+  }
+
   const filterFiles = (files) => (includeDsStore ? files : files.filter((f) => !isDsStore(f)));
   const leftAll = filterFiles(await listFilesRecursive(leftDir));
   const rightAll = filterFiles(await listFilesRecursive(rightDir));
@@ -188,7 +350,6 @@ export async function compareRunFolders(leftDir, rightDir, {
   const leftMap = await hashTree(leftDir, leftAll);
   const rightMap = await hashTree(rightDir, rightAll);
 
-  // 1. Compare input/ FIRST (R11 EYES on runs, R13.4: "inputs first, then whole trees")
   const leftInputs = leftAll.filter((f) => f.startsWith('input/'));
   const rightInputs = rightAll.filter((f) => f.startsWith('input/'));
   const inputReport = { same: 0, changed: [], onlyLeft: [], onlyRight: [], passed: true };
@@ -198,9 +359,9 @@ export async function compareRunFolders(leftDir, rightDir, {
       inputReport.onlyLeft.push(rel);
     } else if (leftMap.get(rel).sha256 === rightMap.get(rel).sha256) {
       inputReport.same += 1;
-    } else if (mode === 'clearpath_vs_mac' && rel === 'input/Agent Data/cleanagentdata.csv') {
-      const l = mapEntitiesToClearpathCsv(leftMap.get(rel).bytes.toString('utf8'));
-      const r = mapEntitiesToClearpathCsv(rightMap.get(rel).bytes.toString('utf8'));
+    } else if ((mode === 'entity_mapped' || (mode === 'substance' && entityMapping?.targetEntity)) && rel === 'input/Agent Data/cleanagentdata.csv') {
+      const l = mapEntitiesCsv(leftMap.get(rel).bytes.toString('utf8'), entityMapping);
+      const r = mapEntitiesCsv(rightMap.get(rel).bytes.toString('utf8'), entityMapping);
       if (l === r) inputReport.same += 1;
       else inputReport.changed.push({ relPath: rel, leftSha256: leftMap.get(rel).sha256, rightSha256: rightMap.get(rel).sha256 });
     } else {
@@ -212,7 +373,67 @@ export async function compareRunFolders(leftDir, rightDir, {
   }
   inputReport.passed = inputReport.changed.length === 0 && inputReport.onlyLeft.length === 0 && inputReport.onlyRight.length === 0;
 
-  // 2. Compare output tree (everything outside input/)
+  if (mode === 'substance') {
+    const leftTables = discoverSubstanceTables(leftMap, { entity });
+    const rightTables = discoverSubstanceTables(rightMap, { entity });
+    const missingRequired = [];
+    for (const required of ['canonical_bob', 'coherent_ledger']) {
+      const hasLeft = leftTables.has(required) || [...leftTables.keys()].some((k) => k.startsWith(`${required}/`));
+      const hasRight = rightTables.has(required) || [...rightTables.keys()].some((k) => k.startsWith(`${required}/`));
+      if (!hasLeft) missingRequired.push({ side: 'left', table: required });
+      if (!hasRight) missingRequired.push({ side: 'right', table: required });
+    }
+
+    const same = [];
+    const unexpectedDiffs = [];
+    const onlyLeft = [];
+    const onlyRight = [];
+
+    for (const [name, leftEntry] of leftTables.entries()) {
+      if (!rightTables.has(name)) {
+        onlyLeft.push(name);
+        continue;
+      }
+      const rightEntry = rightTables.get(name);
+      const lCanon = canonicalizeSubstanceCsv(leftEntry.bytes, entityMapping);
+      const rCanon = canonicalizeSubstanceCsv(rightEntry.bytes, entityMapping);
+      if (lCanon === rCanon) {
+        same.push(name);
+      } else {
+        unexpectedDiffs.push({
+          table: name,
+          leftSha256: leftEntry.sha256,
+          rightSha256: rightEntry.sha256,
+        });
+      }
+    }
+    for (const name of rightTables.keys()) {
+      if (!leftTables.has(name)) onlyRight.push(name);
+    }
+
+    const substancePassed = missingRequired.length === 0
+      && unexpectedDiffs.length === 0
+      && onlyLeft.length === 0
+      && onlyRight.length === 0;
+
+    return {
+      mode,
+      leftLabel,
+      rightLabel,
+      passed: inputReport.passed && substancePassed,
+      inputs: inputReport,
+      substance: {
+        same,
+        missingRequired,
+        unexpectedDiffs,
+        onlyLeft,
+        onlyRight,
+        passed: substancePassed,
+      },
+      tree: null,
+    };
+  }
+
   const leftOut = leftAll.filter((f) => !f.startsWith('input/'));
   const rightOut = rightAll.filter((f) => !f.startsWith('input/'));
   const treeReport = {
@@ -221,20 +442,20 @@ export async function compareRunFolders(leftDir, rightDir, {
     unexpectedDiffs: [],
     onlyLeft: [],
     onlyRight: [],
-    clearpathManifestCheck: null,
+    manifestBundleCheck: null,
     passed: true,
   };
 
   for (const rel of leftOut) {
-    if (mode === 'clearpath_vs_mac' && (rel.startsWith('emits/bundles/') || rel === 'company_manifest.json')) {
-      continue; // Clearpath bundles checked against Clearpath's own company_manifest.json below (R13.4)
+    if (mode === 'entity_mapped' && (rel.startsWith('emits/bundles/') || rel === 'company_manifest.json')) {
+      continue;
     }
     if (!rightMap.has(rel)) {
       treeReport.onlyLeft.push(rel);
     } else if (leftMap.get(rel).sha256 === rightMap.get(rel).sha256) {
       treeReport.same += 1;
     } else {
-      const allowedReason = classifyAllowedDiff(rel, leftMap.get(rel).bytes, rightMap.get(rel).bytes, mode);
+      const allowedReason = classifyAllowedDiff(rel, leftMap.get(rel).bytes, rightMap.get(rel).bytes, mode, entityMapping);
       if (allowedReason) {
         treeReport.allowedDiffs.push({ relPath: rel, reason: allowedReason });
       } else {
@@ -247,36 +468,20 @@ export async function compareRunFolders(leftDir, rightDir, {
     }
   }
   for (const rel of rightOut) {
-    if (mode === 'clearpath_vs_mac' && (rel.startsWith('emits/bundles/') || rel === 'company_manifest.json')) continue;
+    if (mode === 'entity_mapped' && (rel.startsWith('emits/bundles/') || rel === 'company_manifest.json')) continue;
     if (!leftMap.has(rel)) treeReport.onlyRight.push(rel);
   }
 
-  // R13.4: Clearpath bundles verified against Clearpath's own company_manifest.json
-  if (mode === 'clearpath_vs_mac') {
+  if (mode === 'entity_mapped') {
     const manifestEntry = leftMap.get('company_manifest.json') || rightMap.get('company_manifest.json');
-    const clearpathSide = leftMap.has('company_manifest.json') ? leftMap : rightMap;
-    if (!manifestEntry) {
-      treeReport.clearpathManifestCheck = { passed: false, reason: 'company_manifest.json missing from Clearpath run' };
-    } else {
-      const manifestList = JSON.parse(manifestEntry.bytes.toString('utf8'));
-      const missingBundles = [];
-      for (const bundle of manifestList) {
-        const prefix = `emits/bundles/${bundle.output}/`;
-        const hasAny = [...clearpathSide.keys()].some((k) => k.startsWith(prefix));
-        if (!hasAny) missingBundles.push(bundle.output);
-      }
-      treeReport.clearpathManifestCheck = {
-        passed: missingBundles.length === 0,
-        declaredBundles: manifestList.length,
-        missingBundles,
-      };
-    }
+    const targetSide = leftMap.has('company_manifest.json') ? leftMap : rightMap;
+    treeReport.manifestBundleCheck = verifyManifestBundles(targetSide, manifestEntry);
   }
 
   treeReport.passed = treeReport.unexpectedDiffs.length === 0
     && treeReport.onlyLeft.length === 0
     && treeReport.onlyRight.length === 0
-    && (treeReport.clearpathManifestCheck ? treeReport.clearpathManifestCheck.passed : true);
+    && (treeReport.manifestBundleCheck ? treeReport.manifestBundleCheck.passed : true);
 
   const passed = inputReport.passed && treeReport.passed;
   return {
@@ -289,10 +494,6 @@ export async function compareRunFolders(leftDir, rightDir, {
   };
 }
 
-/**
- * Rebuilds two runs stored in the database (or one DB run vs a reference folder on disk) into temporary
- * directories, compares them per R13, optionally records a `checks` row, and removes temporary directories.
- */
 export async function compareDbRuns({
   pool,
   stores,
@@ -300,6 +501,8 @@ export async function compareDbRuns({
   rightRunId = null,
   rightFolderDir = null,
   mode = 'replay',
+  entityMapping = null,
+  entity = null,
   commands = null,
   actor = null,
   tempBaseDir = tmpdir(),
@@ -313,6 +516,8 @@ export async function compareDbRuns({
       : rightFolderDir;
     const report = await compareRunFolders(tmpLeft, rightPath, {
       mode,
+      entityMapping,
+      entity,
       leftLabel: `run:${leftRunId}`,
       rightLabel: rightRunId ? `run:${rightRunId}` : rightFolderDir,
     });

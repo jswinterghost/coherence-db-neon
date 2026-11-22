@@ -1,0 +1,11 @@
+node_modules/
+.devin/
+.neon-*
+.pass2-*
+.env
+.env.*
+.DS_Store
+tmp/
+.tmp/
+*.tmp
+*.log

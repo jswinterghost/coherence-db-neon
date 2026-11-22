@@ -1,18 +1,15 @@
-// Run folder builder & verifier (R5.2, R5.6, R10.9, R13.2, R17.3).
-// Builds a fresh, isolated, writable workspace from the database + separated stores, checks every SHA-256,
-// re-hashes frozen input after every step, and always removes the temporary workspace afterwards.
+// Builds isolated writable step workspaces from PostgreSQL and stores, verifies all file SHA-256 hashes
+// before and after each step, and removes the temporary workspace afterwards.
 import { execFile } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { fingerprintBytes, sha256Hex } from '../util/crypto.mjs';
 import { assertValidRelPath } from '../util/csv.mjs';
 import { AppError } from '../util/redact.mjs';
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_OVERLAY_CHECK = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'python', 'coherence_overlay_check.py');
 
 export async function listFilesRecursive(rootDir, { skipTopDirs = new Set() } = {}) {
   const results = [];
@@ -33,7 +30,8 @@ export async function listFilesRecursive(rootDir, { skipTopDirs = new Set() } = 
 }
 
 /**
- * Checks whether the filesystem under `inputDir` treats "ALL BOB" and "All BOB" as the same folder (R5.6).
+ * Verifies that the workspace filesystem resolves "ALL BOB" and "All BOB" identically
+ * as required by Coherence intake.py.
  */
 export async function verifyCaseInsensitiveAllBob(inputDir) {
   const hasAllBobMixed = await stat(join(inputDir, 'All BOB')).then((s) => s.isDirectory(), () => false);
@@ -41,7 +39,7 @@ export async function verifyCaseInsensitiveAllBob(inputDir) {
   const hasAllBobUpper = await stat(join(inputDir, 'ALL BOB')).then((s) => s.isDirectory(), () => false);
   if (!hasAllBobUpper) {
     throw new AppError(
-      'Coherence intake.py expects ALL BOB while the input folder is All BOB; this workspace requires a case-insensitive filesystem (R5.6).',
+      'Coherence intake.py expects ALL BOB while the input folder is All BOB; this workspace requires a case-insensitive filesystem.',
       500,
       'CASE_SENSITIVE_FS_UNSUPPORTED',
     );
@@ -49,9 +47,9 @@ export async function verifyCaseInsensitiveAllBob(inputDir) {
 }
 
 /**
- * Default engine materializer: extracts the sealed git bundle and wrapper scripts from Nusear's code store,
- * checks out the exact recorded commit, verifies every code file against code_manifest_sha256,
- * verifies git status --porcelain is clean, and verifies wrapper script SHA-256s (R5.6, R6.6, CR-7).
+ * Materializes the sealed engine Git bundle and wrapper scripts from Nusear's code store,
+ * checks out the recorded commit cleanly, and verifies every file against code_manifest_sha256
+ * and wrapper hashes.
  */
 export async function defaultMaterializeEngine({
   engineVersion,
@@ -59,27 +57,27 @@ export async function defaultMaterializeEngine({
   codeStore,
   pythonPath = process.env.COHERENCE_PYTHON || 'python3',
   gitBin = '/usr/bin/git',
-  pnpmBin = '/opt/homebrew/bin/pnpm',
+  pnpmBin = process.env.COHERENCE_PNPM || 'pnpm',
   installWebDeps = false,
-  signal = null,
+  signal = undefined,
 }) {
-  const bundleBytes = await codeStore.readVerified(engineVersion.git_bundle_sha256, null, { signal });
+  const execOpts = signal ? { signal } : {};
+  const bundleBytes = await codeStore.readVerified(engineVersion.git_bundle_sha256, null, execOpts);
   const bundlePath = join(dirname(workspaceDir), `engine-${engineVersion.coherence_commit}.bundle`);
   await writeFile(bundlePath, bundleBytes, { mode: 0o600 });
   try {
-    await execFileAsync(gitBin, ['clone', '--quiet', '--no-checkout', bundlePath, workspaceDir], { signal });
-    await execFileAsync(gitBin, ['-C', workspaceDir, 'checkout', '--quiet', '--detach', engineVersion.coherence_commit], { signal });
+    await execFileAsync(gitBin, ['clone', '--quiet', '--no-checkout', bundlePath, workspaceDir], execOpts);
+    await execFileAsync(gitBin, ['-C', workspaceDir, 'checkout', '--quiet', '--detach', engineVersion.coherence_commit], execOpts);
   } finally {
     await rm(bundlePath, { force: true }).catch(() => {});
   }
 
-  // Verify every code file against code_manifest_sha256
-  const manifestBytes = await codeStore.readVerified(engineVersion.code_manifest_sha256, null, { signal });
+  const manifestBytes = await codeStore.readVerified(engineVersion.code_manifest_sha256, null, execOpts);
   const manifest = JSON.parse(manifestBytes.toString('utf8'));
   const present = await listFilesRecursive(workspaceDir, { skipTopDirs: new Set(['.git', '.venv', 'input', 'runs', 'scratch']) });
   const expectedFiles = Object.keys(manifest).sort();
   if (present.length !== expectedFiles.length || present.some((f, idx) => f !== expectedFiles[idx])) {
-    throw new AppError('Checked-out engine file list does not match sealed code manifest (R6.6).', 502, 'ENGINE_VERIFY_FAILED');
+    throw new AppError('Checked-out engine file list does not match sealed code manifest.', 502, 'ENGINE_VERIFY_FAILED');
   }
   for (const [relPath, expectedSha] of Object.entries(manifest)) {
     const fileBytes = await readFile(join(workspaceDir, ...relPath.split('/')));
@@ -88,26 +86,24 @@ export async function defaultMaterializeEngine({
     }
   }
 
-  // Verify clean checkout (R5.6: no '+' suffix on git code_hash)
-  const { stdout: statusOut } = await execFileAsync(gitBin, ['-C', workspaceDir, 'status', '--porcelain'], { signal });
+  // Require clean git status so Coherence never appends "+" to its stamped build ID.
+  const { stdout: statusOut } = await execFileAsync(gitBin, ['-C', workspaceDir, 'status', '--porcelain'], execOpts);
   if (statusOut.trim().length > 0) {
-    throw new AppError('Engine checkout is not clean after materialization (R5.6).', 502, 'ENGINE_DIRTY');
+    throw new AppError('Engine checkout is not clean after materialization.', 502, 'ENGINE_DIRTY');
   }
 
-  // Extract and verify wrapper bundle from Nusear code store (CR-7)
   const wrapperDir = join(dirname(workspaceDir), 'wrappers');
   await mkdir(wrapperDir, { recursive: true, mode: 0o700 });
-  const wrapperBytes = await codeStore.readVerified(engineVersion.wrapper_bundle_sha256, null, { signal });
+  const wrapperBytes = await codeStore.readVerified(engineVersion.wrapper_bundle_sha256, null, execOpts);
   const wrapperPkg = JSON.parse(wrapperBytes.toString('utf8'));
-  const verifyAndWrite = async (name, expectedSha, fallbackPath = null) => {
+  const verifyAndWrite = async (name, expectedSha) => {
     const content = wrapperPkg[name];
     if (typeof content !== 'string') {
-      if (fallbackPath) return fallbackPath;
       throw new AppError(`Wrapper bundle is missing ${name}.`, 502, 'WRAPPER_MISSING');
     }
     const buf = Buffer.from(content, 'utf8');
     if (sha256Hex(buf) !== expectedSha) {
-      throw new AppError(`Wrapper ${name} SHA-256 does not match engine version record (CR-7).`, 502, 'WRAPPER_VERIFY_FAILED');
+      throw new AppError(`Wrapper ${name} SHA-256 does not match engine version record.`, 502, 'WRAPPER_VERIFY_FAILED');
     }
     const target = join(wrapperDir, name);
     await writeFile(target, buf, { mode: 0o600 });
@@ -115,12 +111,12 @@ export async function defaultMaterializeEngine({
   };
   const companyEmitPath = await verifyAndWrite('company_emit.py', engineVersion.company_emit_sha256);
   await verifyAndWrite('pages_law.py', engineVersion.pages_law_sha256);
-  const overlayCheckPath = await verifyAndWrite('coherence_overlay_check.py', engineVersion.overlay_check_sha256, DEFAULT_OVERLAY_CHECK);
+  const overlayCheckPath = await verifyAndWrite('coherence_overlay_check.py', engineVersion.overlay_check_sha256);
 
   if (installWebDeps) {
     await execFileAsync(pnpmBin, ['install', '--frozen-lockfile', '--offline', '--reporter=silent'], {
       cwd: join(workspaceDir, 'web'),
-      signal,
+      ...execOpts,
     });
   }
 
@@ -159,37 +155,43 @@ export async function materializeInputEntries({ db, inputVersionId, targetDir, d
 }
 
 /**
- * R10.9: Re-hashes every file inside runs/<date>/input/ after a step completes to prove Coherence
- * never mutated the frozen input.
+ * Re-hashes every file inside runs/<date>/input/ after a step completes to prove Coherence
+ * did not mutate frozen input.
  */
 export async function verifyFrozenInputUnchanged(frozenInputDir, expectedHashes) {
   const actualFiles = await listFilesRecursive(frozenInputDir);
   const expectedFiles = [...expectedHashes.keys()].sort();
   if (actualFiles.length !== expectedFiles.length) {
     throw new AppError(
-      `Frozen input file count changed during step (expected ${expectedFiles.length}, found ${actualFiles.length}) (R10.9).`,
+      `Frozen input file count changed during step (expected ${expectedFiles.length}, found ${actualFiles.length}).`,
       500,
       'FROZEN_INPUT_MUTATED',
     );
   }
   for (let i = 0; i < expectedFiles.length; i++) {
     if (actualFiles[i] !== expectedFiles[i]) {
-      throw new AppError(`Frozen input path list changed during step (R10.9).`, 500, 'FROZEN_INPUT_MUTATED');
+      throw new AppError('Frozen input path list changed during step.', 500, 'FROZEN_INPUT_MUTATED');
     }
     const bytes = await readFile(join(frozenInputDir, ...actualFiles[i].split('/')));
     const actualSha = sha256Hex(bytes);
     if (actualSha !== expectedHashes.get(actualFiles[i])) {
-      throw new AppError(`Frozen input file ${actualFiles[i]} changed during step (R10.9).`, 500, 'FROZEN_INPUT_MUTATED');
+      throw new AppError(`Frozen input file ${actualFiles[i]} changed during step.`, 500, 'FROZEN_INPUT_MUTATED');
     }
   }
 }
 
-/**
- * Loads the current non-superseded finished artifacts of a run up through the required steps
- * into `runs/<date>/`, verifying every SHA-256.
- */
-export async function materializePriorRunArtifacts({ db, runId, runDir, stepsToRestore, stores, signal = null }) {
-  const restored = new Map();
+export async function materializePriorRunArtifacts({
+  db,
+  runId,
+  runDir,
+  stepsToRestore,
+  stores,
+  includeCodeBearing = false,
+  allowMissingWorking = false,
+  returnDetails = false,
+  signal = null,
+}) {
+  const effectiveByRelPath = new Map();
   for (const step of stepsToRestore) {
     const evRes = await db.query(
       `SELECT id, born FROM coherence.step_attempt_events
@@ -208,8 +210,37 @@ export async function materializePriorRunArtifacts({ db, runId, runDir, stepsToR
     );
     for (const row of artRes.rows) {
       assertValidRelPath(row.rel_path, 'artifact');
-      // Never write code-bearing artifacts from earlier steps if not needed for computation,
-      // EXCEPT restore full tree when requested (e.g. rebuild proof)
+      if (!includeCodeBearing && row.artifact_kind === 'code_bearing') continue;
+      effectiveByRelPath.set(row.rel_path, row);
+    }
+  }
+
+  const nonWorkingRows = [];
+  const workingRows = [];
+  for (const row of effectiveByRelPath.values()) {
+    if (row.rel_path.startsWith('working/')) workingRows.push(row);
+    else nonWorkingRows.push(row);
+  }
+
+  const restored = new Map();
+  const nonWorkingFiles = [];
+  const missingWorking = new Map();
+
+  for (const row of nonWorkingRows) {
+    const bytes = await stores.readVerified(row.store_kind, row.file_sha256, {
+      byteSize: Number(row.byte_size),
+      md5B64: row.md5_b64,
+      crc32cB64: row.crc32c_b64,
+    }, { signal });
+    const target = join(runDir, ...row.rel_path.split('/'));
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    await writeFile(target, bytes, { mode: 0o600 });
+    restored.set(row.rel_path, row.file_sha256);
+    nonWorkingFiles.push({ relPath: row.rel_path, bytes });
+  }
+
+  for (const row of workingRows) {
+    try {
       const bytes = await stores.readVerified(row.store_kind, row.file_sha256, {
         byteSize: Number(row.byte_size),
         md5B64: row.md5_b64,
@@ -219,14 +250,22 @@ export async function materializePriorRunArtifacts({ db, runId, runDir, stepsToR
       await mkdir(dirname(target), { recursive: true, mode: 0o700 });
       await writeFile(target, bytes, { mode: 0o600 });
       restored.set(row.rel_path, row.file_sha256);
+    } catch (err) {
+      if (err?.code === 'NOT_FOUND' && allowMissingWorking) {
+        missingWorking.set(row.rel_path, row);
+      } else {
+        throw err;
+      }
     }
   }
+
+  if (returnDetails) return { restored, missingWorking, nonWorkingFiles };
   return restored;
 }
 
 /**
- * Builds a complete, verified, isolated temporary workspace for one attempt or review check (R10.9).
- * Caller MUST invoke `cleanup()` in a `finally` block.
+ * Builds a verified temporary workspace for one attempt or review check;
+ * caller must invoke cleanup() in a finally block.
  */
 export async function buildAttemptWorkspace({
   db,
@@ -273,7 +312,7 @@ export async function buildAttemptWorkspace({
         signal,
       });
     } else {
-      // Later steps read ONLY inside runs/<date>/ (R5.2)
+      // Steps after assign read exclusively inside runs/<date>/.
       await mkdir(runDir, { recursive: true, mode: 0o700 });
       expectedInputHashes = await materializeInputEntries({
         db,
@@ -293,19 +332,68 @@ export async function buildAttemptWorkspace({
               ? ['assign', 'attribute', 'bible', 'adjust']
               : ['assign', 'attribute', 'bible'];
 
-      try {
-        await materializePriorRunArtifacts({ db, runId: run.id, runDir, stepsToRestore: restoreSteps, stores, signal });
-      } catch (err) {
-        // R17.3: If derivable working tables were stored as fingerprints only and are absent from object storage,
-        // rebuild them on demand and prove every rebuilt file matches its recorded fingerprint.
-        if (err?.code === 'NOT_FOUND' && typeof rebuildWorkingOnDemand === 'function') {
-          await rebuildWorkingOnDemand({ workspaceDir, runDir, engineRuntime, expectedInputHashes });
-        } else {
-          throw err;
+      const { missingWorking, nonWorkingFiles } = await materializePriorRunArtifacts({
+        db,
+        runId: run.id,
+        runDir,
+        stepsToRestore: restoreSteps,
+        stores,
+        includeCodeBearing: false,
+        allowMissingWorking: typeof rebuildWorkingOnDemand === 'function',
+        returnDetails: true,
+        signal,
+      });
+
+      if (missingWorking.size > 0) {
+        await rebuildWorkingOnDemand({
+          outerDir,
+          workspaceDir,
+          runDir,
+          run,
+          step,
+          stepsToRestore: restoreSteps,
+          missingWorking,
+          engineRuntime,
+          expectedInputHashes,
+          signal,
+        });
+
+        for (const [relPath, expectedRow] of missingWorking.entries()) {
+          const fullPath = join(runDir, ...relPath.split('/'));
+          let rebuiltBytes;
+          try {
+            rebuiltBytes = await readFile(fullPath);
+          } catch {
+            throw new AppError(
+              `On-demand working table rebuild did not produce expected file ${relPath}.`,
+              502,
+              'WORKING_REBUILD_MISSING',
+            );
+          }
+          const fp = fingerprintBytes(rebuiltBytes);
+          if (
+            fp.sha256 !== expectedRow.file_sha256
+            || fp.byteSize !== Number(expectedRow.byte_size)
+            || fp.md5B64 !== expectedRow.md5_b64
+            || fp.crc32cB64 !== expectedRow.crc32c_b64
+          ) {
+            throw new AppError(
+              `Rebuilt working file ${relPath} failed SHA-256 fingerprint verification against recorded artifacts.`,
+              502,
+              'WORKING_REBUILD_FINGERPRINT_MISMATCH',
+            );
+          }
         }
+
+        // Restore verified non-working artifacts after on-demand working rebuild so prior run.json and CSVs stay exact.
+        for (const file of nonWorkingFiles) {
+          const target = join(runDir, ...file.relPath.split('/'));
+          await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+          await writeFile(target, file.bytes, { mode: 0o600 });
+        }
+        await verifyFrozenInputUnchanged(join(runDir, 'input'), expectedInputHashes);
       }
 
-      // Restore run-local overlay.csv for adjust, emit, or adjust review checks
       if (step === 'adjust' || step === 'review_adjust') {
         const saveRes = await db.query(
           `SELECT rs.approvals_file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
@@ -342,7 +430,7 @@ export async function buildAttemptWorkspace({
         }
       }
 
-      // R13.2: For replay runs, write back the replayed run's recorded `born` into run.json after assign
+      // Replay runs restore the original run's born timestamp into run.json after assign so unidentified-policy Bible keys reproduce identically.
       if (run.origin === 'replay' && run.replays_run_id) {
         const origBornRes = await db.query(
           `SELECT born FROM coherence.step_attempt_events
@@ -367,10 +455,6 @@ export async function buildAttemptWorkspace({
   }
 }
 
-/**
- * Reconstructs a complete historical or completed run folder from the database + stores into `targetDir`
- * for storage/rebuild proof (R12.4, R13.1).
- */
 export async function rebuildRunFolderFromDb({ db, runId, targetDir, stores, includeCodeBearing = true }) {
   const runRes = await db.query(
     `SELECT id, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date, input_version_id
@@ -381,7 +465,6 @@ export async function rebuildRunFolderFromDb({ db, runId, targetDir, stores, inc
   const run = runRes.rows[0];
   await mkdir(targetDir, { recursive: true, mode: 0o700 });
 
-  // 1. Rebuild frozen input/
   await materializeInputEntries({
     db,
     inputVersionId: run.input_version_id,
@@ -389,7 +472,6 @@ export async function rebuildRunFolderFromDb({ db, runId, targetDir, stores, inc
     dataStore: stores.dataStore,
   });
 
-  // 2. Rebuild each finished non-superseded step's artifacts in step order
   for (const step of ['assign', 'attribute', 'bible', 'adjust', 'emit']) {
     const evRes = await db.query(
       "SELECT coherence.current_finished_attempt($1::uuid, $2) AS ev_id",
@@ -416,7 +498,6 @@ export async function rebuildRunFolderFromDb({ db, runId, targetDir, stores, inc
     }
   }
 
-  // 3. Restore latest run-local overlay.csv if any review_saves exist and overlay.csv wasn't already written
   const saveRes = await db.query(
     `SELECT rs.approvals_file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
      FROM coherence.review_saves rs

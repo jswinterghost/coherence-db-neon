@@ -1,20 +1,16 @@
-// ============================================================================
-// LAYER 2: MEMBER DATA, CODE PROTECTION, AND SECURITY CONFIGURATION
-// Protects: member PHI confidentiality, Nusear source code isolation, and
-// database/infrastructure security configuration — preventing code or engine
-// bytes from entering a company store, preventing record ids / member PHI /
-// SQL parameters from appearing in any log, error, or URL, preventing writes
-// during "View as", preventing any path from a customer role to code, and
-// proving PostgreSQL roles, ENABLE ALWAYS triggers, fixed search_paths,
-// local pg_hba.conf, and Cloud SQL policy match requirements.
-// ============================================================================
+// Layer 2: protects member PHI confidentiality, Nusear source-code isolation,
+// and database and infrastructure security policies.
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+import { assertCanRead, assertCanWrite } from '../src/commands/authz.mjs';
 import {
   validateCloudSqlConfig,
   verifyCloudSqlConfigFile,
@@ -28,13 +24,16 @@ import { crc32cBase64, fingerprintBytes, sha256Hex } from '../src/util/crypto.mj
 import { createSafeLogger, redactPhi, sanitizeErrorMessage } from '../src/util/redact.mjs';
 import { createWebHandlers } from '../src/web/handlers.mjs';
 import { createCoherenceRouter } from '../src/web/router.mjs';
+import { buildAttemptWorkspace, defaultMaterializeEngine } from '../src/worker/folder-builder.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
 import { createMockEngineMaterializer, makeOverlayCsv, sampleApprovalRow, seedEngineVersion, seedStandingInput } from './helpers/fixtures.mjs';
 import { checkPgAvailable, createTestEnv } from './helpers/test-db.mjs';
 
+const execFileAsync = promisify(execFile);
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const pgCheck = await checkPgAvailable();
 
-test('Layer 2 [Storage Integrity — R6.2, R10.8]: CRC32C vectors, promotion-before-checks refusal, MD5+CRC32C verification, and filesystem create-only store', async (t) => {
+test('Layer 2 [Storage Integrity]: CRC32C vectors, promotion-before-checks refusal, MD5+CRC32C verification, and filesystem create-only store', async (t) => {
   assert.equal(crc32cBase64(Buffer.alloc(0)), 'AAAAAA==');
   assert.equal(crc32cBase64(Buffer.from('123456789', 'ascii')), '4waSgw==');
 
@@ -42,14 +41,12 @@ test('Layer 2 [Storage Integrity — R6.2, R10.8]: CRC32C vectors, promotion-bef
   const dataStore = createDataStore({ backend: mem });
   const payload = Buffer.from('col1,col2\n1,2\n', 'utf8');
 
-  // 1. Promotion before checksPassed=true MUST be refused with ZERO objects stored
   await assert.rejects(
     () => dataStore.promoteBytes(payload, { relPath: 'overlay.csv', checksPassed: false }),
     /PROMOTION_BEFORE_CHECKS|before required checks/i,
   );
   assert.equal(mem.listObjectNames().length, 0);
 
-  // 2. Interrupted promotion resumes safely
   mem.hooks.failNextCreate = new Error('transient network reset');
   await assert.rejects(
     () => dataStore.promoteBytes(payload, { relPath: 'overlay.csv', checksPassed: true }),
@@ -66,7 +63,6 @@ test('Layer 2 [Storage Integrity — R6.2, R10.8]: CRC32C vectors, promotion-bef
   assert.equal(second.md5B64, first.md5B64);
   assert.equal(second.crc32cB64, first.crc32cB64);
 
-  // 3. Corrupted CRC32C on existing object is REFUSED
   mem.hooks.corruptStoredMeta.set(first.objectName, { crc32cB64: 'AAAAAA==' });
   await assert.rejects(
     () => dataStore.promoteBytes(payload, { relPath: 'overlay.csv', checksPassed: true }),
@@ -74,7 +70,6 @@ test('Layer 2 [Storage Integrity — R6.2, R10.8]: CRC32C vectors, promotion-bef
   );
   mem.hooks.corruptStoredMeta.clear();
 
-  // 4. Filesystem create-only store
   const dir = await mkdtemp(join(tmpdir(), 'coherence-filestore-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const fsStore = createDataStore({ backend: createFileObjectStore({ rootDir: dir }) });
@@ -86,8 +81,7 @@ test('Layer 2 [Storage Integrity — R6.2, R10.8]: CRC32C vectors, promotion-bef
   assert.deepEqual(await fsStore.readVerified(r1.sha256, r1), bytes);
 });
 
-test('Layer 2 [Negative Invariant — R1.6, R6.6, R6.11, R9.7, R14.1]: zero code-bearing files or engine bytes can ever enter a company store (storage + DB)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
-  // 1. Storage layer checks
+test('Layer 2 [Negative Invariant]: zero code-bearing files or engine bytes can ever enter a company store (including mid-file script tags)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const codeMem = createMemoryObjectStore({ label: 'nusear-code' });
   const dataMem = createMemoryObjectStore({ label: 'company-data' });
   const codeStore = createCodeStore({ backend: codeMem });
@@ -96,6 +90,9 @@ test('Layer 2 [Negative Invariant — R1.6, R6.6, R6.11, R9.7, R14.1]: zero code
   assert.throws(() => createStorePair({ codeStore, dataStore: createDataStore({ backend: codeMem }) }), /never share/i);
   const stores = createStorePair({ codeStore, dataStore });
 
+  const midBufferScriptCsv = `${'a,b\n'}${'1,2\n'.repeat(3000)}<script>window.__VIEWER_CONFIG__={}</script>\n${'3,4\n'.repeat(4500)}`;
+  assert.ok(Buffer.byteLength(midBufferScriptCsv, 'utf8') > 30_000);
+
   for (const [relPath, content] of [
     ['bible.html', '<!doctype html><html></html>'],
     ['company_emit.py', 'print("hi")'],
@@ -103,6 +100,7 @@ test('Layer 2 [Negative Invariant — R1.6, R6.6, R6.11, R9.7, R14.1]: zero code
     ['viewer.mjs', 'export default 1;'],
     ['fake.csv', 'window.__VIEWER_CONFIG__={"a":1};'],
     ['disguised.csv', '<!DOCTYPE html><html><script>alert(1)</script></html>'],
+    ['mid-buffer-script.csv', midBufferScriptCsv],
   ]) {
     await assert.rejects(
       () => dataStore.promoteBytes(Buffer.from(content, 'utf8'), { relPath, checksPassed: true }),
@@ -112,7 +110,7 @@ test('Layer 2 [Negative Invariant — R1.6, R6.6, R6.11, R9.7, R14.1]: zero code
   }
   assert.equal(dataMem.listObjectNames().length, 0);
 
-  const viewerArt = await stores.promoteArtifact('emits/bundles/entity-managers/Phalanx/viewer.html', Buffer.from('<!doctype html><html></html>'), { checksPassed: true });
+  const viewerArt = await stores.promoteArtifact('emits/bundles/entity-managers/Acme/viewer.html', Buffer.from('<!doctype html><html></html>'), { checksPassed: true });
   const csvArt = await stores.promoteArtifact('emits/statements_20261121.csv', Buffer.from('a,b\n1,2\n'), { checksPassed: true });
   assert.equal(viewerArt.storeKind, 'nusear_code');
   assert.equal(viewerArt.artifactKind, 'code_bearing');
@@ -120,7 +118,6 @@ test('Layer 2 [Negative Invariant — R1.6, R6.6, R6.11, R9.7, R14.1]: zero code
   assert.equal(csvArt.artifactKind, 'data');
   assert.equal(dataMem.listObjectNames()[0], `objects/${fingerprintBytes(Buffer.from('a,b\n1,2\n')).sha256}`);
 
-  // 2. Database-enforced checks (R9.7)
   const env = await createTestEnv();
   t.after(() => env.cleanup());
 
@@ -131,7 +128,7 @@ test('Layer 2 [Negative Invariant — R1.6, R6.6, R6.11, R9.7, R14.1]: zero code
       await c.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
       const je = await c.query(
         `INSERT INTO coherence.journal_entries (actor, command_kind, command_key, request_sha256, body)
-         VALUES ('kairon', 'bad_obj', 'bad-obj-key', $1, '{"commitments":{"counts":{"stored_files":1},"hashes":{}}}'::jsonb) RETURNING seq`,
+         VALUES ('test-owner', 'bad_obj', 'bad-obj-key', $1, '{"commitments":{"counts":{"stored_files":1},"hashes":{}}}'::jsonb) RETURNING seq`,
         [sha256Hex('bad-obj')],
       );
       await c.query(
@@ -157,7 +154,7 @@ test('Layer 2 [Negative Invariant — R1.6, R6.6, R6.11, R9.7, R14.1]: zero code
       const snapId = randomUUID();
       const je = await c.query(
         `INSERT INTO coherence.journal_entries (actor, command_kind, command_key, request_sha256, body)
-         VALUES ('kairon', 'bad_art', 'bad-art-key', $1, '{"commitments":{"counts":{"input_versions":1,"runs":1,"step_attempt_events":1,"artifacts":1},"hashes":{}}}'::jsonb) RETURNING seq`,
+         VALUES ('test-owner', 'bad_art', 'bad-art-key', $1, '{"commitments":{"counts":{"input_versions":1,"runs":1,"step_attempt_events":1,"artifacts":1},"hashes":{}}}'::jsonb) RETURNING seq`,
         [sha256Hex('bad-art')],
       );
       const seq = String(je.rows[0].seq);
@@ -189,15 +186,14 @@ test('Layer 2 [Negative Invariant — R1.6, R6.6, R6.11, R9.7, R14.1]: zero code
   }, /code-bearing/i);
 });
 
-test('Layer 2 [Negative Invariant — R14.3]: no record id, member identifier, or SQL parameter appears in any log, error, or URL', async () => {
-  // 1. Strings & errors (including spaces inside tilde record_ids AND PostgreSQL DETAIL/PARAMETERS SQL values!)
+test('Layer 2 [Negative Invariant]: no record id, member identifier, or SQL parameter appears in any log, error, URL, or Python overlay-checker stderr', async (t) => {
   const raw = [
-    'Failed on uhc~direct~SMITH JOHN~100.00~2026-11',
-    'and policy:aetna:H12345#effective:2026-01-01',
+    'Failed on carrier_b~direct~SMITH JOHN~100.00~2026-11',
+    'and policy:carrier_a:H12345#effective:2026-01-01',
     'MBI 1EG4-TE5-MK72 SSN 123-45-6789 email jane@example.com phone (555) 123-4567',
-    'DETAIL: Key (record_id)=(uhc~direct~DOE JANE~50.00) already exists.',
+    'DETAIL: Key (record_id)=(carrier_b~direct~DOE JANE~50.00) already exists.',
     'Failing row contains (1, SECRET_MEMBER_VAL)',
-    "PARAMETERS: $1 = 'uhc~direct~LEAKED~10.00', $2 = '555-987-6543'",
+    "PARAMETERS: $1 = 'carrier_b~direct~LEAKED~100.00', $2 = '555-987-6543'",
   ].join(' ');
   const cleaned = redactPhi(raw);
   for (const forbidden of ['SMITH', 'JOHN', 'H12345', '1EG4-TE5-MK72', '123-45-6789', 'jane@example.com', '555', 'DOE', 'JANE', 'SECRET_MEMBER_VAL', 'LEAKED']) {
@@ -208,7 +204,6 @@ test('Layer 2 [Negative Invariant — R14.3]: no record id, member identifier, o
     assert.ok(!errMsg.includes(forbidden), `sanitizeErrorMessage leaked: ${forbidden}`);
   }
 
-  // 2. Structured logger scrubs sensitive keys AND values
   const captured = [];
   const logger = createSafeLogger({
     log: (line) => captured.push(line),
@@ -216,8 +211,8 @@ test('Layer 2 [Negative Invariant — R14.3]: no record id, member identifier, o
     error: (line) => captured.push(line),
   });
   logger.error('db_failure', {
-    recordId: 'policy:aetna:P99999#effective:2026-01-01',
-    sqlParams: ['uhc~direct~MEMBER_ONE~100.00', '1EG4-TE5-MK72'],
+    recordId: 'policy:carrier_a:P99999#effective:2026-01-01',
+    sqlParams: ['carrier_b~direct~MEMBER_ONE~100.00', '1EG4-TE5-MK72'],
     detail: "Key (policy)=(SECRET_POLICY) $1 = 'HIDDEN_VAL'",
   });
   const logged = captured.join('\n');
@@ -225,12 +220,11 @@ test('Layer 2 [Negative Invariant — R14.3]: no record id, member identifier, o
     assert.ok(!logged.includes(forbidden), `safe logger leaked: ${forbidden}`);
   }
 
-  // 3. Real PostgreSQL error through command-layer must NOT leak member record_id or SQL parameters
   if (pgCheck.available) {
     const env = await createTestEnv();
     try {
       const secretRow = sampleApprovalRow({
-        record_id: 'uhc~direct~SECRET MEMBER~100.00~2026-11',
+        record_id: 'carrier_b~direct~SECRET MEMBER~100.00~2026-11',
         approved_amount: '999.99',
       });
       const csv = makeOverlayCsv([secretRow]);
@@ -252,7 +246,7 @@ test('Layer 2 [Negative Invariant — R14.3]: no record id, member identifier, o
         caught = err;
       }
       assert.ok(caught, 'DB must reject v1 approvals_file carrying approved_* columns');
-      for (const secret of ['SECRET', 'MEMBER', '999.99', 'uhc~direct']) {
+      for (const secret of ['SECRET', 'MEMBER', '999.99', 'carrier_b~direct']) {
         assert.ok(!String(caught.message).includes(secret), `command-layer error leaked ${secret}`);
       }
     } finally {
@@ -260,45 +254,92 @@ test('Layer 2 [Negative Invariant — R14.3]: no record id, member identifier, o
     }
   }
 
-  // 4. HTTP router refuses any record_id / policy key / member identifier in URLs AND refuses GET /approvals/history
+  const pyStubDir = await mkdtemp(join(tmpdir(), 'coherence-py-phi-'));
+  t.after(() => rm(pyStubDir, { recursive: true, force: true }));
+  await mkdir(join(pyStubDir, 'polars'), { recursive: true });
+  await mkdir(join(pyStubDir, 'coherence'), { recursive: true });
+  await writeFile(join(pyStubDir, 'polars', '__init__.py'), [
+    'class Frame:',
+    '    def __init__(self, cols): self.columns = cols',
+    'def read_csv(path, **kw):',
+    '    return Frame(("record_id","disposition","agent","agency","policy","book","month","status","note","committed_at","approved_amount","approved_agency","approved_agent","approved_agency_from","approved_agent_from"))',
+  ].join('\n'), 'utf8');
+  await writeFile(join(pyStubDir, 'coherence', '__init__.py'), '', 'utf8');
+  await writeFile(join(pyStubDir, 'coherence', 'run.py'), 'from pathlib import Path\ndef root(d): return Path(d)\n', 'utf8');
+  await writeFile(join(pyStubDir, 'coherence', 'overlay.py'), [
+    'ADJUSTMENT_COLUMNS_V1 = ("record_id","disposition","agent","agency","policy","book","month","status","note","committed_at")',
+    'ADJUSTMENT_COLUMNS = ADJUSTMENT_COLUMNS_V1 + ("approved_amount","approved_agency","approved_agent","approved_agency_from","approved_agent_from")',
+    'PRIOR_REL = "input/Overlay/overlay.csv"',
+    'RUN_REL = "overlay.csv"',
+    'def _read(path):',
+    '    raise RuntimeError("Parse error on carrier_b~direct~SENSITIVE MEMBER~100.00 MBI 1EG4-TE5-MK72")',
+  ].join('\n'), 'utf8');
+  await writeFile(join(pyStubDir, 'cand.csv'), 'record_id\n', 'utf8');
+  let pyStderr = '';
+  let pyExit = 0;
+  try {
+    await execFileAsync('python3', [join(REPO_ROOT, 'python', 'coherence_overlay_check.py'), '--parse-only', join(pyStubDir, 'cand.csv')], {
+      env: { ...process.env, PYTHONPATH: pyStubDir },
+    });
+  } catch (err) {
+    pyExit = err.code || 1;
+    pyStderr = String(err.stderr || '');
+  }
+  assert.notEqual(pyExit, 0);
+  for (const leaked of ['SENSITIVE', 'MEMBER', 'carrier_b~direct', '1EG4-TE5-MK72']) {
+    assert.ok(!pyStderr.includes(leaked), `coherence_overlay_check.py stderr leaked ${leaked}`);
+  }
+
   const router = createCoherenceRouter({
-    handlersByCompany: new Map([['phalanx', { getApprovalKeyHistory: async () => ({ history: [] }) }]]),
-    authenticate: async () => ({ id: 'kairon', kind: 'owner' }),
+    handlersByCompany: new Map([['acme', { getApprovalKeyHistory: async () => ({ history: [] }) }]]),
+    authenticate: async () => ({ id: 'test-owner', kind: 'owner' }),
   });
   const server = createServer((req, res) => { void router(req, res); });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
   try {
     const baseUrl = `http://127.0.0.1:${server.address().port}`;
-    const r1 = await fetch(`${baseUrl}/api/coherence/phalanx/approvals/history?recordId=policy:aetna:P10001`);
+    const r1 = await fetch(`${baseUrl}/api/coherence/acme/approvals/history?recordId=policy:carrier_a:P10001`);
     assert.equal(r1.status, 400);
     const b1 = await r1.text();
     assert.ok(!b1.includes('P10001'), 'error response must never echo recordId from URL');
 
-    const r2 = await fetch(`${baseUrl}/api/coherence/phalanx/approvals/history`);
+    const r2 = await fetch(`${baseUrl}/api/coherence/acme/approvals/history`);
     assert.equal(r2.status, 405, 'GET /approvals/history must be refused so recordIds stay in POST JSON body');
 
-    const r3 = await fetch(`${baseUrl}/api/coherence/phalanx/runs/uhc~direct~SMITH%20JOHN~100.00~2026-11`);
+    const r3 = await fetch(`${baseUrl}/api/coherence/acme/runs/carrier_b~direct~SMITH%20JOHN~100.00~2026-11`);
     assert.equal(r3.status, 400);
     const b3 = await r3.text();
     assert.ok(!b3.includes('SMITH'), 'error response must never echo tilde recordId from URL');
   } finally {
-    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolvePromise) => server.close(resolvePromise));
   }
 });
 
-test('Layer 2 [Negative Invariant — R4.5 & R1.6]: no write while viewing as someone, and zero path from customer roles (company_admin, recipient) to any code', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 2 [Negative Invariant]: View-As never writes, worker-only exclusivity, explicit company_admin grants, and zero path from customer roles to code', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createTestEnv();
   t.after(() => env.cleanup());
 
+  assert.throws(
+    () => assertCanWrite(env.ownerActor, 'finish_attempt', { companySlug: env.companySlug, allowWorkerOverride: true }),
+    (err) => err?.code === 'WORKER_ONLY' && err?.status === 403,
+  );
+  assert.throws(
+    () => assertCanRead({ id: 'acme-admin', kind: 'company_admin', company: 'acme' }, 'runs', { companySlug: 'acme' }),
+    (err) => err?.status === 403,
+  );
+  assert.throws(
+    () => assertCanRead({ id: 'acme-admin', kind: 'company_admin', company: 'acme', grants: ['runs', 'checks'] }, 'checks', { companySlug: 'acme' }),
+    (err) => err?.status === 403,
+  );
+
   const { engineVersionId } = await seedEngineVersion(env);
-  const row0 = sampleApprovalRow({ record_id: 'policy:aetna:PRIOR#effective:2026-01-01' });
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:PRIOR#effective:2026-01-01' });
   await seedStandingInput(env, { withPriorOverlay: { version: 'v2', rows: [row0], csv: makeOverlayCsv([row0]) } });
 
-  // Complete a run so outputs, review HTMLs, and viewer HTMLs exist in the DB + stores
   const worker = env.registerWorker(createEngineWorker({
     pool: env.pool,
     pgConfig: env.pgConfig,
-    companySlug: 'phalanx',
+    companySlug: env.companySlug,
     stores: env.stores,
     commands: env.commands,
     workerActor: env.workerActor,
@@ -311,112 +352,189 @@ test('Layer 2 [Negative Invariant — R4.5 & R1.6]: no write while viewing as so
   const runId = launch.result.runId;
   for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
   let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
-  const bibleRows = [row0, sampleApprovalRow({ record_id: 'policy:aetna:P10001#effective:2026-01-01' })];
+  const bibleRows = [row0, sampleApprovalRow({ record_id: 'policy:carrier_a:P10001#effective:2026-01-01' })];
   await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'sec-b', expectedJournalSeq: seq, runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv(bibleRows), 'utf8') });
   assert.equal((await worker.runOnce()).action, 'review_accepted');
-  assert.equal((await worker.runOnce()).action, 'step_finished'); // adjust
+  assert.equal((await worker.runOnce()).action, 'step_finished');
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
-  const adjRows = [...bibleRows, sampleApprovalRow({ record_id: 'aetna~direct~P10001~100.00~2026-11' })];
+  const adjRows = [...bibleRows, sampleApprovalRow({ record_id: 'carrier_a~direct~P10001~100.00~2026-11' })];
   await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'sec-a', expectedJournalSeq: seq, runId, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv(adjRows), 'utf8') });
   const adjAcc = await worker.runOnce();
   assert.equal(adjAcc.action, 'review_accepted');
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await env.commands.confirmEmit({ actor: env.ownerActor, commandKey: 'sec-e', expectedJournalSeq: seq, runId, adjustReviewSaveId: adjAcc.reviewSaveId, typedPhrase: 'create statements for 2026-11-21' });
-  assert.equal((await worker.runOnce()).action, 'step_finished'); // emit
+  assert.equal((await worker.runOnce()).action, 'step_finished');
 
-  // 1. Negative invariant: "View as" NEVER writes (every human write command refused!)
-  const viewAsOwner = { id: 'kairon', kind: 'owner', viewingAs: { id: 'jane-agent', kind: 'recipient' } };
+  const viewAsOwner = { id: 'test-owner', kind: 'owner', viewingAs: { id: 'jane-agent', kind: 'recipient' } };
   await assert.rejects(() => env.commands.launchRun({ actor: viewAsOwner, commandKey: 'va-1', statementDate: '2026-11-22', engineVersionId }), /viewing as/i);
   await assert.rejects(() => env.commands.carrySent({ actor: viewAsOwner, commandKey: 'va-2', runId, typedPhrase: 'sent 2026-11-21' }), /viewing as/i);
   await assert.rejects(() => env.commands.carryApprovals({ actor: viewAsOwner, commandKey: 'va-3', runId, typedPhrase: 'carry 2026-11-21' }), /viewing as/i);
   await assert.rejects(() => env.commands.abandonRun({ actor: viewAsOwner, commandKey: 'va-4', runId, typedPhrase: 'abandon 2026-11-21', reason: 'nope' }), /viewing as/i);
   await assert.rejects(() => env.commands.saveReviewDraft({ actor: viewAsOwner, runId, surface: 'adjust', attemptNo: 1, born: 'b', checksum: 'c', rows: [] }), /viewing as/i);
 
-  // 2. Negative invariant: NO path from a customer role (company_admin or recipient) to ANY code!
-  const handlers = createWebHandlers({ pool: env.pool, companySlug: 'phalanx', stores: env.stores, commands: env.commands, entity: 'Phalanx' });
+  const handlers = createWebHandlers({ pool: env.pool, companySlug: env.companySlug, stores: env.stores, commands: env.commands });
   let currentActor = null;
   const router = createCoherenceRouter({
-    handlersByCompany: new Map([['phalanx', handlers]]),
+    handlersByCompany: new Map([[env.companySlug, handlers]]),
     authenticate: async () => currentActor,
   });
   const server = createServer((req, res) => { void router(req, res); });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+  await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
 
   const customerActors = [
-    { id: 'phalanx-admin', kind: 'company_admin', company: 'phalanx' },
-    {
-      id: 'jane-agent',
-      kind: 'recipient',
-      company: 'phalanx',
-      recipientRole: 'SELLING_AGENT',
-      recipientName: 'Jane Agent',
-      recipientScope: { npns: ['12345678'], entities: ['Phalanx'] },
-    },
+    { id: 'acme-admin', kind: 'company_admin', company: 'acme', grants: ['inputs', 'runs', 'outputs'] },
+    { id: 'jane-agent', kind: 'recipient', company: 'acme' },
   ];
 
   for (const cust of customerActors) {
     currentActor = cust;
-    // Code-bearing file downloads refused on outputs & bundles
     for (const badPath of [
-      'emits/bundles/entity-managers/Phalanx/viewer.html',
-      'emits/bundles/selling-agents/Phalanx/jane-agent/viewer.html',
+      'emits/bundles/entity-managers/Acme/viewer.html',
+      'emits/bundles/selling-agents/Acme/jane-agent/viewer.html',
       'bible.html',
       'adjust.html',
       'company_emit.py',
     ]) {
-      const outRes = await fetch(`${baseUrl}/api/coherence/phalanx/runs/${runId}/outputs/file?path=${encodeURIComponent(badPath)}`);
+      const outRes = await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/outputs/file?path=${encodeURIComponent(badPath)}`);
       assert.equal(outRes.status, 403, `${cust.kind} must receive 403 for outputs/file?path=${badPath}`);
     }
-    const bHtml = await fetch(`${baseUrl}/api/coherence/phalanx/bundles/file?output=selling-agents/Phalanx/jane-agent&path=viewer.html`);
-    assert.equal(bHtml.status, 403, `${cust.kind} must receive 403 for bundles/file?path=viewer.html`);
 
-    // Review pages (bible.html/adjust.html), review-drift (source code check), journal, approvals all 403!
-    assert.equal((await fetch(`${baseUrl}/api/coherence/phalanx/runs/${runId}/review/bible/config`)).status, 403);
-    assert.equal((await fetch(`${baseUrl}/api/coherence/phalanx/runs/${runId}/review/adjust/config`)).status, 403);
-    assert.equal((await fetch(`${baseUrl}/api/coherence/phalanx/review-drift`)).status, 403);
-    assert.equal((await fetch(`${baseUrl}/api/coherence/phalanx/runs/${runId}/journal`)).status, 403);
-    assert.equal((await fetch(`${baseUrl}/api/coherence/phalanx/approvals/history`, {
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/bundles`)).status, 404);
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/bundles/config?output=selling-agents/Acme/jane-agent`)).status, 404);
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/bundles/file?output=selling-agents/Acme/jane-agent&path=viewer.html`)).status, 404);
+
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/review/bible/config`)).status, 403);
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/review/adjust/config`)).status, 403);
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/review-drift`)).status, 403);
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/journal`)).status, 403);
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/checks`)).status, 403);
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/approvals/history`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ recordId: 'x' }),
     })).status, 403);
 
-    // Every write route refused 403!
-    assert.equal((await fetch(`${baseUrl}/api/coherence/phalanx/runs`, {
+    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ commandKey: 'cust-launch', statementDate: '2026-11-22', engineVersionId }),
     })).status, 403);
-
-    // Allowed bundle config response contains ONLY JSON metadata, ZERO HTML/script/JS code (viewer.html stays on server)!
-    const cfgRes = await fetch(`${baseUrl}/api/coherence/phalanx/bundles/config?output=selling-agents/Phalanx/jane-agent`);
-    assert.equal(cfgRes.status, 200);
-    const cfgText = await cfgRes.text();
-    assert.ok(!/<script|<!doctype|<html|window\.__VIEWER_CONFIG__/i.test(cfgText), 'bundle config must never leak viewer.html code bytes');
   }
 
-  // Output listing for company_admin contains ZERO code-bearing files
   currentActor = customerActors[0];
-  const outList = await (await fetch(`${baseUrl}/api/coherence/phalanx/runs/${runId}/outputs`)).json();
+  const outList = await (await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/outputs`)).json();
   assert.ok(outList.files.length > 0);
   assert.ok(outList.files.every((f) => !/\.(html|js|mjs|py|sh|css)$/i.test(f.relPath)), 'company_admin output listing must never include code-bearing files');
 });
 
-test('Layer 2 [Config Assertions — Item 9]: roles/grants, ENABLE ALWAYS triggers, fixed search_path on every function, trojan search_path, local pg_hba.conf, and Cloud SQL policy checklist', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 2 [Workspace Code Isolation]: sealed wrapper verification rejects missing overlay checker and workspaces exclude bible.html and adjust.html', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv();
+  t.after(() => env.cleanup());
+  const dir = await mkdtemp(join(tmpdir(), 'coherence-ws-iso-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const fakeGit = join(dir, 'fake-git');
+  await writeFile(fakeGit, [
+    '#!/bin/sh',
+    'if [ "$1" = "clone" ]; then',
+    '  mkdir -p "$5/coherence"',
+    '  printf "" > "$5/coherence/__init__.py"',
+    '  exit 0',
+    'fi',
+    'exit 0',
+  ].join('\n'), 'utf8');
+  await chmod(fakeGit, 0o700);
+
+  const promo = (relPath, text) => env.codeStore.promoteBytes(Buffer.from(text, 'utf8'), { relPath, checksPassed: true });
+  const companyEmitPy = '# emit\n';
+  const pagesLawPy = '# pages\n';
+  const gitBundle = await promo('engine/coherence.bundle', '# v2 git bundle\n');
+  const codeManifest = await promo('engine/code-manifest.json', JSON.stringify({ 'coherence/__init__.py': sha256Hex('') }));
+  const pythonLock = await promo('engine/uv.lock', 'v=1\n');
+  const pythonWheels = await promo('engine/wheels.tar', 'w');
+  const webLock = await promo('engine/pnpm-lock.yaml', 'v=9\n');
+  const webPackages = await promo('engine/web.tar', 'p');
+  const wrapperBundle = await promo('engine/wrappers.json', JSON.stringify({
+    'company_emit.py': companyEmitPy,
+    'pages_law.py': pagesLawPy,
+  }));
+
+  const reg = await env.commands.registerEngineVersion({
+    actor: env.ownerActor,
+    commandKey: 'missing-overlay-eng',
+    label: 'v-missing-overlay',
+    coherenceCommit: '809c6ea',
+    gitBundle, codeManifest, pythonLock, pythonWheels, webLock, webPackages, wrapperBundle,
+    nusearCommit: 'abc1234',
+    companyEmitSha256: sha256Hex(companyEmitPy),
+    pagesLawSha256: sha256Hex(pagesLawPy),
+    overlayCheckSha256: sha256Hex('expected-overlay'),
+    toolchain: { os: 'Linux', os_version: '6', arch: 'x64', python: '3.12', uv: '0.5', node: '22', pnpm: '9', tz: 'America/New_York', lang: 'en_US.UTF-8', lc_all: 'en_US.UTF-8', pythonutf8: '1' },
+  });
+  const engRow = (await env.pool.query('SELECT * FROM coherence.engine_versions WHERE id = $1::uuid', [reg.result.engineVersionId])).rows[0];
+  await assert.rejects(
+    () => defaultMaterializeEngine({ engineVersion: engRow, workspaceDir: join(dir, 'ws'), codeStore: env.codeStore, gitBin: fakeGit }),
+    (err) => err?.code === 'WRAPPER_MISSING',
+  );
+
+  const { engineVersionId } = await seedEngineVersion(env);
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:PRIOR#effective:2026-01-01' });
+  await seedStandingInput(env, { withPriorOverlay: { version: 'v2', rows: [row0], csv: makeOverlayCsv([row0]) } });
+
+  const worker = env.registerWorker(createEngineWorker({
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
+    stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
+  }));
+  const launch = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'ws-iso-launch', statementDate: '2026-11-21', engineVersionId });
+  const runId = launch.result.runId;
+  for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
+  const seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
+  await env.commands.submitReview({
+    actor: env.ownerActor, commandKey: 'ws-iso-bible', expectedJournalSeq: seq, runId, surface: 'bible',
+    csvBytes: Buffer.from(makeOverlayCsv([row0, sampleApprovalRow({ note: 'b' })]), 'utf8'),
+  });
+  assert.equal((await worker.runOnce()).action, 'review_accepted');
+  assert.equal((await worker.runOnce()).action, 'step_finished');
+
+  const runRow = (await env.pool.query(
+    `SELECT id, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date, origin, input_version_id,
+            prior_approvals_sha256, engine_version_id, replays_run_id
+     FROM coherence.runs WHERE id = $1::uuid`,
+    [runId],
+  )).rows[0];
+
+  const wsAdjust = await buildAttemptWorkspace({
+    db: env.pool, run: runRow, step: 'adjust', stores: env.stores, tempBaseDir: env.tempDir, materializeEngine: createMockEngineMaterializer(),
+  });
+  try {
+    assert.equal(await stat(join(wsAdjust.runDir, 'bible.html')).then(() => true, () => false), false);
+    assert.equal(await stat(join(wsAdjust.runDir, 'bible.csv')).then(() => true, () => false), true);
+    assert.equal(await stat(join(wsAdjust.runDir, 'working', 'tx.csv')).then(() => true, () => false), true);
+  } finally {
+    await wsAdjust.cleanup();
+  }
+
+  const wsEmit = await buildAttemptWorkspace({
+    db: env.pool, run: runRow, step: 'emit', stores: env.stores, tempBaseDir: env.tempDir, materializeEngine: createMockEngineMaterializer(),
+  });
+  try {
+    assert.equal(await stat(join(wsEmit.runDir, 'bible.html')).then(() => true, () => false), false);
+    assert.equal(await stat(join(wsEmit.runDir, 'adjust.html')).then(() => true, () => false), false);
+    assert.equal(await stat(join(wsEmit.runDir, 'adjust.csv')).then(() => true, () => false), true);
+  } finally {
+    await wsEmit.cleanup();
+  }
+});
+
+test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed search_path, trojan search_path, active pg_hba.conf via SHOW hba_file, and Cloud SQL policy', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createTestEnv();
   t.after(() => env.cleanup());
 
-  // 1. Live DB catalog configuration audit:
-  //    - coherence_app has strictly SELECT + INSERT on all 20 business tables (no UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER)
-  //    - coherence_worker has strictly SELECT + INSERT on all 20 business tables
-  //    - coherence_readonly has strictly SELECT; PUBLIC has zero privileges
-  //    - trg_immutable is present and ENABLE ALWAYS (tgenabled='A') on ALL 20 business tables
-  //    - EVERY function in schema coherence pins SET search_path = pg_catalog
   const dbCfg = await verifyDatabaseConfigInvariants(env.pool);
   assert.equal(dbCfg.passed, true, `Database config audit failed:\n${dbCfg.problems.join('\n')}`);
   assert.equal(dbCfg.checkedBusinessTables, 20);
   assert.ok(dbCfg.checkedFunctions >= 40);
 
-  // 2. Runtime proof: trojan search_path cannot hijack functions, and coherence_app cannot acquire EXCLUSIVE/SHARE/ACCESS EXCLUSIVE locks
   const client = env.registerClient(await createClient(env.pgConfig));
   await client.query(`
     CREATE SCHEMA trojan;
@@ -445,20 +563,25 @@ test('Layer 2 [Config Assertions — Item 9]: roles/grants, ENABLE ALWAYS trigge
   }
   await client.query('RESET ROLE');
 
-  // 3. Local pg_hba.conf (/opt/homebrew/var/postgresql@17/pg_hba.conf) has NO trust line
-  const hba = await verifyPgHbaFile();
+  const hba = await verifyPgHbaFile({ pool: env.pool });
   assert.equal(hba.passed, true, `pg_hba.conf check failed: ${hba.problems.join('; ')}`);
   assert.ok(hba.ruleCount >= 2);
   assert.ok(hba.rules.every((r) => r.method !== 'trust'));
 
-  // Negative check: verifyPgHbaFile MUST catch a trust line!
+  const prevHbaEnv = process.env.COHERENCE_PG_HBA_PATH;
+  try {
+    delete process.env.COHERENCE_PG_HBA_PATH;
+    await assert.rejects(() => verifyPgHbaFile(), /pool|filePath|COHERENCE_PG_HBA_PATH/i);
+  } finally {
+    if (prevHbaEnv !== undefined) process.env.COHERENCE_PG_HBA_PATH = prevHbaEnv;
+  }
+
   const tmpHba = join(env.tempDir, 'bad_pg_hba.conf');
   await writeFile(tmpHba, 'local all all trust\nhost all all 127.0.0.1/32 scram-sha-256\n', 'utf8');
   const badHba = await verifyPgHbaFile(tmpHba);
   assert.equal(badHba.passed, false);
   assert.ok(badHba.problems.some((p) => /trust/i.test(p)));
 
-  // 4. Cloud SQL policy checklist reading config/cloudsql-instance.json (TLS required, no authorized networks, pgaudit parameters off)
   const csql = await verifyCloudSqlConfigFile();
   assert.equal(csql.passed, true, `Cloud SQL policy check failed: ${csql.problems.join('; ')}`);
   assert.equal(csql.config.ipConfiguration.requireSsl, true);
@@ -466,7 +589,6 @@ test('Layer 2 [Config Assertions — Item 9]: roles/grants, ENABLE ALWAYS trigge
   assert.equal(csql.config.databaseFlags['pgaudit.log_parameter'], 'off');
   assert.equal(csql.config.databaseFlags['log_parameter_max_length'], '0');
 
-  // Negative check: validateCloudSqlConfig MUST reject weakened settings!
   const badCsql = validateCloudSqlConfig({
     ...csql.config,
     ipConfiguration: { ...csql.config.ipConfiguration, requireSsl: false, authorizedNetworks: [{ value: '0.0.0.0/0' }] },

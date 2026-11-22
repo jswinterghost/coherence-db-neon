@@ -1,14 +1,13 @@
-// HTTP router wiring all R16 server-side handlers to Node http.IncomingMessage / http.ServerResponse.
-// Enforces body size limits, non-PHI error responses (R14.3), gzip negotiation, and non-sandboxed
-// data headers so Nusear's signed-in screens can fetch bundle configs and CSV files (R11, R14.2).
+// HTTP router enforcing body size limits, PHI-scrubbed errors, gzip negotiation,
+// and non-sandboxed data headers so signed-in screens can fetch review configs and data files.
 import { gzipSync } from 'node:zlib';
 import { AppError, redactPhi, sanitizeErrorMessage } from '../util/redact.mjs';
 
 const DEFAULT_MAX_JSON_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_CSV_BYTES = 64 * 1024 * 1024;
 
-// Security headers: strictly no-store, nosniff, same-origin; explicitly NO `sandbox` CSP directive
-// so CoherenceScreen can load bundle JSON configs and fetch CSV data files cleanly (R11 audit).
+// Security headers: private no-store, nosniff, same-origin, and intentionally no CSP sandbox
+// directive so signed-in screens can load JSON configs and CSV files.
 const BASE_HEADERS = Object.freeze({
   'Cache-Control': 'private, no-store',
   'X-Content-Type-Options': 'nosniff',
@@ -64,9 +63,8 @@ function sendFile(res, file, contentType = 'text/csv; charset=utf-8') {
 }
 
 /**
- * Creates a Node HTTP request handler for `/api/coherence/:company/...`.
- * `handlersByCompany`: Map<companySlug, handlers> or function(companySlug) -> handlers
- * `authenticate(req)`: returns actor object (R4) or throws 401 AppError.
+ * Creates a Node HTTP request handler for /api/coherence/:company/... using handlersByCompany
+ * (Map or lookup function) and authenticate(req).
  */
 export function createCoherenceRouter({ handlersByCompany, authenticate }) {
   const resolveHandlers = (company) => {
@@ -83,14 +81,14 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
       const method = (req.method || 'GET').toUpperCase();
       const pathname = url.pathname.replace(/\/+$/, '') || '/';
 
-      // R14.3: Member-identifying record_ids and policy keys must NEVER appear in URL paths or query strings.
+      // Reject member-identifying record_ids and policy keys in URL paths or query strings so they never enter HTTP access logs.
       const decodedUrl = decodeURIComponent(`${pathname}${url.search}`);
       if (
         url.searchParams.has('recordId')
         || url.searchParams.has('record_id')
         || redactPhi(decodedUrl) !== decodedUrl
       ) {
-        throw new AppError('Member identifiers and record ids must never be sent in URLs (R14.3).', 400, 'RECORD_ID_IN_URL_FORBIDDEN');
+        throw new AppError('Member identifiers and record ids must never be sent in URLs.', 400, 'RECORD_ID_IN_URL_FORBIDDEN');
       }
 
       const prefixMatch = /^\/api\/coherence\/([a-z0-9_-]+)(\/.*)?$/.exec(pathname);
@@ -100,7 +98,6 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
       const h = resolveHandlers(company);
       const q = (key) => url.searchParams.get(key);
 
-      // ---- Inputs (R16.1) ----
       if (parts[0] === 'inputs') {
         if (method === 'GET' && parts[1] === 'versions' && parts.length === 2) {
           return sendJson(res, 200, await h.listInputVersions(actor, { asOfSeq: q('asOfSeq'), asOf: q('asOf') }), { acceptsGzip });
@@ -119,12 +116,10 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
         }
       }
 
-      // ---- Review Drift Check (R16.2) ----
       if (method === 'GET' && parts.length === 1 && parts[0] === 'review-drift') {
         return sendJson(res, 200, await h.getReviewDriftStatus(actor));
       }
 
-      // ---- Runs (R16.2) ----
       if (parts[0] === 'runs') {
         if (method === 'GET' && parts.length === 1) {
           return sendJson(res, 200, await h.listRuns(actor, { asOfSeq: q('asOfSeq'), asOf: q('asOf') }), { acceptsGzip });
@@ -194,20 +189,18 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
         }
       }
 
-      // ---- History (R16.3) ----
       if (parts[0] === 'history' && method === 'GET' && parts[1] === 'as-of' && parts.length === 2) {
         return sendJson(res, 200, await h.getHistoryAsOf(actor, { asOfSeq: q('asOfSeq') ?? q('seq'), asOf: q('asOf') ?? q('at') }), { acceptsGzip });
       }
       if (parts[0] === 'approvals' && parts[1] === 'history' && parts.length === 2) {
-        // Strictly POST JSON body so member-naming record_id NEVER appears in HTTP URL access logs (R14.3).
+        // Require POST with a JSON body (refusing GET with 405) so member-naming record_ids never appear in HTTP access logs.
         if (method === 'POST') {
           const body = await readJsonBody(req);
           return sendJson(res, 200, await h.getApprovalKeyHistory(actor, body.recordId), { acceptsGzip });
         }
-        throw new AppError('Approval key history requires POST with a JSON body so record ids stay out of URLs (R14.3).', 405, 'METHOD_NOT_ALLOWED');
+        throw new AppError('Approval key history requires POST with a JSON body so record ids stay out of URLs.', 405, 'METHOD_NOT_ALLOWED');
       }
 
-      // ---- Checks (R16.4) ----
       if (parts[0] === 'checks') {
         if (method === 'GET' && parts.length === 1) {
           return sendJson(res, 200, await h.listChecks(actor, { kind: q('kind'), runId: q('runId') }), { acceptsGzip });
@@ -220,25 +213,10 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
         }
       }
 
-      // ---- Bundles (R16.5, R14.2) ----
-      if (parts[0] === 'bundles') {
-        if (method === 'GET' && parts.length === 1) {
-          return sendJson(res, 200, await h.listBundles(actor, { runId: q('runId'), asOfSeq: q('asOfSeq'), asOf: q('asOf') }));
-        }
-        if (method === 'GET' && parts.length === 2 && parts[1] === 'config') {
-          return sendJson(res, 200, await h.getBundleConfig(actor, { output: q('output'), runId: q('runId'), asOfSeq: q('asOfSeq'), asOf: q('asOf') }), { acceptsGzip });
-        }
-        if (method === 'GET' && parts.length === 2 && parts[1] === 'file') {
-          const file = await h.getBundleFile(actor, { output: q('output'), path: q('path'), acceptsGzip, runId: q('runId'), asOfSeq: q('asOfSeq'), asOf: q('asOf') });
-          return sendFile(res, file);
-        }
-      }
-
       throw new AppError('API route not found.', 404, 'NOT_FOUND');
     } catch (err) {
       const status = err instanceof AppError ? err.status : (err?.status || 500);
       const code = err instanceof AppError ? err.code : 'INTERNAL_ERROR';
-      // R14.3: scrub any potential member data / record_id from error responses
       sendJson(res, status, { error: sanitizeErrorMessage(err), code });
     }
   };

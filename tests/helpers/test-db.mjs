@@ -1,32 +1,22 @@
-// Isolated PostgreSQL 17 test harness (R3.1: local PG 17 defaults to /tmp:5433; W-9: zero live-service access).
+// Isolated PostgreSQL 17 test harness using throwaway test databases and in-memory stores with zero live-service access.
 import { randomBytes } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir, userInfo } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createClient, createPool } from '../../src/db/pg-client.mjs';
+import { createClient, createPool, resolveLocalUser } from '../../src/db/pg-client.mjs';
 import { runMigrations } from '../../src/db/migrate.mjs';
 import { createMemoryObjectStore } from '../../src/storage/object-store.mjs';
 import { createCodeStore, createDataStore, createStorePair } from '../../src/storage/stores.mjs';
 import { createCommandLayer } from '../../src/commands/command-layer.mjs';
 
-const TEST_DB_PREFIX = 'neon_test_';
+export const TEST_DB_PREFIX = 'coherence_test_';
 
-function resolveLocalPgUser() {
-  if (process.env.PGUSER) return process.env.PGUSER;
-  if (process.env.USER) return process.env.USER;
-  try {
-    return userInfo().username;
-  } catch {
-    return 'marcsmac';
-  }
-}
-
-export function getAdminPgConfig() {
+export function getAdminPgConfig(options = {}) {
   return {
     host: process.env.PGHOST || '/tmp',
-    port: Number(process.env.PGPORT || 5433),
+    port: Number(process.env.PGPORT || 5432),
     database: process.env.PGADMIN_DATABASE || 'postgres',
-    user: resolveLocalPgUser(),
+    user: options.user ?? resolveLocalUser(options.getUserInfo),
     password: process.env.PGPASSWORD ?? undefined,
   };
 }
@@ -72,9 +62,6 @@ export async function createEmptyMigratedTestDb() {
   return { dbName, pgConfig, pool, cleanup };
 }
 
-/**
- * Checks whether local PostgreSQL 17 is reachable; returns { available, reason }.
- */
 export async function checkPgAvailable() {
   let client;
   try {
@@ -93,11 +80,11 @@ export async function checkPgAvailable() {
 }
 
 /**
- * Creates a fresh, isolated, migrated PostgreSQL 17 database + isolated in-memory code & data stores +
- * command layer + isolated temp dir. Cleanup stops any registered workers FIRST (W-9), drops the test DB,
- * and removes the temp directory.
+ * Creates an isolated migrated PostgreSQL 17 database, in-memory code and data stores, command layer,
+ * and temp directory. Cleanup stops all registered workers before closing pools, dropping the test
+ * database, and removing temp files.
  */
-export async function createTestEnv({ companySlug = 'phalanx', displayName = 'Phalanx', defaultEmitMode = 'builtin' } = {}) {
+export async function createTestEnv({ companySlug = 'acme', displayName = 'Acme', defaultEmitMode = 'builtin' } = {}) {
   const suffix = randomBytes(6).toString('hex');
   const dbName = `${TEST_DB_PREFIX}${suffix}`;
   assertTestDbName(dbName);
@@ -122,7 +109,7 @@ export async function createTestEnv({ companySlug = 'phalanx', displayName = 'Ph
   const commands = createCommandLayer({ pool, companySlug, stores });
   const tempDir = await mkdtemp(join(tmpdir(), `coherence-test-${suffix}-`));
 
-  const ownerActor = { id: 'kairon', kind: 'owner', actingFor: null };
+  const ownerActor = { id: 'test-owner', kind: 'owner', actingFor: null };
   const workerActor = { id: `coherence-worker:${companySlug}`, kind: 'worker' };
 
   await commands.initCompany({
@@ -145,7 +132,7 @@ export async function createTestEnv({ companySlug = 'phalanx', displayName = 'Ph
   };
 
   async function cleanup() {
-    // W-9: ALWAYS stop every worker and wait for all subprocesses to exit BEFORE removing temp tools or DB!
+    // Stop every worker and wait for child processes to exit before closing connections, dropping the test DB, or removing temp files.
     for (const w of registeredWorkers) {
       await w.stop().catch(() => {});
     }
@@ -171,6 +158,8 @@ export async function createTestEnv({ companySlug = 'phalanx', displayName = 'Ph
 
   return {
     dbName,
+    companySlug,
+    displayName,
     pgConfig,
     pool,
     codeBackend,

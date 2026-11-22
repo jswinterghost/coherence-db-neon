@@ -1,5 +1,4 @@
-// Code vs Data separation policy (R1.6, R6.2, R6.6, R6.11, R9.7, R14.1).
-// Engine bytes, scripts, review pages, and viewers live ONLY in Nusear's code store.
+// Code-versus-data separation policy: engine files, scripts, review pages, and viewers live solely in Nusear's code store and never enter a company data store.
 import { SHA256_RE } from '../util/crypto.mjs';
 import { AppError } from '../util/redact.mjs';
 
@@ -16,19 +15,28 @@ export const ARTIFACT_KINDS = Object.freeze({
 const CODE_BEARING_EXT_RE = /\.(html?|xhtml|js|mjs|cjs|ts|tsx|jsx|py|sh|css|wasm|svg)$/i;
 const ENGINE_PATH_RE = /(?:^|\/)(?:coherence\/|web\/src\/|web\/dist\/|scripts\/coherence\/|pyproject\.toml$|uv\.lock$|pnpm-lock\.yaml$|vite\.config\.ts$|\.git(?:\/|$)|.*\.bundle$)/i;
 
-const CODE_CONTENT_MARKERS = [
+const START_ANCHORED_MARKERS = [
   '# v2 git bundle\n',
   '# v3 git bundle\n',
-  'window.__VIEWER_CONFIG__',
-  'window.__ADJUST_CONFIG__',
   '<!doctype html',
   '<html',
-  '<script>',
-  '<script ',
   '#!/usr/bin/env python',
   '#!/bin/sh',
   '#!/usr/bin/env bash',
 ];
+
+const EMBEDDED_CODE_MARKERS = [
+  'window.__viewer_config__',
+  'window.__adjust_config__',
+  '<script>',
+  '<script ',
+  '</script>',
+  '<!doctype html',
+  '<html',
+];
+
+const SCAN_CHUNK_SIZE = 64 * 1024;
+const SCAN_OVERLAP = 64;
 
 export function objectNameForSha256(sha256) {
   if (typeof sha256 !== 'string' || !SHA256_RE.test(sha256)) {
@@ -45,21 +53,23 @@ export function isCodeBearingPath(relPath) {
 export function isCodeBearingContent(bytes) {
   if (!bytes || bytes.length === 0) return false;
   const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
-  // Inspect head and tail (stamped script tags sit right before </head> or near end of HTML)
-  const head = buf.subarray(0, Math.min(buf.length, 4096)).toString('utf8').toLowerCase();
-  const tail = buf.length > 4096 ? buf.subarray(Math.max(0, buf.length - 8192)).toString('utf8').toLowerCase() : '';
-  for (const marker of CODE_CONTENT_MARKERS) {
-    const lower = marker.toLowerCase();
-    if (head.includes(lower) || (tail && tail.includes(lower))) {
-      return true;
+
+  const head = buf.subarray(0, Math.min(buf.length, 512)).toString('latin1').replace(/^\uFEFF/, '').trimStart().toLowerCase();
+  for (const marker of START_ANCHORED_MARKERS) {
+    if (head.startsWith(marker)) return true;
+  }
+
+  for (let offset = 0; offset < buf.length; offset += SCAN_CHUNK_SIZE) {
+    const end = Math.min(buf.length, offset + SCAN_CHUNK_SIZE + SCAN_OVERLAP);
+    const slice = buf.subarray(offset, end).toString('latin1').toLowerCase();
+    for (const marker of EMBEDDED_CODE_MARKERS) {
+      if (slice.includes(marker)) return true;
     }
+    if (end >= buf.length) break;
   }
   return false;
 }
 
-/**
- * Classifies a run artifact into data vs code_bearing and binds its target store (R6.11).
- */
 export function classifyArtifact(relPath, bytes = null) {
   if (isCodeBearingPath(relPath) || (bytes !== null && isCodeBearingContent(bytes))) {
     return { artifactKind: ARTIFACT_KINDS.CODE_BEARING, storeKind: STORE_KINDS.CODE };
@@ -67,20 +77,17 @@ export function classifyArtifact(relPath, bytes = null) {
   return { artifactKind: ARTIFACT_KINDS.DATA, storeKind: STORE_KINDS.DATA };
 }
 
-/**
- * Defense-in-depth guard: refuses any code-bearing or engine file from entering a company's data store.
- */
 export function assertDataSafeForCompanyStore(relPath, bytes) {
   if (relPath && isCodeBearingPath(relPath)) {
     throw new AppError(
-      `Refused to store code-bearing path in company data store (R1.6, R9.7, R14.1).`,
+      'Refused to store code-bearing path in company data store.',
       403,
       'CODE_IN_DATA_STORE_FORBIDDEN',
     );
   }
   if (bytes && isCodeBearingContent(bytes)) {
     throw new AppError(
-      'Refused to store code-bearing or compiled HTML/script bytes in company data store (R1.6, R9.7, R14.1).',
+      'Refused to store code-bearing or compiled HTML/script bytes in company data store.',
       403,
       'CODE_IN_DATA_STORE_FORBIDDEN',
     );

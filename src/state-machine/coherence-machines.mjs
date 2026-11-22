@@ -1,9 +1,5 @@
-// Single source of truth for Coherence's run and step attempt state machines (R8, R9.4).
-// Used to:
-// 1. Validate reachability and graph completeness statically.
-// 2. Verify PostgreSQL triggers, indexes, CHECK constraints, and derived coherence.run_stage() SQL literals.
-// 3. Drive automated state-machine and guard tests.
-// 4. Generate STATE_MACHINE.md so documentation can never drift from executable code or DB guards.
+// Single declarative specification for Coherence's run and step-attempt state machines:
+// drives static graph checks, PostgreSQL catalog verification, tests, and generated STATE_MACHINE.md.
 import { defineStateMachine, renderMachinesDocument } from './declarative-machine.mjs';
 
 export const COHERENCE_STEPS = Object.freeze([
@@ -18,7 +14,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
   id: 'coherence-step-attempt',
   title: 'Step Attempt Lifecycle',
   version: '1.0.0',
-  requirementRef: 'R6.8, R6.10, R8, R9.4, R9.6, R10.1, R10.2',
   description:
     'Lifecycle of a single numbered attempt of one Coherence step (`assign`, `attribute`, `bible`, `adjust`, `emit`). '
     + 'Attempts are numbered strictly in order, have at most one start and at most one end, and may be superseded only after an end.',
@@ -72,7 +67,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
   guards: {
     worker_holds_slot: {
       description: 'Current PostgreSQL session holds the company running slot advisory lock.',
-      requirementRef: 'R8, R9.6',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -81,8 +75,7 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
       evaluate: (ctx) => Boolean(ctx.holdsSlot),
     },
     no_company_open_attempt: {
-      description: 'No dead/open attempt exists anywhere in the company database (reconcile first).',
-      requirementRef: 'R10.1',
+      description: 'No dead or open attempt exists anywhere in the company database (reconcile first).',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -92,7 +85,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
     },
     predecessor_step_finished: {
       description: 'Predecessor step (`assign -> attribute -> bible -> adjust -> emit`) has a non-superseded finished attempt.',
-      requirementRef: 'R7.3, R8',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -102,7 +94,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
     },
     request_open_and_matching: {
       description: 'Referenced `step_request` exists, belongs to this `(run, step)`, and has not been answered.',
-      requirementRef: 'R7.4, R8',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -112,7 +103,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
     },
     same_slot_starter_connection: {
       description: 'Current connection still holds the slot AND matches the attempt starter `(slot_backend_pid, slot_backend_start)`.',
-      requirementRef: 'R8, R10.2',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -122,7 +112,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
     },
     no_end_yet: {
       description: 'Attempt has no existing end event (`finished`, `failed`, `interrupted`, `cancelled`).',
-      requirementRef: 'R8',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -131,8 +120,7 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
       evaluate: (ctx) => !ctx.alreadyEnded,
     },
     slot_free_or_other_holder: {
-      description: 'Company running slot is free, OR held by a different backend connection than the attempt starter (dead worker replaced).',
-      requirementRef: 'R8, R10.1',
+      description: 'Company running slot is free, or held by a different backend connection than the attempt starter (dead worker replaced).',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -142,7 +130,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
     },
     cancel_request_matches: {
       description: 'Optional `cancel_request_id` matches `(run_id, step, attempt_no)` and was authorized with typed phrase.',
-      requirementRef: 'R6.9, R8',
       dbEnforcement: {
         table: 'coherence.cancel_requests',
         trigger: 'trg_02_cancel_requests_before',
@@ -151,7 +138,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
     },
     attempt_already_ended: {
       description: 'Attempt has an end event (`finished`, `failed`, `interrupted`, `cancelled`) and has not already been superseded.',
-      requirementRef: 'R6.10, R8',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -161,7 +147,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
     },
     not_carried_emit: {
       description: 'An `emit` attempt cannot be superseded after its outputs were carried.',
-      requirementRef: 'R8, R9.4',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -178,7 +163,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
       to: 'started',
       guards: ['worker_holds_slot', 'no_company_open_attempt', 'predecessor_step_finished', 'request_open_and_matching'],
       effects: ['record started event with (slot_backend_pid, slot_backend_start)'],
-      requirementRef: 'R8, R9.6, R10.1',
     },
     {
       id: 'step_finish',
@@ -188,7 +172,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
       to: 'finished',
       guards: ['same_slot_starter_connection', 'no_end_yet'],
       effects: ['record finished event with census, born (assign), artifacts', 'request next step if assign/attribute'],
-      requirementRef: 'R8, R10.2',
     },
     {
       id: 'step_fail',
@@ -198,7 +181,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
       to: 'failed',
       guards: ['same_slot_starter_connection', 'no_end_yet'],
       effects: ['record failed event with log fingerprint and redacted summary'],
-      requirementRef: 'R8, R10.4',
     },
     {
       id: 'worker_lost_interrupt',
@@ -208,7 +190,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
       to: 'interrupted',
       guards: ['slot_free_or_other_holder', 'no_end_yet'],
       effects: ['record interrupted event so run is no longer running'],
-      requirementRef: 'R8, R10.1',
     },
     {
       id: 'step_cancel',
@@ -218,7 +199,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
       to: 'cancelled',
       guards: ['same_slot_starter_connection', 'no_end_yet', 'cancel_request_matches'],
       effects: ['stop engine process group', 'record cancelled event linked to cancel_request'],
-      requirementRef: 'R8, R10.4',
     },
     {
       id: 'supersede_after_end',
@@ -228,7 +208,6 @@ export const STEP_ATTEMPT_MACHINE = defineStateMachine({
       to: 'superseded',
       guards: ['attempt_already_ended', 'not_carried_emit'],
       effects: ['record superseded event so later attempt becomes current'],
-      requirementRef: 'R6.10, R8',
     },
   ],
   dbChecks: [
@@ -251,7 +230,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
   id: 'coherence-run-stage',
   title: 'Run Lifecycle (Derived Stages)',
   version: '1.0.0',
-  requirementRef: 'R8, R9.4, R10, R11',
   description:
     'The 11 derived stages of a Coherence run (computed from immutable events by `coherence.run_stage(run_id, as_of_seq)` '
     + 'and never stored as mutable state). Every guard is enforced directly inside PostgreSQL triggers.',
@@ -280,7 +258,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       id: 'waiting for Bible',
       label: 'waiting for Bible',
       description: 'Human review pause after `bible` finished; Adjust never runs until a Bible review is saved.',
-      derivationRule: 'Non-superseded finished `bible` attempt, no Adjust finished, no open request/attempt.',
+      derivationRule: 'Non-superseded finished `bible` attempt, no Adjust finished, no open request or attempt.',
     },
     {
       id: 'waiting for Adjust',
@@ -292,19 +270,19 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       id: 'ready to create statements',
       label: 'ready to create statements',
       description: 'At least one Adjust review has been saved for Adjust\'s current attempt; awaiting typed Emit confirmation.',
-      derivationRule: 'Non-superseded finished `adjust` attempt with an Adjust `review_save` for that attempt, and no open Emit request/attempt.',
+      derivationRule: 'Non-superseded finished `adjust` attempt with an Adjust `review_save` for that attempt, and no open Emit request or attempt.',
     },
     {
       id: 'emitting',
       label: 'emitting',
       description: 'Emit has been confirmed (queued or actively running on the worker).',
-      derivationRule: 'Open `emit` step request OR open un-ended `started` attempt for `emit`.',
+      derivationRule: 'Open `emit` step request or open un-ended `started` attempt for `emit`.',
     },
     {
       id: 'done',
       label: 'done',
-      description: 'Emit finished cleanly; outputs are ready to inspect and (for `app` / `company_import`) carry.',
-      derivationRule: 'Non-superseded finished `emit` attempt, not abandoned, no open request/attempt.',
+      description: 'Emit finished cleanly; outputs are ready to inspect and (for `app` or `company_import`) carry.',
+      derivationRule: 'Non-superseded finished `emit` attempt, not abandoned, no open request or attempt.',
     },
     {
       id: 'failed',
@@ -335,7 +313,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
   guards: {
     no_sent_statement_for_date: {
       description: 'No sent statement exists for this statement date (a correction belongs to a later date).',
-      requirementRef: 'R8, R9.4',
       dbEnforcement: {
         table: 'coherence.runs',
         trigger: 'trg_02_runs_before',
@@ -345,7 +322,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     no_non_abandoned_run_for_date: {
       description: 'No non-abandoned run of the same origin exists for this date (a finished uncarried run must be abandoned first).',
-      requirementRef: 'R8, R9.4',
       dbEnforcement: {
         table: 'coherence.runs',
         trigger: 'trg_02_runs_before',
@@ -355,7 +331,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     worker_holds_slot: {
       description: 'Worker holds the company running slot advisory lock, predecessor finished, request open and matching.',
-      requirementRef: 'R8, R9.6',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -365,7 +340,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     same_starter_slot_no_end: {
       description: 'Still holds the slot on the attempt starter connection and attempt has no end event yet.',
-      requirementRef: 'R8, R10.2',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -375,7 +349,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     slot_free_or_other_holder_no_end: {
       description: 'Slot is free or held by a different backend than the starter, and attempt has no end event yet.',
-      requirementRef: 'R8, R10.1',
       dbEnforcement: {
         table: 'coherence.step_attempt_events',
         trigger: 'trg_02_step_attempt_events_before',
@@ -385,7 +358,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     open_attempt_and_typed_cancel: {
       description: 'Run has an open attempt and cancel carries the typed phrase `"cancel <date>"`.',
-      requirementRef: 'R6.9, R8',
       dbEnforcement: {
         table: 'coherence.cancel_requests',
         trigger: 'trg_02_cancel_requests_before',
@@ -394,7 +366,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     no_open_request_not_abandoned: {
       description: 'No open step request, no open attempt, and run is not abandoned.',
-      requirementRef: 'R8, R9.4',
       dbEnforcement: {
         table: 'coherence.review_saves',
         trigger: 'trg_02_review_saves_before',
@@ -403,8 +374,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => !ctx.hasOpenRequest && !ctx.hasOpenAttempt && !ctx.abandoned,
     },
     no_adjust_save_for_current_adjust: {
-      description: 'No Adjust review has been saved for Adjust\'s current non-superseded attempt (CR-8).',
-      requirementRef: 'R8, R11 (CR-8)',
+      description: 'No Adjust review has been saved for Adjust\'s current non-superseded attempt.',
       dbEnforcement: {
         table: 'coherence.review_saves',
         trigger: 'trg_02_review_saves_before',
@@ -413,7 +383,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     overlay_extends_frozen_prior: {
       description: 'Coherence overlay check passed and file begins with the run\'s frozen prior approvals.',
-      requirementRef: 'R5.5, R8, R10.7',
       dbEnforcement: {
         table: 'coherence.review_saves',
         trigger: 'trg_02_review_saves_before',
@@ -422,8 +391,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => Boolean(ctx.overlayCheckPassed && ctx.extendsFrozenPrior),
     },
     no_emit_confirmed_for_current_adjust: {
-      description: 'No Emit confirmation exists for Adjust\'s current attempt (CR-1).',
-      requirementRef: 'R8, R11 (CR-1)',
+      description: 'No Emit confirmation exists for Adjust\'s current attempt.',
       dbEnforcement: {
         table: 'coherence.review_saves',
         trigger: 'trg_02_review_saves_before',
@@ -432,7 +400,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     overlay_extends_bible_save: {
       description: 'Adjust approvals file begins with this run\'s saved Bible review.',
-      requirementRef: 'R5.5, R8',
       dbEnforcement: {
         table: 'coherence.review_saves',
         trigger: 'trg_02_review_saves_before',
@@ -441,8 +408,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => Boolean(ctx.extendsBibleSave),
     },
     emit_typed_phrase_and_newest_save: {
-      description: 'Typed phrase is `"create statements for <date>"`, names this run\'s newest Adjust save, and no review submission is waiting (CR-1).',
-      requirementRef: 'R5.4, R6.17, R8, R9.4, R11 (CR-1)',
+      description: 'Typed phrase is `"create statements for <date>"`, names this run\'s newest Adjust save, and no review submission is waiting.',
       dbEnforcement: {
         table: 'coherence.emit_confirmations',
         triggers: ['trg_02_emit_confirmations_before', 'trg_emit_confirmations_verify_deferred'],
@@ -450,8 +416,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => Boolean(ctx.typedPhraseValid && ctx.namesNewestAdjustSave && !ctx.hasPendingReviewSubmission),
     },
     retry_guards: {
-      description: 'A person asks to retry a failed/interrupted/cancelled step; later attempts are superseded; Emit retry keeps its valid confirmation.',
-      requirementRef: 'R6.8, R8, R9.4',
+      description: 'A person asks to retry a failed, interrupted, or cancelled step; later attempts are superseded; Emit retry keeps its valid confirmation.',
       dbEnforcement: {
         table: 'coherence.step_requests',
         trigger: 'trg_02_step_requests_before',
@@ -460,7 +425,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
     },
     carry_sent_guards: {
       description: 'Run is `app` or `company_import` in stage `done`; file matches this run\'s finished Emit statement; at most one sent statement per date; typed phrase `"sent <date>"`.',
-      requirementRef: 'R6.18, R7.6, R8, R9.4',
       dbEnforcement: {
         table: 'coherence.carries',
         trigger: 'trg_02_carries_before',
@@ -469,8 +433,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => Boolean(ctx.carriableOrigin && ctx.matchesEmitStatement && !ctx.hasSentStatementForDate && ctx.typedPhraseValid),
     },
     carry_approvals_guards: {
-      description: 'Run is `app` or `company_import` in stage `done`; file matches this run\'s finished Emit `emits/overlay.csv`; extends current standing approvals file (S-8); typed phrase `"carry <date>"`.',
-      requirementRef: 'R6.18, R7.6, R8, R9.4, R11 (S-8)',
+      description: 'Run is `app` or `company_import` in stage `done`; file matches this run\'s finished Emit `emits/overlay.csv`; extends current standing approvals file; typed phrase `"carry <date>"`.',
       dbEnforcement: {
         table: 'coherence.carries',
         trigger: 'trg_02_carries_before',
@@ -479,8 +442,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => Boolean(ctx.carriableOrigin && ctx.matchesEmitOverlay && ctx.extendsStandingOverlay && ctx.typedPhraseValid),
     },
     abandon_guards: {
-      description: 'No open attempt, no review submission waiting, nothing carried, non-imported run, typed phrase `"abandon <date>"` and non-empty reason.',
-      requirementRef: 'R6.19, R8, R9.4',
+      description: 'No open attempt (when stage is `emitting`, allowed only while queued before `emit` starts), no review submission waiting, nothing carried, non-imported run, typed phrase `"abandon <date>"`, and non-empty reason.',
       dbEnforcement: {
         table: 'coherence.abandonments',
         triggers: ['trg_02_abandonments_before', 'trg_03_abandonments_delete_drafts'],
@@ -497,7 +459,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'preparing',
       guards: ['no_sent_statement_for_date', 'no_non_abandoned_run_for_date'],
       effects: ['create run', 'request assign (reason=launch)'],
-      requirementRef: 'R8',
       dbEnforcement: {
         table: 'coherence.runs',
         triggers: ['trg_02_runs_before', 'trg_runs_verify_deferred'],
@@ -511,7 +472,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'running a step',
       guards: ['worker_holds_slot'],
       effects: ['record started event for assign/attribute/bible/adjust'],
-      requirementRef: 'R8',
     },
     {
       id: 'worker_starts_emit',
@@ -521,7 +481,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'emitting',
       guards: ['worker_holds_slot'],
       effects: ['record started event for emit'],
-      requirementRef: 'R8',
     },
     {
       id: 'step_finishes_continue',
@@ -531,7 +490,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'preparing',
       guards: ['same_starter_slot_no_end'],
       effects: ['record finished event with artifacts', 'request next step (attribute or bible)'],
-      requirementRef: 'R7.3, R8',
     },
     {
       id: 'step_finishes_bible',
@@ -541,7 +499,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'waiting for Bible',
       guards: ['same_starter_slot_no_end'],
       effects: ['record finished event for bible', 'pause for human Bible review'],
-      requirementRef: 'R5.4, R8',
     },
     {
       id: 'step_finishes_adjust',
@@ -551,7 +508,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'waiting for Adjust',
       guards: ['same_starter_slot_no_end'],
       effects: ['record finished event for adjust', 'pause for human Adjust review'],
-      requirementRef: 'R5.4, R8',
     },
     {
       id: 'step_finishes_emit',
@@ -560,8 +516,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       from: ['emitting'],
       to: 'done',
       guards: ['same_starter_slot_no_end'],
-      effects: ['record finished event for emit with statements and bundles'],
-      requirementRef: 'R8',
+      effects: ['record finished event for emit with statements and archived outputs'],
     },
     {
       id: 'step_fails',
@@ -571,7 +526,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'failed',
       guards: ['same_starter_slot_no_end'],
       effects: ['record failed event with log'],
-      requirementRef: 'R8, R10.4',
     },
     {
       id: 'worker_lost',
@@ -581,7 +535,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'interrupted',
       guards: ['slot_free_or_other_holder_no_end'],
       effects: ['record interrupted event'],
-      requirementRef: 'R8, R10.1',
     },
     {
       id: 'cancel',
@@ -591,7 +544,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'cancelled',
       guards: ['open_attempt_and_typed_cancel', 'same_starter_slot_no_end'],
       effects: ['record cancel_request', 'stop engine process group', 'record cancelled event'],
-      requirementRef: 'R8, R10.4',
     },
     {
       id: 'bible_review_saved',
@@ -601,7 +553,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'preparing',
       guards: ['no_open_request_not_abandoned', 'no_adjust_save_for_current_adjust', 'overlay_extends_frozen_prior'],
       effects: ['record review_save (bible)', 'delete bible draft', 'supersede prior Adjust attempt if any', 'request adjust (reason=bible_saved)'],
-      requirementRef: 'R8, R10.7, R11 (CR-8)',
       dbEnforcement: {
         table: 'coherence.review_saves',
         triggers: ['trg_02_review_saves_before', 'trg_03_review_saves_delete_draft', 'trg_review_saves_verify_deferred'],
@@ -615,7 +566,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'ready to create statements',
       guards: ['no_open_request_not_abandoned', 'no_emit_confirmed_for_current_adjust', 'overlay_extends_frozen_prior', 'overlay_extends_bible_save'],
       effects: ['record review_save (adjust)', 'delete adjust draft'],
-      requirementRef: 'R8, R10.7, R11 (CR-1)',
     },
     {
       id: 'emit_confirmed',
@@ -625,7 +575,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'emitting',
       guards: ['no_open_request_not_abandoned', 'emit_typed_phrase_and_newest_save'],
       effects: ['record emit_confirmation', 'request emit (reason=emit_confirmed)'],
-      requirementRef: 'R5.4, R8, R9.4, R11 (CR-1)',
     },
     {
       id: 'retry_non_emit',
@@ -635,7 +584,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'preparing',
       guards: ['no_open_request_not_abandoned', 'retry_guards'],
       effects: ['supersede later attempts if any', 'request step (reason=retry)'],
-      requirementRef: 'R8',
     },
     {
       id: 'retry_emit',
@@ -645,7 +593,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'emitting',
       guards: ['no_open_request_not_abandoned', 'retry_guards'],
       effects: ['request emit (reason=retry) keeping original emit_confirmation'],
-      requirementRef: 'R6.8, R8',
     },
     {
       id: 'record_as_sent',
@@ -655,7 +602,6 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'done',
       guards: ['carry_sent_guards'],
       effects: ['record sent carry', 'publish next standing input version adding Sent/statements_<date>.csv'],
-      requirementRef: 'R6.18, R8, R9.4, R9.5',
     },
     {
       id: 'carry_approvals',
@@ -665,11 +611,10 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'done',
       guards: ['carry_approvals_guards'],
       effects: ['record approvals carry', 'publish next standing input version with Overlay/overlay.csv (or nothing_new=true)'],
-      requirementRef: 'R6.18, R8, R9.4, R9.5, R11 (S-8)',
     },
     {
       id: 'abandon',
-      action: 'abandon (typed)',
+      action: 'abandon (typed, when no attempt is running)',
       actorKinds: ['owner'],
       from: [
         'preparing',
@@ -685,15 +630,12 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       to: 'abandoned',
       guards: ['abandon_guards'],
       effects: ['record abandonment', 'delete review drafts'],
-      requirementRef: 'R6.19, R8, R9.4',
     },
   ],
   dbChecks: [
     {
       kind: 'derived_stage_literals',
       function: 'coherence.run_stage',
-      // `v_latest_end` returns 'failed', 'interrupted', or 'cancelled' via variable return
-      indirectReturns: ['failed', 'interrupted', 'cancelled'],
     },
   ],
 });

@@ -1,9 +1,4 @@
--- Migration 003: Derived run stage views (R8), "as of" historical query functions (R16.3),
--- approvals derivation functions (R5.5), and least-privilege PostgreSQL roles (R14.4, R11 audits).
-
--- ============================================================================
--- A. Derived run stage (R8) — never stored, supports "as of" any journal_seq
--- ============================================================================
+-- Run stage is derived on demand from immutable events and never stored, enabling "as of" historical queries.
 
 CREATE OR REPLACE FUNCTION coherence.run_stage(p_run_id uuid, p_as_of_seq bigint DEFAULT NULL)
 RETURNS text
@@ -23,12 +18,10 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  -- 1. Abandoned
   IF EXISTS (SELECT 1 FROM coherence.abandonments WHERE run_id = p_run_id AND journal_seq <= v_limit) THEN
     RETURN 'abandoned';
   END IF;
 
-  -- 2. Open running attempt
   SELECT s.step INTO v_open_step
   FROM coherence.step_attempt_events s
   WHERE s.run_id = p_run_id
@@ -50,7 +43,6 @@ BEGIN
     RETURN 'running a step';
   END IF;
 
-  -- 3. Open unanswered step request
   SELECT sr.step INTO v_req_step
   FROM coherence.step_requests sr
   WHERE sr.run_id = p_run_id
@@ -69,7 +61,6 @@ BEGIN
     RETURN 'preparing';
   END IF;
 
-  -- 4. Latest non-superseded ended attempt
   SELECT e.event_kind INTO v_latest_end
   FROM coherence.step_attempt_events e
   WHERE e.run_id = p_run_id
@@ -83,11 +74,14 @@ BEGIN
   ORDER BY coherence.step_rank(e.step) DESC, e.attempt_no DESC
   LIMIT 1;
 
-  IF v_latest_end IN ('failed', 'interrupted', 'cancelled') THEN
-    RETURN v_latest_end;
+  IF v_latest_end = 'failed' THEN
+    RETURN 'failed';
+  ELSIF v_latest_end = 'interrupted' THEN
+    RETURN 'interrupted';
+  ELSIF v_latest_end = 'cancelled' THEN
+    RETURN 'cancelled';
   END IF;
 
-  -- 5. Done (emit finished)
   SELECT e.id INTO v_emit_finished
   FROM coherence.step_attempt_events e
   WHERE e.run_id = p_run_id AND e.step = 'emit' AND e.event_kind = 'finished' AND e.journal_seq <= v_limit
@@ -102,7 +96,6 @@ BEGIN
     RETURN 'done';
   END IF;
 
-  -- 6. Adjust finished -> ready to create statements vs waiting for Adjust
   SELECT e.id INTO v_adjust_finished
   FROM coherence.step_attempt_events e
   WHERE e.run_id = p_run_id AND e.step = 'adjust' AND e.event_kind = 'finished' AND e.journal_seq <= v_limit
@@ -124,7 +117,6 @@ BEGIN
     RETURN 'waiting for Adjust';
   END IF;
 
-  -- 7. Bible finished -> waiting for Bible
   SELECT e.id INTO v_bible_finished
   FROM coherence.step_attempt_events e
   WHERE e.run_id = p_run_id AND e.step = 'bible' AND e.event_kind = 'finished' AND e.journal_seq <= v_limit
@@ -143,7 +135,7 @@ BEGIN
 END;
 $$;
 
--- Helper: latest journal_seq touching a given run (for R10.5 optimistic concurrency)
+-- Latest journal_seq touching a run across all run-scoped tables, used for optimistic concurrency checks.
 CREATE OR REPLACE FUNCTION coherence.run_latest_journal_seq(p_run_id uuid)
 RETURNS bigint
 LANGUAGE sql STABLE
@@ -186,10 +178,6 @@ SELECT
   EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = r.id) AS abandoned
 FROM coherence.runs r;
 
--- ============================================================================
--- B. Approvals derivation functions (R5.5): full log, current answers, Bible applied
--- ============================================================================
-
 CREATE OR REPLACE FUNCTION coherence.approvals_full_rows(p_file_sha256 text)
 RETURNS TABLE (
   row_no integer,
@@ -230,7 +218,7 @@ AS $$
   ORDER BY ar.row_no ASC;
 $$;
 
--- Current answer per key: last row per record_id (R5.5)
+-- Current answer per record_id: the latest row in log order wins.
 CREATE OR REPLACE FUNCTION coherence.approvals_current(p_file_sha256 text)
 RETURNS TABLE (
   row_no integer,
@@ -262,7 +250,7 @@ AS $$
   ORDER BY r.record_id, r.row_no DESC;
 $$;
 
--- Bible applied answers: last CORRECT row per Bible key (R5.5)
+-- Applied Bible answers: the latest CORRECT row per Bible record_id.
 CREATE OR REPLACE FUNCTION coherence.approvals_bible_applied(p_file_sha256 text, p_bible_keys text[])
 RETURNS TABLE (
   row_no integer,
@@ -296,7 +284,6 @@ AS $$
   ORDER BY r.record_id, r.row_no DESC;
 $$;
 
--- Standing input version as of any journal_seq (or current when NULL)
 CREATE OR REPLACE FUNCTION coherence.standing_input_version_as_of(p_as_of_seq bigint DEFAULT NULL)
 RETURNS uuid
 LANGUAGE sql STABLE
@@ -309,10 +296,6 @@ AS $$
   ORDER BY journal_seq DESC
   LIMIT 1;
 $$;
-
--- ============================================================================
--- C. Least-privilege roles (R14.4, R11 audit: no table locks / no UPDATE/DELETE/TRUNCATE on business tables)
--- ============================================================================
 
 DO $$
 DECLARE
@@ -339,7 +322,7 @@ BEGIN
     GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA coherence TO coherence_readonly;
   END IF;
 
-  -- coherence_app: SELECT + INSERT ONLY on business tables (NO UPDATE, DELETE, TRUNCATE -> cannot acquire SHARE/EXCLUSIVE/ACCESS EXCLUSIVE table locks!)
+  -- Grant SELECT and INSERT only on business tables so coherence_app cannot acquire SHARE, EXCLUSIVE, or ACCESS EXCLUSIVE table locks.
   IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'coherence_app') THEN
     GRANT USAGE ON SCHEMA coherence TO coherence_app;
     GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA coherence TO coherence_app;

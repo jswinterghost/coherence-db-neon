@@ -1,5 +1,5 @@
 {
-  "$schema_note": "Declarative Cloud SQL PostgreSQL 17 security policy for Coherence company databases (R3.1, R14.4).",
+  "$schema_note": "Declarative Cloud SQL PostgreSQL 17 security policy for company databases.",
   "databaseVersion": "POSTGRES_17",
   "ipConfiguration": {
     "ipv4Enabled": false,

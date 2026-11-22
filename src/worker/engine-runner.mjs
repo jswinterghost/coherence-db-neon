@@ -1,11 +1,9 @@
-// Coherence step process runner (R5.1, R5.6, R5.7, R10.3, R10.4).
-// Spawns Coherence in its own process group with UTF-8 / America/New_York env,
-// and terminates the entire process group on cancel, 15-minute timeout, or slot loss.
+// Coherence step process runner: spawns each step in its own process group with pinned UTF-8
+// and America/New_York environment, stopping the whole process group on cancel, timeout, or slot loss.
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { redactPhi } from '../util/redact.mjs';
+import { redactPhi, sanitizeErrorMessage } from '../util/redact.mjs';
 
 export const STEP_MODULES = Object.freeze({
   assign: 'coherence.phase1.assign',
@@ -15,12 +13,13 @@ export const STEP_MODULES = Object.freeze({
   emit: 'coherence.phase4.emit',
 });
 
-export const DEFAULT_STEP_TIMEOUT_MS = 15 * 60 * 1000; // R10.4: 15 minutes
+export const DEFAULT_STEP_TIMEOUT_MS = 15 * 60 * 1000;
+export const DEFAULT_MAX_CANCEL_POLL_FAILURES = 3;
 
 export function buildCoherenceEnv(workspaceDir, extraEnv = {}) {
-  // R5.6: UTF-8 locale and America/New_York timezone required for determinism.
+  // Pin UTF-8 locale and America/New_York timezone for deterministic Coherence output.
   return {
-    PATH: process.env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
     HOME: process.env.HOME || '',
     LANG: 'en_US.UTF-8',
     LC_ALL: 'en_US.UTF-8',
@@ -38,7 +37,7 @@ export function buildStepArgs({ step, statementDate, emitMode = 'coherence', emi
     return ['-m', STEP_MODULES[step], statementDate];
   }
   if (!companyEmitPath) {
-    throw new Error(`Emit mode '${emitMode}' requires sealed company_emit.py path (CR-7).`);
+    throw new Error(`Emit mode '${emitMode}' requires a sealed company_emit.py path.`);
   }
   if (emitMode === 'builtin') {
     return [companyEmitPath, statementDate, '--builtin'];
@@ -52,28 +51,47 @@ export function buildStepArgs({ step, statementDate, emitMode = 'coherence', emi
   throw new Error(`Unknown emitMode: ${emitMode}`);
 }
 
-export function killProcessGroup(pid, graceMs = 3000) {
+export function killProcessGroup(pid, graceMs = 3000, { killFn = process.kill, logger = null, onError = null } = {}) {
   if (!pid) return;
-  try {
-    process.kill(-pid, 'SIGTERM');
-  } catch {
-    try { process.kill(pid, 'SIGTERM'); } catch { /* already dead */ }
-  }
-  const timer = setTimeout(() => {
-    try {
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      try { process.kill(pid, 'SIGKILL'); } catch { /* already dead */ }
+
+  const reportError = (err, targetPid, sig) => {
+    if (logger && typeof logger.error === 'function') {
+      logger.error('process_group_kill_failed', {
+        pid: targetPid,
+        signal: sig,
+        code: err?.code || null,
+        reason: sanitizeErrorMessage(err),
+      });
     }
+    if (typeof onError === 'function') onError(err, { pid: targetPid, signal: sig });
+  };
+
+  const sendSignal = (sig) => {
+    try {
+      killFn(-pid, sig);
+      return;
+    } catch (groupErr) {
+      if (groupErr?.code !== 'ESRCH') {
+        reportError(groupErr, -pid, sig);
+      }
+      try {
+        killFn(pid, sig);
+      } catch (pidErr) {
+        if (pidErr?.code !== 'ESRCH') {
+          reportError(pidErr, pid, sig);
+        }
+      }
+    }
+  };
+
+  sendSignal('SIGTERM');
+  const timer = setTimeout(() => {
+    sendSignal('SIGKILL');
   }, graceMs);
   if (typeof timer.unref === 'function') timer.unref();
   return timer;
 }
 
-/**
- * Spawns one Coherence step in its own process group.
- * Returns { exitCode, outcome: 'exited'|'cancelled'|'timed_out'|'slot_lost', cancelRequestId, logBytes, tailLines, durationMs }.
- */
 export async function runCoherenceProcess({
   pythonPath,
   args,
@@ -83,7 +101,9 @@ export async function runCoherenceProcess({
   slotSignal = null,
   checkCancelled = null,
   cancelPollMs = 500,
+  maxCancelPollFailures = DEFAULT_MAX_CANCEL_POLL_FAILURES,
   killGraceMs = 2000,
+  logger = null,
   extraEnv = {},
 }) {
   const startedAt = Date.now();
@@ -108,11 +128,12 @@ export async function runCoherenceProcess({
     let settled = false;
     let timeoutHandle = null;
     let cancelHandle = null;
+    let consecutiveCancelPollErrors = 0;
 
     const child = spawn(pythonPath, args, {
       cwd: workspaceDir,
       env,
-      detached: true, // own process group so the whole tree (including Vite/pnpm) can be killed cleanly (R10.3)
+      detached: true, // Detached process group leader so process.kill(-pid) terminates child build tools (Vite/pnpm) cleanly.
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -121,7 +142,7 @@ export async function runCoherenceProcess({
         outcome = reason;
         cancelRequestId = cancelId;
         appendLog(`\n[worker] stopping process group (${reason})\n`);
-        killTimer = killProcessGroup(child.pid, killGraceMs);
+        killTimer = killProcessGroup(child.pid, killGraceMs, { logger });
       }
     };
 
@@ -141,8 +162,29 @@ export async function runCoherenceProcess({
         if (settled || outcome !== 'exited') return;
         try {
           const found = await checkCancelled();
+          consecutiveCancelPollErrors = 0;
           if (found) stopChild('cancelled', found.id);
-        } catch { /* ignore transient poll failure */ }
+        } catch (err) {
+          consecutiveCancelPollErrors += 1;
+          const safeReason = sanitizeErrorMessage(err, 'Cancel status check failed.');
+          appendLog(`[worker] cancel poll error (${consecutiveCancelPollErrors}/${maxCancelPollFailures}): ${safeReason}\n`);
+          if (logger && typeof logger.warn === 'function') {
+            logger.warn('cancel_poll_failed', {
+              consecutiveFailures: consecutiveCancelPollErrors,
+              maxFailures: maxCancelPollFailures,
+              reason: safeReason,
+            });
+          }
+          if (consecutiveCancelPollErrors >= maxCancelPollFailures) {
+            if (logger && typeof logger.error === 'function') {
+              logger.error('cancel_poll_threshold_exceeded', {
+                consecutiveFailures: consecutiveCancelPollErrors,
+                reason: safeReason,
+              });
+            }
+            stopChild('cancel_poll_failed');
+          }
+        }
       }, cancelPollMs);
       if (typeof cancelHandle.unref === 'function') cancelHandle.unref();
     }
@@ -177,9 +219,6 @@ export async function runCoherenceProcess({
   };
 }
 
-/**
- * Runs the sealed extended overlay checker script (R5.8) inside a verified workspace.
- */
 export async function runOverlayCheck({
   pythonPath,
   overlayCheckPath,
@@ -190,6 +229,7 @@ export async function runOverlayCheck({
   outJsonPath,
   timeoutMs = 300_000,
   slotSignal = null,
+  logger = null,
   extraEnv = {},
 }) {
   const args = [overlayCheckPath, statementDate, candidatePath, surface, '--out', outJsonPath];
@@ -207,7 +247,7 @@ export async function runOverlayCheck({
     const stdoutChunks = [];
     const stderrChunks = [];
 
-    const abortChild = () => { killTimer = killProcessGroup(child.pid, 1500); };
+    const abortChild = () => { killTimer = killProcessGroup(child.pid, 1500, { logger }); };
     if (slotSignal) {
       if (slotSignal.aborted) abortChild();
       else slotSignal.addEventListener('abort', abortChild, { once: true });

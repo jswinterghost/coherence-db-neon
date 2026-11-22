@@ -1,4 +1,3 @@
-// Idempotent PostgreSQL 17 migration runner.
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

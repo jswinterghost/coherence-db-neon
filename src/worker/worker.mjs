@@ -1,10 +1,9 @@
-// The Coherence engine worker (R4.6, R5, R10):
-// Holds the company running slot on a dedicated PostgreSQL connection, reconciles dead open attempts first,
-// processes pending review submissions via Coherence's own checker, and executes Coherence steps.
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+// Coherence engine worker: holds the company running slot on a dedicated PostgreSQL connection,
+// reconciles dead attempts first, checks queued review submissions, then executes queued steps.
+import { cp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createSafeLogger, sanitizeErrorMessage } from '../util/redact.mjs';
+import { AppError, createSafeLogger, sanitizeErrorMessage } from '../util/redact.mjs';
 import { buildAttemptWorkspace, listFilesRecursive, verifyFrozenInputUnchanged } from './folder-builder.mjs';
 import { buildStepArgs, DEFAULT_STEP_TIMEOUT_MS, runCoherenceProcess, runOverlayCheck } from './engine-runner.mjs';
 import { reconcileInterruptedAttempts } from './reconciler.mjs';
@@ -27,6 +26,7 @@ export function createEngineWorker({
   commands,
   workerActor = { id: `coherence-worker:${companySlug}`, kind: 'worker' },
   materializeEngine = undefined,
+  rebuildWorkingOnDemand = null,
   tempBaseDir = tmpdir(),
   pollIntervalMs = 1500,
   stepTimeoutMs = DEFAULT_STEP_TIMEOUT_MS,
@@ -35,14 +35,45 @@ export function createEngineWorker({
   livenessTimeoutMs = 3000,
   onLivenessQuery = null,
   onSlotLost = null,
-  onAfterStart = null, // optional test hook to simulate crash/disconnect mid-step (R18)
-  onBeforeFinish = null, // optional test hook to simulate crash after step ends before DB commit (RP-2 / R18)
+  onAfterStart = null, // Optional lifecycle callback invoked immediately after step start is recorded.
+  onBeforeFinish = null, // Optional lifecycle callback invoked after artifact promotion and before recording finish.
   logger = createSafeLogger(),
 }) {
   let running = false;
   let loopPromise = null;
   let activeSlot = null;
   let stopRequested = false;
+
+  async function defaultRebuildWorking({ outerDir, workspaceDir, runDir, run, stepsToRestore, engineRuntime, signal }) {
+    const wsInput = join(workspaceDir, 'input');
+    await rm(wsInput, { recursive: true, force: true }).catch(() => {});
+    await cp(join(runDir, 'input'), wsInput, { recursive: true });
+    try {
+      const rebuildSteps = stepsToRestore.includes('attribute') ? ['assign', 'attribute'] : ['assign'];
+      for (const rebuildStep of rebuildSteps) {
+        const proc = await runCoherenceProcess({
+          pythonPath: engineRuntime.pythonPath,
+          args: buildStepArgs({ step: rebuildStep, statementDate: run.statement_date }),
+          workspaceDir,
+          logPath: join(outerDir, `rebuild-${rebuildStep}.log`),
+          timeoutMs: stepTimeoutMs,
+          slotSignal: signal,
+          logger,
+        });
+        if (proc.outcome !== 'exited' || proc.exitCode !== 0) {
+          throw new AppError(
+            `On-demand working rebuild step ${rebuildStep} failed (${proc.outcome}, exit ${proc.exitCode}).`,
+            502,
+            'WORKING_REBUILD_FAILED',
+          );
+        }
+      }
+    } finally {
+      await rm(wsInput, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  const effectiveRebuildWorking = rebuildWorkingOnDemand || defaultRebuildWorking;
 
   async function processPendingReview(slot) {
     const subRes = await slot.runExclusive((client) => client.query(
@@ -86,6 +117,7 @@ export function createEngineWorker({
         stores,
         tempBaseDir,
         materializeEngine,
+        rebuildWorkingOnDemand: effectiveRebuildWorking,
         signal: slot.signal,
       });
       slot.assertHeld();
@@ -103,12 +135,13 @@ export function createEngineWorker({
         surface: sub.surface,
         outJsonPath,
         slotSignal: slot.signal,
+        logger,
       });
 
       if (slot.isLost()) return { action: 'slot_lost', submissionId: sub.id };
 
       if (!checked.ok) {
-        // R10.7 & R18: rejected submission NEVER promotes bytes and NEVER stalls the worker.
+        // Rejected review submissions are finalized without promoting bytes so they never stall the worker queue.
         const rejected = await slot.runExclusive((client) => commands.rejectReviewSubmission({
           client,
           actor: workerActor,
@@ -120,7 +153,6 @@ export function createEngineWorker({
         return { action: 'review_rejected', ...rejected };
       }
 
-      // Determine parent approvals_file (extends_sha256)
       let extendsSha256 = run.prior_approvals_sha256 || null;
       if (sub.surface === 'adjust') {
         const bibleSaveRes = await slot.runExclusive((client) => client.query(
@@ -133,7 +165,7 @@ export function createEngineWorker({
         if (bibleSaveRes.rows.length > 0) extendsSha256 = bibleSaveRes.rows[0].approvals_file_sha256;
       }
 
-      // R10.8: Promote ONLY AFTER Coherence's overlay check passed!
+      // Promote bytes to object storage only after Coherence's overlay check passes.
       slot.assertHeld();
       const storedFile = await stores.dataStore.promoteBytes(csvBytes, {
         relPath: 'overlay.csv',
@@ -160,7 +192,7 @@ export function createEngineWorker({
       return { action: 'review_accepted', ...accepted };
     } catch (err) {
       if (slot.isLost()) return { action: 'slot_lost', submissionId: sub.id };
-      // Never let a failed submission stall the company worker (R10.7, R18).
+      // Finalize unexpected review-check errors as failed so a bad submission cannot wedge the worker.
       const failed = await slot.runExclusive((client) => commands.rejectReviewSubmission({
         client,
         actor: workerActor,
@@ -204,7 +236,6 @@ export function createEngineWorker({
       replays_run_id: req.replays_run_id,
     };
 
-    // 1. Record step started on slot connection
     const started = await slot.runExclusive((client) => commands.startStepAttempt({
       client,
       actor: workerActor,
@@ -230,6 +261,7 @@ export function createEngineWorker({
         stores,
         tempBaseDir,
         materializeEngine,
+        rebuildWorkingOnDemand: effectiveRebuildWorking,
         signal: slot.signal,
       });
       slot.assertHeld();
@@ -264,9 +296,10 @@ export function createEngineWorker({
         slotSignal: slot.signal,
         checkCancelled,
         cancelPollMs,
+        logger,
       });
 
-      // R10.2: If slot was lost at any point, NEVER record finished/failed/cancelled!
+      // After slot loss, exit without recording an end event so the reconciler marks the attempt interrupted.
       if (slot.isLost() || proc.outcome === 'slot_lost') {
         logger.warn('step_aborted_slot_lost', { runId: run.id, step: req.step, attemptNo });
         return { action: 'slot_lost', runId: run.id, step: req.step, attemptNo };
@@ -296,7 +329,10 @@ export function createEngineWorker({
         return { action: 'step_cancelled', runId: run.id, step: req.step, attemptNo, journalSeq: res.journalSeq };
       }
 
-      if (proc.outcome === 'timed_out') {
+      if (proc.outcome === 'timed_out' || proc.outcome === 'cancel_poll_failed') {
+        const summary = proc.outcome === 'timed_out'
+          ? `Step exceeded time limit (${Math.round(stepTimeoutMs / 1000)} s) and its process group was stopped.`
+          : 'Cancel status polling failed repeatedly; process group stopped.';
         const res = await slot.runExclusive((client) => commands.failStepAttempt({
           client,
           actor: workerActor,
@@ -305,12 +341,17 @@ export function createEngineWorker({
           step: req.step,
           attemptNo,
           logFile: logStored,
-          errorSummary: `Step exceeded time limit (${Math.round(stepTimeoutMs / 1000)} s) and its process group was stopped.`,
+          errorSummary: summary,
         }));
-        return { action: 'step_timed_out', runId: run.id, step: req.step, attemptNo, journalSeq: res.journalSeq };
+        return {
+          action: proc.outcome === 'timed_out' ? 'step_timed_out' : 'step_failed',
+          runId: run.id,
+          step: req.step,
+          attemptNo,
+          journalSeq: res.journalSeq,
+        };
       }
 
-      // Check exit code and Coherence run.json mark
       const runJsonPath = join(workspace.runDir, 'run.json');
       let runJson = null;
       try { runJson = JSON.parse(await readFile(runJsonPath, 'utf8')); } catch { runJson = null; }
@@ -330,10 +371,8 @@ export function createEngineWorker({
         return { action: 'step_failed', runId: run.id, step: req.step, attemptNo, journalSeq: res.journalSeq };
       }
 
-      // R10.9: Re-hash frozen runs/<date>/input/ after EVERY step!
       await verifyFrozenInputUnchanged(join(workspace.runDir, 'input'), workspace.expectedInputHashes);
 
-      // Collect and promote this step's output artifacts (strictly separating code_bearing vs data!)
       const filter = STEP_ARTIFACT_FILTERS[req.step];
       const allRunFiles = await listFilesRecursive(workspace.runDir, { skipTopDirs: new Set(['input']) });
       const stepRelPaths = allRunFiles.filter(filter);
@@ -398,12 +437,6 @@ export function createEngineWorker({
     }
   }
 
-  /**
-   * Executes one full worker cycle holding the company running slot:
-   * 1. Reconcile any dead open attempts.
-   * 2. Process one pending review submission (if any).
-   * 3. Otherwise process one open step request (if any).
-   */
   async function runOnce() {
     const slot = await acquireRunningSlot({
       pgConfig,
@@ -412,6 +445,7 @@ export function createEngineWorker({
       livenessTimeoutMs,
       onLivenessQuery,
       onSlotLost,
+      logger,
     });
     if (!slot) return { action: 'slot_busy' };
     activeSlot = slot;

@@ -1,5 +1,5 @@
-// Reconciler (R10.1): finds open step attempts left behind by dead workers and marks them interrupted
-// BEFORE anything else runs. Also cleans up expired operational review drafts (R6.16).
+// Reconciler: marks open attempts left behind by dead workers as interrupted before any new work runs,
+// and deletes expired review drafts.
 
 export async function findOpenAttempts(db) {
   const res = await db.query(
@@ -28,9 +28,8 @@ export async function findOpenAttempts(db) {
 }
 
 /**
- * Reconciles every dead open attempt. Can be called either holding the slot (on a new worker connection)
- * or without the slot when the slot is free; PostgreSQL's trigger refuses interruption if the original
- * owning worker still holds the slot (R8, R10.1).
+ * Reconciles dead open attempts when the running slot is free or held by a replacement worker;
+ * PostgreSQL refuses interruption while the original starter still holds the slot.
  */
 export async function reconcileInterruptedAttempts({
   pool,
@@ -65,7 +64,6 @@ export async function reconcileInterruptedAttempts({
     });
   }
 
-  // Operational cleanup of expired 30-day review drafts (R6.16)
   if (!slot) {
     await commands.expireOldDrafts();
   } else {

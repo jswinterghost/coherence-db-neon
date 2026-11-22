@@ -1,6 +1,5 @@
-// Member data redaction for logs and error messages (R14.3).
-// Coherence record_ids embed member names, MBIs, and policy numbers (e.g. "uhc~direct~SMITH JOHN~..."),
-// so any error or log string emitted by Coherence or a handler must be scrubbed before logging or returning.
+// Member data redaction for logs and error messages: Coherence record_ids embed member names, MBIs,
+// and policy numbers (for example "carrier~direct~MEMBER~100.00~2026-01"), so all emitted errors and logs must be scrubbed first.
 
 const RECORD_ID_MULTI_TILDE_RE = /\b[a-z0-9_]+~[^~\r\n,;'"\]})]+~[^~\r\n,;'"\]})]+(?:~[^~\r\n,;'"\]})]+)*/gi;
 const RECORD_ID_TILDE_RE = /\b[a-z0-9_]+~[^\s,;'"\]})]{4,}/gi;

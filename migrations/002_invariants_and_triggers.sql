@@ -1,10 +1,4 @@
--- Migration 002: Database-enforced invariants, journal hash chain, immutability (ENABLE ALWAYS),
--- canonical commitments, slot lock enforcement, and all R8/R9/R11 guards.
--- Every function pins SET search_path = pg_catalog and schema-qualifies every reference.
-
--- ============================================================================
--- A. Canonical JSON, hashing, slot advisory lock helpers, and approvals chain
--- ============================================================================
+-- Every function in schema coherence pins SET search_path = pg_catalog and schema-qualifies all references.
 
 CREATE OR REPLACE FUNCTION coherence.slot_class_id()
 RETURNS integer
@@ -273,9 +267,7 @@ AS $$
   );
 $$;
 
--- ============================================================================
--- B. R9.1 Immutability: forbid UPDATE, DELETE, TRUNCATE under ALL settings
--- ============================================================================
+-- Immutability: ENABLE ALWAYS triggers block UPDATE, DELETE, and TRUNCATE even under session_replication_role = 'replica'.
 
 CREATE OR REPLACE FUNCTION coherence.forbid_mutation()
 RETURNS trigger
@@ -283,7 +275,7 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $$
 BEGIN
-  RAISE EXCEPTION 'business table %.% is immutable: % is forbidden (R9.1)',
+  RAISE EXCEPTION 'business table %.% is immutable: % is forbidden',
     TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP
     USING ERRCODE = '55000';
 END;
@@ -313,10 +305,6 @@ BEGIN
 END;
 $$;
 
--- ============================================================================
--- C. R9.2 Journal chain enforcement & R9.3 active-tx / commitment enforcement
--- ============================================================================
-
 CREATE OR REPLACE FUNCTION coherence.trg_journal_before_insert()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -330,7 +318,6 @@ DECLARE
   v_expected_prev_hash text;
   v_computed_hash text;
 BEGIN
-  -- R9.2: writes only at SERIALIZABLE isolation
   IF pg_catalog.current_setting('transaction_isolation') <> 'serializable' THEN
     RAISE EXCEPTION 'journal_entries writes require SERIALIZABLE isolation (current: %)',
       pg_catalog.current_setting('transaction_isolation')
@@ -357,7 +344,7 @@ BEGIN
     v_expected_prev_hash := v_prev_hash;
   END IF;
 
-  -- R9.2 & R11 audit: verify given seq/prev_hash/recorded_at/entry_hash exactly, NEVER overwrite!
+  -- Verify caller-supplied seq, prev_hash, recorded_at, and entry_hash strictly; never overwrite supplied values.
   IF NEW.seq IS NULL THEN
     NEW.seq := v_expected_seq;
   ELSIF NEW.seq <> v_expected_seq THEN
@@ -399,7 +386,7 @@ CREATE TRIGGER trg_journal_before_insert
   BEFORE INSERT ON coherence.journal_entries
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_journal_before_insert();
 
--- R9.2 & R11 audit: strictly ONE journal entry per INSERT statement (blocks multi-row inserts)
+-- Require exactly one journal row per INSERT statement so row triggers always observe the true chain tip.
 CREATE OR REPLACE FUNCTION coherence.trg_journal_single_row()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -422,7 +409,7 @@ CREATE TRIGGER trg_journal_single_row
   REFERENCING NEW TABLE AS new_rows
   FOR EACH STATEMENT EXECUTE FUNCTION coherence.trg_journal_single_row();
 
--- R9.3: Every child business row MUST attach to a journal entry created in THIS transaction (never a previously committed one).
+-- Every child business row must attach to a journal entry created in the current transaction (blocking post-commit attachment).
 CREATE OR REPLACE FUNCTION coherence.trg_require_active_journal()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -469,8 +456,7 @@ BEGIN
 END;
 $$;
 
--- R9.3 Deferred commitment verifier on journal_entries: verifies every attached table count matches declared body->commitments->counts
--- and verifies canonical hashes for large lists committed in the journal entry.
+-- Deferred at COMMIT: verifies every child table row count and canonical hashes against journal_entries.body->commitments.
 CREATE OR REPLACE FUNCTION coherence.trg_journal_verify_commitments()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -486,7 +472,7 @@ DECLARE
   v_declared_hash text;
 BEGIN
   IF NOT (NEW.body ? 'commitments') OR pg_catalog.jsonb_typeof(NEW.body->'commitments') <> 'object' THEN
-    RAISE EXCEPTION 'journal entry % body must include commitments object (R9.3)', NEW.seq
+    RAISE EXCEPTION 'journal entry % body must include commitments object', NEW.seq
       USING ERRCODE = '22023';
   END IF;
 
@@ -508,7 +494,24 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- Verify canonical list hashes for stored_files when inserted
+  IF COALESCE((v_counts->>'company_meta')::bigint, 0) > 0 THEN
+    v_declared_hash := v_hashes->>'company_meta';
+    SELECT coherence.sha256_text(
+      COALESCE(pg_catalog.string_agg(
+        coherence.canonical_json(pg_catalog.jsonb_build_array(
+          company_slug, display_name, default_emit_mode, default_emit_display, default_emit_keep, default_emit_no_manager
+        )) || E'\n',
+        '' ORDER BY company_slug COLLATE "C"
+      ), '')
+    ) INTO v_hash
+    FROM coherence.company_meta
+    WHERE journal_seq = NEW.seq;
+    IF v_declared_hash IS DISTINCT FROM v_hash THEN
+      RAISE EXCEPTION 'journal entry % company_meta commitment hash mismatch', NEW.seq
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
   IF COALESCE((v_counts->>'stored_files')::bigint, 0) > 0 THEN
     v_declared_hash := v_hashes->>'stored_files';
     SELECT coherence.sha256_text(
@@ -527,7 +530,48 @@ BEGIN
     END IF;
   END IF;
 
-  -- Verify input_entries / input_changes hashes against body->commitments->hashes
+  IF COALESCE((v_counts->>'engine_versions')::bigint, 0) > 0 THEN
+    v_declared_hash := v_hashes->>'engine_versions';
+    SELECT coherence.sha256_text(
+      COALESCE(pg_catalog.string_agg(
+        coherence.canonical_json(pg_catalog.jsonb_build_array(
+          id::text, label, coherence_commit,
+          git_bundle_sha256, code_manifest_sha256, python_lock_sha256, python_wheels_sha256,
+          web_lock_sha256, web_packages_sha256, wrapper_bundle_sha256,
+          nusear_commit, company_emit_sha256, pages_law_sha256, overlay_check_sha256,
+          toolchain, container_digest
+        )) || E'\n',
+        '' ORDER BY id::text COLLATE "C"
+      ), '')
+    ) INTO v_hash
+    FROM coherence.engine_versions
+    WHERE journal_seq = NEW.seq;
+    IF v_declared_hash IS DISTINCT FROM v_hash THEN
+      RAISE EXCEPTION 'journal entry % engine_versions commitment hash mismatch', NEW.seq
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
+  IF COALESCE((v_counts->>'input_versions')::bigint, 0) > 0 THEN
+    v_declared_hash := v_hashes->>'input_versions';
+    SELECT coherence.sha256_text(
+      COALESCE(pg_catalog.string_agg(
+        coherence.canonical_json(pg_catalog.jsonb_build_array(
+          id::text, line_kind, parent_id::text, source_kind, reason,
+          entry_count, entries_sha256, entries_list_file_sha256,
+          change_count, changes_sha256
+        )) || E'\n',
+        '' ORDER BY id::text COLLATE "C"
+      ), '')
+    ) INTO v_hash
+    FROM coherence.input_versions
+    WHERE journal_seq = NEW.seq;
+    IF v_declared_hash IS DISTINCT FROM v_hash THEN
+      RAISE EXCEPTION 'journal entry % input_versions commitment hash mismatch', NEW.seq
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
   IF COALESCE((v_counts->>'input_entries')::bigint, 0) > 0 THEN
     v_declared_hash := v_hashes->>'input_entries';
     SELECT coherence.sha256_text(
@@ -558,6 +602,24 @@ BEGIN
     WHERE journal_seq = NEW.seq;
     IF v_declared_hash IS DISTINCT FROM v_hash THEN
       RAISE EXCEPTION 'journal entry % input_changes commitment hash mismatch', NEW.seq
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
+  IF COALESCE((v_counts->>'approvals_files')::bigint, 0) > 0 THEN
+    v_declared_hash := v_hashes->>'approvals_files';
+    SELECT coherence.sha256_text(
+      COALESCE(pg_catalog.string_agg(
+        coherence.canonical_json(pg_catalog.jsonb_build_array(
+          file_sha256, header_kind, row_count, extends_sha256, shared_row_count, added_rows_sha256
+        )) || E'\n',
+        '' ORDER BY file_sha256 COLLATE "C"
+      ), '')
+    ) INTO v_hash
+    FROM coherence.approvals_files
+    WHERE journal_seq = NEW.seq;
+    IF v_declared_hash IS DISTINCT FROM v_hash THEN
+      RAISE EXCEPTION 'journal entry % approvals_files commitment hash mismatch', NEW.seq
         USING ERRCODE = '22023';
     END IF;
   END IF;
@@ -600,7 +662,6 @@ BEGIN
     END IF;
   END IF;
 
-  -- Verify inline small-record commitments when present in body
   IF COALESCE((v_counts->>'runs')::bigint, 0) > 0 THEN
     v_declared_hash := v_hashes->>'runs';
     SELECT coherence.sha256_text(
@@ -618,6 +679,24 @@ BEGIN
     WHERE journal_seq = NEW.seq;
     IF v_declared_hash IS DISTINCT FROM v_hash THEN
       RAISE EXCEPTION 'journal entry % runs commitment hash mismatch', NEW.seq
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
+  IF COALESCE((v_counts->>'cancel_requests')::bigint, 0) > 0 THEN
+    v_declared_hash := v_hashes->>'cancel_requests';
+    SELECT coherence.sha256_text(
+      COALESCE(pg_catalog.string_agg(
+        coherence.canonical_json(pg_catalog.jsonb_build_array(
+          id::text, run_id::text, step, attempt_no, typed_phrase, reason
+        )) || E'\n',
+        '' ORDER BY id::text COLLATE "C"
+      ), '')
+    ) INTO v_hash
+    FROM coherence.cancel_requests
+    WHERE journal_seq = NEW.seq;
+    IF v_declared_hash IS DISTINCT FROM v_hash THEN
+      RAISE EXCEPTION 'journal entry % cancel_requests commitment hash mismatch', NEW.seq
         USING ERRCODE = '22023';
     END IF;
   END IF;
@@ -735,6 +814,44 @@ BEGIN
     END IF;
   END IF;
 
+  IF COALESCE((v_counts->>'imported_files')::bigint, 0) > 0 THEN
+    v_declared_hash := v_hashes->>'imported_files';
+    SELECT coherence.sha256_text(
+      COALESCE(pg_catalog.string_agg(
+        coherence.canonical_json(pg_catalog.jsonb_build_array(
+          id::text, area, rel_path, artifact_kind, store_kind, file_sha256,
+          CASE WHEN original_at IS NULL THEN NULL ELSE coherence.format_utc_us(original_at) END,
+          metadata
+        )) || E'\n',
+        '' ORDER BY id::text COLLATE "C"
+      ), '')
+    ) INTO v_hash
+    FROM coherence.imported_files
+    WHERE journal_seq = NEW.seq;
+    IF v_declared_hash IS DISTINCT FROM v_hash THEN
+      RAISE EXCEPTION 'journal entry % imported_files commitment hash mismatch', NEW.seq
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
+  IF COALESCE((v_counts->>'checks')::bigint, 0) > 0 THEN
+    v_declared_hash := v_hashes->>'checks';
+    SELECT coherence.sha256_text(
+      COALESCE(pg_catalog.string_agg(
+        coherence.canonical_json(pg_catalog.jsonb_build_array(
+          id::text, check_kind, run_id::text, compared_run_id::text, passed, report
+        )) || E'\n',
+        '' ORDER BY id::text COLLATE "C"
+      ), '')
+    ) INTO v_hash
+    FROM coherence.checks
+    WHERE journal_seq = NEW.seq;
+    IF v_declared_hash IS DISTINCT FROM v_hash THEN
+      RAISE EXCEPTION 'journal entry % checks commitment hash mismatch', NEW.seq
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
   RETURN NULL;
 END;
 $$;
@@ -743,10 +860,6 @@ CREATE CONSTRAINT TRIGGER trg_journal_verify_commitments
   AFTER INSERT ON coherence.journal_entries
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_journal_verify_commitments();
-
--- ============================================================================
--- D. Input versions, entries, changes & Sent/Overlay rules (R6.3-6.5, R9.5)
--- ============================================================================
 
 CREATE OR REPLACE FUNCTION coherence.trg_input_versions_before()
 RETURNS trigger
@@ -762,14 +875,14 @@ BEGIN
       RAISE EXCEPTION 'parent input version % does not exist', NEW.parent_id;
     END IF;
     IF v_parent.line_kind <> 'standing' THEN
-      RAISE EXCEPTION 'input version parent must be on the standing line (R6.3)';
+      RAISE EXCEPTION 'input version parent must be on the standing line';
     END IF;
     IF v_parent.journal_seq >= NEW.journal_seq THEN
-      RAISE EXCEPTION 'input version parent must be strictly older than child (R6.3)';
+      RAISE EXCEPTION 'input version parent must be strictly older than child';
     END IF;
   ELSIF NEW.line_kind = 'standing' THEN
     IF EXISTS (SELECT 1 FROM coherence.input_versions WHERE line_kind = 'standing') THEN
-      RAISE EXCEPTION 'standing input line already has a root version; parent_id is required (R6.3)';
+      RAISE EXCEPTION 'standing input line already has a root version; parent_id is required';
     END IF;
   END IF;
   RETURN NEW;
@@ -790,7 +903,7 @@ DECLARE
 BEGIN
   SELECT * INTO v_iv FROM coherence.input_versions WHERE id = NEW.input_version_id;
   IF NOT FOUND OR v_iv.journal_seq <> NEW.journal_seq THEN
-    RAISE EXCEPTION 'input_entries must be inserted in the same journal entry as their input_version (R9.3)';
+    RAISE EXCEPTION 'input_entries must be inserted in the same journal entry as their input_version';
   END IF;
   RETURN NEW;
 END;
@@ -810,7 +923,7 @@ DECLARE
 BEGIN
   SELECT * INTO v_iv FROM coherence.input_versions WHERE id = NEW.input_version_id;
   IF NOT FOUND OR v_iv.journal_seq <> NEW.journal_seq THEN
-    RAISE EXCEPTION 'input_changes must be inserted in the same journal entry as their input_version (R9.3)';
+    RAISE EXCEPTION 'input_changes must be inserted in the same journal entry as their input_version';
   END IF;
   IF v_iv.parent_id IS NULL THEN
     RAISE EXCEPTION 'input_changes are only valid when input_version has a parent_id';
@@ -841,7 +954,6 @@ DECLARE
   v_bad_diff integer;
   v_bad_sent integer;
 BEGIN
-  -- 1. Check declared entry count and canonical hash
   SELECT pg_catalog.count(*)::integer INTO v_entry_count
   FROM coherence.input_entries WHERE input_version_id = NEW.id;
   IF v_entry_count <> NEW.entry_count THEN
@@ -852,7 +964,6 @@ BEGIN
     RAISE EXCEPTION 'input_version % entries_sha256 mismatch', NEW.id;
   END IF;
 
-  -- 2. Check declared change count and canonical hash
   SELECT pg_catalog.count(*)::integer INTO v_change_count
   FROM coherence.input_changes WHERE input_version_id = NEW.id;
   IF v_change_count <> NEW.change_count THEN
@@ -863,7 +974,7 @@ BEGIN
     RAISE EXCEPTION 'input_version % changes_sha256 mismatch', NEW.id;
   END IF;
 
-  -- 3. R6.4 & DS-2: No path may be both a file and a folder (ignoring case and NFC normalization)
+  -- Reject any path that acts as both a file and a parent folder (ignoring case and Unicode NFC normalization).
   IF EXISTS (
     WITH paths AS (
       SELECT mac_key, pg_catalog.string_to_array(mac_key, '/') AS parts
@@ -877,7 +988,7 @@ BEGIN
     )
     SELECT 1 FROM paths p JOIN prefixes f ON p.mac_key = f.folder_key
   ) THEN
-    RAISE EXCEPTION 'input_version % has a file/folder path clash (ignoring case and Unicode normalization) (R6.4)', NEW.id
+    RAISE EXCEPTION 'input_version % has a file/folder path clash (ignoring case and Unicode normalization)', NEW.id
       USING ERRCODE = '23514';
   END IF;
 
@@ -902,7 +1013,7 @@ BEGIN
         ON pd.rel_path = cl.rel_path AND pd.file_sha256 = cl.file_sha256
       WHERE pd.rel_path IS NULL OR cl.rel_path IS NULL
     ) THEN
-      RAISE EXCEPTION 'input_changes does not match parent-side differences of input_version % (R6.5)', NEW.id
+      RAISE EXCEPTION 'input_changes does not match parent-side differences of input_version %', NEW.id
         USING ERRCODE = '23514';
     END IF;
 
@@ -924,11 +1035,11 @@ BEGIN
         ON cd.rel_path = cr.rel_path AND cd.file_sha256 = cr.file_sha256
       WHERE cd.rel_path IS NULL OR cr.rel_path IS NULL
     ) THEN
-      RAISE EXCEPTION 'input_changes does not match child-side differences of input_version % (R6.5)', NEW.id
+      RAISE EXCEPTION 'input_changes does not match child-side differences of input_version %', NEW.id
         USING ERRCODE = '23514';
     END IF;
 
-    -- 5. R9.5 & DS-1: Sent and Overlay protection derived directly from input_entries (NOT input_changes!)
+    -- Derive Sent and Overlay modifications directly from input_entries rather than trusting input_changes.
     WITH parent_e AS (
       SELECT rel_path, mac_key, file_sha256
       FROM coherence.input_entries
@@ -957,12 +1068,12 @@ BEGIN
     FROM diff_entries;
 
     IF v_sent_diff > 0 AND NEW.source_kind NOT IN ('record_sent', 'mac_import', 'company_import') THEN
-      RAISE EXCEPTION 'Sent/ entries can change only through recording a statement as sent or historical import (R9.5, DS-1)'
+      RAISE EXCEPTION 'Sent/ entries can change only through recording a statement as sent or historical import'
         USING ERRCODE = '23514';
     END IF;
 
     IF v_overlay_diff > 0 AND NEW.source_kind NOT IN ('carry_approvals', 'mac_import', 'company_import') THEN
-      RAISE EXCEPTION 'Overlay/ entries can change only through carrying approvals or historical import (R9.5, DS-1)'
+      RAISE EXCEPTION 'Overlay/ entries can change only through carrying approvals or historical import'
         USING ERRCODE = '23514';
     END IF;
 
@@ -971,12 +1082,12 @@ BEGIN
       FROM coherence.carries
       WHERE published_input_version_id = NEW.id AND carry_kind = 'sent' AND journal_seq = NEW.journal_seq;
       IF NOT FOUND THEN
-        RAISE EXCEPTION 'record_sent input_version % requires a matching sent carry in the same journal entry (R9.5)', NEW.id
+        RAISE EXCEPTION 'record_sent input_version % requires a matching sent carry in the same journal entry', NEW.id
           USING ERRCODE = '23514';
       END IF;
       v_expected_sent_path := 'Sent/statements_' || pg_catalog.to_char(v_carry.statement_date, 'YYYYMMDD') || '.csv';
       IF v_sent_diff <> 1 OR v_overlay_diff <> 0 OR v_other_diff <> 0 THEN
-        RAISE EXCEPTION 'record_sent input_version % must change only Sent/statements_<date>.csv (R9.5)', NEW.id
+        RAISE EXCEPTION 'record_sent input_version % must change only Sent/statements_<date>.csv', NEW.id
           USING ERRCODE = '23514';
       END IF;
       IF EXISTS (
@@ -996,11 +1107,11 @@ BEGIN
       FROM coherence.carries
       WHERE published_input_version_id = NEW.id AND carry_kind = 'approvals' AND journal_seq = NEW.journal_seq;
       IF NOT FOUND THEN
-        RAISE EXCEPTION 'carry_approvals input_version % requires a matching approvals carry in the same journal entry (R9.5)', NEW.id
+        RAISE EXCEPTION 'carry_approvals input_version % requires a matching approvals carry in the same journal entry', NEW.id
           USING ERRCODE = '23514';
       END IF;
       IF v_overlay_diff <> 1 OR v_sent_diff <> 0 OR v_other_diff <> 0 THEN
-        RAISE EXCEPTION 'carry_approvals input_version % must change only Overlay/overlay.csv (R9.5)', NEW.id
+        RAISE EXCEPTION 'carry_approvals input_version % must change only Overlay/overlay.csv', NEW.id
           USING ERRCODE = '23514';
       END IF;
       IF NOT EXISTS (
@@ -1012,20 +1123,18 @@ BEGIN
       END IF;
     END IF;
   ELSE
-    -- Root standing version without import cannot inject Sent/Overlay directly
     IF NEW.line_kind = 'standing' AND NEW.source_kind NOT IN ('mac_import', 'company_import') THEN
       IF EXISTS (
         SELECT 1 FROM coherence.input_entries
         WHERE input_version_id = NEW.id
           AND pg_catalog.split_part(mac_key, '/', 1) IN ('sent', 'overlay', 'approvals')
       ) THEN
-        RAISE EXCEPTION 'Sent/ and Overlay/ cannot be created outside carry or historical import (R9.5, DS-1)'
+        RAISE EXCEPTION 'Sent/ and Overlay/ cannot be created outside carry or historical import'
           USING ERRCODE = '23514';
       END IF;
     END IF;
   END IF;
 
-  -- For non-import standing versions, enforce strict Sent/ and no approvals/ folder under input/
   IF NEW.line_kind = 'standing' AND NEW.source_kind NOT IN ('mac_import', 'company_import') THEN
     SELECT pg_catalog.count(*)::integer INTO v_bad_sent
     FROM coherence.input_entries
@@ -1042,7 +1151,7 @@ BEGIN
         )
       );
     IF v_bad_sent > 0 THEN
-      RAISE EXCEPTION 'standing input_version % contains an unauthorized file under Sent/, Overlay/, or approvals/ (DS-1)', NEW.id
+      RAISE EXCEPTION 'standing input_version % contains an unauthorized file under Sent/, Overlay/, or approvals/', NEW.id
         USING ERRCODE = '23514';
     END IF;
   END IF;
@@ -1055,10 +1164,6 @@ CREATE CONSTRAINT TRIGGER trg_input_versions_verify_deferred
   AFTER INSERT ON coherence.input_versions
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_input_versions_verify_deferred();
-
--- ============================================================================
--- E. Approvals files & rows (R5.5, R6.12, R6.13, R7.5, R9.3)
--- ============================================================================
 
 CREATE OR REPLACE FUNCTION coherence.trg_approvals_files_before()
 RETURNS trigger
@@ -1074,7 +1179,7 @@ BEGIN
       RAISE EXCEPTION 'parent approvals_file % does not exist', NEW.extends_sha256;
     END IF;
     IF NEW.shared_row_count <> v_parent.row_count THEN
-      RAISE EXCEPTION 'approvals_file shared_row_count (%) must equal parent row_count (%) (R6.12)',
+      RAISE EXCEPTION 'approvals_file shared_row_count (%) must equal parent row_count (%)',
         NEW.shared_row_count, v_parent.row_count
         USING ERRCODE = '23514';
     END IF;
@@ -1099,9 +1204,8 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'approvals_file % does not exist', NEW.approvals_file_sha256;
   END IF;
-  -- R9.3 & R18: no row can ever be added to a committed approvals file later
   IF v_af.journal_seq <> NEW.journal_seq THEN
-    RAISE EXCEPTION 'cannot add approval_row to previously committed approvals_file % (R9.3)', NEW.approvals_file_sha256
+    RAISE EXCEPTION 'cannot add approval_row to previously committed approvals_file %', NEW.approvals_file_sha256
       USING ERRCODE = '23514';
   END IF;
   IF NEW.row_no <= v_af.shared_row_count OR NEW.row_no > v_af.row_count THEN
@@ -1113,7 +1217,7 @@ BEGIN
     NEW.approved_amount IS NOT NULL OR NEW.approved_agency IS NOT NULL OR NEW.approved_agent IS NOT NULL
     OR NEW.approved_agency_from IS NOT NULL OR NEW.approved_agent_from IS NOT NULL
   ) THEN
-    RAISE EXCEPTION 'v1 approvals_file cannot carry approved_* fact columns (R5.5)'
+    RAISE EXCEPTION 'v1 approvals_file cannot carry approved_* fact columns'
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -1142,7 +1246,7 @@ BEGIN
   WHERE approvals_file_sha256 = NEW.file_sha256;
 
   IF v_actual <> v_expected THEN
-    RAISE EXCEPTION 'approvals_file % row count mismatch: expected % added rows, got % (R9.3)',
+    RAISE EXCEPTION 'approvals_file % row count mismatch: expected % added rows, got %',
       NEW.file_sha256, v_expected, v_actual
       USING ERRCODE = '23514';
   END IF;
@@ -1168,11 +1272,6 @@ CREATE CONSTRAINT TRIGGER trg_approvals_files_verify_deferred
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_approvals_files_verify_deferred();
 
--- ============================================================================
--- F. Runs, step requests, attempts, artifacts, cancel, review, emit, carry, abandon (R8, R9.4)
--- ============================================================================
-
--- Helper: check if a run has an open (un-ended) attempt
 CREATE OR REPLACE FUNCTION coherence.run_has_open_attempt(p_run_id uuid)
 RETURNS boolean
 LANGUAGE sql STABLE
@@ -1193,7 +1292,6 @@ AS $$
   );
 $$;
 
--- Helper: check if ANY run in the company DB has an open attempt
 CREATE OR REPLACE FUNCTION coherence.company_has_open_attempt()
 RETURNS boolean
 LANGUAGE sql STABLE
@@ -1215,7 +1313,6 @@ AS $$
   );
 $$;
 
--- Helper: check if a run has an open (unanswered) step request
 CREATE OR REPLACE FUNCTION coherence.run_has_open_request(p_run_id uuid)
 RETURNS boolean
 LANGUAGE sql STABLE
@@ -1232,7 +1329,6 @@ AS $$
   );
 $$;
 
--- Helper: current non-superseded finished attempt event id for (run, step)
 CREATE OR REPLACE FUNCTION coherence.current_finished_attempt(p_run_id uuid, p_step text)
 RETURNS uuid
 LANGUAGE sql STABLE
@@ -1254,7 +1350,6 @@ AS $$
   LIMIT 1;
 $$;
 
--- Runs BEFORE INSERT
 CREATE OR REPLACE FUNCTION coherence.trg_runs_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1272,30 +1367,28 @@ BEGIN
     RAISE EXCEPTION 'input_version % does not exist', NEW.input_version_id;
   END IF;
 
-  -- R7.2: standing for app and trial; snapshot for imports and their replays
   IF NEW.origin IN ('app', 'trial') AND v_iv.line_kind <> 'standing' THEN
-    RAISE EXCEPTION 'app and trial runs must use a standing input_version (R7.2)'
+    RAISE EXCEPTION 'app and trial runs must use a standing input_version'
       USING ERRCODE = '23514';
   END IF;
   IF NEW.origin IN ('mac_import', 'company_import', 'replay') AND v_iv.line_kind <> 'snapshot' THEN
-    RAISE EXCEPTION 'import and replay runs must use a snapshot input_version (R7.2)'
+    RAISE EXCEPTION 'import and replay runs must use a snapshot input_version'
       USING ERRCODE = '23514';
   END IF;
 
-  -- R7.2: verify prior_approvals_sha256 matches Overlay/overlay.csv inside input_version
   SELECT file_sha256 INTO v_overlay_sha
   FROM coherence.input_entries
   WHERE input_version_id = NEW.input_version_id AND mac_key = 'overlay/overlay.csv';
 
   IF NEW.prior_approvals_sha256 IS DISTINCT FROM v_overlay_sha THEN
-    RAISE EXCEPTION 'run prior_approvals_sha256 must match input_version Overlay/overlay.csv (R7.2)'
+    RAISE EXCEPTION 'run prior_approvals_sha256 must match input_version Overlay/overlay.csv'
       USING ERRCODE = '23514';
   END IF;
 
   IF NEW.origin = 'replay' THEN
     SELECT * INTO v_replayed FROM coherence.runs WHERE id = NEW.replays_run_id;
     IF NOT FOUND OR v_replayed.origin NOT IN ('mac_import', 'company_import') THEN
-      RAISE EXCEPTION 'replay must reference an imported run (R6.7, R7.7)'
+      RAISE EXCEPTION 'replay must reference an imported run'
         USING ERRCODE = '23514';
     END IF;
     IF NEW.input_version_id <> v_replayed.input_version_id THEN
@@ -1305,7 +1398,6 @@ BEGIN
   END IF;
 
   IF NEW.origin = 'app' THEN
-    -- R8 launch guard: no sent statement for that date
     v_sent_name := 'sent/statements_' || pg_catalog.to_char(NEW.statement_date, 'YYYYMMDD') || '.csv';
     IF EXISTS (
       SELECT 1 FROM coherence.carries
@@ -1314,18 +1406,18 @@ BEGIN
       SELECT 1 FROM coherence.input_entries
       WHERE input_version_id = NEW.input_version_id AND mac_key = v_sent_name
     ) THEN
-      RAISE EXCEPTION 'cannot launch app run for %: a sent statement already exists for that date (R8)', NEW.statement_date
+      RAISE EXCEPTION 'cannot launch app run for %: a sent statement already exists for that date', NEW.statement_date
         USING ERRCODE = '23514';
     END IF;
 
-    -- R8 launch guard: no non-abandoned app run of this date may exist (a finished run with no carries must be abandoned first)
+    -- Refuse launching a second app run for the same date until any finished uncarried run is abandoned.
     IF EXISTS (
       SELECT 1 FROM coherence.runs r
       WHERE r.origin = 'app'
         AND r.statement_date = NEW.statement_date
         AND NOT EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = r.id)
     ) THEN
-      RAISE EXCEPTION 'cannot launch app run for %: a non-abandoned run for that date already exists (R8)', NEW.statement_date
+      RAISE EXCEPTION 'cannot launch app run for %: a non-abandoned run for that date already exists', NEW.statement_date
         USING ERRCODE = '23514';
     END IF;
 
@@ -1363,7 +1455,6 @@ CREATE TRIGGER trg_02_runs_before
   BEFORE INSERT ON coherence.runs
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_runs_before();
 
--- Runs DEFERRED: non-import runs must create their initial launch assign request in the same tx
 CREATE OR REPLACE FUNCTION coherence.trg_runs_verify_deferred()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1375,7 +1466,7 @@ BEGIN
       SELECT 1 FROM coherence.step_requests
       WHERE run_id = NEW.id AND step = 'assign' AND reason = 'launch' AND journal_seq = NEW.journal_seq
     ) THEN
-      RAISE EXCEPTION 'launching run % must request assign in the same journal entry (R8)', NEW.id
+      RAISE EXCEPTION 'launching run % must request assign in the same journal entry', NEW.id
         USING ERRCODE = '23514';
     END IF;
   END IF;
@@ -1388,7 +1479,6 @@ CREATE CONSTRAINT TRIGGER trg_runs_verify_deferred
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_runs_verify_deferred();
 
--- Step requests BEFORE INSERT (R8, R9.4)
 CREATE OR REPLACE FUNCTION coherence.trg_step_requests_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1412,17 +1502,16 @@ BEGIN
     RAISE EXCEPTION 'cannot request steps on an imported run';
   END IF;
   IF EXISTS (SELECT 1 FROM coherence.abandonments WHERE run_id = NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot request step on abandoned run % (R9.4)', NEW.run_id
+    RAISE EXCEPTION 'cannot request step on abandoned run %', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
 
-  -- R9.4: one open request per run, and no open attempt
   IF coherence.run_has_open_request(NEW.run_id) THEN
-    RAISE EXCEPTION 'run % already has an open step request (R9.4)', NEW.run_id
+    RAISE EXCEPTION 'run % already has an open step request', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
   IF coherence.run_has_open_attempt(NEW.run_id) THEN
-    RAISE EXCEPTION 'run % already has an open step attempt (R9.4)', NEW.run_id
+    RAISE EXCEPTION 'run % already has an open step attempt', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
 
@@ -1437,7 +1526,7 @@ BEGIN
     v_pred_step := CASE NEW.step WHEN 'attribute' THEN 'assign' WHEN 'bible' THEN 'attribute' ELSE NULL END;
     v_pred_finished := coherence.current_finished_attempt(NEW.run_id, v_pred_step);
     IF v_pred_finished IS NULL THEN
-      RAISE EXCEPTION 'cannot continue to %: predecessor % is not finished (R8)', NEW.step, v_pred_step
+      RAISE EXCEPTION 'cannot continue to %: predecessor % is not finished', NEW.step, v_pred_step
         USING ERRCODE = '23514';
     END IF;
     IF coherence.current_finished_attempt(NEW.run_id, NEW.step) IS NOT NULL THEN
@@ -1447,28 +1536,27 @@ BEGIN
   ELSIF NEW.reason = 'bible_saved' THEN
     v_bible_finished := coherence.current_finished_attempt(NEW.run_id, 'bible');
     IF v_bible_finished IS NULL THEN
-      RAISE EXCEPTION 'bible_saved request requires a finished bible attempt (R8)';
+      RAISE EXCEPTION 'bible_saved request requires a finished bible attempt';
     END IF;
     IF NOT EXISTS (
       SELECT 1 FROM coherence.review_saves
       WHERE run_id = NEW.run_id AND surface = 'bible' AND attempt_event_id = v_bible_finished
         AND journal_seq = NEW.journal_seq
     ) THEN
-      RAISE EXCEPTION 'bible_saved request must accompany a Bible review save in the same journal entry (R8)'
+      RAISE EXCEPTION 'bible_saved request must accompany a Bible review save in the same journal entry'
         USING ERRCODE = '23514';
     END IF;
   ELSIF NEW.reason = 'emit_confirmed' THEN
     SELECT * INTO v_confirm FROM coherence.emit_confirmations WHERE id = NEW.emit_confirmation_id;
     IF NOT FOUND OR v_confirm.run_id <> NEW.run_id OR v_confirm.journal_seq <> NEW.journal_seq THEN
-      RAISE EXCEPTION 'emit_confirmed request must reference an emit_confirmation created in the same journal entry (R8)'
+      RAISE EXCEPTION 'emit_confirmed request must reference an emit_confirmation created in the same journal entry'
         USING ERRCODE = '23514';
     END IF;
     IF EXISTS (SELECT 1 FROM coherence.review_submissions WHERE run_id = NEW.run_id AND status = 'pending') THEN
-      RAISE EXCEPTION 'cannot request emit while a review submission is waiting (R8)'
+      RAISE EXCEPTION 'cannot request emit while a review submission is waiting'
         USING ERRCODE = '23514';
     END IF;
   ELSIF NEW.reason = 'retry' THEN
-    -- Must be retrying a step that ended in failed, interrupted, or cancelled
     SELECT e.event_kind INTO v_last_end
     FROM coherence.step_attempt_events e
     WHERE e.run_id = NEW.run_id
@@ -1481,10 +1569,9 @@ BEGIN
     ORDER BY e.attempt_no DESC
     LIMIT 1;
     IF v_last_end IS NULL OR v_last_end = 'finished' THEN
-      RAISE EXCEPTION 'retry requires a non-superseded failed, interrupted, or cancelled attempt of % (R8)', NEW.step
+      RAISE EXCEPTION 'retry requires a non-superseded failed, interrupted, or cancelled attempt of %', NEW.step
         USING ERRCODE = '23514';
     END IF;
-    -- All attempts of later steps must be superseded first
     IF EXISTS (
       SELECT 1 FROM coherence.step_attempt_events e
       WHERE e.run_id = NEW.run_id
@@ -1495,10 +1582,9 @@ BEGIN
           WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
         )
     ) THEN
-      RAISE EXCEPTION 'cannot retry % while later step attempts are not superseded (R8)', NEW.step
+      RAISE EXCEPTION 'cannot retry % while later step attempts are not superseded', NEW.step
         USING ERRCODE = '23514';
     END IF;
-    -- Predecessor must be finished
     IF NEW.step <> 'assign' THEN
       v_pred_step := CASE NEW.step
         WHEN 'attribute' THEN 'assign'
@@ -1517,7 +1603,7 @@ BEGIN
         SELECT 1 FROM coherence.review_saves
         WHERE run_id = NEW.run_id AND surface = 'bible' AND attempt_event_id = v_bible_finished
       ) THEN
-        RAISE EXCEPTION 'cannot retry adjust without a Bible review save (R8)';
+        RAISE EXCEPTION 'cannot retry adjust without a Bible review save';
       END IF;
     END IF;
     IF NEW.step = 'emit' THEN
@@ -1529,11 +1615,11 @@ BEGIN
       LIMIT 1;
       SELECT * INTO v_confirm FROM coherence.emit_confirmations WHERE id = NEW.emit_confirmation_id;
       IF NOT FOUND OR v_confirm.run_id <> NEW.run_id OR v_confirm.adjust_review_save_id IS DISTINCT FROM v_latest_adjust_save THEN
-        RAISE EXCEPTION 'Emit retry must keep the valid confirmation bound to the newest Adjust save (R6.8, R8, R9.4)'
+        RAISE EXCEPTION 'Emit retry must keep the valid confirmation bound to the newest Adjust save'
           USING ERRCODE = '23514';
       END IF;
       IF EXISTS (SELECT 1 FROM coherence.review_submissions WHERE run_id = NEW.run_id AND status = 'pending') THEN
-        RAISE EXCEPTION 'cannot retry emit while a review submission is waiting (R8)'
+        RAISE EXCEPTION 'cannot retry emit while a review submission is waiting'
           USING ERRCODE = '23514';
       END IF;
     END IF;
@@ -1547,7 +1633,6 @@ CREATE TRIGGER trg_02_step_requests_before
   BEFORE INSERT ON coherence.step_requests
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_step_requests_before();
 
--- Cancel requests BEFORE INSERT (R6.9, R8)
 CREATE OR REPLACE FUNCTION coherence.trg_cancel_requests_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1570,7 +1655,6 @@ BEGIN
     RAISE EXCEPTION 'cancel typed_phrase must be "%"', v_expected_phrase
       USING ERRCODE = '23514';
   END IF;
-  -- Must target an open attempt
   IF NOT EXISTS (
     SELECT 1 FROM coherence.step_attempt_events s
     WHERE s.run_id = NEW.run_id AND s.step = NEW.step AND s.attempt_no = NEW.attempt_no AND s.event_kind = 'started'
@@ -1580,7 +1664,7 @@ BEGIN
           AND e.event_kind IN ('finished', 'failed', 'interrupted', 'cancelled')
       )
   ) THEN
-    RAISE EXCEPTION 'cancel request requires an open attempt for (%, %, %) (R8)', NEW.run_id, NEW.step, NEW.attempt_no
+    RAISE EXCEPTION 'cancel request requires an open attempt for (%, %, %)', NEW.run_id, NEW.step, NEW.attempt_no
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -1591,7 +1675,6 @@ CREATE TRIGGER trg_02_cancel_requests_before
   BEFORE INSERT ON coherence.cancel_requests
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_cancel_requests_before();
 
--- Step attempt events BEFORE INSERT (R8, R9.4, R9.6, R10.1, R10.2)
 CREATE OR REPLACE FUNCTION coherence.trg_step_attempt_events_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1615,7 +1698,7 @@ BEGIN
   END IF;
 
   IF EXISTS (SELECT 1 FROM coherence.abandonments WHERE run_id = NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot record step attempt event on abandoned run % (R9.4)', NEW.run_id
+    RAISE EXCEPTION 'cannot record step attempt event on abandoned run %', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
 
@@ -1633,14 +1716,12 @@ BEGIN
   v_own_start := coherence.own_backend_start();
 
   IF NEW.event_kind = 'started' THEN
-    -- Must hold company running slot (R8, R9.6)
     IF NOT coherence.this_connection_holds_slot() THEN
-      RAISE EXCEPTION 'starting a step attempt requires holding the company running slot (R8, R9.6)'
+      RAISE EXCEPTION 'starting a step attempt requires holding the company running slot'
         USING ERRCODE = '55000';
     END IF;
-    -- No dead/open attempt may exist anywhere before anything else runs (R10.1)
     IF coherence.company_has_open_attempt() THEN
-      RAISE EXCEPTION 'another open attempt exists; reconcile interrupted attempts before starting (R10.1)'
+      RAISE EXCEPTION 'another open attempt exists; reconcile interrupted attempts before starting'
         USING ERRCODE = '23514';
     END IF;
     -- Record/verify exact slot backend identity (prevents PID reuse and lost-slot finishes)
@@ -1655,30 +1736,27 @@ BEGIN
       RAISE EXCEPTION 'slot_backend_start must match current PostgreSQL backend start';
     END IF;
 
-    -- Must answer an open step_request for this run and step
     IF NEW.step_request_id IS NULL THEN
-      RAISE EXCEPTION 'started event requires step_request_id (R6.10, R8)';
+      RAISE EXCEPTION 'started event requires step_request_id';
     END IF;
     SELECT * INTO v_req FROM coherence.step_requests WHERE id = NEW.step_request_id;
     IF NOT FOUND OR v_req.run_id <> NEW.run_id OR v_req.step <> NEW.step THEN
-      RAISE EXCEPTION 'step_request % does not match (%, %) (R8)', NEW.step_request_id, NEW.run_id, NEW.step
+      RAISE EXCEPTION 'step_request % does not match (%, %)', NEW.step_request_id, NEW.run_id, NEW.step
         USING ERRCODE = '23514';
     END IF;
     IF EXISTS (SELECT 1 FROM coherence.step_attempt_events WHERE step_request_id = NEW.step_request_id) THEN
-      RAISE EXCEPTION 'step_request % was already answered (R7.4)', NEW.step_request_id
+      RAISE EXCEPTION 'step_request % was already answered', NEW.step_request_id
         USING ERRCODE = '23514';
     END IF;
 
-    -- Attempts numbered strictly in order (R8)
     SELECT COALESCE(pg_catalog.max(attempt_no), 0) + 1 INTO v_expected_attempt
     FROM coherence.step_attempt_events
     WHERE run_id = NEW.run_id AND step = NEW.step AND event_kind = 'started';
     IF NEW.attempt_no <> v_expected_attempt THEN
-      RAISE EXCEPTION 'attempt_no for (%, %) must be % (got %) (R8)', NEW.run_id, NEW.step, v_expected_attempt, NEW.attempt_no
+      RAISE EXCEPTION 'attempt_no for (%, %) must be % (got %)', NEW.run_id, NEW.step, v_expected_attempt, NEW.attempt_no
         USING ERRCODE = '23514';
     END IF;
 
-    -- Predecessor must be finished (R8)
     IF NEW.step <> 'assign' THEN
       v_pred_step := CASE NEW.step
         WHEN 'attribute' THEN 'assign'
@@ -1687,12 +1765,12 @@ BEGIN
         WHEN 'emit' THEN 'adjust'
       END;
       IF coherence.current_finished_attempt(NEW.run_id, v_pred_step) IS NULL THEN
-        RAISE EXCEPTION 'cannot start %: predecessor % is not finished (R8)', NEW.step, v_pred_step
+        RAISE EXCEPTION 'cannot start %: predecessor % is not finished', NEW.step, v_pred_step
           USING ERRCODE = '23514';
       END IF;
     END IF;
 
-    -- Emit confirmation binding re-checked at start
+    -- Re-verify Emit confirmation still binds the newest Adjust save at start time, not only at request time.
     IF NEW.step = 'emit' THEN
       v_adjust_finished := coherence.current_finished_attempt(NEW.run_id, 'adjust');
       SELECT id INTO v_latest_adjust_save
@@ -1702,11 +1780,11 @@ BEGIN
       LIMIT 1;
       SELECT * INTO v_confirm FROM coherence.emit_confirmations WHERE id = v_req.emit_confirmation_id;
       IF NOT FOUND OR v_confirm.adjust_review_save_id IS DISTINCT FROM v_latest_adjust_save THEN
-        RAISE EXCEPTION 'cannot start emit: confirmation no longer matches newest Adjust save (R9.4)'
+        RAISE EXCEPTION 'cannot start emit: confirmation no longer matches newest Adjust save'
           USING ERRCODE = '23514';
       END IF;
       IF EXISTS (SELECT 1 FROM coherence.review_submissions WHERE run_id = NEW.run_id AND status = 'pending') THEN
-        RAISE EXCEPTION 'cannot start emit while a review submission is waiting (R8)'
+        RAISE EXCEPTION 'cannot start emit while a review submission is waiting'
           USING ERRCODE = '23514';
       END IF;
     END IF;
@@ -1724,14 +1802,13 @@ BEGIN
       WHERE run_id = NEW.run_id AND step = NEW.step AND attempt_no = NEW.attempt_no
         AND event_kind IN ('finished', 'failed', 'interrupted', 'cancelled')
     ) THEN
-      RAISE EXCEPTION 'attempt (%, %, %) already ended (R8)', NEW.run_id, NEW.step, NEW.attempt_no
+      RAISE EXCEPTION 'attempt (%, %, %) already ended', NEW.run_id, NEW.step, NEW.attempt_no
         USING ERRCODE = '23514';
     END IF;
-    -- R8 & R10.2: must still hold the slot on the SAME connection that started the attempt
     IF NOT coherence.this_connection_holds_slot()
        OR pg_catalog.pg_backend_pid() <> v_start.slot_backend_pid
        OR v_own_start <> v_start.slot_backend_start THEN
-      RAISE EXCEPTION 'attempt end (%) must be recorded on the slot connection that started it (R8, R10.2)', NEW.event_kind
+      RAISE EXCEPTION 'attempt end (%) must be recorded on the slot connection that started it', NEW.event_kind
         USING ERRCODE = '55000';
     END IF;
     IF NEW.event_kind = 'cancelled' AND NEW.cancel_request_id IS NOT NULL THEN
@@ -1755,10 +1832,10 @@ BEGIN
       WHERE run_id = NEW.run_id AND step = NEW.step AND attempt_no = NEW.attempt_no
         AND event_kind IN ('finished', 'failed', 'interrupted', 'cancelled')
     ) THEN
-      RAISE EXCEPTION 'attempt (%, %, %) already ended (R8)', NEW.run_id, NEW.step, NEW.attempt_no
+      RAISE EXCEPTION 'attempt (%, %, %) already ended', NEW.run_id, NEW.step, NEW.attempt_no
         USING ERRCODE = '23514';
     END IF;
-    -- R8 & R10.1: allowed only when slot is free OR held by a different backend than the one that started the attempt
+    -- Allowed only when the running slot is free or held by a different backend than the attempt starter.
     IF NOT (
       coherence.slot_is_free()
       OR (
@@ -1766,18 +1843,17 @@ BEGIN
         AND (pg_catalog.pg_backend_pid() <> v_start.slot_backend_pid OR v_own_start <> v_start.slot_backend_start)
       )
     ) THEN
-      RAISE EXCEPTION 'cannot mark attempt interrupted while its owning worker still holds the slot (R8, R10.1)'
+      RAISE EXCEPTION 'cannot mark attempt interrupted while its owning worker still holds the slot'
         USING ERRCODE = '55000';
     END IF;
 
   ELSIF NEW.event_kind = 'superseded' THEN
-    -- R6.10: superseded only AFTER an end
     IF NOT EXISTS (
       SELECT 1 FROM coherence.step_attempt_events
       WHERE run_id = NEW.run_id AND step = NEW.step AND attempt_no = NEW.attempt_no
         AND event_kind IN ('finished', 'failed', 'interrupted', 'cancelled')
     ) THEN
-      RAISE EXCEPTION 'cannot supersede an attempt before it has ended (R6.10)'
+      RAISE EXCEPTION 'cannot supersede an attempt before it has ended'
         USING ERRCODE = '23514';
     END IF;
     IF NEW.step = 'emit' AND EXISTS (SELECT 1 FROM coherence.carries WHERE run_id = NEW.run_id) THEN
@@ -1793,7 +1869,6 @@ CREATE TRIGGER trg_02_step_attempt_events_before
   BEFORE INSERT ON coherence.step_attempt_events
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_step_attempt_events_before();
 
--- Artifacts BEFORE INSERT (R6.11, R9.3, R9.7)
 CREATE OR REPLACE FUNCTION coherence.trg_artifacts_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1804,12 +1879,11 @@ DECLARE
 BEGIN
   SELECT * INTO v_ev FROM coherence.step_attempt_events WHERE id = NEW.attempt_event_id;
   IF NOT FOUND OR v_ev.event_kind <> 'finished' OR v_ev.journal_seq <> NEW.journal_seq THEN
-    RAISE EXCEPTION 'artifacts must belong to a finished step_attempt_event in the same journal entry (R9.3)'
+    RAISE EXCEPTION 'artifacts must belong to a finished step_attempt_event in the same journal entry'
       USING ERRCODE = '23514';
   END IF;
-  -- R6.11 & R9.7: code-bearing files MUST be classified code_bearing and stored ONLY in nusear_code
   IF coherence.is_code_bearing_path(NEW.rel_path) AND NEW.artifact_kind <> 'code_bearing' THEN
-    RAISE EXCEPTION 'code-bearing artifact % must have artifact_kind = code_bearing and live in nusear_code store (R6.11, R9.7)', NEW.rel_path
+    RAISE EXCEPTION 'code-bearing artifact % must have artifact_kind = code_bearing and live in nusear_code store', NEW.rel_path
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -1820,7 +1894,6 @@ CREATE TRIGGER trg_02_artifacts_before
   BEFORE INSERT ON coherence.artifacts
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_artifacts_before();
 
--- Step attempt events DEFERRED: verify artifact count & hash on finished events
 CREATE OR REPLACE FUNCTION coherence.trg_step_attempt_events_verify_deferred()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1835,12 +1908,12 @@ BEGIN
     FROM coherence.artifacts
     WHERE attempt_event_id = NEW.id;
     IF v_cnt <> NEW.artifact_count THEN
-      RAISE EXCEPTION 'finished attempt % artifact_count mismatch: declared %, actual % (R9.3)', NEW.id, NEW.artifact_count, v_cnt
+      RAISE EXCEPTION 'finished attempt % artifact_count mismatch: declared %, actual %', NEW.id, NEW.artifact_count, v_cnt
         USING ERRCODE = '23514';
     END IF;
     v_hash := coherence.hash_artifacts(NEW.id);
     IF v_hash <> NEW.artifacts_sha256 THEN
-      RAISE EXCEPTION 'finished attempt % artifacts_sha256 mismatch (R9.3)', NEW.id
+      RAISE EXCEPTION 'finished attempt % artifacts_sha256 mismatch', NEW.id
         USING ERRCODE = '23514';
     END IF;
   END IF;
@@ -1853,7 +1926,6 @@ CREATE CONSTRAINT TRIGGER trg_step_attempt_events_verify_deferred
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_step_attempt_events_verify_deferred();
 
--- Review submissions operational guards (R6.15, R8, R10.7, CR-1)
 CREATE OR REPLACE FUNCTION coherence.trg_review_submissions_guard()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1882,20 +1954,20 @@ BEGIN
       RAISE EXCEPTION 'cannot submit review for missing or imported run';
     END IF;
     IF EXISTS (SELECT 1 FROM coherence.abandonments WHERE run_id = NEW.run_id) THEN
-      RAISE EXCEPTION 'cannot submit review for abandoned run % (R9.4)', NEW.run_id
+      RAISE EXCEPTION 'cannot submit review for abandoned run %', NEW.run_id
         USING ERRCODE = '23514';
     END IF;
     IF coherence.run_has_open_attempt(NEW.run_id) OR coherence.run_has_open_request(NEW.run_id) THEN
-      RAISE EXCEPTION 'cannot submit review while run % has an open request or running step (R8)', NEW.run_id
+      RAISE EXCEPTION 'cannot submit review while run % has an open request or running step', NEW.run_id
         USING ERRCODE = '23514';
     END IF;
     IF coherence.current_finished_attempt(NEW.run_id, 'emit') IS NOT NULL THEN
-      RAISE EXCEPTION 'cannot submit review after Emit has finished (R8)'
+      RAISE EXCEPTION 'cannot submit review after Emit has finished'
         USING ERRCODE = '23514';
     END IF;
     v_surface_attempt := coherence.current_finished_attempt(NEW.run_id, NEW.surface);
     IF v_surface_attempt IS NULL THEN
-      RAISE EXCEPTION 'cannot submit % review: step % has not finished (R8)', NEW.surface, NEW.surface
+      RAISE EXCEPTION 'cannot submit % review: step % has not finished', NEW.surface, NEW.surface
         USING ERRCODE = '23514';
     END IF;
     IF NEW.surface = 'bible' THEN
@@ -1904,7 +1976,7 @@ BEGIN
         SELECT 1 FROM coherence.review_saves
         WHERE run_id = NEW.run_id AND surface = 'adjust' AND attempt_event_id = v_adjust_attempt
       ) THEN
-        RAISE EXCEPTION 'cannot submit Bible review after an Adjust review was saved for Adjust''s current attempt (R8, CR-8)'
+        RAISE EXCEPTION 'cannot submit Bible review after an Adjust review was saved for Adjust''s current attempt'
           USING ERRCODE = '23514';
       END IF;
     ELSIF NEW.surface = 'adjust' THEN
@@ -1913,14 +1985,13 @@ BEGIN
         JOIN coherence.review_saves rs ON rs.id = ec.adjust_review_save_id
         WHERE ec.run_id = NEW.run_id AND rs.attempt_event_id = v_surface_attempt
       ) THEN
-        RAISE EXCEPTION 'cannot submit Adjust review after Emit has been confirmed for Adjust''s current attempt (R8, CR-1)'
+        RAISE EXCEPTION 'cannot submit Adjust review after Emit has been confirmed for Adjust''s current attempt'
           USING ERRCODE = '23514';
       END IF;
     END IF;
     RETURN NEW;
   END IF;
 
-  -- TG_OP = 'UPDATE'
   IF pg_catalog.current_setting('transaction_isolation') <> 'serializable' THEN
     RAISE EXCEPTION 'review_submissions resolution requires SERIALIZABLE isolation'
       USING ERRCODE = '25001';
@@ -1942,7 +2013,7 @@ BEGIN
       USING ERRCODE = '55000';
   END IF;
   IF NOT coherence.this_connection_holds_slot() THEN
-    RAISE EXCEPTION 'only the worker holding the company running slot may resolve review_submissions (R4.6, R10.7)'
+    RAISE EXCEPTION 'only the worker holding the company running slot may resolve review_submissions'
       USING ERRCODE = '55000';
   END IF;
   IF NEW.status = 'accepted' THEN
@@ -1953,7 +2024,7 @@ BEGIN
         AND rs.journal_seq = NEW.result_journal_seq
         AND je.created_xid = pg_catalog.pg_current_xact_id()
     ) THEN
-      RAISE EXCEPTION 'accepted review_submission must be resolved in the same transaction as its review_save (R10.7)'
+      RAISE EXCEPTION 'accepted review_submission must be resolved in the same transaction as its review_save'
         USING ERRCODE = '23514';
     END IF;
   END IF;
@@ -1971,7 +2042,6 @@ CREATE TRIGGER trg_review_submissions_no_trunc
   FOR EACH STATEMENT EXECUTE FUNCTION coherence.forbid_mutation();
 ALTER TABLE coherence.review_submissions ENABLE ALWAYS TRIGGER trg_review_submissions_no_trunc;
 
--- Review saves BEFORE INSERT (R5.5, R6.14, R8, R9.4, CR-1, CR-8)
 CREATE OR REPLACE FUNCTION coherence.trg_review_saves_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -2007,39 +2077,38 @@ BEGIN
     RAISE EXCEPTION 'live review_save cannot target an imported run';
   END IF;
   IF EXISTS (SELECT 1 FROM coherence.abandonments WHERE run_id = NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot save review on abandoned run % (R9.4)', NEW.run_id
+    RAISE EXCEPTION 'cannot save review on abandoned run %', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
   IF coherence.run_has_open_request(NEW.run_id) OR coherence.run_has_open_attempt(NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot save review while run % has an open request or running step (R8)', NEW.run_id
+    RAISE EXCEPTION 'cannot save review while run % has an open request or running step', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
   IF coherence.current_finished_attempt(NEW.run_id, 'emit') IS NOT NULL THEN
-    RAISE EXCEPTION 'cannot save review after Emit finished (R8)'
+    RAISE EXCEPTION 'cannot save review after Emit finished'
       USING ERRCODE = '23514';
   END IF;
 
   v_current_surface := coherence.current_finished_attempt(NEW.run_id, NEW.surface);
   IF v_current_surface IS DISTINCT FROM NEW.attempt_event_id THEN
-    RAISE EXCEPTION 'review_save must review the current non-superseded finished % attempt (R8)', NEW.surface
+    RAISE EXCEPTION 'review_save must review the current non-superseded finished % attempt', NEW.surface
       USING ERRCODE = '23514';
   END IF;
 
-  -- Must extend frozen prior approvals (R5.5)
   IF v_run.prior_approvals_sha256 IS NOT NULL
      AND NOT coherence.approvals_extends(NEW.approvals_file_sha256, v_run.prior_approvals_sha256) THEN
-    RAISE EXCEPTION 'saved approvals file does not extend the run''s frozen prior approvals (R5.5)'
+    RAISE EXCEPTION 'saved approvals file does not extend the run''s frozen prior approvals'
       USING ERRCODE = '23514';
   END IF;
 
   IF NEW.surface = 'bible' THEN
-    -- R8 & CR-8: allowed in waiting for Bible, or waiting for Adjust with NO Adjust save for Adjust's current attempt
+    -- Bible review may be saved while waiting for Bible, or while waiting for Adjust only before any Adjust review is saved for Adjust's current attempt.
     v_current_adjust := coherence.current_finished_attempt(NEW.run_id, 'adjust');
     IF v_current_adjust IS NOT NULL AND EXISTS (
       SELECT 1 FROM coherence.review_saves
       WHERE run_id = NEW.run_id AND surface = 'adjust' AND attempt_event_id = v_current_adjust
     ) THEN
-      RAISE EXCEPTION 'Bible review cannot be re-saved after an Adjust review was saved for Adjust''s current attempt (R8, CR-8)'
+      RAISE EXCEPTION 'Bible review cannot be re-saved after an Adjust review was saved for Adjust''s current attempt'
         USING ERRCODE = '23514';
     END IF;
     -- Also refuse if Adjust has a non-superseded failed/interrupted/cancelled attempt (must retry or be waiting for Adjust)
@@ -2052,20 +2121,18 @@ BEGIN
           WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
         )
     ) THEN
-      RAISE EXCEPTION 'cannot save Bible review while Adjust has an un-superseded failed/interrupted/cancelled attempt (R8)'
+      RAISE EXCEPTION 'cannot save Bible review while Adjust has an un-superseded failed/interrupted/cancelled attempt'
         USING ERRCODE = '23514';
     END IF;
   ELSIF NEW.surface = 'adjust' THEN
-    -- R8 & CR-1: no Emit confirmed for Adjust's current attempt
     IF EXISTS (
       SELECT 1 FROM coherence.emit_confirmations ec
       JOIN coherence.review_saves rs ON rs.id = ec.adjust_review_save_id
       WHERE ec.run_id = NEW.run_id AND rs.attempt_event_id = NEW.attempt_event_id
     ) THEN
-      RAISE EXCEPTION 'Adjust review cannot be saved after Emit is confirmed for Adjust''s current attempt (R8, CR-1)'
+      RAISE EXCEPTION 'Adjust review cannot be saved after Emit is confirmed for Adjust''s current attempt'
         USING ERRCODE = '23514';
     END IF;
-    -- R5.5 & R8: must begin with this run's Bible review
     v_current_bible := coherence.current_finished_attempt(NEW.run_id, 'bible');
     SELECT approvals_file_sha256 INTO v_bible_save_sha
     FROM coherence.review_saves
@@ -2073,11 +2140,11 @@ BEGIN
     ORDER BY journal_seq DESC
     LIMIT 1;
     IF v_bible_save_sha IS NULL THEN
-      RAISE EXCEPTION 'Adjust review requires a saved Bible review first (R8)'
+      RAISE EXCEPTION 'Adjust review requires a saved Bible review first'
         USING ERRCODE = '23514';
     END IF;
     IF NOT coherence.approvals_extends(NEW.approvals_file_sha256, v_bible_save_sha) THEN
-      RAISE EXCEPTION 'Adjust approvals file must extend this run''s Bible review (R5.5, R8)'
+      RAISE EXCEPTION 'Adjust approvals file must extend this run''s Bible review'
         USING ERRCODE = '23514';
     END IF;
   END IF;
@@ -2090,7 +2157,6 @@ CREATE TRIGGER trg_02_review_saves_before
   BEFORE INSERT ON coherence.review_saves
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_review_saves_before();
 
--- Delete review draft automatically on save (R6.16)
 CREATE OR REPLACE FUNCTION coherence.trg_review_saves_after_delete_draft()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -2107,7 +2173,6 @@ CREATE TRIGGER trg_03_review_saves_delete_draft
   AFTER INSERT ON coherence.review_saves
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_review_saves_after_delete_draft();
 
--- Deferred Bible review save check: prior Adjust attempt must be superseded and Adjust requested
 CREATE OR REPLACE FUNCTION coherence.trg_review_saves_verify_deferred()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -2116,14 +2181,14 @@ AS $$
 BEGIN
   IF NOT NEW.imported AND NEW.surface = 'bible' THEN
     IF coherence.current_finished_attempt(NEW.run_id, 'adjust') IS NOT NULL THEN
-      RAISE EXCEPTION 're-saving Bible review must supersede the prior Adjust attempt in the same transaction (R8)'
+      RAISE EXCEPTION 're-saving Bible review must supersede the prior Adjust attempt in the same transaction'
         USING ERRCODE = '23514';
     END IF;
     IF NOT EXISTS (
       SELECT 1 FROM coherence.step_requests
       WHERE run_id = NEW.run_id AND step = 'adjust' AND reason = 'bible_saved' AND journal_seq = NEW.journal_seq
     ) THEN
-      RAISE EXCEPTION 'saving Bible review must request Adjust in the same transaction (R8)'
+      RAISE EXCEPTION 'saving Bible review must request Adjust in the same transaction'
         USING ERRCODE = '23514';
     END IF;
   END IF;
@@ -2136,7 +2201,6 @@ CREATE CONSTRAINT TRIGGER trg_review_saves_verify_deferred
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_review_saves_verify_deferred();
 
--- Review drafts guard (R6.16, CR-9, CR-10): bound to current non-superseded finished attempt
 CREATE OR REPLACE FUNCTION coherence.trg_review_drafts_guard()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -2151,7 +2215,7 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
   IF coherence.current_finished_attempt(NEW.run_id, 'emit') IS NOT NULL THEN
-    RAISE EXCEPTION 'cannot save draft after Emit has finished (CR-10)'
+    RAISE EXCEPTION 'cannot save draft after Emit has finished'
       USING ERRCODE = '23514';
   END IF;
   v_finished := coherence.current_finished_attempt(NEW.run_id, NEW.surface);
@@ -2161,7 +2225,7 @@ BEGIN
   END IF;
   SELECT attempt_no INTO v_attempt_no FROM coherence.step_attempt_events WHERE id = v_finished;
   IF NEW.attempt_no <> v_attempt_no THEN
-    RAISE EXCEPTION 'draft attempt_no (%) must match current finished % attempt (%) (CR-9)',
+    RAISE EXCEPTION 'draft attempt_no (%) must match current finished % attempt (%)',
       NEW.attempt_no, NEW.surface, v_attempt_no
       USING ERRCODE = '23514';
   END IF;
@@ -2173,7 +2237,6 @@ CREATE TRIGGER trg_review_drafts_guard
   BEFORE INSERT OR UPDATE ON coherence.review_drafts
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_review_drafts_guard();
 
--- Emit confirmations BEFORE INSERT (R5.4, R6.17, R8, R9.4, CR-1)
 CREATE OR REPLACE FUNCTION coherence.trg_emit_confirmations_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -2190,16 +2253,15 @@ BEGIN
     RAISE EXCEPTION 'cannot confirm Emit on missing or imported run';
   END IF;
   IF EXISTS (SELECT 1 FROM coherence.abandonments WHERE run_id = NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot confirm Emit on abandoned run % (R9.4)', NEW.run_id
+    RAISE EXCEPTION 'cannot confirm Emit on abandoned run %', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
   IF coherence.run_has_open_request(NEW.run_id) OR coherence.run_has_open_attempt(NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot confirm Emit while run % has an open request or running step (R8)', NEW.run_id
+    RAISE EXCEPTION 'cannot confirm Emit while run % has an open request or running step', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
-  -- R8 & CR-1: no review submission waiting
   IF EXISTS (SELECT 1 FROM coherence.review_submissions WHERE run_id = NEW.run_id AND status = 'pending') THEN
-    RAISE EXCEPTION 'cannot confirm Emit while a review submission is waiting (R8, CR-1)'
+    RAISE EXCEPTION 'cannot confirm Emit while a review submission is waiting'
       USING ERRCODE = '23514';
   END IF;
   IF coherence.current_finished_attempt(NEW.run_id, 'emit') IS NOT NULL THEN
@@ -2209,13 +2271,13 @@ BEGIN
 
   v_expected_phrase := 'create statements for ' || pg_catalog.to_char(v_run.statement_date, 'YYYY-MM-DD');
   IF NEW.typed_phrase <> v_expected_phrase THEN
-    RAISE EXCEPTION 'Emit typed_phrase must be "%" (R5.4, R8)', v_expected_phrase
+    RAISE EXCEPTION 'Emit typed_phrase must be "%"', v_expected_phrase
       USING ERRCODE = '23514';
   END IF;
 
   v_adjust_finished := coherence.current_finished_attempt(NEW.run_id, 'adjust');
   IF v_adjust_finished IS NULL THEN
-    RAISE EXCEPTION 'cannot confirm Emit: Adjust has not finished (R8)'
+    RAISE EXCEPTION 'cannot confirm Emit: Adjust has not finished'
       USING ERRCODE = '23514';
   END IF;
 
@@ -2225,7 +2287,7 @@ BEGIN
   ORDER BY journal_seq DESC
   LIMIT 1;
   IF v_newest_save IS NULL OR NEW.adjust_review_save_id <> v_newest_save THEN
-    RAISE EXCEPTION 'Emit confirmation must name the run''s newest Adjust review save (R6.17, R8, R9.4)'
+    RAISE EXCEPTION 'Emit confirmation must name the run''s newest Adjust review save'
       USING ERRCODE = '23514';
   END IF;
 
@@ -2234,7 +2296,7 @@ BEGIN
     JOIN coherence.review_saves rs ON rs.id = ec.adjust_review_save_id
     WHERE ec.run_id = NEW.run_id AND rs.attempt_event_id = v_adjust_finished
   ) THEN
-    RAISE EXCEPTION 'Emit is already confirmed for Adjust''s current attempt (R8)'
+    RAISE EXCEPTION 'Emit is already confirmed for Adjust''s current attempt'
       USING ERRCODE = '23514';
   END IF;
 
@@ -2257,7 +2319,7 @@ BEGIN
     WHERE run_id = NEW.run_id AND step = 'emit' AND reason = 'emit_confirmed'
       AND emit_confirmation_id = NEW.id AND journal_seq = NEW.journal_seq
   ) THEN
-    RAISE EXCEPTION 'emit_confirmation % must create its emit step_request in the same journal entry (R8)', NEW.id
+    RAISE EXCEPTION 'emit_confirmation % must create its emit step_request in the same journal entry', NEW.id
       USING ERRCODE = '23514';
   END IF;
   RETURN NULL;
@@ -2269,7 +2331,6 @@ CREATE CONSTRAINT TRIGGER trg_emit_confirmations_verify_deferred
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_emit_confirmations_verify_deferred();
 
--- Carries BEFORE INSERT (R6.18, R7.6, R8, R9.4, S-8)
 CREATE OR REPLACE FUNCTION coherence.trg_carries_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -2288,12 +2349,11 @@ BEGIN
     RAISE EXCEPTION 'run % does not exist', NEW.run_id;
   END IF;
   IF EXISTS (SELECT 1 FROM coherence.abandonments WHERE run_id = NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot carry from abandoned run % (R9.4)', NEW.run_id
+    RAISE EXCEPTION 'cannot carry from abandoned run %', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
-  -- R7.6 & R8: Trial, replay, and mac_import are never carried
   IF v_run.origin NOT IN ('app', 'company_import') THEN
-    RAISE EXCEPTION 'only app and company_import runs can be carried (origin: %) (R8)', v_run.origin
+    RAISE EXCEPTION 'only app and company_import runs can be carried (origin: %)', v_run.origin
       USING ERRCODE = '23514';
   END IF;
   IF NEW.statement_date <> v_run.statement_date THEN
@@ -2301,13 +2361,13 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
   IF coherence.run_has_open_request(NEW.run_id) OR coherence.run_has_open_attempt(NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot carry while run % has an open request or attempt (R8)', NEW.run_id
+    RAISE EXCEPTION 'cannot carry while run % has an open request or attempt', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
 
   v_emit_event := coherence.current_finished_attempt(NEW.run_id, 'emit');
   IF v_emit_event IS NULL THEN
-    RAISE EXCEPTION 'cannot carry from run %: Emit has not finished (R8)', NEW.run_id
+    RAISE EXCEPTION 'cannot carry from run %: Emit has not finished', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
 
@@ -2331,7 +2391,7 @@ BEGIN
         AND rel_path = v_expected_artifact
         AND file_sha256 = NEW.file_sha256
     ) THEN
-      RAISE EXCEPTION 'sent carry file_sha256 must match this run''s finished Emit artifact % (R6.18, R8)', v_expected_artifact
+      RAISE EXCEPTION 'sent carry file_sha256 must match this run''s finished Emit artifact %', v_expected_artifact
         USING ERRCODE = '23514';
     END IF;
     IF v_prev_standing_id IS NOT NULL AND NOT EXISTS (
@@ -2339,7 +2399,7 @@ BEGIN
       WHERE id = NEW.published_input_version_id AND line_kind = 'standing'
         AND source_kind = 'record_sent' AND parent_id = v_prev_standing_id AND journal_seq = NEW.journal_seq
     ) THEN
-      RAISE EXCEPTION 'sent carry must publish the next standing input_version in the same journal entry (R8)'
+      RAISE EXCEPTION 'sent carry must publish the next standing input_version in the same journal entry'
         USING ERRCODE = '23514';
     END IF;
 
@@ -2355,7 +2415,7 @@ BEGIN
         AND rel_path = 'emits/overlay.csv'
         AND file_sha256 = NEW.file_sha256
     ) THEN
-      RAISE EXCEPTION 'approvals carry file_sha256 must match this run''s finished Emit emits/overlay.csv (R6.18, R8)'
+      RAISE EXCEPTION 'approvals carry file_sha256 must match this run''s finished Emit emits/overlay.csv'
         USING ERRCODE = '23514';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM coherence.approvals_files WHERE file_sha256 = NEW.file_sha256) THEN
@@ -2370,19 +2430,18 @@ BEGIN
     END IF;
 
     IF v_standing_overlay_sha IS NOT NULL THEN
-      -- R8, R9.4, S-8: carried approvals MUST extend the current standing approvals file
       IF NOT coherence.approvals_extends(NEW.file_sha256, v_standing_overlay_sha) THEN
-        RAISE EXCEPTION 'approvals carry refused: emitted overlay does not extend the standing approvals file (R8, R9.4, S-8)'
+        RAISE EXCEPTION 'approvals carry refused: emitted overlay does not extend the standing approvals file'
           USING ERRCODE = '23514';
       END IF;
       IF NEW.file_sha256 = v_standing_overlay_sha THEN
         IF NOT NEW.nothing_new OR NEW.published_input_version_id IS NOT NULL THEN
-          RAISE EXCEPTION 'when emitted approvals are identical to standing approvals, carry must set nothing_new = true and published_input_version_id = NULL (R6.18, R8)'
+          RAISE EXCEPTION 'when emitted approvals are identical to standing approvals, carry must set nothing_new = true and published_input_version_id = NULL'
             USING ERRCODE = '23514';
         END IF;
       ELSE
         IF NEW.nothing_new OR NEW.published_input_version_id IS NULL THEN
-          RAISE EXCEPTION 'approvals carry with new rows must publish the next standing input_version (R8)'
+          RAISE EXCEPTION 'approvals carry with new rows must publish the next standing input_version'
             USING ERRCODE = '23514';
         END IF;
         IF NOT EXISTS (
@@ -2390,13 +2449,13 @@ BEGIN
           WHERE id = NEW.published_input_version_id AND line_kind = 'standing'
             AND source_kind = 'carry_approvals' AND parent_id = v_prev_standing_id AND journal_seq = NEW.journal_seq
         ) THEN
-          RAISE EXCEPTION 'approvals carry must publish the next standing input_version in the same journal entry (R8)'
+          RAISE EXCEPTION 'approvals carry must publish the next standing input_version in the same journal entry'
             USING ERRCODE = '23514';
         END IF;
       END IF;
     ELSE
       IF NEW.nothing_new OR NEW.published_input_version_id IS NULL THEN
-        RAISE EXCEPTION 'first approvals carry must publish the next standing input_version (R8)'
+        RAISE EXCEPTION 'first approvals carry must publish the next standing input_version'
           USING ERRCODE = '23514';
       END IF;
       IF v_prev_standing_id IS NOT NULL AND NOT EXISTS (
@@ -2404,7 +2463,7 @@ BEGIN
         WHERE id = NEW.published_input_version_id AND line_kind = 'standing'
           AND source_kind = 'carry_approvals' AND parent_id = v_prev_standing_id AND journal_seq = NEW.journal_seq
       ) THEN
-        RAISE EXCEPTION 'approvals carry must publish the next standing input_version in the same journal entry (R8)'
+        RAISE EXCEPTION 'approvals carry must publish the next standing input_version in the same journal entry'
           USING ERRCODE = '23514';
       END IF;
     END IF;
@@ -2418,7 +2477,6 @@ CREATE TRIGGER trg_02_carries_before
   BEFORE INSERT ON coherence.carries
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_carries_before();
 
--- Abandonments BEFORE INSERT (R6.19, R8, R9.4)
 CREATE OR REPLACE FUNCTION coherence.trg_abandonments_before()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -2440,17 +2498,16 @@ BEGIN
     RAISE EXCEPTION 'abandon typed_phrase must be "%"', v_expected_phrase
       USING ERRCODE = '23514';
   END IF;
-  -- R8 & R9.4: no open attempt, no review waiting, nothing carried
   IF coherence.run_has_open_attempt(NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot abandon run % while an attempt is open (R8, R9.4)', NEW.run_id
+    RAISE EXCEPTION 'cannot abandon run % while an attempt is open', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
   IF EXISTS (SELECT 1 FROM coherence.review_submissions WHERE run_id = NEW.run_id AND status = 'pending') THEN
-    RAISE EXCEPTION 'cannot abandon run % while a review submission is waiting (R8, R9.4)', NEW.run_id
+    RAISE EXCEPTION 'cannot abandon run % while a review submission is waiting', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
   IF EXISTS (SELECT 1 FROM coherence.carries WHERE run_id = NEW.run_id) THEN
-    RAISE EXCEPTION 'cannot abandon run % because it has carried outputs (R8, R9.4)', NEW.run_id
+    RAISE EXCEPTION 'cannot abandon run % because it has carried outputs', NEW.run_id
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -2461,7 +2518,6 @@ CREATE TRIGGER trg_02_abandonments_before
   BEFORE INSERT ON coherence.abandonments
   FOR EACH ROW EXECUTE FUNCTION coherence.trg_abandonments_before();
 
--- Delete review drafts automatically on abandon (R6.16)
 CREATE OR REPLACE FUNCTION coherence.trg_abandonments_after_delete_drafts()
 RETURNS trigger
 LANGUAGE plpgsql

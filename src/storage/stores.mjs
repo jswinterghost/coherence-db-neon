@@ -1,4 +1,3 @@
-// The two separated stores: Nusear's code store and the company's data store (R6.2, R6.6, R6.11, R9.7, R10.8, R14.1).
 import { readFile } from 'node:fs/promises';
 import { fingerprintBytes, SHA256_RE } from '../util/crypto.mjs';
 import { AppError } from '../util/redact.mjs';
@@ -16,10 +15,9 @@ function makeStore({ backend, storeKind, enforceDataOnly }) {
   }
 
   async function promoteBytes(bytes, { relPath = '', checksPassed = false, contentType = null, signal = null } = {}) {
-    // R10.8 & R11 audit: files are promoted ONLY after their checks pass.
     if (checksPassed !== true) {
       throw new AppError(
-        'Cannot promote bytes to object store before required checks have passed (R10.8).',
+        'Cannot promote bytes to object store before required checks have passed.',
         409,
         'PROMOTION_BEFORE_CHECKS',
       );
@@ -117,7 +115,7 @@ export function createDataStore({ backend }) {
   const base = makeStore({ backend, storeKind: STORE_KINDS.DATA, enforceDataOnly: true });
 
   /**
-   * Stages unverified review submission bytes outside objects/<sha256> until the worker checks them (R10.7, R10.8).
+   * Stages unverified review bytes outside objects/<sha256> until the worker validates and promotes them.
    */
   async function stageReview({ submissionId, bytes }) {
     const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
@@ -154,7 +152,7 @@ export function createStorePair({ codeStore, dataStore }) {
     throw new Error('createStorePair requires a company_data store.');
   }
   if (codeStore.backend === dataStore.backend || codeStore.backend.id === dataStore.backend.id) {
-    throw new AppError('Nusear code store and company data store must never share the same backend/bucket (R14.1).', 500, 'MIXED_STORES');
+    throw new AppError('Nusear code store and company data store must never share the same backend or bucket.', 500, 'MIXED_STORES');
   }
 
   function forKind(storeKind) {

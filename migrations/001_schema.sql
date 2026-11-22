@@ -1,10 +1,7 @@
--- Coherence Company Database Schema (PostgreSQL 17)
--- Migration 001: Core tables, keys, foreign keys, CHECK constraints, and uniqueness indexes.
--- Every business table is immutable once written (enforced in 002_invariants_and_triggers.sql).
+-- Core tables for a company database. Every business table is append-only; immutability triggers live in 002_invariants_and_triggers.sql.
 
 CREATE SCHEMA IF NOT EXISTS coherence;
 
--- 1. Journal (R6.22, R9.2): append-only hash-chained ledger of every business mutation.
 CREATE TABLE coherence.journal_entries (
   seq BIGINT PRIMARY KEY CHECK (seq >= 1),
   recorded_at TIMESTAMPTZ NOT NULL,
@@ -22,7 +19,6 @@ CREATE TABLE coherence.journal_entries (
 CREATE INDEX journal_entries_recorded_at_idx ON coherence.journal_entries (recorded_at, seq);
 CREATE INDEX journal_entries_command_kind_idx ON coherence.journal_entries (command_kind, seq);
 
--- 2. Company identity (R6.1): singleton immutable record identifying this company's database.
 CREATE TABLE coherence.company_meta (
   singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton = true),
   company_slug TEXT NOT NULL CHECK (company_slug ~ '^[a-z][a-z0-9_-]{1,63}$'),
@@ -38,7 +34,6 @@ CREATE TABLE coherence.company_meta (
   )
 );
 
--- 3. Stored files (R6.2, R9.7): content-addressed objects in either Nusear's code store or the company's data store.
 CREATE TABLE coherence.stored_files (
   store_kind TEXT NOT NULL CHECK (store_kind IN ('nusear_code', 'company_data')),
   sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
@@ -52,7 +47,7 @@ CREATE TABLE coherence.stored_files (
 
 CREATE INDEX stored_files_journal_seq_idx ON coherence.stored_files (journal_seq);
 
--- 4. Engine versions (R6.6, R7.8, R9.7): fingerprints and metadata only; bytes live solely in nusear_code store.
+-- Engine versions store fingerprints and metadata only; executable bytes live solely in the nusear_code store.
 CREATE TABLE coherence.engine_versions (
   id UUID PRIMARY KEY,
   label TEXT NOT NULL UNIQUE CHECK (pg_catalog.length(pg_catalog.btrim(label)) > 0),
@@ -96,7 +91,7 @@ CREATE TABLE coherence.engine_versions (
 
 CREATE INDEX engine_versions_journal_seq_idx ON coherence.engine_versions (journal_seq);
 
--- 5. Input versions (R6.3, R7.1, R9.5): standing (linear chain) or snapshot (historical frozen input).
+-- Input versions belong to either the company's linear standing line or an unchained historical snapshot.
 CREATE TABLE coherence.input_versions (
   id UUID PRIMARY KEY,
   line_kind TEXT NOT NULL CHECK (line_kind IN ('standing', 'snapshot')),
@@ -134,7 +129,7 @@ CREATE INDEX input_versions_standing_seq_idx
 
 CREATE INDEX input_versions_journal_seq_idx ON coherence.input_versions (journal_seq);
 
--- 6. Input entries (R6.4, R9.5): relative paths preserved verbatim (no trimming!), case/NFC uniqueness enforced.
+-- Preserve relative paths verbatim without trimming trailing spaces; mac_key enforces case- and NFC-normalized uniqueness.
 CREATE TABLE coherence.input_entries (
   input_version_id UUID NOT NULL REFERENCES coherence.input_versions(id),
   rel_path TEXT NOT NULL CHECK (
@@ -158,7 +153,6 @@ CREATE TABLE coherence.input_entries (
 CREATE INDEX input_entries_journal_seq_idx ON coherence.input_entries (journal_seq);
 CREATE INDEX input_entries_file_idx ON coherence.input_entries (file_sha256);
 
--- 7. Input changes (R6.5): exact diff from parent standing version.
 CREATE TABLE coherence.input_changes (
   input_version_id UUID NOT NULL REFERENCES coherence.input_versions(id),
   rel_path TEXT NOT NULL CHECK (pg_catalog.length(rel_path) > 0),
@@ -185,7 +179,6 @@ CREATE UNIQUE INDEX input_changes_one_rename_old
 
 CREATE INDEX input_changes_journal_seq_idx ON coherence.input_changes (journal_seq);
 
--- 8. Approvals files (R5.5, R6.12, R7.5): every distinct overlay.csv by content, chained by extends_sha256.
 CREATE TABLE coherence.approvals_files (
   file_sha256 TEXT PRIMARY KEY CHECK (file_sha256 ~ '^[0-9a-f]{64}$'),
   store_kind TEXT NOT NULL DEFAULT 'company_data' CHECK (store_kind = 'company_data'),
@@ -203,7 +196,7 @@ CREATE TABLE coherence.approvals_files (
 CREATE INDEX approvals_files_journal_seq_idx ON coherence.approvals_files (journal_seq);
 CREATE INDEX approvals_files_extends_idx ON coherence.approvals_files (extends_sha256);
 
--- 9. Approval rows (R5.5, R6.13, R9.3): rows added by each approvals file, numbered from shared_row_count + 1.
+-- Stores only the newly added rows for each approvals file (numbered from shared_row_count + 1); inherited rows live on ancestor files.
 CREATE TABLE coherence.approval_rows (
   approvals_file_sha256 TEXT NOT NULL REFERENCES coherence.approvals_files(file_sha256),
   row_no INTEGER NOT NULL CHECK (row_no >= 1),
@@ -229,7 +222,6 @@ CREATE TABLE coherence.approval_rows (
 CREATE INDEX approval_rows_record_id_idx ON coherence.approval_rows (record_id, approvals_file_sha256, row_no);
 CREATE INDEX approval_rows_journal_seq_idx ON coherence.approval_rows (journal_seq);
 
--- 10. Runs (R6.7, R7.2, R7.7)
 CREATE TABLE coherence.runs (
   id UUID PRIMARY KEY,
   statement_date DATE NOT NULL,
@@ -278,7 +270,7 @@ CREATE UNIQUE INDEX runs_unique_import_source
 CREATE INDEX runs_date_origin_idx ON coherence.runs (statement_date DESC, origin, journal_seq DESC);
 CREATE INDEX runs_journal_seq_idx ON coherence.runs (journal_seq);
 
--- 11. Step requests (R6.8, R7.4) — emit_confirmation_id FK added after emit_confirmations is declared.
+-- emit_confirmation_id foreign key is added via ALTER TABLE below after coherence.emit_confirmations is declared.
 CREATE TABLE coherence.step_requests (
   id UUID PRIMARY KEY,
   run_id UUID NOT NULL REFERENCES coherence.runs(id),
@@ -296,7 +288,6 @@ CREATE TABLE coherence.step_requests (
 CREATE INDEX step_requests_run_idx ON coherence.step_requests (run_id, journal_seq);
 CREATE INDEX step_requests_journal_seq_idx ON coherence.step_requests (journal_seq);
 
--- 12. Cancel requests (R6.9)
 CREATE TABLE coherence.cancel_requests (
   id UUID PRIMARY KEY,
   run_id UUID NOT NULL REFERENCES coherence.runs(id),
@@ -310,7 +301,6 @@ CREATE TABLE coherence.cancel_requests (
 CREATE INDEX cancel_requests_run_idx ON coherence.cancel_requests (run_id, step, attempt_no, journal_seq);
 CREATE INDEX cancel_requests_journal_seq_idx ON coherence.cancel_requests (journal_seq);
 
--- 13. Step attempt events (R6.10, R7.3, R7.4, R8)
 CREATE TABLE coherence.step_attempt_events (
   id UUID PRIMARY KEY,
   run_id UUID NOT NULL REFERENCES coherence.runs(id),
@@ -340,7 +330,6 @@ CREATE TABLE coherence.step_attempt_events (
   FOREIGN KEY (log_store_kind, log_file_sha256) REFERENCES coherence.stored_files(store_kind, sha256)
 );
 
--- At most one start, one end, one superseded per (run, step, attempt_no), and at most one start per request.
 CREATE UNIQUE INDEX sae_one_start
   ON coherence.step_attempt_events (run_id, step, attempt_no)
   WHERE event_kind = 'started';
@@ -360,7 +349,6 @@ CREATE UNIQUE INDEX sae_one_superseded
 CREATE INDEX sae_run_step_idx ON coherence.step_attempt_events (run_id, step, attempt_no, journal_seq);
 CREATE INDEX sae_journal_seq_idx ON coherence.step_attempt_events (journal_seq);
 
--- 14. Artifacts (R6.11, R7.8, R9.7): strict separation of data vs code_bearing stores.
 CREATE TABLE coherence.artifacts (
   attempt_event_id UUID NOT NULL REFERENCES coherence.step_attempt_events(id),
   rel_path TEXT NOT NULL CHECK (
@@ -386,7 +374,7 @@ CREATE TABLE coherence.artifacts (
 CREATE INDEX artifacts_journal_seq_idx ON coherence.artifacts (journal_seq);
 CREATE INDEX artifacts_file_idx ON coherence.artifacts (store_kind, file_sha256);
 
--- 15. Review submissions (operational, R6.15, R10.7)
+-- Operational queue table (not an append-only business table); updated once by the worker when resolved.
 CREATE TABLE coherence.review_submissions (
   id UUID PRIMARY KEY,
   run_id UUID NOT NULL REFERENCES coherence.runs(id),
@@ -417,7 +405,6 @@ CREATE UNIQUE INDEX rs_one_pending_per_run
 
 CREATE INDEX rs_pending_queue_idx ON coherence.review_submissions (created_at) WHERE status = 'pending';
 
--- 16. Review saves (R6.14, R7.5, R8)
 CREATE TABLE coherence.review_saves (
   id UUID PRIMARY KEY,
   run_id UUID NOT NULL REFERENCES coherence.runs(id),
@@ -439,7 +426,7 @@ CREATE INDEX review_saves_run_surface_idx ON coherence.review_saves (run_id, sur
 CREATE INDEX review_saves_attempt_idx ON coherence.review_saves (attempt_event_id, surface);
 CREATE INDEX review_saves_journal_seq_idx ON coherence.review_saves (journal_seq);
 
--- 17. Review drafts (operational, R6.16, CR-9): keyed by (run_id, surface, attempt_no); never read by calculations.
+-- Operational scratchpad for in-progress reviews, keyed by (run_id, surface, attempt_no); never read by calculations.
 CREATE TABLE coherence.review_drafts (
   run_id UUID NOT NULL REFERENCES coherence.runs(id),
   surface TEXT NOT NULL CHECK (surface IN ('bible', 'adjust')),
@@ -456,7 +443,6 @@ CREATE TABLE coherence.review_drafts (
 
 CREATE INDEX review_drafts_expires_idx ON coherence.review_drafts (expires_at);
 
--- 18. Emit confirmations (R6.17, R7.4, R8, R9.4)
 CREATE TABLE coherence.emit_confirmations (
   id UUID PRIMARY KEY,
   run_id UUID NOT NULL REFERENCES coherence.runs(id),
@@ -472,7 +458,6 @@ ALTER TABLE coherence.step_requests
 CREATE INDEX emit_confirmations_run_idx ON coherence.emit_confirmations (run_id, journal_seq);
 CREATE INDEX emit_confirmations_journal_seq_idx ON coherence.emit_confirmations (journal_seq);
 
--- 19. Carries (R6.18, R7.6, R8, R9.4)
 CREATE TABLE coherence.carries (
   id UUID PRIMARY KEY,
   run_id UUID NOT NULL REFERENCES coherence.runs(id),
@@ -498,7 +483,6 @@ CREATE UNIQUE INDEX carries_one_sent_per_date
 CREATE INDEX carries_run_idx ON coherence.carries (run_id, carry_kind);
 CREATE INDEX carries_journal_seq_idx ON coherence.carries (journal_seq);
 
--- 20. Abandonments (R6.19, R8, R9.4)
 CREATE TABLE coherence.abandonments (
   id UUID PRIMARY KEY,
   run_id UUID NOT NULL UNIQUE REFERENCES coherence.runs(id),
@@ -509,7 +493,7 @@ CREATE TABLE coherence.abandonments (
 
 CREATE INDEX abandonments_journal_seq_idx ON coherence.abandonments (journal_seq);
 
--- 21. Imported files belonging to no run (R6.20, R12)
+-- Standalone historical files that do not belong to any run.
 CREATE TABLE coherence.imported_files (
   id UUID PRIMARY KEY,
   area TEXT NOT NULL CHECK (area IN ('incident_report', 'staging', 'documents', 'archive_inventory', 'nusear_log', 'nusear_record', 'other')),
@@ -538,7 +522,6 @@ CREATE TABLE coherence.imported_files (
 CREATE INDEX imported_files_area_idx ON coherence.imported_files (area, rel_path);
 CREATE INDEX imported_files_journal_seq_idx ON coherence.imported_files (journal_seq);
 
--- 22. Checks (R6.21)
 CREATE TABLE coherence.checks (
   id UUID PRIMARY KEY,
   check_kind TEXT NOT NULL CHECK (check_kind IN ('chain', 'commitments', 'objects', 'import', 'replay', 'shadow', 'trial_comparison')),

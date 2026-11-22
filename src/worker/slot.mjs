@@ -1,7 +1,7 @@
-// Company running slot holder using a dedicated PostgreSQL session advisory lock (R9.6, R10.1, R10.2, R10.3).
-// Liveness checks run strictly BETWEEN transactions, never inside a transaction, with their own timeout.
+// Company running-slot holder backed by a dedicated PostgreSQL session advisory lock;
+// liveness checks run strictly between transactions with a bounded timeout.
 import { createClient } from '../db/pg-client.mjs';
-import { AppError } from '../util/redact.mjs';
+import { AppError, createSafeLogger, sanitizeErrorMessage } from '../util/redact.mjs';
 
 export async function acquireRunningSlot({
   pgConfig,
@@ -10,6 +10,7 @@ export async function acquireRunningSlot({
   livenessTimeoutMs = 3000,
   onSlotLost = null,
   onLivenessQuery = null,
+  logger = createSafeLogger(),
 } = {}) {
   const client = await clientFactory();
   const controller = new AbortController();
@@ -29,7 +30,13 @@ export async function acquireRunningSlot({
     const err = reason instanceof Error ? reason : new Error(String(reason || 'Company running slot was lost.'));
     if (!controller.signal.aborted) controller.abort(err);
     if (typeof onSlotLost === 'function') {
-      try { onSlotLost(err); } catch { /* ignore listener errors */ }
+      try {
+        onSlotLost(err);
+      } catch (listenerErr) {
+        if (logger && typeof logger.error === 'function') {
+          logger.error('slot_lost_listener_error', { reason: sanitizeErrorMessage(listenerErr) });
+        }
+      }
     }
   };
 
@@ -47,7 +54,7 @@ export async function acquireRunningSlot({
   const backendPid = Number(lockRes.rows[0].pid);
 
   async function checkLivenessOnce() {
-    // R10.3 & R11 audit: NEVER run a liveness query inside an open transaction!
+    // Never run a liveness query while a transaction is open on the same connection.
     if (lost || released || inTransaction || checking) return !lost;
     checking = true;
     let timeoutHandle = null;
@@ -79,15 +86,15 @@ export async function acquireRunningSlot({
   }
 
   /**
-   * Executes a transactional callback while suspending liveness queries so no liveness check
-   * can ever execute inside a PostgreSQL transaction (R10.3, R11).
+   * Runs a transactional callback on the slot connection while pausing liveness queries
+   * so no probe runs mid-transaction.
    */
   async function runExclusive(fn) {
-    if (lost || released) throw new AppError('Company running slot was lost (R10.2).', 409, 'SLOT_LOST');
+    if (lost || released) throw new AppError('Company running slot was lost.', 409, 'SLOT_LOST');
     // Wait for any in-flight liveness query to complete before opening a transaction on the same connection.
     while (checking) {
       await new Promise((r) => setTimeout(r, 10));
-      if (lost || released) throw new AppError('Company running slot was lost (R10.2).', 409, 'SLOT_LOST');
+      if (lost || released) throw new AppError('Company running slot was lost.', 409, 'SLOT_LOST');
     }
     inTransaction = true;
     try {
@@ -107,7 +114,7 @@ export async function acquireRunningSlot({
     if (!lost) {
       try {
         await client.query('SELECT pg_catalog.pg_advisory_unlock(coherence.slot_class_id(), coherence.slot_obj_id())');
-      } catch { /* connection may already be closed */ }
+      } catch { /* Session advisory locks release automatically if the connection already closed. */ }
     }
     await client.end().catch(() => {});
   }
@@ -119,7 +126,7 @@ export async function acquireRunningSlot({
     isLost: () => lost,
     isInTransaction: () => inTransaction,
     assertHeld() {
-      if (lost || released) throw new AppError('Company running slot was lost (R10.2).', 409, 'SLOT_LOST');
+      if (lost || released) throw new AppError('Company running slot was lost.', 409, 'SLOT_LOST');
     },
     abort(reason = 'Worker stopping') {
       markLost(new Error(reason));

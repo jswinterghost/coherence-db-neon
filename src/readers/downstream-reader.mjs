@@ -1,6 +1,5 @@
-// Database + object-store reader for Nusear's downstream tools (R15, R14.2, R4.4).
-// Replaces filesystem reads in lib/coherence.mjs and lib/clearpath-feed.mjs with reads from
-// the company's newest finished, non-abandoned `app` or `company_import` run.
+// Database and object-store reader for downstream tools and signed agent feeds,
+// serving the company's newest finished non-abandoned app or company_import run.
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { basename } from 'node:path';
 import { gzipSync } from 'node:zlib';
@@ -9,12 +8,12 @@ import { AppError } from '../util/redact.mjs';
 
 export const AGENT_ROLES = ['RETENTION_AGENT', 'SELLING_AGENT'];
 
-// Exact 24 no-dollar columns matching lib/clearpath-feed.mjs (owner rule: agents never see dollar values).
-export const AGENT_BOOK_COLUMNS = [
-  'member', 'plx_id', 'carrier_policy_number', 'entity', 'carrier', 'status', 'plan_name', 'effective_date',
+// Permitted agent book columns; dollar and commission columns are excluded by policy.
+// Companies with additional vendor-specific identifier columns pass them via agentBookColumns config.
+export const DEFAULT_AGENT_BOOK_COLUMNS = [
+  'member', 'carrier_policy_number', 'entity', 'carrier', 'status', 'plan_name', 'effective_date',
   'plan_type', 'simple_plan_type', 'mbi', 'state', 'submission_date', 'writing_npn', 'writing_agent',
-  'policy_id', 'spark_policy_number', 'dob', 'phone', 'email', 'address', 'county', 'origin_effective',
-  'termination_date',
+  'policy_id', 'dob', 'phone', 'email', 'address', 'county', 'origin_effective', 'termination_date',
 ];
 
 export const HOUSE_FEATURES = [
@@ -49,8 +48,8 @@ export function extractViewerConfig(htmlText) {
 }
 
 /**
- * Finds the company's newest finished, non-abandoned `app` or `company_import` run (R15).
- * Explicitly excludes trial, replay, and mac_import runs.
+ * Returns the company's newest finished, non-abandoned app or company_import run,
+ * excluding trial, replay, and legacy host imports.
  */
 export async function findLatestPublishedRun(pool, { asOfSeq = null } = {}) {
   const limitSeq = asOfSeq != null ? String(asOfSeq) : '9223372036854775807';
@@ -107,7 +106,7 @@ async function isRunSent(pool, run) {
   return standingRes.rows.length > 0;
 }
 
-async function listRunBundles(pool, stores, emitAttemptEventId) {
+async function listRunAgentBundles(pool, stores, emitAttemptEventId) {
   const res = await pool.query(
     `SELECT a.rel_path, a.store_kind, a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
      FROM coherence.artifacts a
@@ -117,25 +116,6 @@ async function listRunBundles(pool, stores, emitAttemptEventId) {
      ORDER BY a.rel_path COLLATE "C"`,
     [emitAttemptEventId],
   );
-  // Check if company_manifest.json exists for explicit scope lookup
-  const manRes = await pool.query(
-    `SELECT a.store_kind, a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
-     FROM coherence.artifacts a
-     JOIN coherence.stored_files sf ON sf.store_kind = a.store_kind AND sf.sha256 = a.file_sha256
-     WHERE a.attempt_event_id = $1::uuid AND a.rel_path = 'company_manifest.json'`,
-    [emitAttemptEventId],
-  );
-  const manifestByOutput = new Map();
-  if (manRes.rows.length > 0) {
-    const m = manRes.rows[0];
-    const bytes = await stores.readVerified(m.store_kind, m.file_sha256, {
-      byteSize: Number(m.byte_size), md5B64: m.md5_b64, crc32cB64: m.crc32c_b64,
-    });
-    for (const item of JSON.parse(bytes.toString('utf8'))) {
-      if (item?.output) manifestByOutput.set(item.output, item);
-    }
-  }
-
   const bundles = [];
   for (const row of res.rows) {
     const bundleOutput = row.rel_path.slice('emits/bundles/'.length, -'/viewer.html'.length);
@@ -143,13 +123,11 @@ async function listRunBundles(pool, stores, emitAttemptEventId) {
       byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
     });
     const viewerConfig = extractViewerConfig(htmlBytes.toString('utf8'));
-    const manifestEntry = manifestByOutput.get(bundleOutput) || null;
     bundles.push({
       output: bundleOutput,
-      role: viewerConfig.role || manifestEntry?.role || null,
-      name: viewerConfig.name || manifestEntry?.viewer?.name || null,
-      title: viewerConfig.title || manifestEntry?.viewer?.title || null,
-      scope: manifestEntry?.scope ?? (viewerConfig.role === 'ENTITY_MANAGER' || viewerConfig.role === 'INVESTOR' ? 'all' : null),
+      role: viewerConfig.role || null,
+      name: viewerConfig.name || null,
+      title: viewerConfig.title || null,
       viewerConfig,
     });
   }
@@ -157,55 +135,8 @@ async function listRunBundles(pool, stores, emitAttemptEventId) {
 }
 
 /**
- * Checks whether a recipient actor is permitted to access a specific bundle (R4.4, R14.2, R16.5).
- */
-export function bundleMatchesRecipientScope(bundle, actor) {
-  if (!actor) return false;
-  if (actor.kind === 'owner' || actor.kind === 'nusear_staff' || actor.kind === 'company_admin') return true;
-  if (actor.kind !== 'recipient') return false;
-  if (actor.recipientRole && bundle.role !== actor.recipientRole) return false;
-
-  // Entity Manager / Investor with scope 'all'
-  if (bundle.scope === 'all') {
-    return actor.recipientScope === 'all' && ['ENTITY_MANAGER', 'INVESTOR'].includes(actor.recipientRole);
-  }
-
-  // If explicit manifest scope is present, require bundle scope to be inside actor's granted scope
-  if (bundle.scope && typeof bundle.scope === 'object') {
-    const granted = actor.recipientScope;
-    if (!granted || typeof granted !== 'object') return false;
-    if (bundle.scope.entities) {
-      if (!Array.isArray(granted.entities)) return false;
-      if (!bundle.scope.entities.every((e) => granted.entities.includes(e))) return false;
-    }
-    if (bundle.scope.npns) {
-      if (!Array.isArray(granted.npns)) return false;
-      if (!bundle.scope.npns.every((n) => granted.npns.includes(n))) return false;
-    }
-    return true;
-  }
-
-  // Fallback when bundle came from built-in manifest without company_manifest.json:
-  // match by output path conventions + actor recipientScope (npns / entities / output / name)
-  if (actor.recipientOutput && bundle.output === actor.recipientOutput) return true;
-  if (bundle.role === 'AGENCY_MANAGER' && Array.isArray(actor.recipientScope?.entities)) {
-    const agencyFolder = bundle.output.split('/')[1];
-    return actor.recipientScope.entities.includes(agencyFolder);
-  }
-  if ((bundle.role === 'SELLING_AGENT' || bundle.role === 'RETENTION_AGENT')) {
-    if (Array.isArray(actor.recipientScope?.npns) && bundle.title && actor.recipientScope.npns.includes(bundle.title)) {
-      return true;
-    }
-    if (actor.recipientName && bundle.name && normalizeName(bundle.name) === normalizeName(actor.recipientName)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Database-backed equivalent of lib/coherence.mjs (R15).
- * Reads the company's newest finished non-abandoned app/company_import run's Entity Manager bundle.
+ * Creates a reader over the company's newest finished non-abandoned Entity Manager bundle
+ * in PostgreSQL and object storage.
  */
 export function createDatabaseCoherenceReader({
   pool,
@@ -231,7 +162,7 @@ export function createDatabaseCoherenceReader({
       const res = await pool.query(
         `SELECT r.id, pg_catalog.to_char(r.statement_date, 'YYYY-MM-DD') AS statement_date,
                 pg_catalog.to_char(r.statement_date, 'YYYYMMDD') AS stamp,
-                r.input_version_id,
+                r.input_version_id, r.emit_display,
                 coherence.current_finished_attempt(r.id, 'emit') AS emit_attempt_event_id
          FROM coherence.runs r
          WHERE r.id = $1::uuid`,
@@ -244,28 +175,54 @@ export function createDatabaseCoherenceReader({
     }
     if (!run) return null;
 
-    const viewerRel = `emits/bundles/entity-managers/${entity}/viewer.html`;
-    let artRes = await pool.query(
-      `SELECT a.rel_path, a.store_kind, a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
-       FROM coherence.artifacts a
-       JOIN coherence.stored_files sf ON sf.store_kind = a.store_kind AND sf.sha256 = a.file_sha256
-       WHERE a.attempt_event_id = $1::uuid AND a.rel_path = $2`,
-      [run.emit_attempt_event_id, viewerRel],
-    );
-    // Fallback: pick the sole ENTITY_MANAGER bundle if entity display differs (e.g. Clearpath vs Phalanx)
-    if (artRes.rows.length === 0) {
-      artRes = await pool.query(
+    const metaRes = await pool.query(
+      'SELECT default_emit_display, display_name FROM coherence.company_meta LIMIT 1',
+    ).catch(() => ({ rows: [] }));
+    const companyMeta = metaRes.rows[0] || null;
+    const candidates = [...new Set([
+      entity,
+      display,
+      run.emit_display,
+      companyMeta?.default_emit_display,
+      companyMeta?.display_name,
+    ].filter((v) => typeof v === 'string' && v.trim().length > 0))];
+
+    let viewerArt = null;
+    for (const candidate of candidates) {
+      const viewerRel = `emits/bundles/entity-managers/${candidate}/viewer.html`;
+      const exactRes = await pool.query(
+        `SELECT a.rel_path, a.store_kind, a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
+         FROM coherence.artifacts a
+         JOIN coherence.stored_files sf ON sf.store_kind = a.store_kind AND sf.sha256 = a.file_sha256
+         WHERE a.attempt_event_id = $1::uuid AND a.rel_path = $2`,
+        [run.emit_attempt_event_id, viewerRel],
+      );
+      if (exactRes.rows.length > 0) {
+        viewerArt = exactRes.rows[0];
+        break;
+      }
+    }
+
+    if (!viewerArt) {
+      const fallbackRes = await pool.query(
         `SELECT a.rel_path, a.store_kind, a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
          FROM coherence.artifacts a
          JOIN coherence.stored_files sf ON sf.store_kind = a.store_kind AND sf.sha256 = a.file_sha256
          WHERE a.attempt_event_id = $1::uuid AND a.rel_path LIKE 'emits/bundles/entity-managers/%/viewer.html'
-         ORDER BY a.rel_path COLLATE "C" LIMIT 1`,
+         ORDER BY a.rel_path COLLATE "C" LIMIT 2`,
         [run.emit_attempt_event_id],
       );
+      if (fallbackRes.rows.length > 1) {
+        throw new AppError(
+          'Multiple entity-manager bundles exist for this run; specify the target entity explicitly.',
+          409,
+          'AMBIGUOUS_ENTITY_BUNDLE',
+        );
+      }
+      if (fallbackRes.rows.length === 0) return null;
+      viewerArt = fallbackRes.rows[0];
     }
-    if (artRes.rows.length === 0) return null;
 
-    const viewerArt = artRes.rows[0];
     const bundlePrefix = viewerArt.rel_path.slice(0, -'viewer.html'.length);
     const htmlBytes = await stores.readVerified(viewerArt.store_kind, viewerArt.file_sha256, {
       byteSize: Number(viewerArt.byte_size), md5B64: viewerArt.md5_b64, crc32cB64: viewerArt.crc32c_b64,
@@ -312,7 +269,7 @@ export function createDatabaseCoherenceReader({
     if (artRes.rows.length === 0) throw new AppError('That file is missing from the run.', 404, 'FILE_MISSING');
     const art = artRes.rows[0];
     if (art.store_kind !== 'company_data' || art.artifact_kind !== 'data') {
-      throw new AppError('Only data files may be served from bundle endpoints.', 403, 'CODE_FILE_FORBIDDEN');
+      throw new AppError('Only data files may be served from downstream reader endpoints.', 403, 'CODE_FILE_FORBIDDEN');
     }
     let bytes = await stores.dataStore.readVerified(art.file_sha256, {
       byteSize: Number(art.byte_size), md5B64: art.md5_b64, crc32cB64: art.crc32c_b64,
@@ -327,115 +284,33 @@ export function createDatabaseCoherenceReader({
     };
   }
 
-  /**
-   * Lists bundles accessible to `actor` for the newest (or specified) run (R4.4, R14.2, R16.5).
-   */
-  async function listAccessibleBundles(actor, { runId = null, asOfSeq = null } = {}) {
-    const run = runId
-      ? (await pool.query(
-        `SELECT r.id, pg_catalog.to_char(r.statement_date, 'YYYY-MM-DD') AS statement_date,
-                pg_catalog.to_char(r.statement_date, 'YYYYMMDD') AS stamp,
-                coherence.current_finished_attempt(r.id, 'emit') AS emit_attempt_event_id
-         FROM coherence.runs r WHERE r.id = $1::uuid`,
-        [runId],
-      )).rows[0] || null
-      : await findLatestPublishedRun(pool, { asOfSeq });
-    if (!run?.emit_attempt_event_id) return { available: false, bundles: [] };
-    const all = await listRunBundles(pool, stores, run.emit_attempt_event_id);
-    const visible = all
-      .filter((b) => bundleMatchesRecipientScope(b, actor))
-      .map((b) => ({
-        output: b.output,
-        role: b.role,
-        name: b.name,
-        title: b.title,
-        statementDate: b.viewerConfig.statementDate || run.statement_date,
-        files: inventoryOf(b.viewerConfig).length,
-      }));
-    return { available: true, runId: run.id, statementDate: run.statement_date, bundles: visible };
-  }
-
-  async function getBundleConfig(actor, bundleOutput, { runId = null, asOfSeq = null } = {}) {
-    const run = runId
-      ? (await pool.query(
-        `SELECT r.id, pg_catalog.to_char(r.statement_date, 'YYYY-MM-DD') AS statement_date,
-                pg_catalog.to_char(r.statement_date, 'YYYYMMDD') AS stamp,
-                coherence.current_finished_attempt(r.id, 'emit') AS emit_attempt_event_id
-         FROM coherence.runs r WHERE r.id = $1::uuid`,
-        [runId],
-      )).rows[0] || null
-      : await findLatestPublishedRun(pool, { asOfSeq });
-    if (!run?.emit_attempt_event_id) throw new AppError('No completed run is available.', 404, 'NO_RUN');
-    const all = await listRunBundles(pool, stores, run.emit_attempt_event_id);
-    const found = all.find((b) => b.output === bundleOutput);
-    if (!found || !bundleMatchesRecipientScope(found, actor)) {
-      throw new AppError('You do not have access to this bundle (R4.4).', 403, 'BUNDLE_SCOPE_DENIED');
-    }
-    return {
-      runId: run.id,
-      statementDate: found.viewerConfig.statementDate || run.statement_date,
-      sent: await isRunSent(pool, run),
-      output: found.output,
-      role: found.role,
-      viewer: found.viewerConfig,
-    };
-  }
-
-  async function getBundleFile(actor, bundleOutput, relpath, acceptsGzip = false, { runId = null, asOfSeq = null } = {}) {
-    const cfg = await getBundleConfig(actor, bundleOutput, { runId, asOfSeq });
-    const allowed = inventoryOf(cfg.viewer);
-    if (!allowed.includes(relpath)) throw new AppError('That file is not part of this bundle.', 404, 'FILE_NOT_IN_INVENTORY');
-    const emitRes = await pool.query("SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev_id", [cfg.runId]);
-    const fullRel = `emits/bundles/${bundleOutput}/${relpath}`;
-    const artRes = await pool.query(
-      `SELECT a.store_kind, a.artifact_kind, a.file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
-       FROM coherence.artifacts a
-       JOIN coherence.stored_files sf ON sf.store_kind = a.store_kind AND sf.sha256 = a.file_sha256
-       WHERE a.attempt_event_id = $1::uuid AND a.rel_path = $2`,
-      [emitRes.rows[0].ev_id, fullRel],
-    );
-    if (artRes.rows.length === 0) throw new AppError('Bundle data file missing.', 404, 'FILE_MISSING');
-    const art = artRes.rows[0];
-    if (art.store_kind !== 'company_data' || art.artifact_kind !== 'data') {
-      throw new AppError('Only data files may be served from bundle endpoints.', 403, 'CODE_FILE_FORBIDDEN');
-    }
-    const bytes = await stores.dataStore.readVerified(art.file_sha256, {
-      byteSize: Number(art.byte_size), md5B64: art.md5_b64, crc32cB64: art.crc32c_b64,
-    });
-    return {
-      name: basename(relpath),
-      body: acceptsGzip ? gzipSync(bytes) : bytes,
-      gzip: Boolean(acceptsGzip),
-    };
-  }
-
   return {
     configured,
     instanceId,
     instanceName,
     summary,
     file,
-    listAccessibleBundles,
-    getBundleConfig,
-    getBundleFile,
   };
 }
 
 /**
- * Database-backed equivalent of lib/clearpath-feed.mjs (R15).
- * Reads newest finished, non-abandoned app/company_import run from DB + stores;
- * strips all dollar columns from agent books; verifies HMAC-SHA256 feed signatures with replay protection.
+ * Creates a signed feed reader over the company's newest finished non-abandoned run,
+ * stripping dollar columns from agent books and enforcing HMAC-SHA256 replay protection.
  */
-export function createDatabaseClearpathFeed({
+export function createSignedAgentFeedReader({
   pool,
   stores,
   entity = '',
   display = '',
   rename = null,
   secret = '',
+  agentBookColumns = DEFAULT_AGENT_BOOK_COLUMNS,
   now = () => Date.now(),
 } = {}) {
   const configured = Boolean(pool && stores && entity && typeof secret === 'string' && secret.length >= 32);
+  const allowedBookCols = Array.isArray(agentBookColumns) && agentBookColumns.length > 0
+    ? agentBookColumns
+    : DEFAULT_AGENT_BOOK_COLUMNS;
   const house = createDatabaseCoherenceReader({ pool, stores, entity, display, rename });
   const seen = new Map();
 
@@ -465,7 +340,7 @@ export function createDatabaseClearpathFeed({
     if (!run) return null;
     const allowedNames = await agentFileNamesForRun(run.input_version_id);
     if (!allowedNames.has(wanted)) return null;
-    const bundles = await listRunBundles(pool, stores, run.emit_attempt_event_id);
+    const bundles = await listRunAgentBundles(pool, stores, run.emit_attempt_event_id);
     const match = bundles.find((b) => AGENT_ROLES.includes(b.role) && normalizeName(b.name) === wanted);
     if (!match) return null;
     return { run, bundle: match };
@@ -521,7 +396,7 @@ export function createDatabaseClearpathFeed({
       });
 
       const [header = [], ...rows] = parseCsv(csvBytes.toString('utf8'));
-      const keep = header.map((col, idx) => [col, idx]).filter(([col]) => AGENT_BOOK_COLUMNS.includes(col));
+      const keep = header.map((col, idx) => [col, idx]).filter(([col]) => allowedBookCols.includes(col));
       const columns = keep.map(([col]) => col);
       const body = rows
         .filter((row) => row.length > 1 || row[0])

@@ -1,6 +1,5 @@
-// Review app drift check against Coherence's web/src/adjust (R16.2).
-// Mirrors workspace-ui/scripts/check-drift.mjs: verifies copied review components against Coherence's
-// committed source tree (via git show or direct source directory) and approved copy hashes.
+// Verifies copied review-app components against Coherence's committed web/src/adjust source tree
+// and approved copy hashes.
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -18,13 +17,31 @@ export async function checkReviewAppDrift({
   provenance = null,
   nusearUiRoot,
   coherenceRepo = null,
-  sourceDir = null, // optional direct directory for tests without git
+  readSourceFile = null,
+  allowOfflineCopyOnly = false,
   gitBin = '/usr/bin/git',
 } = {}) {
   const manifest = provenance || JSON.parse(await readFile(provenancePath, 'utf8'));
   const records = (manifest.records || []).filter((r) => String(r.source || '').startsWith('web/src/adjust/'));
   const problems = [];
   let sourceChecked = 0;
+
+  const hasSourceVerifier = typeof readSourceFile === 'function' || Boolean(coherenceRepo);
+  if (!hasSourceVerifier && !allowOfflineCopyOnly) {
+    problems.push('Source verification requires coherenceRepo or readSourceFile (or explicit allowOfflineCopyOnly: true).');
+  }
+  if (hasSourceVerifier && !manifest.tag) {
+    problems.push('Provenance manifest is missing required tag for Coherence source verification.');
+  }
+
+  const defaultReadSource = async (tag, relPath) => {
+    const { stdout } = await execFileAsync(gitBin, ['-C', coherenceRepo, 'show', `${tag}:${relPath}`], {
+      encoding: 'buffer',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return stdout;
+  };
+  const sourceReader = typeof readSourceFile === 'function' ? readSourceFile : (coherenceRepo ? defaultReadSource : null);
 
   for (const item of records) {
     const copyPath = resolve(nusearUiRoot, item.copy);
@@ -42,37 +59,26 @@ export async function checkReviewAppDrift({
       problems.push(`${item.copy} differs from its approved hash`);
     }
 
-    if (sourceDir) {
+    if (sourceReader && manifest.tag) {
       try {
-        const srcHash = sha256Hex(await readFile(resolve(sourceDir, item.source)));
+        const srcBytes = await sourceReader(manifest.tag, item.source);
         sourceChecked++;
-        if (srcHash !== item.sourceSha256) {
-          problems.push(`${item.source} no longer matches recorded source hash`);
-        }
-      } catch {
-        problems.push(`Missing Coherence source: ${item.source}`);
-      }
-    } else if (coherenceRepo && manifest.tag) {
-      try {
-        const { stdout } = await execFileAsync(gitBin, ['-C', coherenceRepo, 'show', `${manifest.tag}:${item.source}`], {
-          encoding: 'buffer',
-          maxBuffer: 16 * 1024 * 1024,
-        });
-        sourceChecked++;
-        if (sha256Hex(stdout) !== item.sourceSha256) {
+        if (sha256Hex(srcBytes) !== item.sourceSha256) {
           problems.push(`${item.source} at ${manifest.tag} no longer matches recorded source hash`);
         }
       } catch {
-        // Coherence repo unavailable on host; approved copies were still checked.
+        problems.push(`Unable to read Coherence source ${item.source} at tag ${manifest.tag}`);
       }
     }
   }
 
+  const sourceVerified = hasSourceVerifier && records.length > 0 && sourceChecked === records.length && problems.length === 0;
   return {
     passed: problems.length === 0,
     tag: manifest.tag || null,
     checkedCopies: records.length,
     sourceChecked,
+    sourceVerified,
     problems,
   };
 }

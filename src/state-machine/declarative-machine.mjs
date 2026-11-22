@@ -1,6 +1,5 @@
-// Reusable declarative state-machine engine (designed for Coherence and Nusear's other tools).
-// Declare states, transitions, guards, and database enforcement bindings ONCE as data;
-// derive static graph checks, runtime guard evaluation, PostgreSQL catalog verification, and Markdown docs from it.
+// Reusable declarative state-machine library: declare states, transitions, guards, and database bindings
+// once as data to drive static validation, PostgreSQL catalog checks, and Markdown docs.
 import { canonicalJson, sha256Hex } from '../util/crypto.mjs';
 
 export class StateMachineDefinitionError extends Error {
@@ -44,9 +43,6 @@ function mermaidId(stateId) {
   return String(stateId).replace(/[^A-Za-z0-9_]/g, '_');
 }
 
-/**
- * Defines and statically validates a declarative state machine.
- */
 export function defineStateMachine(rawSpec) {
   if (!rawSpec || typeof rawSpec !== 'object') {
     throw new StateMachineDefinitionError('State machine spec must be an object.');
@@ -158,7 +154,6 @@ export function defineStateMachine(rawSpec) {
     for (const f of fromList) outgoing.get(f).push(normalized);
   }
 
-  // Reachability BFS from initial states
   const visited = new Set(initialStates);
   const queue = [...initialStates];
   while (queue.length > 0) {
@@ -331,7 +326,6 @@ export function defineStateMachine(rawSpec) {
       if (res.rows.length === 0) problems.push(`Missing declared index: ${qualifiedIdx}`);
     }
 
-    // Machine-specific catalog checks (enum CHECK constraints, derived stage SQL literals, etc.)
     for (const check of normalizedSpec.dbChecks) {
       if (check.kind === 'column_check_values') {
         const [schema, table] = check.table.split('.');
@@ -373,9 +367,6 @@ export function defineStateMachine(rawSpec) {
         } else {
           const def = res.rows[0].def;
           const literalReturns = new Set([...def.matchAll(/RETURN\s+'([^']+)'/gi)].map((m) => m[1]));
-          for (const extra of check.indirectReturns || []) {
-            if (def.includes(`'${extra}'`)) literalReturns.add(extra);
-          }
           const expectedStages = [...stateMap.values()].filter((s) => !s.pseudo).map((s) => s.id).sort();
           const actualStages = [...literalReturns].sort();
           if (JSON.stringify(actualStages) !== JSON.stringify(expectedStages)) {
@@ -419,7 +410,7 @@ export function defineStateMachine(rawSpec) {
           : st.initial
             ? 'initial'
             : 'active';
-      lines.push(`| \`${mdEscape(st.id)}\` | ${kind} | ${mdEscape(st.description)} | ${mdEscape(st.derivationRule || '—')} |`);
+      lines.push(`| \`${mdEscape(st.id)}\` | ${kind} | ${mdEscape(st.description)} | ${mdEscape(st.derivationRule || '-')} |`);
     }
     lines.push('');
 
@@ -429,17 +420,23 @@ export function defineStateMachine(rawSpec) {
     lines.push('|---|---|---|---|---|---|---|');
     for (const tr of normalizedSpec.transitions) {
       const fromStr = tr.from.map((s) => `\`${mdEscape(s)}\``).join(', ');
-      const actorsStr = tr.actorKinds.length ? tr.actorKinds.map((a) => `\`${a}\``).join(', ') : '—';
-      const guardsStr = tr.guards.length ? tr.guards.map((g) => `\`${g}\``).join(', ') : '—';
-      const effectsStr = tr.effects.length ? tr.effects.map(mdEscape).join('; ') : '—';
+      const actorsStr = tr.actorKinds.length ? tr.actorKinds.map((a) => `\`${a}\``).join(', ') : '-';
+      const guardsStr = tr.guards.length ? tr.guards.map((g) => `\`${g}\``).join(', ') : '-';
+      const effectsStr = tr.effects.length ? tr.effects.map(mdEscape).join('; ') : '-';
       lines.push(`| \`${mdEscape(tr.id)}\` | ${mdEscape(tr.action)} | ${fromStr} | \`${mdEscape(tr.to)}\` | ${actorsStr} | ${guardsStr} | ${effectsStr} |`);
     }
     lines.push('');
 
     lines.push('### Guards and Database Enforcement');
     lines.push('');
-    lines.push('| Guard | Requirement | Rule | Database Enforcement |');
-    lines.push('|---|---|---|---|');
+    const hasGuardReqs = Object.values(normalizedSpec.guards).some((g) => Boolean(g.requirementRef));
+    if (hasGuardReqs) {
+      lines.push('| Guard | Requirement | Rule | Database Enforcement |');
+      lines.push('|---|---|---|---|');
+    } else {
+      lines.push('| Guard | Rule | Database Enforcement |');
+      lines.push('|---|---|---|');
+    }
     for (const g of Object.values(normalizedSpec.guards)) {
       const enfParts = [];
       if (g.dbEnforcement?.table) enfParts.push(`table \`${g.dbEnforcement.table}\``);
@@ -450,7 +447,11 @@ export function defineStateMachine(rawSpec) {
       if (g.dbEnforcement?.indexes?.length) {
         enfParts.push(`indexes ${g.dbEnforcement.indexes.map((i) => `\`${i}\``).join(', ')}`);
       }
-      lines.push(`| \`${mdEscape(g.id)}\` | ${mdEscape(g.requirementRef || '—')} | ${mdEscape(g.description)} | ${enfParts.join('; ') || '—'} |`);
+      if (hasGuardReqs) {
+        lines.push(`| \`${mdEscape(g.id)}\` | ${mdEscape(g.requirementRef || '-')} | ${mdEscape(g.description)} | ${enfParts.join('; ') || '-'} |`);
+      } else {
+        lines.push(`| \`${mdEscape(g.id)}\` | ${mdEscape(g.description)} | ${enfParts.join('; ') || '-'} |`);
+      }
     }
     lines.push('');
 
@@ -502,9 +503,6 @@ export function defineStateMachine(rawSpec) {
   });
 }
 
-/**
- * Renders a complete STATE_MACHINE.md document from one or more declared machines.
- */
 export function renderMachinesDocument({
   title,
   intro = '',

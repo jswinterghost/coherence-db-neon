@@ -1,4 +1,3 @@
-// Actor and permission enforcement (R4).
 import { AppError } from '../util/redact.mjs';
 
 export const ACTOR_KINDS = Object.freeze({
@@ -44,6 +43,8 @@ const OWNER_TYPED_COMMANDS = new Set([
   'import_standalone_files',
 ]);
 
+const COMPANY_ADMIN_GRANTABLE_AREAS = new Set(['inputs', 'runs', 'outputs']);
+
 export function assertValidActor(actor) {
   if (!actor || typeof actor !== 'object' || typeof actor.id !== 'string' || !actor.id.trim()) {
     throw new AppError('Authentication required.', 401, 'UNAUTHENTICATED');
@@ -54,58 +55,51 @@ export function assertValidActor(actor) {
 }
 
 /**
- * Enforces R4.1 through R4.6 on every write command.
- * "View as" ALWAYS refuses writes (R4.5). Nusear support actingFor a company writes and records actingFor.
+ * Enforces actor write permissions. "View as" sessions always refuse writes; support sessions
+ * using actingFor may write and record actingFor in the journal.
  */
-export function assertCanWrite(actor, commandKind, { companySlug, allowWorkerOverride = false } = {}) {
+export function assertCanWrite(actor, commandKind, { companySlug } = {}) {
   assertValidActor(actor);
 
-  // R4.5: "View as" NEVER writes.
   if (actor.viewingAs) {
-    throw new AppError('Cannot make changes while viewing as another user (R4.5).', 403, 'VIEW_AS_READ_ONLY');
+    throw new AppError('Cannot make changes while viewing as another user.', 403, 'VIEW_AS_READ_ONLY');
   }
 
-  // R4.6: Worker commands belong strictly to the worker service identity.
   if (WORKER_ONLY_COMMANDS.has(commandKind)) {
-    if (actor.kind !== ACTOR_KINDS.WORKER && !(allowWorkerOverride && actor.kind === ACTOR_KINDS.OWNER)) {
-      throw new AppError('Only the Coherence engine worker service identity may perform this operation (R4.6).', 403, 'WORKER_ONLY');
+    if (actor.kind !== ACTOR_KINDS.WORKER) {
+      throw new AppError('Only the Coherence engine worker service identity may perform this operation.', 403, 'WORKER_ONLY');
     }
     return;
   }
 
-  // Worker cannot issue human-only decisions (launch, confirm_emit, carry, abandon, etc.)
   if (actor.kind === ACTOR_KINDS.WORKER) {
     if (commandKind === 'record_check' || commandKind === 'register_stored_files') return;
-    throw new AppError('The worker service identity cannot execute human decision commands (R4.6).', 403, 'HUMAN_ONLY');
+    throw new AppError('The worker service identity cannot execute human decision commands.', 403, 'HUMAN_ONLY');
   }
 
-  // R4.4: Recipients never write anything.
   if (actor.kind === ACTOR_KINDS.RECIPIENT) {
-    throw new AppError('Recipients have read-only access to their own bundle scope only (R4.4).', 403, 'FORBIDDEN');
+    throw new AppError('Recipients do not have write access.', 403, 'FORBIDDEN');
   }
 
-  // R4.3: Company administrators are read-only on runs/inputs/outputs unless specifically granted.
   if (actor.kind === ACTOR_KINDS.COMPANY_ADMIN) {
-    throw new AppError('Company administrators do not have write access to Coherence runs (R4.3).', 403, 'FORBIDDEN');
+    throw new AppError('Company administrators do not have write access to Coherence runs.', 403, 'FORBIDDEN');
   }
 
-  // R4.1: Nusear's owner (Kairon) can perform every human command.
   if (actor.kind === ACTOR_KINDS.OWNER) {
     return;
   }
 
-  // R4.2: Nusear staff — only assigned customers, never anyone with run-coherence withheld.
   if (actor.kind === ACTOR_KINDS.NUSEAR_STAFF) {
     const customers = Array.isArray(actor.customers) ? actor.customers : [];
     if (companySlug && !customers.includes(companySlug)) {
-      throw new AppError('Your account is not assigned to this company (R4.2).', 403, 'COMPANY_NOT_ASSIGNED');
+      throw new AppError('Your account is not assigned to this company.', 403, 'COMPANY_NOT_ASSIGNED');
     }
     const withheld = Array.isArray(actor.withheld) ? actor.withheld : [];
     if (RUN_COHERENCE_COMMANDS.has(commandKind) && withheld.includes('run-coherence')) {
-      throw new AppError('Your account is held back from running Coherence (R4.2).', 403, 'COHERENCE_WITHHELD');
+      throw new AppError('Your account is held back from running Coherence.', 403, 'COHERENCE_WITHHELD');
     }
     if (OWNER_TYPED_COMMANDS.has(commandKind)) {
-      throw new AppError('This typed decision requires Nusear owner authorization (R4.1).', 403, 'OWNER_ONLY');
+      throw new AppError('This typed decision requires Nusear owner authorization.', 403, 'OWNER_ONLY');
     }
     return;
   }
@@ -114,8 +108,8 @@ export function assertCanWrite(actor, commandKind, { companySlug, allowWorkerOve
 }
 
 /**
- * Enforces read permissions across Screens (R4, R14.2, R16).
- * area: 'inputs' | 'runs' | 'journal' | 'approvals' | 'checks' | 'bundles'
+ * Enforces read permissions by surface area: 'inputs' | 'runs' | 'outputs' | 'journal' | 'approvals' | 'checks'.
+ * Company administrators require explicit per-area grants restricted to inputs, runs, and outputs.
  */
 export function assertCanRead(actor, area, { companySlug } = {}) {
   assertValidActor(actor);
@@ -125,25 +119,22 @@ export function assertCanRead(actor, area, { companySlug } = {}) {
   if (actor.kind === ACTOR_KINDS.NUSEAR_STAFF) {
     const customers = Array.isArray(actor.customers) ? actor.customers : [];
     if (companySlug && !customers.includes(companySlug)) {
-      throw new AppError('Your account is not assigned to this company (R4.2).', 403, 'COMPANY_NOT_ASSIGNED');
+      throw new AppError('Your account is not assigned to this company.', 403, 'COMPANY_NOT_ASSIGNED');
     }
     return;
   }
 
   if (actor.kind === ACTOR_KINDS.COMPANY_ADMIN) {
     if (companySlug && actor.company !== companySlug) {
-      throw new AppError('Access restricted to your own company (R4.3).', 403, 'FORBIDDEN');
+      throw new AppError('Access restricted to your own company.', 403, 'FORBIDDEN');
     }
-    if (area === 'inputs' || area === 'runs' || area === 'bundles' || area === 'checks') return;
-    throw new AppError('Company administrators do not have access to this surface (R4.3).', 403, 'FORBIDDEN');
+    const grants = Array.isArray(actor.grants) ? actor.grants : [];
+    if (COMPANY_ADMIN_GRANTABLE_AREAS.has(area) && grants.includes(area)) return;
+    throw new AppError('Company administrator does not hold a read grant for this surface.', 403, 'FORBIDDEN');
   }
 
   if (actor.kind === ACTOR_KINDS.RECIPIENT) {
-    if (companySlug && actor.company !== companySlug) {
-      throw new AppError('Access restricted to your own company (R4.4).', 403, 'FORBIDDEN');
-    }
-    if (area === 'bundles') return;
-    throw new AppError('Recipients may only access their own bundle data (R4.4).', 403, 'FORBIDDEN');
+    throw new AppError('Recipients do not have access to Coherence management surfaces.', 403, 'FORBIDDEN');
   }
 
   throw new AppError('Access denied.', 403, 'FORBIDDEN');

@@ -1,8 +1,9 @@
-// Synthetic fixtures and mock Coherence Python engine for deterministic end-to-end tests (W-9: never touches live data).
-import { chmod, mkdir, writeFile } from 'node:fs/promises';
+// Synthetic fixtures and mock Python engine for deterministic end-to-end tests with zero access to live data or services.
+import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { APPROVAL_ROW_COLUMNS, sha256Hex } from '../../src/util/crypto.mjs';
-import { toCsv } from '../../src/util/csv.mjs';
+import { parseCsv, toCsv } from '../../src/util/csv.mjs';
+import { AppError } from '../../src/util/redact.mjs';
 
 export const V1_COLUMNS = APPROVAL_ROW_COLUMNS.slice(0, 10);
 export const V2_COLUMNS = APPROVAL_ROW_COLUMNS;
@@ -16,12 +17,66 @@ export function makeOverlayCsv(rows = [], { version = 'v2' } = {}) {
   return toCsv(matrix);
 }
 
+/**
+ * Test-only overlay CSV parser double used by synthetic import tests that do not run the Coherence Python package.
+ */
+export function createTestOverlayParser() {
+  async function parseTestOverlay(filePath, { parentPath = null } = {}) {
+    const text = await readFile(filePath, 'utf8');
+    const parsedRows = parseCsv(text);
+    if (parsedRows.length === 0) throw new AppError('Approvals CSV has no header.', 422, 'INVALID_OVERLAY');
+    const header = parsedRows[0];
+    let headerKind;
+    if (header.length === V2_COLUMNS.length && header.every((c, i) => c === V2_COLUMNS[i])) headerKind = 'v2';
+    else if (header.length === V1_COLUMNS.length && header.every((c, i) => c === V1_COLUMNS[i])) headerKind = 'v1';
+    else throw new AppError('Approvals CSV header does not match v1 or v2 overlay contract.', 422, 'INVALID_OVERLAY');
+
+    const toObj = (raw) => {
+      const obj = {};
+      for (let i = 0; i < V2_COLUMNS.length; i++) {
+        const val = i < header.length ? raw[i] : '';
+        obj[V2_COLUMNS[i]] = val === '' || val === undefined ? null : val;
+      }
+      return obj;
+    };
+
+    const rows = parsedRows.slice(1)
+      .filter((r) => r.length > 1 || (r.length === 1 && r[0] !== ''))
+      .map(toObj);
+
+    let sharedRowCount = 0;
+    if (parentPath) {
+      const parentRaw = parseCsv(await readFile(parentPath, 'utf8')).slice(1)
+        .filter((r) => r.length > 1 || (r.length === 1 && r[0] !== ''))
+        .map(toObj);
+      if (rows.length < parentRaw.length) {
+        throw new AppError('Approvals file is shorter than its parent.', 422, 'OVERLAY_PREFIX_MISMATCH');
+      }
+      for (let i = 0; i < parentRaw.length; i++) {
+        for (const col of V2_COLUMNS) {
+          if ((rows[i][col] ?? null) !== (parentRaw[i][col] ?? null)) {
+            throw new AppError('Approvals file does not begin with every row of its parent.', 422, 'OVERLAY_PREFIX_MISMATCH');
+          }
+        }
+      }
+      sharedRowCount = parentRaw.length;
+    }
+
+    const addedRows = rows.slice(sharedRowCount).map((row, idx) => ({
+      row_no: sharedRowCount + idx + 1,
+      ...row,
+    }));
+    return { headerKind, rowCount: rows.length, sharedRowCount, addedRows };
+  }
+  return parseTestOverlay;
+}
+
 export function sampleApprovalRow(overrides = {}) {
   return {
-    record_id: 'policy:aetna:P10001#effective:2026-01-01',
+    record_id: 'policy:carrier_a:P10001#effective:2026-01-01',
     disposition: 'CONFIRM',
     agent: '12345678',
-    agency: 'Phalanx',
+    agency: 'Acme',
     policy: null,
     book: null,
     month: null,
@@ -29,7 +84,7 @@ export function sampleApprovalRow(overrides = {}) {
     note: 'verified',
     committed_at: '2026-11-21T15:00:00Z',
     approved_amount: '100.00',
-    approved_agency: 'Phalanx',
+    approved_agency: 'Acme',
     approved_agent: '12345678',
     approved_agency_from: null,
     approved_agent_from: null,
@@ -51,9 +106,6 @@ export const DEFAULT_TOOLCHAIN = {
   pythonutf8: '1',
 };
 
-/**
- * Seeds a fingerprinted engine version strictly into Nusear's codeStore and registers it in the DB.
- */
 export async function seedEngineVersion(env, { label = 'v2.2.5-test', coherenceCommit = '809c6ea', nusearCommit = 'abc1234' } = {}) {
   const promo = async (relPath, content) => env.codeStore.promoteBytes(Buffer.from(content, 'utf8'), { relPath, checksPassed: true });
 
@@ -96,14 +148,14 @@ export async function seedEngineVersion(env, { label = 'v2.2.5-test', coherenceC
 }
 
 /**
- * Seeds a standing input version (including trailing-space folder `All BOB/Molina ` and cleanagentdata.csv).
+ * Seeds a standing input version including a trailing-space folder name and agent data CSV.
  */
 export async function seedStandingInput(env, { extraFiles = {}, withPriorOverlay = null, commandKey = 'seed-standing-input' } = {}) {
   const files = {
-    'Agent Data/cleanagentdata.csv': 'agent_name,agent_npn,entity,start_date\nJane Agent,12345678,Phalanx,01/01/2025\nBob Seller,87654321,Apex,01/01/2025\nRyan Manager,11112222,InsureItAll,01/01/2025\n',
-    'All Statements/aetna_202611.csv': 'member,policy_number,amount\nTest Member,P10001,100.00\n',
-    'All BOB/Molina /book.csv': 'member,policy_number,status\nTest Member,P10001,ACTIVE\n',
-    'Sunfire/enrollments.csv': 'member,policy_number,npn\nTest Member,P10001,12345678\n',
+    'Agent Data/cleanagentdata.csv': 'agent_name,agent_npn,entity,start_date\nJane Agent,12345678,Acme,01/01/2025\nBob Seller,87654321,SubAgency,01/01/2025\nJordan Manager,11112222,PartnerAgency,01/01/2025\n',
+    'All Statements/carrier_a_202611.csv': 'member,policy_number,amount\nTest Member,P10001,100.00\n',
+    'All BOB/TrailingCarrier /book.csv': 'member,policy_number,status\nTest Member,P10001,ACTIVE\n',
+    'EnrollSys/enrollments.csv': 'member,policy_number,npn\nTest Member,P10001,12345678\n',
     ...extraFiles,
   };
 
@@ -148,10 +200,8 @@ export async function seedStandingInput(env, { extraFiles = {}, withPriorOverlay
 }
 
 /**
- * Creates a stock-Python3 (zero third-party deps) mock Coherence engine materializer for tests!
- * Simulates all 5 Coherence steps (assign, attribute, bible, adjust, emit), company_emit.py,
- * and coherence_overlay_check.py faithfully, supporting fault injection (sleep, grandchild process,
- * fail step, mutate frozen input, exit unmarked).
+ * Creates a standard-library-only Python 3 mock Coherence engine materializer supporting fault injection
+ * (sleep, grandchild process, step failure, input tampering, unmarked exit).
  */
 export function createMockEngineMaterializer({
   pythonPath = 'python3',
@@ -219,11 +269,10 @@ shutil.copytree(ROOT / "input", run_dir / "input")
 maybe_hook("assign", run_dir)
 working = run_dir / "working"
 working.mkdir()
-# Verify trailing space folder survived verbatim
-molina = run_dir / "input" / "All BOB" / "Molina " / "book.csv"
-molina_hash = hashlib.sha256(molina.read_bytes()).hexdigest()[:12] if molina.is_file() else "none"
+trailing = run_dir / "input" / "All BOB" / "TrailingCarrier " / "book.csv"
+trailing_hash = hashlib.sha256(trailing.read_bytes()).hexdigest()[:12] if trailing.is_file() else "none"
 for name in ("tx", "cbob", "sf", "tx_tx", "tx_cbob", "tx_sf", "cbob_sf", "pbob"):
-    (working / f"{name}.csv").write_text(f"id,tag\\n1,{molina_hash}\\n", encoding="utf-8")
+    (working / f"{name}.csv").write_text(f"id,tag\\n1,{trailing_hash}\\n", encoding="utf-8")
 born = time.strftime("%Y-%m-%dT%H:%M:%S") + f".{time.time_ns() % 1_000_000_000:09d}"
 state = {"date": date, "born": born, "steps": {}}
 if UNMARKED_STEP != "assign":
@@ -255,8 +304,8 @@ maybe_hook("bible", run_dir)
 state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
 unid_hash = hashlib.sha256((state["born"] + ":0").encode()).hexdigest()
 items = [
-    {"record_id": "policy:aetna:P10001#effective:2026-01-01", "case": "BIBLE", "subtype": "CONFLICT", "amount": "100.00"},
-    {"record_id": f"policy:aetna:unidentified:{unid_hash}", "case": "BIBLE", "subtype": "HOUSE", "amount": "50.00"},
+    {"record_id": "policy:carrier_a:P10001#effective:2026-01-01", "case": "BIBLE", "subtype": "CONFLICT", "amount": "100.00"},
+    {"record_id": f"policy:carrier_a:unidentified:{unid_hash}", "case": "BIBLE", "subtype": "HOUSE", "amount": "50.00"},
 ]
 with open(run_dir / "bible.csv", "w", newline="", encoding="utf-8") as fh:
     w = csv.DictWriter(fh, fieldnames=["record_id", "case", "subtype", "amount"])
@@ -281,7 +330,7 @@ ov_path = run_dir / "overlay.csv"
 if not ov_path.is_file():
     print("adjust requires Bible overlay.csv", file=sys.stderr)
     sys.exit(1)
-items = [{"record_id": "aetna~direct~P10001~100.00~2026-11", "case": "NEW", "subtype": "NEW_BUSINESS", "amount": "100.00"}]
+items = [{"record_id": "carrier_a~direct~P10001~100.00~2026-11", "case": "NEW", "subtype": "NEW_BUSINESS", "amount": "100.00"}]
 with open(run_dir / "adjust.csv", "w", newline="", encoding="utf-8") as fh:
     w = csv.DictWriter(fh, fieldnames=["record_id", "case", "subtype", "amount"])
     w.writeheader()
@@ -307,19 +356,18 @@ emits.mkdir(parents=True)
 stamp = date.replace("-", "")
 (emits / f"statements_{stamp}.csv").write_text(
     "record_id,entity,writing_npn,gross_comm,downline_amount,run_action\\n"
-    "aetna~direct~P10001~100.00~2026-11,Phalanx,12345678,100.00,80.00,NEW\\n",
+    "carrier_a~direct~P10001~100.00~2026-11,Acme,12345678,100.00,80.00,NEW\\n",
     encoding="utf-8"
 )
 (emits / "adjustments.csv").write_text((run_dir / "overlay.csv").read_text(encoding="utf-8"), encoding="utf-8")
 (emits / "overlay.csv").write_text((run_dir / "overlay.csv").read_text(encoding="utf-8"), encoding="utf-8")
 
-# Entity Manager bundle
-em_dir = emits / "bundles" / "entity-managers" / "Phalanx"
+em_dir = emits / "bundles" / "entity-managers" / "Acme"
 (em_dir / "data").mkdir(parents=True)
-(em_dir / "data" / "canonical_bob.csv").write_text("member,entity,carrier,policy_id,gross_comm\\nTest Member,Phalanx,aetna,1,100.00\\n", encoding="utf-8")
-(em_dir / "data" / "coherent_ledger.csv").write_text("member,entity,carrier,gross_comm\\nTest Member,Phalanx,aetna,100.00\\n", encoding="utf-8")
+(em_dir / "data" / "canonical_bob.csv").write_text("member,entity,carrier,policy_id,gross_comm\\nTest Member,Acme,carrier_a,1,100.00\\n", encoding="utf-8")
+(em_dir / "data" / "coherent_ledger.csv").write_text("member,entity,carrier,gross_comm\\nTest Member,Acme,carrier_a,100.00\\n", encoding="utf-8")
 em_cfg = {
-    "name": "Entity Manager", "title": "Phalanx", "statementDate": date, "build": CODE_HASH, "stamped": True,
+    "name": "Entity Manager", "title": "Acme", "statementDate": date, "build": CODE_HASH, "stamped": True,
     "role": "ENTITY_MANAGER",
     "features": {"CANONICAL_BOB": {"canonical_bob": "data/canonical_bob.csv"}, "COHERENT_LEDGER": {"coherent_ledger": "data/coherent_ledger.csv"}},
     "defaultVisible": {"CANONICAL_BOB": {"canonical_bob": ["member", "entity"]}},
@@ -327,20 +375,20 @@ em_cfg = {
 }
 (em_dir / "viewer.html").write_text(f"<!doctype html><html><head><script>window.__VIEWER_CONFIG__={json.dumps(em_cfg, separators=(',', ':'))};</script></head><body>viewer</body></html>", encoding="utf-8")
 
-# Selling agent bundle (includes a dollar column "amount" that Clearpath feed MUST strip!)
-ag_dir = emits / "bundles" / "selling-agents" / "Phalanx" / "jane-agent"
+# Selling agent bundle intentionally includes a dollar column that the agent feed must strip.
+ag_dir = emits / "bundles" / "selling-agents" / "Acme" / "jane-agent"
 (ag_dir / "data").mkdir(parents=True)
-(ag_dir / "data" / "Phalanx_jane-agent_12345678_bob.csv").write_text(
+(ag_dir / "data" / "Acme_jane-agent_12345678_bob.csv").write_text(
     "member,entity,carrier,status,writing_npn,writing_agent,amount,gross_comm\\n"
-    "Test Member,Phalanx,aetna,ACTIVE_PAYING,12345678,Jane Agent,100.00,100.00\\n",
+    "Test Member,Acme,carrier_a,ACTIVE_PAYING,12345678,Jane Agent,100.00,100.00\\n",
     encoding="utf-8"
 )
 ag_cfg = {
     "name": "Jane Agent", "title": "12345678", "statementDate": date, "build": CODE_HASH, "stamped": True,
     "role": "SELLING_AGENT",
-    "features": {"BOB": {"bob": "data/Phalanx_jane-agent_12345678_bob.csv"}},
+    "features": {"BOB": {"bob": "data/Acme_jane-agent_12345678_bob.csv"}},
     "defaultVisible": {"BOB": {"bob": ["member", "entity", "amount"]}},
-    "defaultFilters": {"BOB": {"bob": {"amount": {"positiveOnly": True}, "carrier": {"include": ["aetna"]}}}},
+    "defaultFilters": {"BOB": {"bob": {"amount": {"positiveOnly": True}, "carrier": {"include": ["carrier_a"]}}}},
 }
 (ag_dir / "viewer.html").write_text(f"<!doctype html><html><head><script>window.__VIEWER_CONFIG__={json.dumps(ag_cfg, separators=(',', ':'))};</script></head><body>viewer</body></html>", encoding="utf-8")
 
@@ -366,7 +414,7 @@ if rc != 0:
 if args.display:
     manifest = [
         {"output": f"entity-managers/{args.display}", "role": "ENTITY_MANAGER", "scope": "all", "viewer": {"name": "Entity Manager", "title": args.display}},
-        {"output": "selling-agents/Phalanx/jane-agent", "role": "SELLING_AGENT", "scope": {"npns": ["12345678"], "entities": ["Phalanx"]}, "viewer": {"name": "Jane Agent", "title": "12345678"}},
+        {"output": "selling-agents/Acme/jane-agent", "role": "SELLING_AGENT", "scope": {"npns": ["12345678"], "entities": ["Acme"]}, "viewer": {"name": "Jane Agent", "title": "12345678"}},
     ]
     (Path.cwd() / "runs" / args.date / "company_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 `);
@@ -413,18 +461,27 @@ parser.add_argument("--out", default=None)
 parser.add_argument("args", nargs="+")
 p = parser.parse_args()
 try:
-    date, cand, surface = p.args
-    root = Path.cwd() / "runs" / date
-    kind, rows = read_ov(Path(cand))
-    _, prior = read_ov(root / "input" / "Overlay" / "overlay.csv")
-    if rows[:len(prior)] != prior:
-        raise ValueError("The saved file does not begin with the run's prior approvals.")
-    _, current = read_ov(root / "overlay.csv") if surface == "adjust" else (None, [])
-    if current and rows[:len(current)] != current:
-        raise ValueError("The saved file does not begin with this run's Bible review.")
-    shared = max(len(prior), len(current))
-    new_rows = [{"row_no": shared + i + 1, **r} for i, r in enumerate(rows[shared:])]
-    summary = {"header_kind": kind, "prior": len(prior), "current": len(current), "shared": shared, "rows": len(rows), "added": len(new_rows)}
+    if p.parse_only:
+        kind, rows = read_ov(Path(p.args[0]))
+        _, parent = read_ov(Path(p.extends)) if p.extends else (None, [])
+        if parent and rows[:len(parent)] != parent:
+            raise ValueError("The approvals file does not begin with every row of its parent approvals file.")
+        shared = len(parent)
+        new_rows = [{"row_no": shared + i + 1, **r} for i, r in enumerate(rows[shared:])]
+        summary = {"header_kind": kind, "prior": shared, "current": 0, "shared": shared, "rows": len(rows), "added": len(new_rows)}
+    else:
+        date, cand, surface = p.args
+        root = Path.cwd() / "runs" / date
+        kind, rows = read_ov(Path(cand))
+        _, prior = read_ov(root / "input" / "Overlay" / "overlay.csv")
+        if rows[:len(prior)] != prior:
+            raise ValueError("The saved file does not begin with the run's prior approvals.")
+        _, current = read_ov(root / "overlay.csv") if surface == "adjust" else (None, [])
+        if current and rows[:len(current)] != current:
+            raise ValueError("The saved file does not begin with this run's Bible review.")
+        shared = max(len(prior), len(current))
+        new_rows = [{"row_no": shared + i + 1, **r} for i, r in enumerate(rows[shared:])]
+        summary = {"header_kind": kind, "prior": len(prior), "current": len(current), "shared": shared, "rows": len(rows), "added": len(new_rows)}
     if p.out:
         Path(p.out).write_text(json.dumps({**summary, "new_rows": new_rows}), encoding="utf-8")
         print(json.dumps(summary))

@@ -1,17 +1,6 @@
-"""Extended Nusear overlay checker for the Coherence database web app (R5.8).
+"""Overlay checker that runs inside the run's sealed Coherence Python environment so only Coherence's own reader (coherence.overlay._read) parses approvals files.
 
-Runs under the run's sealed Coherence Python environment so ONLY Coherence's own
-overlay reader (`coherence.overlay._read`) ever parses an approvals file.
-
-Modes:
-  1. Run review check:
-     python coherence_overlay_check.py <date> <candidate_path> <surface> [--out <json_path>]
-  2. Standalone approvals file parse (for priors and historical imports):
-     python coherence_overlay_check.py --parse-only <candidate_path> [--extends <parent_path>] [--out <json_path>]
-
-Prints one compact JSON summary line (no member data) to stdout.
-If --out <json_path> is provided, writes the full JSON report including `new_rows` to that file.
-Exits non-zero with a plain message (no member data) on any refusal. Reads only; writes nothing to the run folder.
+Supports run review checks (<date> <candidate_path> <surface>) and standalone parsing (--parse-only <candidate_path> [--extends <parent_path>]). Prints one member-data-free JSON summary to stdout; writes full new_rows JSON only to --out. Read-only against the run folder.
 """
 
 import argparse
@@ -23,16 +12,20 @@ import polars as pl
 from coherence import overlay, run
 
 
+class OverlayValidationError(Exception):
+    """Controlled validation failure guaranteed to contain no member data."""
+
+
 def detect_header_kind(path: Path) -> str:
     if not path.is_file():
-        raise ValueError("Approvals file is missing.")
+        raise OverlayValidationError("Approvals file is missing.")
     frame = pl.read_csv(path, n_rows=0, infer_schema_length=0, null_values="")
     cols = tuple(frame.columns)
     if cols == overlay.ADJUSTMENT_COLUMNS:
         return "v2"
     if cols == overlay.ADJUSTMENT_COLUMNS_V1:
         return "v1"
-    raise ValueError("The saved file header does not match the v1 or v2 overlay contract.")
+    raise OverlayValidationError("The saved file header does not match the v1 or v2 overlay contract.")
 
 
 def normalize_row(row: dict, row_no: int) -> dict:
@@ -46,7 +39,7 @@ def normalize_row(row: dict, row_no: int) -> dict:
 def validate_rows_have_ids(rows: list[dict]) -> None:
     for idx, row in enumerate(rows, start=1):
         if not row.get("record_id"):
-            raise ValueError(f"Approvals row {idx} carries no record_id.")
+            raise OverlayValidationError(f"Approvals row {idx} carries no record_id.")
 
 
 def main() -> None:
@@ -60,14 +53,14 @@ def main() -> None:
     try:
         if parsed.parse_only:
             if len(parsed.args) != 1:
-                raise ValueError("Usage: --parse-only <candidate_path>")
+                raise OverlayValidationError("Usage: --parse-only <candidate_path>")
             candidate = Path(parsed.args[0])
             header_kind = detect_header_kind(candidate)
             rows = overlay._read(candidate)
             validate_rows_have_ids(rows)
             parent_rows = overlay._read(Path(parsed.extends)) if parsed.extends else []
             if parent_rows and rows[: len(parent_rows)] != parent_rows:
-                raise ValueError("The approvals file does not begin with every row of its parent approvals file.")
+                raise OverlayValidationError("The approvals file does not begin with every row of its parent approvals file.")
             shared = len(parent_rows)
             new_rows = [normalize_row(row, shared + i + 1) for i, row in enumerate(rows[shared:])]
             summary = {
@@ -80,10 +73,10 @@ def main() -> None:
             }
         else:
             if len(parsed.args) != 3:
-                raise ValueError("Usage: <date> <candidate_path> <surface>")
+                raise OverlayValidationError("Usage: <date> <candidate_path> <surface>")
             date, candidate_str, surface = parsed.args
             if surface not in ("bible", "adjust"):
-                raise ValueError("Surface must be 'bible' or 'adjust'.")
+                raise OverlayValidationError("Surface must be 'bible' or 'adjust'.")
             candidate = Path(candidate_str)
             header_kind = detect_header_kind(candidate)
             root = run.root(date)
@@ -91,10 +84,10 @@ def main() -> None:
             rows = overlay._read(candidate)
             validate_rows_have_ids(rows)
             if rows[: len(prior)] != prior:
-                raise ValueError("The saved file does not begin with the run's prior approvals.")
+                raise OverlayValidationError("The saved file does not begin with the run's prior approvals.")
             current = overlay._read(root / overlay.RUN_REL) if surface == "adjust" else []
             if current and rows[: len(current)] != current:
-                raise ValueError("The saved file does not begin with this run's Bible review.")
+                raise OverlayValidationError("The saved file does not begin with this run's Bible review.")
             shared = max(len(prior), len(current))
             new_rows = [normalize_row(row, shared + i + 1) for i, row in enumerate(rows[shared:])]
             summary = {
@@ -112,10 +105,11 @@ def main() -> None:
             print(json.dumps(summary))
         else:
             print(json.dumps({**summary, "new_rows": new_rows}, ensure_ascii=False))
-    except Exception as exc:
-        # Never print member data / record_ids to stderr; emit concise reason only.
-        msg = str(exc).splitlines()[0] if str(exc) else "Overlay check failed."
-        print(msg, file=sys.stderr)
+    except OverlayValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+    except Exception:
+        print("Overlay check failed due to an unexpected file or parsing error.", file=sys.stderr)
         sys.exit(1)
 
 

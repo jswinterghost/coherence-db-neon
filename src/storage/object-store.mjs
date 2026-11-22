@@ -1,5 +1,4 @@
-// Create-only object storage backends with MD5 and CRC32C verification (R6.2, R10.8).
-// Supports Google Cloud Storage (HTTP/1.1 keep-alive, ifGenerationMatch=0), local filesystem, and in-memory backends.
+// Create-only object storage backends (Google Cloud Storage, local filesystem, and in-memory) verifying both MD5 and CRC32C checksums on every write and reuse.
 import { createHash, createSign, randomBytes } from 'node:crypto';
 import { mkdir, readFile, stat, unlink, writeFile, link } from 'node:fs/promises';
 import { Agent as HttpAgent, request as httpRequest } from 'node:http';
@@ -90,9 +89,8 @@ function assertChecksumsMatch(objectName, actual, expected) {
 }
 
 /**
- * Google Cloud Storage create-only backend (R6.2, R10.8).
- * Enforces ifGenerationMatch=0, never deletes objects, and verifies BOTH MD5 and CRC32C
- * on every upload AND when resuming after an existing object (412/409).
+ * Google Cloud Storage create-only backend: sets ifGenerationMatch=0, never deletes objects,
+ * and verifies both MD5 and CRC32C on upload and when resuming on 412/409.
  */
 export function createGcsObjectStore({
   bucket,
@@ -203,7 +201,6 @@ export function createGcsObjectStore({
       };
     } catch (err) {
       if (err.status !== 409) throw err;
-      // R10.8: verify existing object by BOTH MD5 and CRC32C (and size) before treating as safely stored.
       const existing = await statObject(objectName);
       if (!existing) throw err;
       assertChecksumsMatch(objectName, existing, expected);
@@ -306,8 +303,7 @@ export function createFileObjectStore({ rootDir, label = null } = {}) {
 }
 
 /**
- * In-memory create-only backend for unit and integration tests.
- * Supports optional fault injection (failNextCreate, corruptNextMeta) for R10.8 / R18 tests.
+ * In-memory create-only backend for tests, with optional fault injection hooks (failNextCreate, corruptStoredMeta, onCreate).
  */
 export function createMemoryObjectStore({ label = `mem:${randomBytes(4).toString('hex')}` } = {}) {
   const objects = new Map();
