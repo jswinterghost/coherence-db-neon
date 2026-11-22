@@ -826,7 +826,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
   }
 
   async function startStepAttempt({ client, actor, commandKey, eventId = randomUUID(), runId, step, stepRequestId }) {
-    if (!client) throw new AppError('startStepAttempt must run on the worker''s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
+    if (!client) throw new AppError('startStepAttempt must run on the worker\'s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
     const payload = { runId, step, stepRequestId };
     return executeJournalCommand({
       client,
@@ -878,7 +878,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     storedFiles = [],
     continueToNextStep = (step === 'assign' || step === 'attribute'),
   }) {
-    if (!client) throw new AppError('finishStepAttempt must run on the worker''s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
+    if (!client) throw new AppError('finishStepAttempt must run on the worker\'s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
     const normalizedArtifacts = artifacts.map((a) => ({
       attemptEventId: eventId,
       relPath: a.relPath ?? a.rel_path,
@@ -956,7 +956,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
   }
 
   async function failStepAttempt({ client, actor, commandKey, eventId = randomUUID(), runId, step, attemptNo, logFile = null, errorSummary = '', storedFiles = [] }) {
-    if (!client) throw new AppError('failStepAttempt must run on the worker''s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
+    if (!client) throw new AppError('failStepAttempt must run on the worker\'s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
     const safeSummary = sanitizeErrorMessage(errorSummary, 'Step failed.');
     const payload = { runId, step, attemptNo, logFileSha256: logFile?.sha256 ?? null, errorSummary: safeSummary };
     return executeJournalCommand({
@@ -993,7 +993,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     client, actor, commandKey, eventId = randomUUID(), runId, step, attemptNo,
     cancelRequestId = null, logFile = null, errorSummary = 'Cancelled.', storedFiles = [],
   }) {
-    if (!client) throw new AppError('cancelStepAttempt must run on the worker''s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
+    if (!client) throw new AppError('cancelStepAttempt must run on the worker\'s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
     const safeSummary = sanitizeErrorMessage(errorSummary, 'Cancelled.');
     const payload = { runId, step, attemptNo, cancelRequestId, logFileSha256: logFile?.sha256 ?? null, errorSummary: safeSummary };
     return executeJournalCommand({
@@ -1267,7 +1267,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     addedRows = [],
   }) {
     assertCanWrite(actor, 'accept_review_submission', { companySlug });
-    if (!client) throw new AppError('acceptReviewSubmission must run on the worker''s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
+    if (!client) throw new AppError('acceptReviewSubmission must run on the worker\'s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
 
     const tx = client;
     try {
@@ -1452,7 +1452,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
 
   async function rejectReviewSubmission({ client, actor, submissionId, status = 'rejected', reason = 'Review file rejected.' }) {
     assertCanWrite(actor, 'reject_review_submission', { companySlug });
-    if (!client) throw new AppError('rejectReviewSubmission must run on the worker''s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
+    if (!client) throw new AppError('rejectReviewSubmission must run on the worker\'s slot connection.', 500, 'SLOT_CONNECTION_REQUIRED');
     if (!['rejected', 'failed'].includes(status)) throw new AppError('status must be rejected or failed.', 400, 'INVALID_STATUS');
     const safeReason = sanitizeErrorMessage(reason, 'Review submission rejected.');
     try {
