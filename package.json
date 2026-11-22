@@ -11,7 +11,10 @@
     "pg": "8.13.1"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "check": "node scripts/check-syntax.mjs",
+    "docs:state-machine": "node scripts/generate-state-machine-doc.mjs",
+    "docs:state-machine:check": "node scripts/generate-state-machine-doc.mjs --check",
+    "test": "node scripts/check-syntax.mjs && node scripts/generate-state-machine-doc.mjs --check && node --test tests/layer1_money_and_history.test.mjs tests/layer2_member_data_code_and_config.test.mjs tests/layer3_state_machine_and_races.test.mjs tests/layer4_import_and_proofs.test.mjs tests/layer5_screens_and_readers.test.mjs",
     "migrate": "node src/db/migrate.mjs"
   }
 }

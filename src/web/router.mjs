@@ -2,7 +2,7 @@
 // Enforces body size limits, non-PHI error responses (R14.3), gzip negotiation, and non-sandboxed
 // data headers so Nusear's signed-in screens can fetch bundle configs and CSV files (R11, R14.2).
 import { gzipSync } from 'node:zlib';
-import { AppError, sanitizeErrorMessage } from '../util/redact.mjs';
+import { AppError, redactPhi, sanitizeErrorMessage } from '../util/redact.mjs';
 
 const DEFAULT_MAX_JSON_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_CSV_BYTES = 64 * 1024 * 1024;
@@ -82,6 +82,16 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
       const url = new URL(req.url, 'http://localhost');
       const method = (req.method || 'GET').toUpperCase();
       const pathname = url.pathname.replace(/\/+$/, '') || '/';
+
+      // R14.3: Member-identifying record_ids and policy keys must NEVER appear in URL paths or query strings.
+      const decodedUrl = decodeURIComponent(`${pathname}${url.search}`);
+      if (
+        url.searchParams.has('recordId')
+        || url.searchParams.has('record_id')
+        || redactPhi(decodedUrl) !== decodedUrl
+      ) {
+        throw new AppError('Member identifiers and record ids must never be sent in URLs (R14.3).', 400, 'RECORD_ID_IN_URL_FORBIDDEN');
+      }
 
       const prefixMatch = /^\/api\/coherence\/([a-z0-9_-]+)(\/.*)?$/.exec(pathname);
       if (!prefixMatch) throw new AppError('API route not found.', 404, 'NOT_FOUND');
@@ -189,14 +199,12 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
         return sendJson(res, 200, await h.getHistoryAsOf(actor, { asOfSeq: q('asOfSeq') ?? q('seq'), asOf: q('asOf') ?? q('at') }), { acceptsGzip });
       }
       if (parts[0] === 'approvals' && parts[1] === 'history' && parts.length === 2) {
-        // Supports POST body so member-naming record_id never appears in HTTP URL access logs (R14.3).
+        // Strictly POST JSON body so member-naming record_id NEVER appears in HTTP URL access logs (R14.3).
         if (method === 'POST') {
           const body = await readJsonBody(req);
           return sendJson(res, 200, await h.getApprovalKeyHistory(actor, body.recordId), { acceptsGzip });
         }
-        if (method === 'GET') {
-          return sendJson(res, 200, await h.getApprovalKeyHistory(actor, q('recordId')), { acceptsGzip });
-        }
+        throw new AppError('Approval key history requires POST with a JSON body so record ids stay out of URLs (R14.3).', 405, 'METHOD_NOT_ALLOWED');
       }
 
       // ---- Checks (R16.4) ----

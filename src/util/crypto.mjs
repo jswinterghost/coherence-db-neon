@@ -119,9 +119,10 @@ export function formatTimestampUtcUs(value) {
     return value.toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
   }
   const text = String(value ?? '').trim();
-  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:?\d{2})?$/.exec(text);
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}(?::?\d{2})?)?$/.exec(text);
   if (match) {
-    const [, day, hms, frac = '', tz = 'Z'] = match;
+    const [, day, hms, frac = '', rawTz = 'Z'] = match;
+    const tz = /^[+-]\d{2}$/.test(rawTz) ? `${rawTz}:00` : rawTz;
     if (tz === 'Z' || tz === '+00:00' || tz === '+0000' || tz === '-00:00' || tz === '-0000') {
       return `${day}T${hms}.${frac.padEnd(6, '0')}Z`;
     }

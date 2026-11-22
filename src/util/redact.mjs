@@ -2,16 +2,47 @@
 // Coherence record_ids embed member names, MBIs, and policy numbers (e.g. "uhc~direct~SMITH JOHN~..."),
 // so any error or log string emitted by Coherence or a handler must be scrubbed before logging or returning.
 
+const RECORD_ID_MULTI_TILDE_RE = /\b[a-z0-9_]+~[^~\r\n,;'"\]})]+~[^~\r\n,;'"\]})]+(?:~[^~\r\n,;'"\]})]+)*/gi;
 const RECORD_ID_TILDE_RE = /\b[a-z0-9_]+~[^\s,;'"\]})]{4,}/gi;
 const POLICY_KEY_RE = /\bpolicy:[a-z0-9_]+:[^\s,;'"\]})]+/gi;
 const MBI_RE = /\b[1-9][AC-HJKMNP-RT-Y][A-Z0-9][0-9]-?[AC-HJKMNP-RT-Y][A-Z0-9][0-9]-?[AC-HJKMNP-RT-Y]{2}[0-9]{2}\b/gi;
 const SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
 const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const PHONE_RE = /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b/g;
+const SQL_PG_KEY_DETAIL_RE = /\bKey\s*\([^)]+\)\s*=\s*\([^)]+\)/gi;
+const SQL_PG_FAILING_ROW_RE = /\bFailing row contains\s*\([^)]+\)/gi;
+const SQL_PG_PARAMS_LINE_RE = /\bPARAMETERS:\s*[^\r\n]+/gi;
+const SQL_BOUND_PARAM_RE = /\$\d+\s*=\s*'[^']*'/g;
+
+const SENSITIVE_LOG_KEYS = new Set([
+  'recordid',
+  'record_id',
+  'member',
+  'membername',
+  'member_name',
+  'mbi',
+  'ssn',
+  'policy',
+  'policynumber',
+  'policy_number',
+  'sqlparams',
+  'sql_params',
+  'params',
+  'parameters',
+  'values',
+  'password',
+  'secret',
+  'authorization',
+]);
 
 export function redactPhi(text) {
   if (text == null) return '';
   return String(text)
+    .replace(SQL_PG_KEY_DETAIL_RE, 'Key ([redacted])=([redacted-sql-param])')
+    .replace(SQL_PG_FAILING_ROW_RE, 'Failing row contains ([redacted-sql-param])')
+    .replace(SQL_PG_PARAMS_LINE_RE, 'PARAMETERS: [redacted-sql-params]')
+    .replace(SQL_BOUND_PARAM_RE, '[redacted-sql-param]')
+    .replace(RECORD_ID_MULTI_TILDE_RE, '[redacted-record-id]')
     .replace(RECORD_ID_TILDE_RE, '[redacted-record-id]')
     .replace(POLICY_KEY_RE, '[redacted-policy-key]')
     .replace(MBI_RE, '[redacted-mbi]')
@@ -41,6 +72,10 @@ export function createSafeLogger(sink = console) {
     const safe = {};
     for (const [key, value] of Object.entries(fields)) {
       if (value == null) continue;
+      if (SENSITIVE_LOG_KEYS.has(key.toLowerCase())) {
+        safe[key] = '[redacted]';
+        continue;
+      }
       if (typeof value === 'number' || typeof value === 'boolean') safe[key] = value;
       else if (typeof value === 'string') safe[key] = redactPhi(value);
       else safe[key] = redactPhi(JSON.stringify(value));

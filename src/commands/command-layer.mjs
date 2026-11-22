@@ -55,7 +55,7 @@ async function filterNewStoredFiles(tx, files) {
   const existing = await tx.query(
     `SELECT store_kind, sha256, byte_size, md5_b64, crc32c_b64
      FROM coherence.stored_files
-     WHERE (store_kind, sha256) IN (SELECT * FROM pg_catalog.unnest($1::text[], $2::text[]))`,
+     WHERE (store_kind, sha256) IN (SELECT s, h FROM unnest($1::text[], $2::text[]) AS t(s, h))`,
     [storeKinds, shas],
   );
   const existingMap = new Map(existing.rows.map((r) => [`${r.store_kind}:${r.sha256}`, r]));
@@ -79,7 +79,7 @@ async function insertStoredFilesBatch(tx, files, journalSeq) {
     await tx.query(
       `INSERT INTO coherence.stored_files (store_kind, sha256, byte_size, md5_b64, crc32c_b64, object_name, journal_seq)
        SELECT s, h, sz, m, c, o, $7
-       FROM pg_catalog.unnest($1::text[], $2::text[], $3::bigint[], $4::text[], $5::text[], $6::text[]) AS t(s, h, sz, m, c, o)`,
+       FROM unnest($1::text[], $2::text[], $3::bigint[], $4::text[], $5::text[], $6::text[]) AS t(s, h, sz, m, c, o)`,
       [
         chunk.map((f) => f.storeKind),
         chunk.map((f) => f.sha256),
@@ -99,7 +99,7 @@ async function insertInputEntriesBatch(tx, inputVersionId, entries, journalSeq) 
     await tx.query(
       `INSERT INTO coherence.input_entries (input_version_id, rel_path, store_kind, file_sha256, journal_seq)
        SELECT $1::uuid, p, 'company_data', h, $4
-       FROM pg_catalog.unnest($2::text[], $3::text[]) AS t(p, h)`,
+       FROM unnest($2::text[], $3::text[]) AS t(p, h)`,
       [
         inputVersionId,
         chunk.map((e) => e.relPath ?? e.rel_path),
@@ -116,7 +116,7 @@ async function insertInputChangesBatch(tx, inputVersionId, changes, journalSeq) 
     await tx.query(
       `INSERT INTO coherence.input_changes (input_version_id, rel_path, change_kind, old_rel_path, store_kind, file_sha256, prev_file_sha256, journal_seq)
        SELECT $1::uuid, p, k, op, 'company_data', h, ph, $7
-       FROM pg_catalog.unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) AS t(p, k, op, h, ph)`,
+       FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) AS t(p, k, op, h, ph)`,
       [
         inputVersionId,
         chunk.map((c) => c.relPath ?? c.rel_path),
@@ -136,7 +136,7 @@ async function insertArtifactsBatch(tx, artifacts, journalSeq) {
     await tx.query(
       `INSERT INTO coherence.artifacts (attempt_event_id, rel_path, artifact_kind, store_kind, file_sha256, journal_seq)
        SELECT e, p, ak, sk, h, $6
-       FROM pg_catalog.unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[]) AS t(e, p, ak, sk, h)`,
+       FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[]) AS t(e, p, ak, sk, h)`,
       [
         chunk.map((a) => a.attemptEventId ?? a.attempt_event_id),
         chunk.map((a) => a.relPath ?? a.rel_path),
@@ -159,7 +159,7 @@ async function insertApprovalRowsBatch(tx, rows, journalSeq) {
          approved_agency_from, approved_agent_from, journal_seq
        )
        SELECT af, rn, rid, disp, ag, agy, pol, bk, mo, st, nt, ca, aa, aagy, aag, aagyf, aagf, $18
-       FROM pg_catalog.unnest(
+       FROM unnest(
          $1::text[], $2::integer[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[],
          $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[], $15::text[],
          $16::text[], $17::text[]

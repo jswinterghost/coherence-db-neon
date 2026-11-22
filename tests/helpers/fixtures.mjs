@@ -171,18 +171,19 @@ export function createMockEngineMaterializer({
       return full;
     };
 
+    const pyLit = (v) => (v == null ? 'None' : JSON.stringify(v));
     const sharedHeader = `
 import csv, hashlib, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 
-ROOT = Path(${JSON.stringify(workspaceDir)})
-CODE_HASH = ${JSON.stringify(fixedCodeHash)}
-SLEEP_STEP = ${JSON.stringify(sleepStep)}
+ROOT = Path(${pyLit(workspaceDir)})
+CODE_HASH = ${pyLit(fixedCodeHash)}
+SLEEP_STEP = ${pyLit(sleepStep)}
 SLEEP_SECONDS = ${Number(sleepSeconds)}
-GRANDCHILD_PID_FILE = ${JSON.stringify(spawnGrandchildPidFile)}
-FAIL_STEP = ${JSON.stringify(failStep)}
-MUTATE_STEP = ${JSON.stringify(mutateFrozenInputStep)}
-UNMARKED_STEP = ${JSON.stringify(unmarkedExitStep)}
+GRANDCHILD_PID_FILE = ${pyLit(spawnGrandchildPidFile)}
+FAIL_STEP = ${pyLit(failStep)}
+MUTATE_STEP = ${pyLit(mutateFrozenInputStep)}
+UNMARKED_STEP = ${pyLit(unmarkedExitStep)}
 
 def check_env():
     assert os.environ.get("PYTHONUTF8") == "1", "PYTHONUTF8 must be 1"
@@ -262,7 +263,7 @@ with open(run_dir / "bible.csv", "w", newline="", encoding="utf-8") as fh:
     w.writeheader()
     w.writerows(items)
 cfg = {"statementDate": date, "build": CODE_HASH, "stamped": True, "surface": "bible", "runBorn": state["born"], "queue": items, "overlay": [], "checksum": unid_hash[:16]}
-html = f"<!doctype html><html><head><title>Coherence Bible</title><script>window.__ADJUST_CONFIG__={json.dumps(cfg)};</script></head><body>bible</body></html>"
+html = f"<!doctype html><html><head><title>Coherence Bible</title><script>window.__ADJUST_CONFIG__={json.dumps(cfg, separators=(',', ':'))};</script></head><body>bible</body></html>"
 (run_dir / "bible.html").write_text(html, encoding="utf-8")
 if UNMARKED_STEP != "bible":
     state["steps"]["bible"] = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "code": CODE_HASH, "seconds": 0.1, "bible_items": len(items)}
@@ -286,7 +287,7 @@ with open(run_dir / "adjust.csv", "w", newline="", encoding="utf-8") as fh:
     w.writeheader()
     w.writerows(items)
 cfg = {"statementDate": date, "build": CODE_HASH, "stamped": True, "surface": "adjust", "runBorn": state["born"], "queue": items, "overlay": [], "checksum": "adj123"}
-html = f"<!doctype html><html><head><title>Coherence Adjust</title><script>window.__ADJUST_CONFIG__={json.dumps(cfg)};</script></head><body>adjust</body></html>"
+html = f"<!doctype html><html><head><title>Coherence Adjust</title><script>window.__ADJUST_CONFIG__={json.dumps(cfg, separators=(',', ':'))};</script></head><body>adjust</body></html>"
 (run_dir / "adjust.html").write_text(html, encoding="utf-8")
 if UNMARKED_STEP != "adjust":
     state["steps"]["adjust"] = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "code": CODE_HASH, "seconds": 0.1, "queue_items": len(items)}
@@ -324,7 +325,7 @@ em_cfg = {
     "defaultVisible": {"CANONICAL_BOB": {"canonical_bob": ["member", "entity"]}},
     "defaultFilters": {},
 }
-(em_dir / "viewer.html").write_text(f"<!doctype html><html><head><script>window.__VIEWER_CONFIG__={json.dumps(em_cfg)};</script></head><body>viewer</body></html>", encoding="utf-8")
+(em_dir / "viewer.html").write_text(f"<!doctype html><html><head><script>window.__VIEWER_CONFIG__={json.dumps(em_cfg, separators=(',', ':'))};</script></head><body>viewer</body></html>", encoding="utf-8")
 
 # Selling agent bundle (includes a dollar column "amount" that Clearpath feed MUST strip!)
 ag_dir = emits / "bundles" / "selling-agents" / "Phalanx" / "jane-agent"
@@ -341,7 +342,7 @@ ag_cfg = {
     "defaultVisible": {"BOB": {"bob": ["member", "entity", "amount"]}},
     "defaultFilters": {"BOB": {"bob": {"amount": {"positiveOnly": True}, "carrier": {"include": ["aetna"]}}}},
 }
-(ag_dir / "viewer.html").write_text(f"<!doctype html><html><head><script>window.__VIEWER_CONFIG__={json.dumps(ag_cfg)};</script></head><body>viewer</body></html>", encoding="utf-8")
+(ag_dir / "viewer.html").write_text(f"<!doctype html><html><head><script>window.__VIEWER_CONFIG__={json.dumps(ag_cfg, separators=(',', ':'))};</script></head><body>viewer</body></html>", encoding="utf-8")
 
 if UNMARKED_STEP != "emit":
     state["steps"]["emit"] = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "code": CODE_HASH, "seconds": 0.1, "statements": 1}

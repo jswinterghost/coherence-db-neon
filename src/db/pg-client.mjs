@@ -1,24 +1,28 @@
 // PostgreSQL 17 connection adapter (R3.1, R14.4).
-// Uses `pg` (node-postgres) when installed, with a built-in zero-dependency PG v3 wire-protocol fallback.
-import { WireClient, WirePool } from './wire-pg.mjs';
+// Uses the standard `pg` (node-postgres) driver.
+import { userInfo } from 'node:os';
+import pg from 'pg';
 
-let loadedPg = undefined;
+const { Pool, Client, types } = pg;
 
-async function resolveDriver() {
-  if (loadedPg !== undefined) return loadedPg;
+// Preserve full PostgreSQL microsecond precision on TIMESTAMPTZ (1184) and TIMESTAMP (1114)
+// rather than letting JS Date truncate sub-millisecond digits.
+types.setTypeParser(1184, (val) => val);
+types.setTypeParser(1114, (val) => val);
+
+function resolveLocalUser() {
+  if (process.env.PGUSER) return process.env.PGUSER;
+  if (process.env.USER) return process.env.USER;
   try {
-    const mod = await import('pg');
-    const pkg = mod.default || mod;
-    loadedPg = { Pool: pkg.Pool, Client: pkg.Client, driver: 'pg' };
+    return userInfo().username;
   } catch {
-    loadedPg = { Pool: WirePool, Client: WireClient, driver: 'wire-pg' };
+    return 'marcsmac';
   }
-  return loadedPg;
 }
 
 /**
  * Builds PostgreSQL connection options honoring R3.1 and R14.4:
- * - Local dev: defaults to local PostgreSQL 17 on port 5433 (Mac user on Unix socket or password over TCP).
+ * - Local dev: defaults to local PostgreSQL 17 on Unix socket /tmp port 5433 (Mac user on socket, password over TCP).
  * - Production (Cloud SQL): IAM service account authentication + TLS required, never direct unencrypted TCP.
  */
 export function buildConnectionConfig(options = {}) {
@@ -50,10 +54,10 @@ export function buildConnectionConfig(options = {}) {
     };
   }
   return {
-    host: options.host ?? process.env.PGHOST ?? '127.0.0.1',
+    host: options.host ?? process.env.PGHOST ?? '/tmp',
     port: Number(options.port ?? process.env.PGPORT ?? 5433),
     database: options.database ?? process.env.PGDATABASE ?? 'coherence_dev',
-    user: options.user ?? process.env.PGUSER ?? process.env.USER ?? 'postgres',
+    user: options.user ?? resolveLocalUser(),
     password: options.password ?? process.env.PGPASSWORD ?? undefined,
     ssl: options.ssl ?? false,
     max: options.max ?? 10,
@@ -62,18 +66,16 @@ export function buildConnectionConfig(options = {}) {
 }
 
 export async function createPool(options = {}) {
-  const { Pool, driver } = await resolveDriver();
   const config = buildConnectionConfig(options);
   const pool = new Pool(config);
-  pool.driverName = driver;
+  pool.driverName = 'pg';
   return pool;
 }
 
 export async function createClient(options = {}) {
-  const { Client, driver } = await resolveDriver();
   const config = buildConnectionConfig(options);
   const client = new Client(config);
-  client.driverName = driver;
+  client.driverName = 'pg';
   await client.connect();
   return client;
 }

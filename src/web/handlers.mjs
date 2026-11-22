@@ -489,7 +489,7 @@ export function createWebHandlers({
    * Never returns compiled HTML/JS code to clients.
    */
   async function getReviewConfig(actor, runId, surface) {
-    assertCanRead(actor, 'runs', { companySlug });
+    assertCanRead(actor, 'approvals', { companySlug });
     if (!['bible', 'adjust'].includes(surface)) throw new AppError('Choose bible or adjust.', 400, 'INVALID_SURFACE');
     const runRes = await pool.query(
       `SELECT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date,
@@ -521,7 +521,7 @@ export function createWebHandlers({
   }
 
   async function getReviewSubmission(actor, submissionId) {
-    assertCanRead(actor, 'runs', { companySlug });
+    assertCanRead(actor, 'approvals', { companySlug });
     const res = await pool.query(
       `SELECT id, run_id, surface, status, staged_sha256, review_save_id, result_journal_seq, result_message, created_at, resolved_at
        FROM coherence.review_submissions WHERE id = $1::uuid`,
@@ -799,6 +799,9 @@ export function createWebHandlers({
   async function getBundleFile(actor, { output, path, acceptsGzip = false, runId = null, asOfSeq = null, asOf = null } = {}) {
     assertCanRead(actor, 'bundles', { companySlug });
     if (!output || !path) throw new AppError('Bundle output and file path are required.', 400, 'MISSING_PARAMS');
+    if (isCodeBearingPath(path)) {
+      throw new AppError('Code-bearing files cannot be served from bundle endpoints (R1.6, R14.2).', 403, 'CODE_FILE_FORBIDDEN');
+    }
     const seq = await resolveAsOfSeq({ asOfSeq, asOf });
     return reader.getBundleFile(actor, output, path, acceptsGzip, { runId, asOfSeq: seq });
   }
@@ -806,7 +809,7 @@ export function createWebHandlers({
   // ---- R16.2 Review App Drift Check ----
 
   async function getReviewDriftStatus(actor) {
-    assertCanRead(actor, 'runs', { companySlug });
+    assertCanRead(actor, 'journal', { companySlug });
     if (!driftCheckConfig) return { configured: false, passed: true, checkedCopies: 0, problems: [] };
     return { configured: true, ...(await checkReviewAppDrift(driftCheckConfig)) };
   }
@@ -825,7 +828,7 @@ export function createWebHandlers({
     getAttemptLog,
     getReviewConfig,
     getReviewDraft: async (actor, runId, surface, attemptNo) => {
-      assertCanRead(actor, 'runs', { companySlug });
+      assertCanRead(actor, 'approvals', { companySlug });
       return { draft: await commands.getReviewDraft({ runId, surface, attemptNo }) };
     },
     saveReviewDraft: (actor, runId, surface, body) => commands.saveReviewDraft({ actor, runId, surface, ...body }),

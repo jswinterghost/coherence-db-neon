@@ -40,7 +40,7 @@ function formatDateCol(val) {
  */
 export async function exportJournalNdjson(pool) {
   const entriesRes = await pool.query(
-    `SELECT seq, recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
+    `SELECT seq, coherence.format_utc_us(recorded_at) AS recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
      FROM coherence.journal_entries
      ORDER BY seq ASC`,
   );
@@ -392,7 +392,7 @@ export async function rebuildFromJournalExport(pool, ndjsonText) {
  */
 export async function verifyChain(pool) {
   const res = await pool.query(
-    `SELECT seq, recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
+    `SELECT seq, coherence.format_utc_us(recorded_at) AS recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
      FROM coherence.journal_entries ORDER BY seq ASC`,
   );
   const problems = [];
@@ -452,6 +452,11 @@ export async function verifyCommitments(pool) {
         sql = `SELECT id, run_id, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date, carry_kind,
                       file_sha256, published_input_version_id, nothing_new, typed_phrase
                FROM coherence.carries WHERE journal_seq = $1`;
+      } else if (tbl === 'review_saves') {
+        sql = `SELECT id, run_id, surface, attempt_event_id, approvals_file_sha256, imported,
+                      CASE WHEN original_at IS NULL THEN NULL ELSE coherence.format_utc_us(original_at) END AS original_at,
+                      submission_id
+               FROM coherence.review_saves WHERE journal_seq = $1`;
       }
       const res = await pool.query(sql, [String(seq)]);
       if (res.rows.length > 0) tables[tbl] = res.rows;
