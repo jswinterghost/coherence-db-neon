@@ -65,7 +65,7 @@ Tests create and drop throwaway databases strictly under the `coherence_test_*` 
 
 ## Read-Only History Proof Runner
 
-To migrate a fresh throwaway local `test_*` database (strictly refusing non-local `PGHOST` values and non-`test_*` database names, verifying configured manifest folders exist, failing missing comparator targets by name, and cleaning its temporary folder on exit), import a company-agnostic JSON manifest read-only (with zero network calls), run Layers 0, 1, 2, and 4 plus the substance comparator where comparison targets exist, and print a strictly PHI-free summary:
+To migrate a fresh throwaway local `test_*` database (pinning local PostgreSQL mode, strictly refusing non-local `PGHOST` values including any socket path under `/cloudsql` and non-`test_*` database names, verifying configured manifest folders exist, failing missing comparator targets by name, and cleaning its temporary folder on exit), import a company-agnostic JSON manifest read-only (with zero network calls), run Layers 0, 1, 2, and 4 plus the substance comparator where comparison targets exist, and print a strictly PHI-free summary:
 
 ```sh
 PGHOST=/tmp PGPORT=5433 PGUSER="$USER" \

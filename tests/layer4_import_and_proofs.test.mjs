@@ -8,10 +8,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { runHistoryProof } from '../scripts/prove-history.mjs';
-import { compareDatabasesAsOf, exportJournalNdjson, rebuildFromJournalExport } from '../src/commands/journal-export.mjs';
+import { assertLocalPgHost, runHistoryProof } from '../scripts/prove-history.mjs';
+import { createCommandLayer } from '../src/commands/command-layer.mjs';
+import { compareDatabasesAsOf, exportJournalNdjson, rebuildFromJournalExport, verifyChain, verifyCommitments } from '../src/commands/journal-export.mjs';
 import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstruction.mjs';
 import { compareCsvExactText, compareDbRuns, compareRunFolders, mapEntitiesCsv } from '../src/compare/run-comparator.mjs';
+import { createPool } from '../src/db/pg-client.mjs';
 import { formatOverlayCsvFromRows, generateOverlayCsv } from '../src/decisions/overlay-generator.mjs';
 import {
   buildImportManifest,
@@ -24,6 +26,7 @@ import {
   resolveLiveProofConfig,
 } from '../src/importer/history-importer.mjs';
 import { findLatestPublishedRun } from '../src/readers/downstream-reader.mjs';
+import { formatTimestampUtcUs } from '../src/util/crypto.mjs';
 import { buildAttemptWorkspace } from '../src/worker/folder-builder.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
 import {
@@ -1208,7 +1211,7 @@ test('Layer 4 [Pre-Coherence 5 Sent Dates & 2 Method Corrections]: imports via p
   assert.equal((await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.statement_batches')).rows[0].n, 7);
 });
 
-test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows without $0 agency lines, loud unreversedOnly/agents.lookup failures, Coherence banker rounding, and cent-exact expected totals abort', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows without $0 agency lines, loud unreversedOnly/agents.lookup failures, Coherence ROUND_HALF_UP rounding (positive and negative half-cents), and cent-exact expected totals abort', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
   t.after(() => env.cleanup());
 
@@ -1232,12 +1235,21 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
     ].join('\n') + '\n',
     'ALLAGENCY20260731Spark.csv': [
       'entity,npn,agent,member,mbi,policy_number,carrier,channel,amount,earned,payment,note,state,plan_type,coverage_type,effective,submitted',
-      // 0.05 at 50% split: downline = round(0.025) = 0.02 (HALF_EVEN), upline = 0.03 (vs HALF_UP -> 0.02)
+      // 0.05 at 50% split: downline = round_half_up(0.025) = 0.03, upline = 0.05 - 0.03 = 0.02 (HALF_EVEN would give 0.02 / 0.03)
       `Beacon,11111111,Sam Seller,${plantedMember},1AB2CD3EF45,POL4,carriera,spark,0.05,2026-07-01,2026-07-15,half1,NC,MA,MA,2026-01-01,2026-01-01`,
-      // 0.03 at 50% split: downline = round(0.015) = 0.02 (HALF_EVEN), upline = 0.01 (vs round(0.03*0.50)=0.02)
+      // 0.03 at 50% split: downline = round_half_up(0.015) = 0.02, upline = 0.03 - 0.02 = 0.01
       `Beacon,11111111,Sam Seller,${plantedMember},1AB2CD3EF45,POL5,carriera,spark,0.03,2026-07-01,2026-07-15,half2,NC,MA,MA,2026-01-01,2026-01-01`,
-      // 0.15 at 70% split (30% upline): downline = round(0.105) = 0.10 (HALF_EVEN), upline = 0.05 (vs HALF_UP -> 0.04)
+      // 0.15 at 70% split: downline = round_half_up(0.105) = 0.11, upline = 0.15 - 0.11 = 0.04 (HALF_EVEN would give 0.10 / 0.05)
       `Beacon,22222222,Pat Rep,${plantedMember},1AB2CD3EF45,POL6,carriera,spark,0.15,2026-07-01,2026-07-15,half3,NC,MA,MA,2026-01-01,2026-01-01`,
+    ].join('\n') + '\n',
+    'ALLAGENCY20260731NegSpark.csv': [
+      'entity,npn,agent,member,mbi,policy_number,carrier,channel,amount,earned,payment,note,state,plan_type,coverage_type,effective,submitted',
+      // -0.05 at 50% split: downline = round_half_up(-0.025) = -0.03, upline = -0.05 - (-0.03) = -0.02 (HALF_EVEN would give -0.02 / -0.03)
+      `Beacon,11111111,Sam Seller,${plantedMember},1AB2CD3EF45,POL7,carriera,spark,-0.05,2026-07-01,2026-07-15,neghalf1,NC,MA,MA,2026-01-01,2026-01-01`,
+      // -0.15 at 70% split: downline = round_half_up(-0.105) = -0.11, upline = -0.15 - (-0.11) = -0.04 (HALF_EVEN would give -0.10 / -0.05)
+      `Beacon,22222222,Pat Rep,${plantedMember},1AB2CD3EF45,POL8,carriera,spark,-0.15,2026-07-01,2026-07-15,neghalf2,NC,MA,MA,2026-01-01,2026-01-01`,
+      // -0.03 at 50% split: downline = round_half_up(-0.015) = -0.02, upline = -0.03 - (-0.02) = -0.01
+      `Beacon,11111111,Sam Seller,${plantedMember},1AB2CD3EF45,POL9,carriera,spark,-0.03,2026-07-01,2026-07-15,neghalf3,NC,MA,MA,2026-01-01,2026-01-01`,
     ].join('\n') + '\n',
   });
   await mkdir(sentDir, { recursive: true });
@@ -1247,7 +1259,7 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
     'utf8',
   );
 
-  // 1) plx upline-only rows + Coherence rounding + exact expected cents succeed
+  // 1) plx upline-only rows + Coherence ROUND_HALF_UP rounding (positive and negative) + exact expected cents succeed
   const okParsed = await readLegacyStatementBatches({
     statementsDir: stmtDir,
     sentDir,
@@ -1257,11 +1269,23 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
         kind: 'split_reallocation',
         statementDate: '2026-08-01',
         sourceGrammar: 'all_agency',
+        sourceFiles: ['ALLAGENCY20260731Spark.csv'],
         unreversedOnly: true,
         useAgentsSplit: true,
-        expectedAgencyNetCents: -9,
-        expectedUplineNetCents: 9,
-        reason: '2026-08-01 split reallocation',
+        expectedAgencyNetCents: -7,
+        expectedUplineNetCents: 7,
+        reason: '2026-08-01 split reallocation positive half-cents',
+      },
+      {
+        kind: 'split_reallocation',
+        statementDate: '2026-08-02',
+        sourceGrammar: 'all_agency',
+        sourceFiles: ['ALLAGENCY20260731NegSpark.csv'],
+        unreversedOnly: true,
+        useAgentsSplit: true,
+        expectedAgencyNetCents: 7,
+        expectedUplineNetCents: -7,
+        reason: '2026-08-02 split reallocation negative half-cents',
       },
       {
         kind: 'upline_takeback',
@@ -1281,9 +1305,15 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
   assert.equal(plxBatch.agencyNetTotal, '80.00');
   assert.equal(plxBatch.uplineLineCount, 3, 'must capture blank-DLTotal, zero-DLTotal, and split upline lines');
   assert.equal(plxBatch.uplineNetTotal, '60.00');
-  assert.equal(okParsed.methodCorrectionBatches[0].agencyNetTotal, '-0.09');
-  assert.equal(okParsed.methodCorrectionBatches[0].uplineNetTotal, '0.09');
-  assert.equal(okParsed.methodCorrectionBatches[1].uplineNetTotal, '-60.00');
+  assert.equal(okParsed.methodCorrectionBatches[0].agencyNetTotal, '-0.07');
+  assert.equal(okParsed.methodCorrectionBatches[0].uplineNetTotal, '0.07');
+  assert.deepEqual(okParsed.methodCorrectionBatches[0].agencyLines.map((l) => l.amount), ['-0.02', '-0.01', '-0.04']);
+  assert.deepEqual(okParsed.methodCorrectionBatches[0].uplineLines.map((l) => l.amount), ['0.02', '0.01', '0.04']);
+  assert.equal(okParsed.methodCorrectionBatches[1].agencyNetTotal, '0.07');
+  assert.equal(okParsed.methodCorrectionBatches[1].uplineNetTotal, '-0.07');
+  assert.deepEqual(okParsed.methodCorrectionBatches[1].agencyLines.map((l) => l.amount), ['0.02', '0.04', '0.01']);
+  assert.deepEqual(okParsed.methodCorrectionBatches[1].uplineLines.map((l) => l.amount), ['-0.02', '-0.04', '-0.01']);
+  assert.equal(okParsed.methodCorrectionBatches[2].uplineNetTotal, '-60.00');
 
   // 2) unreversedOnly without readable sentDir must fail loudly
   await assert.rejects(
@@ -1295,10 +1325,11 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
         kind: 'split_reallocation',
         statementDate: '2026-08-01',
         sourceGrammar: 'all_agency',
+        sourceFiles: ['ALLAGENCY20260731Spark.csv'],
         unreversedOnly: true,
         useAgentsSplit: true,
-        expectedAgencyNetCents: -9,
-        expectedUplineNetCents: 9,
+        expectedAgencyNetCents: -7,
+        expectedUplineNetCents: 7,
       }],
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -1319,10 +1350,11 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
         kind: 'split_reallocation',
         statementDate: '2026-08-01',
         sourceGrammar: 'all_agency',
+        sourceFiles: ['ALLAGENCY20260731Spark.csv'],
         unreversedOnly: true,
         useAgentsSplit: true,
-        expectedAgencyNetCents: -9,
-        expectedUplineNetCents: 9,
+        expectedAgencyNetCents: -7,
+        expectedUplineNetCents: 7,
       }],
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -1393,26 +1425,44 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
   );
   assert.equal((await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.statement_batches')).rows[0].n, 0);
 
-  // 6) Fixed-rate split_reallocation (useAgentsSplit: false) also uses Coherence ROUND_HALF_EVEN downline = round(amount * split), upline = amount - downline
+  // 6) Fixed-rate split_reallocation (useAgentsSplit: false) also uses Coherence ROUND_HALF_UP downline = round_half_up(amount * split), upline = amount - downline
   const fixedRateRes = await readLegacyStatementBatches({
     statementsDir: stmtDir,
     sentDir,
-    methodCorrections: [{
-      kind: 'split_reallocation',
-      statementDate: '2026-08-01',
-      sourceGrammar: 'all_agency',
-      unreversedOnly: true,
-      useAgentsSplit: false,
-      uplineRate: '0.50', // 0.05 -> dl 0.02 ul 0.03; 0.03 -> dl 0.02 ul 0.01; 0.15 -> dl 0.08 ul 0.07 => total ul = 0.11
-      expectedAgencyNetCents: -11,
-      expectedUplineNetCents: 11,
-    }],
+    methodCorrections: [
+      {
+        kind: 'split_reallocation',
+        statementDate: '2026-08-01',
+        sourceGrammar: 'all_agency',
+        sourceFiles: ['ALLAGENCY20260731Spark.csv'],
+        unreversedOnly: true,
+        useAgentsSplit: false,
+        uplineRate: '0.50', // 0.05 -> dl 0.03 ul 0.02; 0.03 -> dl 0.02 ul 0.01; 0.15 -> dl 0.08 ul 0.07 => total ul = 0.10
+        expectedAgencyNetCents: -10,
+        expectedUplineNetCents: 10,
+      },
+      {
+        kind: 'split_reallocation',
+        statementDate: '2026-08-02',
+        sourceGrammar: 'all_agency',
+        sourceFiles: ['ALLAGENCY20260731NegSpark.csv'],
+        unreversedOnly: true,
+        useAgentsSplit: false,
+        uplineRate: '0.50', // -0.05 -> dl -0.03 ul -0.02; -0.15 -> dl -0.08 ul -0.07; -0.03 -> dl -0.02 ul -0.01 => total ul = -0.10
+        expectedAgencyNetCents: 10,
+        expectedUplineNetCents: -10,
+      },
+    ],
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
     tempBaseDir: env.tempDir,
   });
-  assert.equal(fixedRateRes.methodCorrectionBatches[0].agencyNetTotal, '-0.11');
-  assert.equal(fixedRateRes.methodCorrectionBatches[0].uplineNetTotal, '0.11');
+  assert.equal(fixedRateRes.methodCorrectionBatches[0].agencyNetTotal, '-0.10');
+  assert.equal(fixedRateRes.methodCorrectionBatches[0].uplineNetTotal, '0.10');
+  assert.deepEqual(fixedRateRes.methodCorrectionBatches[0].uplineLines.map((l) => l.amount), ['0.02', '0.01', '0.07']);
+  assert.equal(fixedRateRes.methodCorrectionBatches[1].agencyNetTotal, '0.10');
+  assert.equal(fixedRateRes.methodCorrectionBatches[1].uplineNetTotal, '-0.10');
+  assert.deepEqual(fixedRateRes.methodCorrectionBatches[1].uplineLines.map((l) => l.amount), ['-0.02', '-0.07', '-0.01']);
 });
 
 test('Layer 4 [Fix 3 - Consistent SQLite Snapshot & Sidecar Guard]: never reads live WAL DB directly, takes one consistent copy into temp dir, refuses -wal/-shm without consistent copy, and reads counts + all 8 tables from that one copy in one read transaction', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
@@ -2355,4 +2405,301 @@ test('Layer 4 [Fix 10 & Note 2 - Proof Runner Missing Right Run, Configured Fold
   // Temporary folder inside scratchRoot MUST be completely cleaned even when storesDir was passed!
   const remainingTemp = await readdir(scratchRoot);
   assert.deepEqual(remainingTemp, [], `proof runner leaked temporary directories: ${JSON.stringify(remainingTemp)}`);
+});
+
+test('Layer 4 [Fix2-2 - Gate 4 Non-Vacuous Entity Parity]: fails naming missing run_materializations when expectedEntityParity is given, and compares entity totals over the union so unexpected extra entities fail', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const srcRoot = join(env.tempDir, 'src-gate4');
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P401#effective:2026-01-01' });
+  const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
+
+  const bobCsv = [
+    'policy_id,member,entity,amount,upline_amount',
+    '1,Pat Sample,Beacon,80.00,20.00',
+    '2,Chris Sample,Harbor,40.00,10.00',
+  ].join('\n') + '\n';
+  const ledCsv = [
+    'tx_id,record_id,policy_id,src_type,member,entity,gross_comm,commission_amount,downline_amount,upline_amount',
+    '1,r-beacon-1,1,direct,Pat Sample,Beacon,100.00,100.00,80.00,20.00',
+    '2,r-harbor-1,2,direct,Chris Sample,Harbor,50.00,50.00,40.00,10.00',
+  ].join('\n') + '\n';
+  const stmtCsv = [
+    'record_id,entity,gross_comm,downline_amount,upline_amount,run_action',
+    'r-beacon-1,Beacon,100.00,80.00,20.00,NEW',
+    'r-harbor-1,Harbor,50.00,40.00,10.00,NEW',
+  ].join('\n') + '\n';
+
+  const runFiles = {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/canonical_bob.csv': bobCsv,
+    'emits/coherent_ledger.csv': ledCsv,
+    'emits/statements_20261102.csv': stmtCsv,
+    'run.json': JSON.stringify({ date: '2026-11-02', steps: { assign: { at: '2026-11-02T10:00:00' }, emit: { at: '2026-11-02T10:05:00' } } }),
+  };
+  await writeTree(join(srcRoot, 'runs', '2026-11-02'), runFiles);
+  const refDir = join(srcRoot, 'ref-2026-11-02');
+  await writeTree(refDir, runFiles);
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(srcRoot, 'runs') },
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+  const imp = await executeHistoryImport({
+    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: env.tempDir,
+  });
+  assert.equal(imp.passed, true);
+  const leftRunId = imp.importedRuns[0].runId;
+
+  // 1) Before run_materializations exists, passing expectedEntityParity MUST check Gate 4 and fail naming run_materializations
+  const missingMatRep = await compareDbRuns({
+    pool: env.pool,
+    stores: env.stores,
+    leftRunId,
+    rightFolderDir: refDir,
+    mode: 'substance',
+    requireStatementsDelta: true,
+    requireConservation: true,
+    expectedEntityParity: {
+      perEntityTotals: { Beacon: '80.00', Harbor: '40.00', 'Acme Upline': '30.00' },
+    },
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(missingMatRep.gates.gate4.entityStatements.dbReconciliation.checked, true, 'Gate 4 must be checked when expectedEntityParity is given');
+  assert.equal(missingMatRep.gates.gate4.entityStatements.dbReconciliation.passed, false, 'Gate 4 must fail when left run has no run_materializations row');
+  assert.equal(missingMatRep.gates.gate4.passed, false);
+  assert.equal(missingMatRep.passed, false);
+  assert.equal(missingMatRep.stoppedAtGate, 4);
+  assert.ok(
+    missingMatRep.problems.some((p) => /run_materializations/i.test(p)),
+    `expected problems to name missing run_materializations, got: ${JSON.stringify(missingMatRep.problems)}`,
+  );
+
+  // Materialize the Emit so run_materializations and entity statement views are populated
+  const emitEv = (await env.pool.query(
+    "SELECT id FROM coherence.step_attempt_events WHERE run_id = $1::uuid AND step = 'emit' AND event_kind = 'finished'",
+    [leftRunId],
+  )).rows[0].id;
+  await env.commands.materializeEmit({
+    actor: env.workerActor,
+    commandKey: 'mat-gate4-test',
+    runId: leftRunId,
+    attemptEventId: emitEv,
+    statementDate: '2026-11-02',
+    canonicalBobCsv: bobCsv,
+    coherentLedgerCsv: ledCsv,
+    statementsCsv: stmtCsv,
+  });
+
+  // 2) Exact entity parity passes Gate 4
+  const okRep = await compareDbRuns({
+    pool: env.pool,
+    stores: env.stores,
+    leftRunId,
+    rightFolderDir: refDir,
+    mode: 'substance',
+    requireStatementsDelta: true,
+    requireConservation: true,
+    expectedEntityParity: {
+      datesChecked: 1,
+      filesChecked: 3,
+      totalLines: 4,
+      ledgerGrossTotal: '150.00',
+      perEntityTotals: { Beacon: '80.00', Harbor: '40.00', 'Acme Upline': '30.00' },
+    },
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(okRep.passed, true, `expected exact parity to pass, got: ${JSON.stringify(okRep.problems)}`);
+  assert.equal(okRep.gates.gate4.passed, true);
+
+  // 3) Unexpected extra actual entity (Harbor present in DB, omitted from expectedEntityParity) MUST fail Gate 4
+  const extraEntityRep = await compareDbRuns({
+    pool: env.pool,
+    stores: env.stores,
+    leftRunId,
+    rightFolderDir: refDir,
+    mode: 'substance',
+    requireStatementsDelta: true,
+    requireConservation: true,
+    expectedEntityParity: {
+      perEntityTotals: { Beacon: '80.00', 'Acme Upline': '30.00' },
+    },
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(extraEntityRep.gates.gate4.entityStatements.dbReconciliation.checked, true);
+  assert.equal(extraEntityRep.gates.gate4.entityStatements.dbReconciliation.passed, false);
+  assert.equal(extraEntityRep.gates.gate4.entityStatements.dbReconciliation.expectedParityPassed, false);
+  assert.ok(
+    extraEntityRep.gates.gate4.entityStatements.dbReconciliation.expectedParityProblems.some((p) => p.includes('Harbor')),
+    `expected Harbor in expectedParityProblems, got: ${JSON.stringify(extraEntityRep.gates.gate4.entityStatements.dbReconciliation.expectedParityProblems)}`,
+  );
+  assert.equal(extraEntityRep.gates.gate4.passed, false);
+  assert.equal(extraEntityRep.passed, false);
+  assert.equal(extraEntityRep.stoppedAtGate, 4);
+  assert.ok(
+    extraEntityRep.problems.some((p) => p.includes('Harbor')),
+    `expected Harbor named in Gate 4 problems, got: ${JSON.stringify(extraEntityRep.problems)}`,
+  );
+});
+
+test('Layer 4 [Fix2-3 - Zone-Less Timestamps on Non-UTC Session]: normalizes manifest checkpoint originalAt like run.json and stores standalone files originalAt as UTC so commitment hash and PostgreSQL agree under America/New_York', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  let nyPool = null;
+  t.after(async () => {
+    if (nyPool) await nyPool.end().catch(() => {});
+    await env.cleanup();
+  });
+
+  await env.pool.query(`ALTER DATABASE "${env.dbName}" SET TimeZone = 'America/New_York'`);
+  nyPool = await createPool(env.pgConfig);
+  assert.equal((await nyPool.query("SELECT current_setting('TimeZone') AS tz")).rows[0].tz, 'America/New_York');
+  const nyCommands = createCommandLayer({ pool: nyPool, companySlug: env.companySlug, stores: env.stores });
+
+  const zonelessTs = '2026-10-15T10:30:00';
+
+  // 1) Direct importStandaloneFiles with a zone-less originalAt MUST store normalized UTC matching commitment hash on America/New_York session
+  const directFile = await env.dataStore.promoteBytes(Buffer.from('hello standalone\n', 'utf8'), { relPath: 'standalone/note.txt', checksPassed: true });
+  await nyCommands.importStandaloneFiles({
+    actor: env.ownerActor,
+    commandKey: 'fix2-3-standalone-zoneless',
+    files: [{
+      area: 'other',
+      relPath: 'standalone/note.txt',
+      artifactKind: 'data',
+      storeKind: 'company_data',
+      fileSha256: directFile.sha256,
+      originalAt: zonelessTs,
+      metadata: {},
+    }],
+    storedFiles: [directFile],
+  });
+  const directRow = (await nyPool.query(
+    "SELECT coherence.format_utc_us(original_at) AS orig_utc FROM coherence.imported_files WHERE rel_path = 'standalone/note.txt'",
+  )).rows[0];
+  assert.equal(directRow.orig_utc, formatTimestampUtcUs(zonelessTs));
+
+  // 2) Manifest overlayCheckpoint with zone-less originalAt MUST normalize via local-time parser just like run.json and pass commitments under America/New_York
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const srcRoot = join(env.tempDir, 'src-zoneless');
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:PZ1#effective:2026-01-01', note: 'cp' });
+  const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:PZ2#effective:2026-01-01', note: 'run' });
+  const cpPath = join(srcRoot, 'cp-zoneless.csv');
+  await mkdir(srcRoot, { recursive: true });
+  await writeFile(cpPath, makeOverlayCsv([row0], { version: 'v2' }), 'utf8');
+  await writeTree(join(srcRoot, 'runs', '2026-10-16'), {
+    'input/a.csv': 'k\n1\n',
+    'input/Overlay/overlay.csv': makeOverlayCsv([row0], { version: 'v2' }),
+    'overlay.csv': makeOverlayCsv([row0, row1], { version: 'v2' }),
+    'run.json': JSON.stringify({ date: '2026-10-16', steps: { assign: { at: zonelessTs } } }),
+  });
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(srcRoot, 'runs') },
+    overlayCheckpoints: [{ label: 'zoneless-cp', absPath: cpPath, originalAt: zonelessTs }],
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+
+  const imp = await executeHistoryImport({
+    pool: nyPool,
+    stores: env.stores,
+    commands: nyCommands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(imp.passed, true, `import failed on America/New_York session: ${JSON.stringify(imp.problems)}`);
+
+  const expectedLocalNormalizedUtc = formatTimestampUtcUs(new Date(zonelessTs).toISOString());
+  const runStepOrig = (await nyPool.query(
+    "SELECT coherence.format_utc_us(original_at) AS orig_utc FROM coherence.step_attempt_events WHERE step = 'assign' AND event_kind = 'finished'",
+  )).rows[0].orig_utc;
+  const cpImpRow = (await nyPool.query(
+    "SELECT coherence.format_utc_us(original_at) AS orig_utc, metadata->>'decisionCommitId' AS commit_id FROM coherence.imported_files WHERE rel_path = 'overlay-checkpoints/zoneless-cp'",
+  )).rows[0];
+  const cpCommitOrig = (await nyPool.query(
+    'SELECT coherence.format_utc_us(original_at) AS orig_utc FROM coherence.decision_commits WHERE id = $1::uuid',
+    [cpImpRow.commit_id],
+  )).rows[0].orig_utc;
+
+  assert.equal(runStepOrig, expectedLocalNormalizedUtc);
+  assert.equal(cpImpRow.orig_utc, runStepOrig, 'checkpoint imported_files.original_at must match run.json local-time normalization');
+  assert.equal(cpCommitOrig, runStepOrig, 'checkpoint decision_commits.original_at must match run.json local-time normalization');
+
+  const chainCheck = await verifyChain(nyPool);
+  const commitCheck = await verifyCommitments(nyPool);
+  assert.equal(chainCheck.passed, true, `chain check failed: ${JSON.stringify(chainCheck.problems)}`);
+  assert.equal(commitCheck.passed, true, `commitment check failed: ${JSON.stringify(commitCheck.problems)}`);
+});
+
+test('Layer 4 [Fix2-4a - Proof Runner /cloudsql Refusal & Local Mode Pinning]: refuses any PGHOST under /cloudsql and pins local mode even when COHERENCE_PG_MODE=cloudsql', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-prove-cloudsql-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  for (const badHost of [
+    '/cloudsql',
+    '/cloudsql/proj:us-central1:prod',
+    '//cloudsql/proj:us-central1:prod',
+    '/tmp/../cloudsql/proj:us-central1:prod',
+    '/CloudSQL/proj:us-central1:prod',
+  ]) {
+    assert.throws(
+      () => assertLocalPgHost(badHost),
+      (err) => err?.code === 'NON_LOCAL_PGHOST',
+      `expected assertLocalPgHost(${JSON.stringify(badHost)}) to refuse with NON_LOCAL_PGHOST`,
+    );
+  }
+
+  await assert.rejects(
+    () => execFileAsync(process.execPath, ['scripts/prove-history.mjs', '--manifest', join(work, 'none.json'), '--database', 'test_cloudsql_refuse'], {
+      cwd: process.cwd(),
+      env: { ...process.env, PGHOST: '/cloudsql/proj:us-central1:prod' },
+    }),
+    (err) => String(err.stderr || '').includes('NON_LOCAL_PGHOST'),
+  );
+
+  // Pinning mode: 'local' means proof runner succeeds on local PG even if COHERENCE_PG_MODE=cloudsql is set in env
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P410#effective:2026-01-01' });
+  const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
+  await writeTree(join(work, 'src', 'runs', '2026-11-02'), {
+    'input/a.csv': 'k\n1\n',
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'run.json': JSON.stringify({ date: '2026-11-02', steps: { assign: { at: '2026-11-02T10:00:00' }, emit: { at: '2026-11-02T10:05:00' } } }),
+  });
+  const manifestPath = join(work, 'manifest.json');
+  await writeFile(manifestPath, JSON.stringify({
+    companySlug: 'acme',
+    coherenceRepo: mockRepo,
+    pythonPath: 'python3',
+    sources: { legacyRunsRoot: 'src/runs' },
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  }), 'utf8');
+
+  const dbName = `test_prove_pin_${createHash('sha256').update(work).digest('hex').slice(0, 8)}`;
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    ['scripts/prove-history.mjs', '--manifest', manifestPath, '--database', dbName, '--drop-db'],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, COHERENCE_PG_MODE: 'cloudsql' },
+      maxBuffer: 8 * 1024 * 1024,
+    },
+  );
+  const summary = JSON.parse(stdout);
+  assert.equal(summary.passed, true, `proof runner should succeed in pinned local mode despite COHERENCE_PG_MODE=cloudsql: ${JSON.stringify(summary.problems)}`);
 });

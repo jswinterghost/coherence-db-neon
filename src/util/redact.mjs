@@ -1,6 +1,8 @@
 // Member data redaction for logs and error messages: Coherence record_ids embed member names, MBIs,
-// and policy numbers (for example "carrier~direct~MEMBER~100.00~2026-01"), so all emitted errors and logs must be scrubbed first.
+// and policy numbers (for example "carrier|direct|NM:doe,jane|100.00|2026-01" or "carrier~direct~MEMBER~100.00~2026-01"),
+// so all emitted errors and logs must be scrubbed first.
 
+const RECORD_ID_PIPE_RE = /\b[a-z0-9_-]+\|[a-z0-9_-]+\|[^|\r\n;'"\]})]+\|-?\d+(?:\.\d{1,2})?(?:\|(?:None|\d{4}-\d{2}(?:-\d{2})?))?/gi;
 const RECORD_ID_MULTI_TILDE_RE = /\b[a-z0-9_]+~[^~\r\n,;'"\]})]+~[^~\r\n,;'"\]})]+(?:~[^~\r\n,;'"\]})]+)*/gi;
 const RECORD_ID_TILDE_RE = /\b[a-z0-9_]+~[^\s,;'"\]})]{4,}/gi;
 const POLICY_KEY_RE = /\bpolicy:[a-z0-9_]+:[^\s,;'"\]})]+/gi;
@@ -41,6 +43,7 @@ export function redactPhi(text) {
     .replace(SQL_PG_FAILING_ROW_RE, 'Failing row contains ([redacted-sql-param])')
     .replace(SQL_PG_PARAMS_LINE_RE, 'PARAMETERS: [redacted-sql-params]')
     .replace(SQL_BOUND_PARAM_RE, '[redacted-sql-param]')
+    .replace(RECORD_ID_PIPE_RE, '[redacted-record-id]')
     .replace(RECORD_ID_MULTI_TILDE_RE, '[redacted-record-id]')
     .replace(RECORD_ID_TILDE_RE, '[redacted-record-id]')
     .replace(POLICY_KEY_RE, '[redacted-policy-key]')

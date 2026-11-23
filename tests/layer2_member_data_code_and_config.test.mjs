@@ -213,6 +213,30 @@ test('Layer 2 [Negative Invariant]: no record id, member identifier, or SQL para
     assert.ok(!errMsg.includes(forbidden), `sanitizeErrorMessage leaked: ${forbidden}`);
   }
 
+  // Pipe-delimited Coherence record IDs (carrier|channel|subject|amount|stamp from coherence/phase3/statement.py)
+  const pipeRaw = [
+    'Failed on carrier_a|direct|1EG4TE5MK72|100.00|2026-11',
+    'and carrier_a|direct|PN:POL99881|-50.25|2026-11-15',
+    'and carrier_b|slate|NM:doe,jane|42.50|2026-03',
+    'and carrier_b|danman|NM:de,la,cruz,maria|-7.07|2026-01-18',
+    'and carrier_a|direct|98765432|25.00|2026-11',
+    'and carrier_a|direct|None|15.00|2026-11',
+    'and None|direct|NM:smith,robert|100.00|None',
+    'json={"record_id":"carrier_a|direct|NM:taylor,pat|12.34|2026-05"}',
+  ].join(' ');
+  const pipeCleaned = redactPhi(pipeRaw);
+  for (const forbidden of ['1EG4TE5MK72', 'POL99881', 'doe,jane', 'de,la,cruz,maria', '98765432', 'smith,robert', 'taylor,pat']) {
+    assert.ok(!pipeCleaned.includes(forbidden), `redactPhi leaked pipe record_id token: ${forbidden}`);
+  }
+  assert.ok(pipeCleaned.includes('[redacted-record-id]'), 'redactPhi must replace pipe record_ids with [redacted-record-id]');
+  const pipeErrMsg = sanitizeErrorMessage(new Error(pipeRaw));
+  for (const forbidden of ['POL99881', 'doe,jane', 'de,la,cruz,maria', 'smith,robert', 'taylor,pat']) {
+    assert.ok(!pipeErrMsg.includes(forbidden), `sanitizeErrorMessage leaked pipe record_id token: ${forbidden}`);
+  }
+  // Benign pipe-separated log fields must not be falsely redacted
+  const benignPipe = 'status=ok | count=3 | mode=local';
+  assert.equal(redactPhi(benignPipe), benignPipe);
+
   const captured = [];
   const logger = createSafeLogger({
     log: (line) => captured.push(line),
@@ -311,6 +335,11 @@ test('Layer 2 [Negative Invariant]: no record id, member identifier, or SQL para
     assert.equal(r1.status, 400);
     const b1 = await r1.text();
     assert.ok(!b1.includes('P10001'), 'error response must never echo recordId from URL');
+
+    const r1Pipe = await fetch(`${baseUrl}/api/coherence/acme/runs?q=${encodeURIComponent('carrier_a|direct|NM:doe,jane|100.00|2026-11')}`);
+    assert.equal(r1Pipe.status, 400);
+    const b1Pipe = await r1Pipe.text();
+    assert.ok(!b1Pipe.includes('doe,jane'), 'error response must never echo pipe record_id from URL');
 
     const r2 = await fetch(`${baseUrl}/api/coherence/acme/approvals/history`);
     assert.equal(r2.status, 405, 'GET /approvals/history must be refused so recordIds stay in POST JSON body');

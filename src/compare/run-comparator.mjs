@@ -707,6 +707,27 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
     [leftRunId],
   );
   if (matCheck.rows.length === 0) {
+    if (expectedEntityParity && typeof expectedEntityParity === 'object') {
+      const reason = 'left run has no run_materializations row';
+      return {
+        checked: true,
+        passed: false,
+        reconciled: false,
+        reason,
+        datesChecked: 0,
+        filesChecked: 0,
+        totalLines: 0,
+        perEntityTotals: {},
+        entityVariancesCents: {},
+        unreconciledEntities: 0,
+        recordMismatchCount: 0,
+        ledgerGrossTotal: null,
+        ledgerRemainderCents: null,
+        rightComparison: null,
+        expectedParityPassed: false,
+        expectedParityProblems: [reason],
+      };
+    }
     return { checked: false, passed: true, reason: 'left run has no run_materializations row' };
   }
 
@@ -837,11 +858,23 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
       expectedParityProblems.push(`ledgerGrossTotal expected ${expectedEntityParity.ledgerGrossTotal}, got ${matCheck.rows[0].ledger_gross_total}`);
     }
     if (expectedEntityParity.perEntityTotals && typeof expectedEntityParity.perEntityTotals === 'object') {
-      for (const [ent, expectedAmt] of Object.entries(expectedEntityParity.perEntityTotals)) {
-        const actualAmt = perEntityTotals[ent] ?? '0.00';
-        if (actualAmt !== String(expectedAmt)) {
+      const expectedMap = expectedEntityParity.perEntityTotals;
+      const allEntities = [...new Set([...Object.keys(expectedMap), ...Object.keys(perEntityTotals)])].sort();
+      for (const ent of allEntities) {
+        const hasExpected = Object.prototype.hasOwnProperty.call(expectedMap, ent);
+        const hasActual = Object.prototype.hasOwnProperty.call(perEntityTotals, ent);
+        if (!hasExpected) {
           expectedParityPassed = false;
-          const delta = Number((parseCents(actualAmt) ?? 0n) - (parseCents(String(expectedAmt)) ?? 0n));
+          const actualAmt = perEntityTotals[ent] ?? '0.00';
+          const delta = Number(parseCents(actualAmt) ?? 0n);
+          expectedParityProblems.push(`unexpected entity ${ent} total ${actualAmt} (delta ${delta} cents)`);
+          continue;
+        }
+        const expectedAmt = String(expectedMap[ent]);
+        const actualAmt = hasActual ? perEntityTotals[ent] : '0.00';
+        if (actualAmt !== expectedAmt) {
+          expectedParityPassed = false;
+          const delta = Number((parseCents(actualAmt) ?? 0n) - (parseCents(expectedAmt) ?? 0n));
           expectedParityProblems.push(`entity ${ent} total delta ${delta} cents`);
         }
       }
@@ -1163,10 +1196,38 @@ export async function compareRunFolders(leftDir, rightDir, {
         expectedEntityParity,
       });
       if (dbEntityReport.checked && !dbEntityReport.passed) {
-        problems.push(
-          `Gate 4 failed: entity statement reconciliation or parity mismatch (unreconciled=${dbEntityReport.unreconciledEntities}, recordMismatches=${dbEntityReport.recordMismatchCount}, rightMatch=${dbEntityReport.rightComparison?.passed ?? true})`,
-        );
+        if (dbEntityReport.reason) {
+          problems.push(`Gate 4 failed: ${dbEntityReport.reason}`);
+        } else {
+          const parityDetail = dbEntityReport.expectedParityProblems?.length
+            ? `, parity=[${dbEntityReport.expectedParityProblems.join('; ')}]`
+            : '';
+          problems.push(
+            `Gate 4 failed: entity statement reconciliation or parity mismatch (unreconciled=${dbEntityReport.unreconciledEntities}, recordMismatches=${dbEntityReport.recordMismatchCount}, rightMatch=${dbEntityReport.rightComparison?.passed ?? true}${parityDetail})`,
+          );
+        }
       }
+    } else if (expectedEntityParity && typeof expectedEntityParity === 'object') {
+      const reason = 'expectedEntityParity requested without a database run (no run_materializations row)';
+      dbEntityReport = {
+        checked: true,
+        passed: false,
+        reconciled: false,
+        reason,
+        datesChecked: 0,
+        filesChecked: 0,
+        totalLines: 0,
+        perEntityTotals: {},
+        entityVariancesCents: {},
+        unreconciledEntities: 0,
+        recordMismatchCount: 0,
+        ledgerGrossTotal: null,
+        ledgerRemainderCents: null,
+        rightComparison: null,
+        expectedParityPassed: false,
+        expectedParityProblems: [reason],
+      };
+      problems.push(`Gate 4 failed: ${reason}`);
     }
 
     const dbEntityPassed = dbEntityReport ? (!dbEntityReport.checked || dbEntityReport.passed) : true;

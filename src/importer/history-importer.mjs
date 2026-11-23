@@ -2136,7 +2136,7 @@ export async function executeHistoryImport({
     const label = cp.label || cp.relPath || absPath;
     const info = await stat(absPath);
     const parsedNameTs = parseReviewSaveTimestamp(basename(absPath))?.originalAt || null;
-    const originalAtIso = (cp.originalAt && parseTimestampMs(cp.originalAt) != null ? cp.originalAt : null)
+    const originalAtIso = parseLocalRunJsonTime(cp.originalAt)
       || parsedNameTs
       || (cp.statementDate && isValidIsoDate(cp.statementDate) ? `${cp.statementDate}T00:00:00.000Z` : null)
       || info.mtime.toISOString();

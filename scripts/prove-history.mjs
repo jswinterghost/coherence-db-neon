@@ -5,7 +5,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCommandLayer } from '../src/commands/command-layer.mjs';
 import {
@@ -44,7 +44,18 @@ export function assertProofDbName(dbName) {
 
 export function assertLocalPgHost(host) {
   const h = String(host ?? '').trim();
-  const isLocal = h.startsWith('/') || h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  if (h.startsWith('/')) {
+    const normalized = posix.resolve(h).toLowerCase();
+    if (normalized === '/cloudsql' || normalized.startsWith('/cloudsql/')) {
+      throw new AppError(
+        `Refusing to run proof runner against Cloud SQL socket PGHOST: ${h}`,
+        400,
+        'NON_LOCAL_PGHOST',
+      );
+    }
+    return;
+  }
+  const isLocal = h === 'localhost' || h === '127.0.0.1' || h === '::1';
   if (!isLocal) {
     throw new AppError(
       `Refusing to run proof runner against non-local PGHOST: ${h || '(empty)'}`,
@@ -56,6 +67,7 @@ export function assertLocalPgHost(host) {
 
 function getAdminPgConfig() {
   return {
+    mode: 'local',
     host: process.env.PGHOST || '/tmp',
     port: Number(process.env.PGPORT || 5432),
     database: process.env.PGADMIN_DATABASE || 'postgres',
@@ -467,6 +479,7 @@ export async function runHistoryProof({
             uplineAmountColumn: target.uplineAmountColumn || null,
             requireStatementsDelta: Boolean(target.requireStatementsDelta),
             requireConservation: Boolean(target.requireConservation),
+            expectedEntityParity: target.expectedEntityParity || null,
             leftLabel: target.label ? `${target.label}:left` : 'left',
             rightLabel: target.label ? `${target.label}:right` : 'right',
           });

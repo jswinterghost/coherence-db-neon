@@ -7,7 +7,7 @@ and full structured batch records to --out.
 import argparse
 from collections import Counter
 import dataclasses
-from decimal import Decimal, ROUND_HALF_EVEN
+from decimal import Decimal, ROUND_HALF_UP
 import importlib
 import json
 from pathlib import Path
@@ -27,14 +27,14 @@ class LegacyStatementError(Exception):
 
 
 def fmt_money(value: Decimal) -> str:
-    q = value.quantize(CENT, rounding=ROUND_HALF_EVEN)
+    q = value.quantize(CENT, rounding=ROUND_HALF_UP)
     if q == Decimal("-0.00"):
         q = Decimal("0.00")
     return f"{q:.2f}"
 
 
 def decimal_to_cents(value: Decimal) -> int:
-    q = value.quantize(CENT, rounding=ROUND_HALF_EVEN)
+    q = value.quantize(CENT, rounding=ROUND_HALF_UP)
     return int((q * 100).to_integral_exact())
 
 
@@ -215,8 +215,8 @@ def main() -> None:
                         ul_amount = parse_legacy_money(raw_row.get("ULTotal"))
                         raw_gross = parse_legacy_money(raw_row.get("CommissionAmount"))
 
-                    dl_amt = rec.amount.quantize(CENT, rounding=ROUND_HALF_EVEN) if rec.amount is not None else None
-                    ul_amt = ul_amount.quantize(CENT, rounding=ROUND_HALF_EVEN) if ul_amount is not None else None
+                    dl_amt = rec.amount.quantize(CENT, rounding=ROUND_HALF_UP) if rec.amount is not None else None
+                    ul_amt = ul_amount.quantize(CENT, rounding=ROUND_HALF_UP) if ul_amount is not None else None
                     has_upline = ul_amt is not None and ul_amt != Decimal("0.00")
 
                     if dl_amt is None and not has_upline:
@@ -232,7 +232,7 @@ def main() -> None:
                     emit_agency = dl_amt is not None and (dl_amt != Decimal("0.00") or not has_upline)
                     if emit_agency:
                         ag_line_no += 1
-                        ag_gross = (raw_gross if raw_gross is not None else rec.amount).quantize(CENT, rounding=ROUND_HALF_EVEN)
+                        ag_gross = (raw_gross if raw_gross is not None else rec.amount).quantize(CENT, rounding=ROUND_HALF_UP)
                         ag_net += dl_amt
                         ag_line = {
                             **common,
@@ -256,7 +256,7 @@ def main() -> None:
 
                     if has_upline:
                         up_line_no += 1
-                        up_gross = (raw_gross if raw_gross is not None else ul_amount).quantize(CENT, rounding=ROUND_HALF_EVEN)
+                        up_gross = (raw_gross if raw_gross is not None else ul_amount).quantize(CENT, rounding=ROUND_HALF_UP)
                         up_net += ul_amt
                         up_line = {
                             **common,
@@ -377,8 +377,8 @@ def main() -> None:
                         else:
                             split_dec = default_downline_rate
 
-                        downline_target = (rec.amount * split_dec).quantize(CENT, rounding=ROUND_HALF_EVEN)
-                        upline_delta = (rec.amount - downline_target).quantize(CENT, rounding=ROUND_HALF_EVEN)
+                        downline_target = (rec.amount * split_dec).quantize(CENT, rounding=ROUND_HALF_UP)
+                        upline_delta = rec.amount - downline_target
 
                         if upline_delta == Decimal("0.00"):
                             continue
@@ -451,7 +451,7 @@ def main() -> None:
                         orig_amt = Decimal(item["line"]["amount"])
                         if orig_amt == Decimal("0.00"):
                             continue
-                        takeback_amt = (-orig_amt).quantize(CENT, rounding=ROUND_HALF_EVEN)
+                        takeback_amt = (-orig_amt).quantize(CENT, rounding=ROUND_HALF_UP)
                         up_no += 1
                         up_net += takeback_amt
                         up_lines.append({

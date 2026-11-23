@@ -2534,17 +2534,19 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             fileSha256: a.fileSha256,
           }));
           const artsSha = hashArtifacts(stepArts);
+          const startedOrig = st.startedAt ?? st.finishedAt ?? null;
+          const finishedOrig = st.finishedAt ?? null;
           attemptEventRows.push({
             id: startId, runId, step: st.step, attemptNo, eventKind: 'started',
             stepRequestId: null, cancelRequestId: null, born: null, logFileSha256: null,
-            artifactCount: null, artifactsSha256: null, originalAt: st.startedAt ?? st.finishedAt ?? null, census: null,
+            artifactCount: null, artifactsSha256: null, originalAt: startedOrig ? formatTimestampUtcUs(startedOrig) : null, census: null,
           });
           attemptEventRows.push({
             id: finishId, runId, step: st.step, attemptNo, eventKind: 'finished',
             stepRequestId: null, cancelRequestId: null, born: st.born ?? null,
             logFileSha256: st.logFileSha256 ?? null,
             artifactCount: stepArts.length, artifactsSha256: artsSha,
-            originalAt: st.finishedAt ?? null, census: st.census ?? {},
+            originalAt: finishedOrig ? formatTimestampUtcUs(finishedOrig) : null, census: st.census ?? {},
           });
           allArtifacts.push(...stepArts);
           finishedIdByStep.set(st.step, finishId);
@@ -2554,6 +2556,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         for (const rs of reviewSaves) {
           const attemptEventId = rs.attemptEventId || finishedIdByStep.get(rs.surface);
           if (!attemptEventId) continue;
+          const rawSaveOrig = rs.originalAt ?? rs.original_at ?? null;
           saveRows.push({
             id: rs.id || randomUUID(),
             runId,
@@ -2562,7 +2565,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             approvalsFileSha256: rs.approvalsFileSha256 ?? null,
             decisionCommitId: rs.decisionCommitId ?? null,
             imported: true,
-            originalAt: rs.originalAt ?? null,
+            originalAt: rawSaveOrig ? formatTimestampUtcUs(rawSaveOrig) : null,
             submissionId: null,
           });
         }
@@ -2660,6 +2663,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         const extraImportedRows = (extraImportedFiles || []).map((f) => {
           const meta = f.metadata && typeof f.metadata === 'object' ? { ...f.metadata } : {};
           if (meta.runId === '__THIS_RUN__') meta.runId = runId;
+          const rawOrig = f.originalAt ?? f.original_at ?? null;
           return {
             id: f.id || randomUUID(),
             area: f.area || 'other',
@@ -2667,7 +2671,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             artifactKind: f.artifactKind || 'data',
             storeKind: f.storeKind || 'company_data',
             fileSha256: f.fileSha256,
-            originalAt: f.originalAt ?? null,
+            originalAt: rawOrig ? formatTimestampUtcUs(rawOrig) : null,
             metadata: meta,
           };
         });
@@ -2853,6 +2857,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             [f.area, f.relPath, f.fileSha256],
           );
           if (ex.rows.length === 0) {
+            const rawOriginalAt = f.originalAt ?? f.original_at ?? null;
             toInsert.push({
               id: f.id || randomUUID(),
               area: f.area,
@@ -2860,7 +2865,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
               artifactKind: f.artifactKind || 'data',
               storeKind: f.storeKind || 'company_data',
               fileSha256: f.fileSha256,
-              originalAt: f.originalAt ?? null,
+              originalAt: rawOriginalAt ? formatTimestampUtcUs(rawOriginalAt) : null,
               metadata: f.metadata || {},
             });
           }
