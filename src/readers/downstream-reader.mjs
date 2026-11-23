@@ -77,6 +77,7 @@ export async function findLatestPublishedRun(pool, { asOfSeq = null } = {}) {
        LIMIT 1
      ) ev ON true
      WHERE r.origin IN ('app', 'company_import')
+       AND (r.source_folder IS NULL OR r.source_folder NOT LIKE 'company-abandoned/%')
        AND r.journal_seq <= $1::bigint
        AND NOT EXISTS (
          SELECT 1 FROM coherence.abandonments a

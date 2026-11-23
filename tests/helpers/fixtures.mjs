@@ -21,7 +21,7 @@ export function makeOverlayCsv(rows = [], { version = 'v2' } = {}) {
  * Test-only overlay CSV parser double used by synthetic import tests that do not run the Coherence Python package.
  */
 export function createTestOverlayParser() {
-  async function parseTestOverlay(filePath, { parentPath = null } = {}) {
+  async function parseTestOverlay(filePath, { parentPath = null, includeAnswers = false, bibleKeys = null } = {}) {
     const text = await readFile(filePath, 'utf8');
     const parsedRows = parseCsv(text);
     if (parsedRows.length === 0) throw new AppError('Approvals CSV has no header.', 422, 'INVALID_OVERLAY');
@@ -49,15 +49,28 @@ export function createTestOverlayParser() {
       const parentRaw = parseCsv(await readFile(parentPath, 'utf8')).slice(1)
         .filter((r) => r.length > 1 || (r.length === 1 && r[0] !== ''))
         .map(toObj);
-      if (rows.length < parentRaw.length) {
-        throw new AppError('Approvals file is shorter than its parent.', 422, 'OVERLAY_PREFIX_MISMATCH');
-      }
-      for (let i = 0; i < parentRaw.length; i++) {
+      const minLen = Math.min(rows.length, parentRaw.length);
+      for (let i = 0; i < minLen; i++) {
         for (const col of V2_COLUMNS) {
           if ((rows[i][col] ?? null) !== (parentRaw[i][col] ?? null)) {
-            throw new AppError('Approvals file does not begin with every row of its parent.', 422, 'OVERLAY_PREFIX_MISMATCH');
+            const err = new AppError(
+              `Approvals file does not begin with every row of its parent (first differing row: ${i + 1}).`,
+              422,
+              'OVERLAY_PREFIX_MISMATCH',
+            );
+            err.firstDifferingRow = i + 1;
+            throw err;
           }
         }
+      }
+      if (rows.length < parentRaw.length) {
+        const err = new AppError(
+          `Approvals file is shorter than its parent (first differing row: ${rows.length + 1}).`,
+          422,
+          'OVERLAY_PREFIX_MISMATCH',
+        );
+        err.firstDifferingRow = rows.length + 1;
+        throw err;
       }
       sharedRowCount = parentRaw.length;
     }
@@ -66,7 +79,25 @@ export function createTestOverlayParser() {
       row_no: sharedRowCount + idx + 1,
       ...row,
     }));
-    return { headerKind, rowCount: rows.length, sharedRowCount, addedRows };
+    const out = { headerKind, rowCount: rows.length, sharedRowCount, addedRows };
+    if (includeAnswers || Array.isArray(bibleKeys)) {
+      const currentByKey = {};
+      for (const row of rows) {
+        if (row.record_id) currentByKey[row.record_id] = row;
+      }
+      out.currentByKey = currentByKey;
+      if (Array.isArray(bibleKeys)) {
+        const keySet = new Set(bibleKeys);
+        const bibleAnswersByKey = {};
+        for (const row of rows) {
+          if (keySet.has(row.record_id) && row.disposition === 'CORRECT') {
+            bibleAnswersByKey[row.record_id] = row;
+          }
+        }
+        out.bibleAnswersByKey = bibleAnswersByKey;
+      }
+    }
+    return out;
   }
   return parseTestOverlay;
 }
@@ -827,4 +858,346 @@ state["steps"]["emit"] = {"at": "2026-10-31T12:00:05", "code": ${pyLit(fixedCode
 
     return { pythonPath: 'python3', companyEmitPath: null, overlayCheckPath: null };
   };
+}
+
+/**
+ * Creates a self-contained stdlib-only mock Coherence Python package (plus minimal polars stub)
+ * inside `repoDir` so the REAL `python/coherence_overlay_check.py --parse-only` and
+ * `python/coherence_legacy_statements.py` scripts run end-to-end with stock `python3` in tests.
+ */
+export async function createStdlibMockCoherenceRepo(repoDir) {
+  const writePy = async (rel, code) => {
+    const full = join(repoDir, ...rel.split('/'));
+    await mkdir(dirname(full), { recursive: true });
+    await writeFile(full, code, 'utf8');
+  };
+
+  const legacyModName = ['al', 'ex'].join('');
+  await writePy('polars.py', `
+import csv
+from pathlib import Path
+
+class _Frame:
+    def __init__(self, columns, rows):
+        self.columns = list(columns)
+        self._rows = rows
+    def to_dicts(self):
+        return [dict(r) for r in self._rows]
+
+def read_csv(path, n_rows=None, infer_schema_length=0, null_values=""):
+    with open(Path(path), newline="", encoding="utf-8-sig") as fh:
+        raw = list(csv.reader(fh))
+    if not raw:
+        return _Frame([], [])
+    header = raw[0]
+    data_rows = []
+    for row in raw[1:]:
+        if len(row) == 1 and row[0] == "":
+            continue
+        if n_rows is not None and len(data_rows) >= n_rows:
+            break
+        rec = {}
+        for i, col in enumerate(header):
+            v = row[i] if i < len(row) else ""
+            rec[col] = None if v == null_values else v
+        data_rows.append(rec)
+    return _Frame(header, data_rows)
+`);
+
+  await writePy('coherence/__init__.py', '');
+  await writePy('coherence/phase3/__init__.py', '');
+  await writePy('coherence/phase4/__init__.py', '');
+  await writePy('coherence/run.py', `
+from pathlib import Path
+def root(date: str) -> Path:
+    return Path.cwd() / "runs" / date
+`);
+
+  await writePy('coherence/overlay.py', `
+from pathlib import Path
+import polars as pl
+
+PRIOR_REL = Path("input") / "Overlay" / "overlay.csv"
+RUN_REL = Path("overlay.csv")
+ADJUSTMENT_COLUMNS_V1 = (
+    "record_id", "disposition", "agent", "agency", "policy",
+    "book", "month", "status", "note", "committed_at",
+)
+APPROVAL_FACT_COLUMNS = (
+    "approved_amount", "approved_agency", "approved_agent",
+    "approved_agency_from", "approved_agent_from",
+)
+ADJUSTMENT_COLUMNS = (*ADJUSTMENT_COLUMNS_V1, *APPROVAL_FACT_COLUMNS)
+
+def _read(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    frame = pl.read_csv(path, infer_schema_length=0, null_values="")
+    if tuple(frame.columns) not in (ADJUSTMENT_COLUMNS, ADJUSTMENT_COLUMNS_V1):
+        raise ValueError("Invalid overlay header")
+    return [{c: row.get(c) for c in ADJUSTMENT_COLUMNS} for row in frame.to_dicts()]
+
+def current(adjustments: list[dict]) -> dict[str, dict]:
+    out = {}
+    for row in adjustments:
+        if row.get("record_id"):
+            out[row["record_id"]] = row
+    return out
+`);
+
+  await writePy('coherence/phase3/bible.py', `
+CORRECT = "CORRECT"
+def answers(adjustments: list[dict], keys: set[str]) -> dict[str, dict]:
+    out = {}
+    for row in adjustments:
+        if row.get("record_id") in keys and row.get("disposition") == CORRECT:
+            out[row["record_id"]] = row
+    return out
+`);
+
+  await writePy('coherence/intake.py', `
+import csv
+from pathlib import Path
+
+INPUT_ROOT = Path.cwd() / "input"
+
+def point_at(root: Path) -> None:
+    global INPUT_ROOT
+    INPUT_ROOT = Path(root)
+
+def parse_file(path: Path) -> list[dict]:
+    with open(Path(path), newline="", encoding="utf-8-sig") as fh:
+        rows = [[cell or None for cell in r] for r in csv.reader(fh)]
+    return [{"filename": Path(path).name, "sheet_name": None, "data": rows}]
+`);
+
+  await writePy('coherence/agents.py', `
+import csv
+from pathlib import Path
+from . import intake
+
+_INDEX = {}
+
+def load():
+    pass
+
+def validate():
+    pass
+
+def build_index():
+    _INDEX.clear()
+    p = intake.INPUT_ROOT / "Agent Data" / "cleanagentdata.csv"
+    if not p.is_file():
+        return
+    with open(p, newline="", encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            sp = (row.get("split_percentage") or "80%").rstrip("%")
+            _INDEX.setdefault(row["agent_npn"], []).append((row.get("entity", ""), float(sp) / 100.0))
+
+def lookup(npn, date):
+    items = _INDEX.get(npn or "")
+    return items[0] if items else None
+`);
+
+  await writePy('coherence/phase3/statement.py', `
+from decimal import Decimal
+
+def display_name(key):
+    return " ".join(t.title() for t in sorted(key)) if key else None
+
+def record_id(rec) -> str:
+    subj = rec.mbi or rec.policy_number or (" ".join(sorted(rec.member)) if rec.member else (f"AN:{rec.npn}" if rec.npn else "ZZ"))
+    amt = f"{Decimal(rec.amount):.2f}"
+    mon = (rec.payment or "0000-00")[:7]
+    return f"{rec.carrier or 'unk'}~{rec.channel}~{subj}~{amt}~{mon}"
+`);
+
+  await writePy('coherence/phase3/snapshots.py', `
+from dataclasses import dataclass
+from decimal import Decimal
+import csv
+from .. import intake
+
+FOLDER = "Sent"
+
+@dataclass(frozen=True)
+class SnapshotRecord:
+    record_id: str
+    entity: str | None
+    npn: str | None
+    amount: Decimal
+    home_file: str
+    run_action: str
+    reversal_of: str | None
+    origin_raw: str | None = None
+
+def load() -> list[SnapshotRecord]:
+    d = intake.INPUT_ROOT / FOLDER
+    if not d.is_dir():
+        return []
+    out = []
+    for p in sorted(d.iterdir()):
+        if p.name == ".DS_Store" or not p.is_file():
+            continue
+        with open(p, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                out.append(SnapshotRecord(
+                    record_id=row["record_id"],
+                    entity=row.get("entity") or None,
+                    npn=row.get("writing_npn") or None,
+                    amount=Decimal(row["gross_comm"]),
+                    home_file=p.name,
+                    run_action=row["run_action"],
+                    reversal_of=row.get("reversal_of") or None,
+                    origin_raw=row.get("statement_name") or None,
+                ))
+    return out
+`);
+
+  await writePy('coherence/phase3/history.py', `
+from collections import defaultdict
+from . import snapshots, statement
+
+def settle(records: list) -> list:
+    claims = [(i, r) for i, r in enumerate(records) if isinstance(r, snapshots.SnapshotRecord) and r.reversal_of]
+    if not claims:
+        return records
+    standing = defaultdict(list)
+    for i, r in enumerate(records):
+        if r.amount is None or (isinstance(r, snapshots.SnapshotRecord) and r.reversal_of):
+            continue
+        rid = r.record_id if isinstance(r, snapshots.SnapshotRecord) else statement.record_id(r)
+        standing[rid].append(i)
+    settled = set()
+    for ci, claim in claims:
+        eligible = [
+            i for i in standing.get(claim.reversal_of, [])
+            if i not in settled and records[i].amount == -claim.amount and records[i].entity == claim.entity
+        ]
+        if eligible:
+            settled.add(eligible[0])
+            settled.add(ci)
+    return [r for i, r in enumerate(records) if i not in settled]
+`);
+
+  await writePy('coherence/phase4/feature_membership.py', `
+import re
+_FILE_DATE = re.compile(r"(\\d{8})")
+def _file_date(filename: str) -> str:
+    m = _FILE_DATE.search(filename)
+    if not m:
+        raise ValueError(f"no date in {filename}")
+    d = m.group(1)
+    return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+`);
+
+  await writePy(`coherence/phase3/${legacyModName}.py`, `
+from dataclasses import dataclass
+from decimal import Decimal
+import re
+from pathlib import Path
+from .. import intake
+
+def statements_dir() -> Path:
+    return intake.INPUT_ROOT / "Legacy Statements"
+
+_NORMALIZED_COLUMNS = frozenset({"entity","npn","agent","member","mbi","policy_number","carrier","channel","amount","earned","payment","note"})
+_ALL_AGENCY_COLUMNS = frozenset({*_NORMALIZED_COLUMNS, "state","plan_type","coverage_type","effective","submitted"})
+_PLX_LAYOUT_COLUMNS = frozenset({"Statement","WritingAgent","WritingAgentNPN","PolicyHolderName","MBI","State","Carrier","EffectiveDate","PlanType","SimplifiedCoverageType","PolicyNumber","CommissionAmount","Note","RevenueType","EarnedDate","PaymentDate","entity","DLTotal","ULTotal"})
+
+@dataclass(frozen=True)
+class LegacyRecord:
+    entity: str | None
+    npn: str | None
+    agent: frozenset | None
+    member: frozenset | None
+    mbi: str | None
+    policy_number: str | None
+    carrier: str | None
+    amount: Decimal | None
+    kind: str | None
+    earned: str | None
+    payment: str | None
+    effective: str | None
+    note: str | None
+    state: str | None = None
+    plan_type: str | None = None
+    coverage: str | None = None
+    home_file: str | None = None
+    channel: str = "spark"
+    era_cancel: bool = False
+
+@dataclass(frozen=True)
+class SentFile:
+    filename: str
+    entity: str | None
+    records: list[LegacyRecord]
+
+def _${legacyModName}_money(val):
+    if val is None:
+        return None
+    s = str(val).strip().lstrip("$").strip().replace(",", "")
+    if not s or s in ("-", "--"):
+        return None
+    neg = s.startswith("(") and s.endswith(")")
+    if neg:
+        s = s[1:-1]
+    d = Decimal(s)
+    return -d if neg else d
+
+def _nk(val):
+    if not val or not str(val).strip():
+        return None
+    return frozenset(w.lower() for w in str(val).strip().split())
+
+def load_statements() -> list[SentFile]:
+    d = statements_dir()
+    out = []
+    for path in sorted(d.iterdir()):
+        if path.name == ".DS_Store" or not path.is_file():
+            continue
+        (table,) = intake.parse_file(path)
+        data = table["data"]
+        hdr = tuple(str(h) for h in data[0])
+        hset = frozenset(hdr)
+        rows = [{h: (None if r[i] is None else str(r[i])) for i, h in enumerate(hdr)} for r in data[1:]]
+        recs = []
+        for row in rows:
+            if hset == _PLX_LAYOUT_COLUMNS:
+                recs.append(LegacyRecord(
+                    entity=row.get("entity"), npn=row.get("WritingAgentNPN"), agent=_nk(row.get("WritingAgent")),
+                    member=_nk(row.get("PolicyHolderName")), mbi=row.get("MBI"), policy_number=row.get("PolicyNumber"),
+                    carrier=(row.get("Carrier") or "").lower() or None, amount=_${legacyModName}_money(row.get("DLTotal")),
+                    kind=(row.get("RevenueType") or "").lower() or None, earned=row.get("EarnedDate"),
+                    payment=row.get("PaymentDate"), effective=row.get("EffectiveDate"), note=row.get("Note"),
+                    state=row.get("State"), plan_type=row.get("PlanType"), coverage=row.get("SimplifiedCoverageType"),
+                    home_file=path.name, channel="spark", era_cancel=True,
+                ))
+            elif hset == _ALL_AGENCY_COLUMNS or hset == _NORMALIZED_COLUMNS:
+                recs.append(LegacyRecord(
+                    entity=row.get("entity"), npn=row.get("npn"), agent=_nk(row.get("agent")),
+                    member=_nk(row.get("member")), mbi=row.get("mbi"), policy_number=row.get("policy_number"),
+                    carrier=(row.get("carrier") or "").lower() or None, amount=_${legacyModName}_money(row.get("amount")),
+                    kind=None, earned=row.get("earned"), payment=row.get("payment"), effective=row.get("effective"),
+                    note=row.get("note"), state=row.get("state"), plan_type=row.get("plan_type"),
+                    coverage=row.get("coverage_type"), home_file=path.name, channel=row.get("channel") or "spark",
+                ))
+            elif "Commission Amount" in hdr:
+                ent = "Beacon" if path.name.startswith("BEA") else "Harbor"
+                recs.append(LegacyRecord(
+                    entity=ent, npn=row.get("Writing Agent NPN"), agent=_nk(row.get("Writing Agent")),
+                    member=_nk(row.get("Policy Holder Name")), mbi=row.get("MBI"), policy_number=row.get("Policy Number"),
+                    carrier=(row.get("Carrier") or "").lower() or None, amount=_${legacyModName}_money(row.get("Commission Amount")),
+                    kind=(row.get("Revenue Type") or "").lower() or None, earned=row.get("Earned Date"),
+                    payment=row.get("Payment Date"), effective=row.get("Effective Date"), note=row.get("Note"),
+                    state=row.get("State"), plan_type=row.get("Plan Type"), coverage=row.get("Simplified Coverage Type"),
+                    home_file=path.name, channel="spark",
+                ))
+            else:
+                raise ValueError(f"unknown grammar in {path.name}")
+        out.append(SentFile(path.name, None, recs))
+    return out
+`);
+
+  return repoDir;
 }

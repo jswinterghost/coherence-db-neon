@@ -28,12 +28,20 @@ def detect_header_kind(path: Path) -> str:
     raise OverlayValidationError("The saved file header does not match the v1 or v2 overlay contract.")
 
 
-def normalize_row(row: dict, row_no: int) -> dict:
-    out = {"row_no": row_no}
+def normalize_row(row: dict, row_no: int | None = None) -> dict:
+    out = {} if row_no is None else {"row_no": row_no}
     for col in overlay.ADJUSTMENT_COLUMNS:
         val = row.get(col)
         out[col] = None if val is None or val == "" else str(val)
     return out
+
+
+def find_first_diff_row(parent_rows: list[dict], rows: list[dict]) -> int:
+    limit = min(len(parent_rows), len(rows))
+    for idx in range(limit):
+        if rows[idx] != parent_rows[idx]:
+            return idx + 1
+    return limit + 1
 
 
 def validate_rows_have_ids(rows: list[dict]) -> None:
@@ -46,11 +54,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Validate and parse a Coherence overlay.csv using Coherence's own reader.")
     parser.add_argument("--parse-only", action="store_true", help="Parse a standalone overlay.csv without a run folder.")
     parser.add_argument("--extends", default=None, help="Optional parent overlay.csv path for --parse-only prefix check.")
+    parser.add_argument("--answers", action="store_true", help="Include overlay.current() (and optional bible.answers()) in --out JSON.")
+    parser.add_argument("--bible-keys-file", default=None, help="Optional JSON file containing an array of Bible record_id keys.")
     parser.add_argument("--out", default=None, help="Path to write full JSON payload including new_rows.")
     parser.add_argument("args", nargs="+")
     parsed = parser.parse_args()
 
     try:
+        extra_payload: dict = {}
         if parsed.parse_only:
             if len(parsed.args) != 1:
                 raise OverlayValidationError("Usage: --parse-only <candidate_path>")
@@ -60,7 +71,10 @@ def main() -> None:
             validate_rows_have_ids(rows)
             parent_rows = overlay._read(Path(parsed.extends)) if parsed.extends else []
             if parent_rows and rows[: len(parent_rows)] != parent_rows:
-                raise OverlayValidationError("The approvals file does not begin with every row of its parent approvals file.")
+                first_diff = find_first_diff_row(parent_rows, rows)
+                raise OverlayValidationError(
+                    f"The approvals file does not begin with every row of its parent approvals file (first differing row: {first_diff})."
+                )
             shared = len(parent_rows)
             new_rows = [normalize_row(row, shared + i + 1) for i, row in enumerate(rows[shared:])]
             summary = {
@@ -71,6 +85,23 @@ def main() -> None:
                 "rows": len(rows),
                 "added": len(new_rows),
             }
+            if parsed.answers or parsed.bible_keys_file:
+                current_map = overlay.current(rows)
+                extra_payload["current_by_key"] = {
+                    k: normalize_row(v) for k, v in current_map.items()
+                }
+                summary["current_count"] = len(current_map)
+                if parsed.bible_keys_file:
+                    keys_data = json.loads(Path(parsed.bible_keys_file).read_text(encoding="utf-8"))
+                    if not isinstance(keys_data, list):
+                        raise OverlayValidationError("Bible keys file must contain a JSON array.")
+                    from coherence.phase3 import bible as bible_mod
+
+                    bible_map = bible_mod.answers(rows, {str(k) for k in keys_data})
+                    extra_payload["bible_answers_by_key"] = {
+                        k: normalize_row(v) for k, v in bible_map.items()
+                    }
+                    summary["bible_answer_count"] = len(bible_map)
         else:
             if len(parsed.args) != 3:
                 raise OverlayValidationError("Usage: <date> <candidate_path> <surface>")
@@ -84,10 +115,16 @@ def main() -> None:
             rows = overlay._read(candidate)
             validate_rows_have_ids(rows)
             if rows[: len(prior)] != prior:
-                raise OverlayValidationError("The saved file does not begin with the run's prior approvals.")
+                first_diff = find_first_diff_row(prior, rows)
+                raise OverlayValidationError(
+                    f"The saved file does not begin with the run's prior approvals (first differing row: {first_diff})."
+                )
             current = overlay._read(root / overlay.RUN_REL) if surface == "adjust" else []
             if current and rows[: len(current)] != current:
-                raise OverlayValidationError("The saved file does not begin with this run's Bible review.")
+                first_diff = find_first_diff_row(current, rows)
+                raise OverlayValidationError(
+                    f"The saved file does not begin with this run's Bible review (first differing row: {first_diff})."
+                )
             shared = max(len(prior), len(current))
             new_rows = [normalize_row(row, shared + i + 1) for i, row in enumerate(rows[shared:])]
             summary = {
@@ -101,10 +138,13 @@ def main() -> None:
 
         if parsed.out:
             out_path = Path(parsed.out)
-            out_path.write_text(json.dumps({**summary, "new_rows": new_rows}, ensure_ascii=False), encoding="utf-8")
+            out_path.write_text(
+                json.dumps({**summary, "new_rows": new_rows, **extra_payload}, ensure_ascii=False),
+                encoding="utf-8",
+            )
             print(json.dumps(summary))
         else:
-            print(json.dumps({**summary, "new_rows": new_rows}, ensure_ascii=False))
+            print(json.dumps({**summary, "new_rows": new_rows, **extra_payload}, ensure_ascii=False))
     except OverlayValidationError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

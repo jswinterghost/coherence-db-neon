@@ -1,5 +1,5 @@
 <!-- GENERATED FILE: DO NOT EDIT BY HAND. -->
-<!-- Source: src/state-machine/coherence-machines.mjs | Checksum: 8d8a8e031342af24bd35aebf98d8abe193b689dade2f8d51eaa7d65560466068 -->
+<!-- Source: src/state-machine/coherence-machines.mjs | Checksum: b59ad5c9dda337a0bfdfd6d6ef4d10ebbfbfc85efbab1e10841b5225aa226c96 -->
 
 # Coherence State Machines
 
@@ -7,7 +7,7 @@ Generated directly from `src/state-machine/coherence-machines.mjs` using the reu
 
 | Machine | ID | States | Transitions | Guards | Spec SHA-256 |
 |---|---|---|---|---|---|
-| Run Lifecycle (Derived Stages) | `coherence-run-stage` | 11 | 18 | 17 | `23c6101b401c6634` |
+| Run Lifecycle (Derived Stages) | `coherence-run-stage` | 11 | 18 | 17 | `69d57e95e17e3c49` |
 | Step Attempt Lifecycle | `coherence-step-attempt` | 7 | 6 | 10 | `0b4c38c3b5037486` |
 
 ---
@@ -16,7 +16,7 @@ Generated directly from `src/state-machine/coherence-machines.mjs` using the reu
 
 The 11 derived stages of a Coherence run (computed from immutable events by `coherence.run_stage(run_id, as_of_seq)` and never stored as mutable state). Every guard is enforced directly inside PostgreSQL triggers.
 
-- Version: `1.0.0` | Storage: derived (never stored) | Spec SHA-256: `23c6101b401c6634`
+- Version: `1.0.0` | Storage: derived (never stored) | Spec SHA-256: `69d57e95e17e3c49`
 
 ### States
 
@@ -78,7 +78,7 @@ The 11 derived stages of a Coherence run (computed from immutable events by `coh
 | `retry_guards` | A person asks to retry a failed, interrupted, or cancelled step; later attempts are superseded; Emit retry keeps its valid confirmation. | table `coherence.step_requests`; trigger `trg_02_step_requests_before` |
 | `carry_sent_guards` | Run is `app` or `company_import` in stage `done`; file matches this run's finished Emit statement; at most one sent statement per date; typed phrase `"sent <date>"`. | table `coherence.carries`; trigger `trg_02_carries_before`; indexes `coherence.carries_one_sent_per_date` |
 | `carry_approvals_guards` | Run is `app` or `company_import` in stage `done`; carried decision commit (or emitted overlay) extends the standing head; typed phrase `"carry <date>"`. | table `coherence.carries`; trigger `trg_02_carries_before` |
-| `abandon_guards` | No open attempt (when stage is `emitting`, allowed only while queued before `emit` starts), no review submission waiting, nothing carried, non-imported run, typed phrase `"abandon <date>"`, and non-empty reason. | table `coherence.abandonments`; triggers `trg_02_abandonments_before`, `trg_03_abandonments_delete_drafts` |
+| `abandon_guards` | No open attempt (when stage is `emitting`, allowed only while queued before `emit` starts), no review submission waiting, nothing carried, non-imported run (or abandoned `company_import` recorded atomically during `import_historical_run`), typed phrase `"abandon <date>"`, and non-empty reason. | table `coherence.abandonments`; triggers `trg_02_abandonments_before`, `trg_03_abandonments_delete_drafts` |
 
 ### State Diagram
 

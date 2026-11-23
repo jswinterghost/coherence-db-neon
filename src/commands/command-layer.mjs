@@ -2149,8 +2149,12 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     inputVersionId = randomUUID(),
     runId,
     typedPhrase,
+    reason = null,
+    provenance = null,
   }) {
-    const payload = { runId, typedPhrase };
+    const payload = provenance != null || reason != null
+      ? { runId, typedPhrase, ...(reason != null ? { reason } : {}), ...(provenance != null ? { provenance } : {}) }
+      : { runId, typedPhrase };
     return executeJournalCommand({
       actor,
       commandKind: 'carry_sent',
@@ -2189,6 +2193,9 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           : [];
 
         const sentRelPath = `Sent/statements_${stamp}.csv`;
+        if (parentEntries.some((r) => normalizeMacKey(r.rel_path) === normalizeMacKey(sentRelPath))) {
+          throw new AppError(`Standing input already contains ${sentRelPath}.`, 409, 'SENT_ALREADY_IN_STANDING_INPUT');
+        }
         const nextEntries = [
           ...parentEntries.map((r) => ({ inputVersionId, relPath: r.rel_path, fileSha256: r.file_sha256 })),
           { inputVersionId, relPath: sentRelPath, fileSha256 },
@@ -2201,7 +2208,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
 
         const ivMeta = {
           id: inputVersionId, lineKind: 'standing', parentId, sourceKind: 'record_sent',
-          reason: `Record statement ${statementDate} as sent`,
+          reason: reason || `Record statement ${statementDate} as sent`,
           entryCount: nextEntries.length, entriesSha256, changeCount: changes.length, changesSha256,
         };
         const carryRow = {
@@ -2217,7 +2224,8 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         const body = {
           carry: carryRow,
           inputVersion: ivMeta,
-          result: { carryId, publishedInputVersionId: inputVersionId, statementDate, fileSha256 },
+          ...(provenance != null ? { sentProvenance: provenance } : {}),
+          result: { carryId, publishedInputVersionId: inputVersionId, statementDate, fileSha256, ...(provenance != null ? { sentProvenance: provenance } : {}) },
           commitments,
         };
         const je = await writeJournal(body);
@@ -2396,6 +2404,16 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     });
   }
 
+  function safeDecisionTimestamp(primary, fallbackA, fallbackB) {
+    for (const candidate of [primary, fallbackA, fallbackB]) {
+      if (candidate == null || candidate === '') continue;
+      try {
+        return formatTimestampUtcUs(candidate);
+      } catch {}
+    }
+    return formatTimestampUtcUs(new Date());
+  }
+
   async function importHistoricalRun({
     actor,
     commandKey,
@@ -2403,9 +2421,15 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
     inputVersion,
     inputEntries = [],
     approvalsFiles = [],
+    decisionCommits = [],
+    decisions = [],
+    generatedOverlays = [],
+    reviewQueueItems = [],
     stepAttempts = [],
     reviewSaves = [],
     storedFiles = [],
+    extraImportedFiles = [],
+    abandonment = null,
   }) {
     const payload = {
       origin: run.origin,
@@ -2413,6 +2437,9 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
       statementDate: run.statementDate,
       inputEntriesSha256: hashInputEntries(inputEntries),
       steps: stepAttempts.map((s) => s.step),
+      ...(decisionCommits.length ? { decisionCommitCount: decisionCommits.length } : {}),
+      ...(extraImportedFiles.length ? { extraImportedFileCount: extraImportedFiles.length } : {}),
+      ...(abandonment ? { abandoned: true } : {}),
     };
     return executeJournalCommand({
       actor,
@@ -2480,6 +2507,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           origin: run.origin,
           inputVersionId: ivId,
           priorApprovalsSha256: overlayEntry?.fileSha256 ?? null,
+          priorDecisionCommitId: run.priorDecisionCommitId ?? null,
           engineVersionId: run.engineVersionId ?? null,
           emitMode: run.emitMode || 'coherence',
           emitDisplay: run.emitDisplay ?? null,
@@ -2487,7 +2515,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           emitNoManager: run.emitNoManager ?? [],
           replaysRunId: null,
           comparedRunId: null,
-          rerunReason: null,
+          rerunReason: run.rerunReason ?? null,
           sourceFolder: run.sourceFolder,
         };
 
@@ -2524,34 +2552,171 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
 
         const saveRows = [];
         for (const rs of reviewSaves) {
-          const attemptEventId = finishedIdByStep.get(rs.surface);
+          const attemptEventId = rs.attemptEventId || finishedIdByStep.get(rs.surface);
           if (!attemptEventId) continue;
           saveRows.push({
             id: rs.id || randomUUID(),
             runId,
             surface: rs.surface,
             attemptEventId,
-            approvalsFileSha256: rs.approvalsFileSha256,
+            approvalsFileSha256: rs.approvalsFileSha256 ?? null,
+            decisionCommitId: rs.decisionCommitId ?? null,
             imported: true,
             originalAt: rs.originalAt ?? null,
             submissionId: null,
           });
         }
+        const insertedSaveIds = new Set(saveRows.map((s) => s.id));
+
+        const queueItemRows = [];
+        for (const q of reviewQueueItems) {
+          const attemptEventId = q.attemptEventId || finishedIdByStep.get(q.attemptStep || q.surface);
+          if (!attemptEventId) continue;
+          queueItemRows.push({
+            attemptEventId,
+            itemOrder: Number(q.itemOrder ?? q.item_order),
+            runId,
+            surface: q.surface,
+            recordId: q.recordId ?? q.record_id,
+            caseKind: q.caseKind ?? q.case_kind ?? null,
+            subtype: q.subtype ?? null,
+            entity: q.entity ?? null,
+            npn: q.npn ?? null,
+            amount: q.amount ?? null,
+            entityFrom: q.entityFrom ?? q.entity_from ?? null,
+            npnFrom: q.npnFrom ?? q.npn_from ?? null,
+            needsReconfirm: Boolean(q.needsReconfirm ?? q.needs_reconfirm),
+          });
+        }
+
+        const nowIso = formatTimestampUtcUs(new Date());
+        const normOpt = (v) => (v == null || v === '' ? null : String(v));
+        const decisionRows = decisions.map((d) => {
+          const resolvedSaveId = d.reviewSaveId && insertedSaveIds.has(d.reviewSaveId) ? d.reviewSaveId : null;
+          const committedAtRaw = normOpt(d.committedAtRaw ?? d.committed_at_raw ?? d.committed_at ?? d.committedAt);
+          return {
+            id: d.id || randomUUID(),
+            decisionCommitId: d.decisionCommitId ?? d.decision_commit_id,
+            rowOrder: Number(d.rowOrder ?? d.row_order),
+            runId: d.runId === '__THIS_RUN__' || d.attachToRun ? runId : (d.runId ?? d.run_id ?? runId),
+            reviewSaveId: resolvedSaveId,
+            surface: resolvedSaveId ? (d.surface ?? null) : (d.surface ?? null),
+            recordId: String(d.recordId ?? d.record_id),
+            replacesDecisionId: d.replacesDecisionId ?? d.replaces_decision_id ?? null,
+            disposition: String(d.disposition ?? 'CONFIRM'),
+            agent: normOpt(d.agent),
+            agency: normOpt(d.agency),
+            policy: normOpt(d.policy),
+            book: normOpt(d.book),
+            month: normOpt(d.month),
+            status: normOpt(d.status),
+            note: normOpt(d.note),
+            approvedAmount: normOpt(d.approvedAmount ?? d.approved_amount),
+            approvedAgency: normOpt(d.approvedAgency ?? d.approved_agency),
+            approvedAgent: normOpt(d.approvedAgent ?? d.approved_agent),
+            approvedAgencyFrom: normOpt(d.approvedAgencyFrom ?? d.approved_agency_from),
+            approvedAgentFrom: normOpt(d.approvedAgentFrom ?? d.approved_agent_from),
+            decidedBy: String(d.decidedBy ?? d.decided_by ?? 'historical_import'),
+            actingFor: normOpt(d.actingFor ?? d.acting_for ?? null),
+            decidedAt: safeDecisionTimestamp(d.decidedAt ?? d.decided_at, committedAtRaw, d.originalAt ?? nowIso),
+            committedAtRaw,
+            imported: true,
+          };
+        });
+
+        const decisionsByCommit = new Map();
+        for (const d of decisionRows) {
+          if (!decisionsByCommit.has(d.decisionCommitId)) decisionsByCommit.set(d.decisionCommitId, []);
+          decisionsByCommit.get(d.decisionCommitId).push(d);
+        }
+
+        const commitRows = decisionCommits.map((dc) => {
+          const rowsForCommit = decisionsByCommit.get(dc.id) || [];
+          return {
+            id: dc.id,
+            parentCommitId: dc.parentCommitId ?? dc.parent_commit_id ?? null,
+            commitKind: dc.commitKind ?? dc.commit_kind ?? 'historical_overlay',
+            headerContract: dc.headerContract ?? dc.header_contract ?? 'v2',
+            addedDecisionCount: rowsForCommit.length,
+            cumulativeDecisionCount: Number(dc.cumulativeDecisionCount ?? dc.cumulative_decision_count),
+            addedDecisionsSha256: hashDecisions(rowsForCommit),
+            imported: true,
+            originalAt: (dc.originalAt ?? dc.original_at) ? safeDecisionTimestamp(dc.originalAt ?? dc.original_at, null, nowIso) : null,
+          };
+        });
+
+        const overlayReceiptRows = generatedOverlays.map((go) => ({
+          id: go.id || randomUUID(),
+          decisionCommitId: go.decisionCommitId ?? go.decision_commit_id,
+          runId,
+          purpose: go.purpose,
+          attemptEventId: go.attemptEventId || (go.attemptStep ? (finishedIdByStep.get(go.attemptStep) ?? null) : null),
+          headerContract: go.headerContract ?? go.header_contract ?? 'v2',
+          rowCount: Number(go.rowCount ?? go.row_count),
+          storeKind: 'company_data',
+          fileSha256: go.fileSha256 ?? go.file_sha256,
+        }));
+
+        const extraImportedRows = (extraImportedFiles || []).map((f) => {
+          const meta = f.metadata && typeof f.metadata === 'object' ? { ...f.metadata } : {};
+          if (meta.runId === '__THIS_RUN__') meta.runId = runId;
+          return {
+            id: f.id || randomUUID(),
+            area: f.area || 'other',
+            relPath: f.relPath,
+            artifactKind: f.artifactKind || 'data',
+            storeKind: f.storeKind || 'company_data',
+            fileSha256: f.fileSha256,
+            originalAt: f.originalAt ?? null,
+            metadata: meta,
+          };
+        });
+
+        const abandonmentRows = abandonment
+          ? [{
+            id: abandonment.id || randomUUID(),
+            runId,
+            typedPhrase: abandonment.typedPhrase || `abandon ${run.statementDate}`,
+            reason: abandonment.reason || `Imported abandoned run from ${run.sourceFolder}`,
+          }]
+          : [];
 
         const commitments = buildCommitments({
           stored_files: newFiles,
           approvals_files: afToInsert,
           approval_rows: arToInsert,
+          decision_commits: commitRows,
+          decisions: decisionRows,
+          generated_overlays: overlayReceiptRows,
+          review_queue_items: queueItemRows,
           input_versions: [ivMeta],
           input_entries: entryRows,
           runs: [runRow],
           step_attempt_events: attemptEventRows,
           artifacts: allArtifacts,
           review_saves: saveRows,
+          ...(abandonmentRows.length ? { abandonments: abandonmentRows } : {}),
+          ...(extraImportedRows.length ? { imported_files: extraImportedRows } : {}),
         });
         const body = {
-          importedRun: { runId, origin: run.origin, sourceFolder: run.sourceFolder, statementDate: run.statementDate },
-          result: { runId, inputVersionId: ivId, alreadyImported: false, steps: stepAttempts.length, reviewSaves: saveRows.length },
+          importedRun: {
+            runId,
+            origin: run.origin,
+            sourceFolder: run.sourceFolder,
+            statementDate: run.statementDate,
+            ...(abandonmentRows.length ? { abandoned: true } : {}),
+          },
+          result: {
+            runId,
+            inputVersionId: ivId,
+            alreadyImported: false,
+            abandoned: abandonmentRows.length > 0,
+            steps: stepAttempts.length,
+            reviewSaves: saveRows.length,
+            decisionCommits: commitRows.length,
+            decisions: decisionRows.length,
+            generatedOverlays: overlayReceiptRows.length,
+          },
           commitments,
         };
         const je = await writeJournal(body);
@@ -2567,6 +2732,21 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         }
         if (arToInsert.length) await insertApprovalRowsBatch(tx, arToInsert, je.journalSeq);
 
+        for (const dc of commitRows) {
+          await tx.query(
+            `INSERT INTO coherence.decision_commits (
+               id, parent_commit_id, commit_kind, header_contract,
+               added_decision_count, cumulative_decision_count, added_decisions_sha256,
+               imported, original_at, journal_seq
+             ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, true, $8::timestamptz, $9)`,
+            [
+              dc.id, dc.parentCommitId, dc.commitKind, dc.headerContract,
+              dc.addedDecisionCount, dc.cumulativeDecisionCount, dc.addedDecisionsSha256,
+              dc.originalAt, String(je.journalSeq),
+            ],
+          );
+        }
+
         await tx.query(
           `INSERT INTO coherence.input_versions (
              id, line_kind, parent_id, source_kind, reason,
@@ -2579,17 +2759,17 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
         await tx.query(
           `INSERT INTO coherence.runs (
              id, statement_date, folder_number, origin, input_version_id, prior_approvals_sha256,
-             engine_version_id, emit_mode, emit_display, emit_keep, emit_no_manager,
+             prior_decision_commit_id, engine_version_id, emit_mode, emit_display, emit_keep, emit_no_manager,
              replays_run_id, compared_run_id, rerun_reason, source_folder, journal_seq
            ) VALUES (
              $1::uuid, $2::date, $3, $4, $5::uuid, $6,
-             $7::uuid, $8, $9, $10::text[], $11::text[],
-             NULL, NULL, NULL, $12, $13
+             $7::uuid, $8::uuid, $9, $10, $11::text[], $12::text[],
+             NULL, NULL, $13, $14, $15
            )`,
           [
             runId, runRow.statementDate, runRow.folderNumber, runRow.origin, ivId, runRow.priorApprovalsSha256,
-            runRow.engineVersionId, runRow.emitMode, runRow.emitDisplay, runRow.emitKeep, runRow.emitNoManager,
-            runRow.sourceFolder, String(je.journalSeq),
+            runRow.priorDecisionCommitId, runRow.engineVersionId, runRow.emitMode, runRow.emitDisplay,
+            runRow.emitKeep, runRow.emitNoManager, runRow.rerunReason, runRow.sourceFolder, String(je.journalSeq),
           ],
         );
 
@@ -2611,13 +2791,44 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           );
         }
         if (allArtifacts.length) await insertArtifactsBatch(tx, allArtifacts, je.journalSeq);
+        if (queueItemRows.length) await insertReviewQueueItemsBatch(tx, queueItemRows, je.journalSeq);
 
         for (const rs of saveRows) {
           await tx.query(
             `INSERT INTO coherence.review_saves (
-               id, run_id, surface, attempt_event_id, approvals_file_sha256, imported, original_at, submission_id, journal_seq
-             ) VALUES ($1::uuid, $2::uuid, $3, $4::uuid, $5, true, $6::timestamptz, NULL, $7)`,
-            [rs.id, runId, rs.surface, rs.attemptEventId, rs.approvalsFileSha256, rs.originalAt, String(je.journalSeq)],
+               id, run_id, surface, attempt_event_id, approvals_file_sha256, decision_commit_id,
+               imported, original_at, submission_id, journal_seq
+             ) VALUES ($1::uuid, $2::uuid, $3, $4::uuid, $5, $6::uuid, true, $7::timestamptz, NULL, $8)`,
+            [rs.id, runId, rs.surface, rs.attemptEventId, rs.approvalsFileSha256, rs.decisionCommitId, rs.originalAt, String(je.journalSeq)],
+          );
+        }
+
+        if (decisionRows.length) await insertDecisionsBatch(tx, decisionRows, je.journalSeq);
+
+        for (const go of overlayReceiptRows) {
+          await tx.query(
+            `INSERT INTO coherence.generated_overlays (
+               id, decision_commit_id, run_id, purpose, attempt_event_id,
+               header_contract, row_count, store_kind, file_sha256, journal_seq
+             ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, 'company_data', $8, $9)`,
+            [go.id, go.decisionCommitId, go.runId, go.purpose, go.attemptEventId, go.headerContract, go.rowCount, go.fileSha256, String(je.journalSeq)],
+          );
+        }
+
+        for (const f of extraImportedRows) {
+          await tx.query(
+            `INSERT INTO coherence.imported_files (
+               id, area, rel_path, artifact_kind, store_kind, file_sha256, original_at, metadata, journal_seq
+             ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::timestamptz, $8::jsonb, $9)`,
+            [f.id, f.area, f.relPath, f.artifactKind, f.storeKind, f.fileSha256, f.originalAt, JSON.stringify(f.metadata), String(je.journalSeq)],
+          );
+        }
+
+        for (const ab of abandonmentRows) {
+          await tx.query(
+            `INSERT INTO coherence.abandonments (id, run_id, typed_phrase, reason, journal_seq)
+             VALUES ($1::uuid, $2::uuid, $3, $4, $5)`,
+            [ab.id, ab.runId, ab.typedPhrase, ab.reason, String(je.journalSeq)],
           );
         }
 
@@ -2805,7 +3016,7 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
           const replacesDecisionId = headByKey.get(recordId) ?? null;
           headByKey.set(recordId, id);
           const committedAtRaw = normOpt(d.committedAtRaw ?? d.committed_at_raw ?? d.committed_at ?? d.committedAt);
-          const decidedAt = d.decidedAt ?? d.decided_at ?? committedAtRaw ?? originalAt ?? nowIso;
+          const decidedAt = safeDecisionTimestamp(d.decidedAt ?? d.decided_at, committedAtRaw, originalAt ?? nowIso);
           return {
             id,
             decisionCommitId,

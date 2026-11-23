@@ -450,7 +450,7 @@ export const RUN_STAGE_MACHINE = defineStateMachine({
       evaluate: (ctx) => Boolean(ctx.carriableOrigin && ctx.matchesEmitOverlay && ctx.extendsStandingOverlay && ctx.typedPhraseValid),
     },
     abandon_guards: {
-      description: 'No open attempt (when stage is `emitting`, allowed only while queued before `emit` starts), no review submission waiting, nothing carried, non-imported run, typed phrase `"abandon <date>"`, and non-empty reason.',
+      description: 'No open attempt (when stage is `emitting`, allowed only while queued before `emit` starts), no review submission waiting, nothing carried, non-imported run (or abandoned `company_import` recorded atomically during `import_historical_run`), typed phrase `"abandon <date>"`, and non-empty reason.',
       dbEnforcement: {
         table: 'coherence.abandonments',
         triggers: ['trg_02_abandonments_before', 'trg_03_abandonments_delete_drafts'],

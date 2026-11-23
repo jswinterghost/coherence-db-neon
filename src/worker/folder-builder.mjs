@@ -490,7 +490,7 @@ export async function buildAttemptWorkspace({
 
 export async function rebuildRunFolderFromDb({ db, runId, targetDir, stores, includeCodeBearing = true }) {
   const runRes = await db.query(
-    `SELECT id, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date, input_version_id
+    `SELECT id, origin, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date, input_version_id
      FROM coherence.runs WHERE id = $1::uuid`,
     [runId],
   );
@@ -531,22 +531,46 @@ export async function rebuildRunFolderFromDb({ db, runId, targetDir, stores, inc
     }
   }
 
-  const saveRes = await db.query(
-    `SELECT rs.approvals_file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
-     FROM coherence.review_saves rs
-     JOIN coherence.stored_files sf ON sf.store_kind = 'company_data' AND sf.sha256 = rs.approvals_file_sha256
-     WHERE rs.run_id = $1::uuid
-     ORDER BY rs.journal_seq DESC LIMIT 1`,
+  // Restore any non-input partial run files captured for zero-step imported/abandoned runs.
+  const partialRes = await db.query(
+    `SELECT i.metadata->>'runRelPath' AS run_rel_path, i.artifact_kind, i.store_kind, i.file_sha256,
+            sf.byte_size, sf.md5_b64, sf.crc32c_b64
+     FROM coherence.imported_files i
+     JOIN coherence.stored_files sf ON sf.store_kind = i.store_kind AND sf.sha256 = i.file_sha256
+     WHERE i.metadata->>'runId' = $1::text
+       AND i.metadata->>'runRelPath' IS NOT NULL
+     ORDER BY i.metadata->>'runRelPath' COLLATE "C"`,
     [runId],
   );
-  if (saveRes.rows.length > 0) {
-    const row = saveRes.rows[0];
-    const overlayPath = join(targetDir, 'overlay.csv');
-    if (!(await stat(overlayPath).then(() => true, () => false))) {
-      const bytes = await stores.dataStore.readVerified(row.approvals_file_sha256, {
-        byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
-      });
-      await writeFile(overlayPath, bytes, { mode: 0o600 });
+  for (const row of partialRes.rows) {
+    if (!includeCodeBearing && row.artifact_kind === 'code_bearing') continue;
+    assertValidRelPath(row.run_rel_path, 'partial run artifact');
+    const bytes = await stores.readVerified(row.store_kind, row.file_sha256, {
+      byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
+    });
+    const outPath = join(targetDir, ...row.run_rel_path.split('/'));
+    await mkdir(dirname(outPath), { recursive: true, mode: 0o700 });
+    await writeFile(outPath, bytes, { mode: 0o600 });
+  }
+
+  if (!['mac_import', 'company_import'].includes(run.origin)) {
+    const saveRes = await db.query(
+      `SELECT rs.approvals_file_sha256, sf.byte_size, sf.md5_b64, sf.crc32c_b64
+       FROM coherence.review_saves rs
+       JOIN coherence.stored_files sf ON sf.store_kind = 'company_data' AND sf.sha256 = rs.approvals_file_sha256
+       WHERE rs.run_id = $1::uuid
+       ORDER BY rs.journal_seq DESC LIMIT 1`,
+      [runId],
+    );
+    if (saveRes.rows.length > 0) {
+      const row = saveRes.rows[0];
+      const overlayPath = join(targetDir, 'overlay.csv');
+      if (!(await stat(overlayPath).then(() => true, () => false))) {
+        const bytes = await stores.dataStore.readVerified(row.approvals_file_sha256, {
+          byteSize: Number(row.byte_size), md5B64: row.md5_b64, crc32cB64: row.crc32c_b64,
+        });
+        await writeFile(overlayPath, bytes, { mode: 0o600 });
+      }
     }
   }
 

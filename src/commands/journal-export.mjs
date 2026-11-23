@@ -1,9 +1,12 @@
 import {
+  canonicalJson,
   computeJournalHash,
   formatTimestampUtcUs,
   GENESIS_HASH,
+  sha256Hex,
 } from '../util/crypto.mjs';
-import { isCodeBearingPath } from '../storage/artifact-policy.mjs';
+import { generateOverlayCsv } from '../decisions/overlay-generator.mjs';
+import { isCodeBearingContent, isCodeBearingPath } from '../storage/artifact-policy.mjs';
 import { buildCommitments, BUSINESS_TABLES, formatIsoDate } from './commitments.mjs';
 
 const EXPORT_TABLE_ORDER = [
@@ -86,6 +89,10 @@ function selectQueryForTable(tbl) {
             FROM coherence.input_entries WHERE journal_seq = $1
             ORDER BY input_version_id::text COLLATE "C", rel_path COLLATE "C"`;
   }
+  if (tbl === 'approvals_files') {
+    return `SELECT * FROM coherence.approvals_files WHERE journal_seq = $1
+            ORDER BY row_count ASC, (extends_sha256 IS NOT NULL) ASC, file_sha256 COLLATE "C"`;
+  }
   if (tbl === 'approval_rows') {
     return `SELECT approvals_file_sha256, row_no, record_id, disposition, agent, agency, policy, book, month,
                    status, note, committed_at, approved_amount, approved_agency, approved_agent,
@@ -105,7 +112,8 @@ function selectQueryForTable(tbl) {
     return `SELECT id, parent_commit_id, commit_kind, header_contract, added_decision_count,
                    cumulative_decision_count, added_decisions_sha256, imported,
                    CASE WHEN original_at IS NULL THEN NULL ELSE coherence.format_utc_us(original_at) END AS original_at
-            FROM coherence.decision_commits WHERE journal_seq = $1 ORDER BY id::text COLLATE "C"`;
+            FROM coherence.decision_commits WHERE journal_seq = $1
+            ORDER BY cumulative_decision_count ASC, (parent_commit_id IS NOT NULL) ASC, id::text COLLATE "C"`;
   }
   if (tbl === 'review_saves') {
     return `SELECT id, run_id, surface, attempt_event_id, approvals_file_sha256, decision_commit_id, imported,
@@ -149,18 +157,26 @@ function selectQueryForTable(tbl) {
 }
 
 /**
- * Exports the company journal as deterministic NDJSON (one line per seq 1..N, or up to upToSeq)
+ * Exports the company journal as deterministic NDJSON (one line per seq 1..N, or up to upToSeq / asOfTimestamp)
  * including all child business rows attached to each entry.
  */
-export async function exportJournalNdjson(pool, { upToSeq = null } = {}) {
+export async function exportJournalNdjson(pool, { upToSeq = null, asOfTimestamp = null } = {}) {
   const cap = upToSeq != null ? String(upToSeq) : '9223372036854775807';
-  const entriesRes = await pool.query(
-    `SELECT seq, coherence.format_utc_us(recorded_at) AS recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
-     FROM coherence.journal_entries
-     WHERE seq <= $1::bigint
-     ORDER BY seq ASC`,
-    [cap],
-  );
+  const entriesRes = asOfTimestamp != null
+    ? await pool.query(
+      `SELECT seq, coherence.format_utc_us(recorded_at) AS recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
+       FROM coherence.journal_entries
+       WHERE seq <= $1::bigint AND recorded_at <= $2::timestamptz
+       ORDER BY seq ASC`,
+      [cap, formatTimestampUtcUs(asOfTimestamp)],
+    )
+    : await pool.query(
+      `SELECT seq, coherence.format_utc_us(recorded_at) AS recorded_at, actor, acting_for, command_kind, command_key, request_sha256, body, prev_hash, entry_hash
+       FROM coherence.journal_entries
+       WHERE seq <= $1::bigint
+       ORDER BY seq ASC`,
+      [cap],
+    );
 
   const lines = [];
   for (const je of entriesRes.rows) {
@@ -277,7 +293,34 @@ export async function rebuildFromJournalExport(pool, ndjsonText, { upToSeq = nul
           );
         }
 
-        for (const r of recs.approvals_files || []) {
+        const orderedApprovalsFiles = (() => {
+          const list = [...(recs.approvals_files || [])].sort((a, b) => (
+            Number(a.row_count) - Number(b.row_count)
+            || Number(Boolean(a.extends_sha256)) - Number(Boolean(b.extends_sha256))
+            || String(a.file_sha256).localeCompare(String(b.file_sha256))
+          ));
+          const inBatch = new Set(list.map((af) => af.file_sha256));
+          const placed = new Set();
+          const out = [];
+          while (out.length < list.length) {
+            let progressed = false;
+            for (const af of list) {
+              if (placed.has(af.file_sha256)) continue;
+              if (!af.extends_sha256 || !inBatch.has(af.extends_sha256) || placed.has(af.extends_sha256)) {
+                out.push(af);
+                placed.add(af.file_sha256);
+                progressed = true;
+              }
+            }
+            if (!progressed) {
+              for (const af of list) if (!placed.has(af.file_sha256)) out.push(af);
+              break;
+            }
+          }
+          return out;
+        })();
+
+        for (const r of orderedApprovalsFiles) {
           await client.query(
             `INSERT INTO coherence.approvals_files (
                file_sha256, store_kind, header_kind, row_count, extends_sha256, shared_row_count, added_rows_sha256, journal_seq
@@ -300,7 +343,30 @@ export async function rebuildFromJournalExport(pool, ndjsonText, { upToSeq = nul
           );
         }
 
-        for (const r of recs.decision_commits || []) {
+        const orderedCommits = (() => {
+          const list = [...(recs.decision_commits || [])];
+          const inBatch = new Set(list.map((c) => c.id));
+          const placed = new Set();
+          const out = [];
+          while (out.length < list.length) {
+            let progressed = false;
+            for (const c of list) {
+              if (placed.has(c.id)) continue;
+              if (!c.parent_commit_id || !inBatch.has(c.parent_commit_id) || placed.has(c.parent_commit_id)) {
+                out.push(c);
+                placed.add(c.id);
+                progressed = true;
+              }
+            }
+            if (!progressed) {
+              for (const c of list) if (!placed.has(c.id)) out.push(c);
+              break;
+            }
+          }
+          return out;
+        })();
+
+        for (const r of orderedCommits) {
           await client.query(
             `INSERT INTO coherence.decision_commits (
                id, parent_commit_id, commit_kind, header_contract,
@@ -429,7 +495,37 @@ export async function rebuildFromJournalExport(pool, ndjsonText, { upToSeq = nul
           );
         }
 
-        for (const r of recs.decisions || []) {
+        const commitRank = new Map(orderedCommits.map((c, idx) => [c.id, idx]));
+        const orderedDecisions = (() => {
+          const list = [...(recs.decisions || [])].sort((a, b) => {
+            const ra = commitRank.has(a.decision_commit_id) ? commitRank.get(a.decision_commit_id) : Number.MAX_SAFE_INTEGER;
+            const rb = commitRank.has(b.decision_commit_id) ? commitRank.get(b.decision_commit_id) : Number.MAX_SAFE_INTEGER;
+            if (ra !== rb) return ra - rb;
+            if (Number(a.row_order) !== Number(b.row_order)) return Number(a.row_order) - Number(b.row_order);
+            return String(a.id).localeCompare(String(b.id));
+          });
+          const inBatch = new Set(list.map((d) => d.id));
+          const placed = new Set();
+          const out = [];
+          while (out.length < list.length) {
+            let progressed = false;
+            for (const d of list) {
+              if (placed.has(d.id)) continue;
+              if (!d.replaces_decision_id || !inBatch.has(d.replaces_decision_id) || placed.has(d.replaces_decision_id)) {
+                out.push(d);
+                placed.add(d.id);
+                progressed = true;
+              }
+            }
+            if (!progressed) {
+              for (const d of list) if (!placed.has(d.id)) out.push(d);
+              break;
+            }
+          }
+          return out;
+        })();
+
+        for (const r of orderedDecisions) {
           await client.query(
             `INSERT INTO coherence.decisions (
                id, decision_commit_id, row_order, run_id, review_save_id, surface, record_id,
@@ -802,6 +898,7 @@ export async function verifyObjects(pool, stores, { deep = false } = {}) {
     'SELECT store_kind, sha256, byte_size, md5_b64, crc32c_b64, object_name FROM coherence.stored_files ORDER BY store_kind, sha256',
   );
   const problems = [];
+  let codeInDataStoreCount = 0;
   for (const row of res.rows) {
     const check = await stores.verifyObject({
       storeKind: row.store_kind,
@@ -811,7 +908,19 @@ export async function verifyObjects(pool, stores, { deep = false } = {}) {
       crc32cB64: row.crc32c_b64,
       objectName: row.object_name,
     }, { deep });
-    if (!check.ok) problems.push(`${row.store_kind}/${row.sha256}: ${check.reason}`);
+    if (!check.ok) {
+      problems.push(`${row.store_kind}/${row.sha256}: ${check.reason}`);
+    } else if (deep && row.store_kind === 'company_data') {
+      const bytes = await stores.readVerified(row.store_kind, row.sha256, {
+        byteSize: Number(row.byte_size),
+        md5B64: row.md5_b64,
+        crc32cB64: row.crc32c_b64,
+      });
+      if (isCodeBearingContent(bytes)) {
+        codeInDataStoreCount += 1;
+        problems.push(`code-bearing bytes detected in company_data object ${row.sha256}`);
+      }
+    }
   }
 
   const badArts = await pool.query(
@@ -821,9 +930,184 @@ export async function verifyObjects(pool, stores, { deep = false } = {}) {
   );
   for (const art of badArts.rows) {
     if (isCodeBearingPath(art.rel_path) || art.artifact_kind === 'code_bearing') {
+      codeInDataStoreCount += 1;
       problems.push(`code-bearing artifact ${art.rel_path} stored in company_data`);
     }
   }
 
-  return { passed: problems.length === 0, checkedObjects: res.rows.length, problems };
+  const badImported = await pool.query(
+    `SELECT rel_path, artifact_kind, store_kind
+     FROM coherence.imported_files
+     WHERE store_kind = 'company_data'`,
+  );
+  for (const imp of badImported.rows) {
+    if (isCodeBearingPath(imp.rel_path) || imp.artifact_kind === 'code_bearing') {
+      codeInDataStoreCount += 1;
+      problems.push(`code-bearing imported file ${imp.rel_path} stored in company_data`);
+    }
+  }
+
+  const badInputs = await pool.query(
+    `SELECT rel_path FROM coherence.input_entries WHERE store_kind = 'company_data'`,
+  );
+  for (const inp of badInputs.rows) {
+    if (isCodeBearingPath(inp.rel_path)) {
+      codeInDataStoreCount += 1;
+      problems.push(`code-bearing input entry ${inp.rel_path} stored in company_data`);
+    }
+  }
+
+  return { passed: problems.length === 0, checkedObjects: res.rows.length, codeInDataStoreCount, problems };
+}
+
+function normalizeRowForCompare(raw) {
+  const clean = normalizeExportRow(raw);
+  if (raw.journal_seq !== undefined) clean.journal_seq = Number(raw.journal_seq);
+  return clean;
+}
+
+function selectUpToSeqQueryForTable(tbl) {
+  return selectQueryForTable(tbl).replace('WHERE journal_seq = $1', 'WHERE journal_seq <= $1::bigint');
+}
+
+/**
+ * Compares a source database as of `cutoffSeq` against a database rebuilt from its journal NDJSON
+ * across journal_entries and all 30 child business tables (excluding strictly session-ephemeral
+ * created_xid, slot_backend_pid, and slot_backend_start), plus run stages, standing input, and
+ * generated overlay SHA-256. Returns a strictly PHI-free report.
+ */
+export async function compareDatabasesAsOf(sourcePool, rebuiltPool, cutoffSeq = null) {
+  const resolvedCutoff = cutoffSeq != null
+    ? Number(cutoffSeq)
+    : Number((await sourcePool.query('SELECT COALESCE(pg_catalog.max(seq), 0)::bigint AS seq FROM coherence.journal_entries')).rows[0]?.seq ?? 0);
+  const cutoffStr = String(resolvedCutoff);
+  const problems = [];
+  const tableDiffs = [];
+
+  const jeSql = `SELECT seq, coherence.format_utc_us(recorded_at) AS recorded_at, actor, acting_for,
+                        command_kind, command_key, request_sha256, body, prev_hash, entry_hash,
+                        (created_xid IS NOT NULL) AS has_xid
+                 FROM coherence.journal_entries
+                 WHERE seq <= $1::bigint
+                 ORDER BY seq ASC`;
+  const [srcJe, rebJe] = await Promise.all([
+    sourcePool.query(jeSql, [cutoffStr]),
+    rebuiltPool.query(jeSql, ['9223372036854775807']),
+  ]);
+
+  const toJeCanonical = (rows) => rows.map((r) => canonicalJson({
+    seq: Number(r.seq),
+    recorded_at: formatTimestampUtcUs(r.recorded_at),
+    actor: r.actor,
+    acting_for: r.acting_for ?? null,
+    command_kind: r.command_kind,
+    command_key: r.command_key,
+    request_sha256: r.request_sha256,
+    body: r.body,
+    prev_hash: r.prev_hash,
+    entry_hash: r.entry_hash,
+    has_xid: Boolean(r.has_xid),
+  }));
+  const srcJeList = toJeCanonical(srcJe.rows);
+  const rebJeList = toJeCanonical(rebJe.rows);
+  let jeDiffs = Math.abs(srcJeList.length - rebJeList.length);
+  for (let i = 0; i < Math.min(srcJeList.length, rebJeList.length); i++) {
+    if (srcJeList[i] !== rebJeList[i]) jeDiffs += 1;
+  }
+  if (jeDiffs > 0) {
+    tableDiffs.push({ table: 'journal_entries', sourceCount: srcJeList.length, rebuiltCount: rebJeList.length, diffCount: jeDiffs });
+    problems.push(`journal_entries mismatch as of seq ${resolvedCutoff}: source=${srcJeList.length}, rebuilt=${rebJeList.length}, diffs=${jeDiffs}`);
+  }
+
+  for (const tbl of EXPORT_TABLE_ORDER) {
+    const q = selectUpToSeqQueryForTable(tbl);
+    const [srcRes, rebRes] = await Promise.all([
+      sourcePool.query(q, [cutoffStr]),
+      rebuiltPool.query(q, ['9223372036854775807']),
+    ]);
+    const srcCanon = srcRes.rows.map((r) => canonicalJson(normalizeRowForCompare(r))).sort();
+    const rebCanon = rebRes.rows.map((r) => canonicalJson(normalizeRowForCompare(r))).sort();
+    let diffs = 0;
+    if (srcCanon.length !== rebCanon.length) {
+      diffs = Math.abs(srcCanon.length - rebCanon.length);
+    }
+    const minLen = Math.min(srcCanon.length, rebCanon.length);
+    for (let i = 0; i < minLen; i++) {
+      if (srcCanon[i] !== rebCanon[i]) diffs += 1;
+    }
+    if (diffs > 0) {
+      tableDiffs.push({
+        table: tbl,
+        sourceCount: srcCanon.length,
+        rebuiltCount: rebCanon.length,
+        diffCount: diffs,
+        sourceDigest: sha256Hex(srcCanon.join('\n')),
+        rebuiltDigest: sha256Hex(rebCanon.join('\n')),
+      });
+      problems.push(`${tbl} mismatch as of seq ${resolvedCutoff}: source=${srcCanon.length}, rebuilt=${rebCanon.length}, diffs=${diffs}`);
+    }
+  }
+
+  // Compare derived run stages as of cutoffSeq vs rebuilt tip.
+  const srcRuns = (await sourcePool.query(
+    `SELECT id, coherence.run_stage(id, $1::bigint) AS stage
+     FROM coherence.runs
+     WHERE journal_seq <= $1::bigint
+     ORDER BY id::text COLLATE "C"`,
+    [cutoffStr],
+  )).rows;
+  const rebRuns = (await rebuiltPool.query(
+    `SELECT id, coherence.run_stage(id, NULL) AS stage
+     FROM coherence.runs
+     ORDER BY id::text COLLATE "C"`,
+  )).rows;
+  const rebStageById = new Map(rebRuns.map((r) => [r.id, r.stage]));
+  const stageDiffs = [];
+  for (const sr of srcRuns) {
+    const rs = rebStageById.get(sr.id) ?? null;
+    if (rs !== sr.stage) {
+      stageDiffs.push({ runId: sr.id, sourceStage: sr.stage, rebuiltStage: rs });
+    }
+  }
+  for (const rr of rebRuns) {
+    if (!srcRuns.some((sr) => sr.id === rr.id)) {
+      stageDiffs.push({ runId: rr.id, sourceStage: null, rebuiltStage: rr.stage });
+    }
+  }
+  if (stageDiffs.length > 0) {
+    problems.push(`run_stage mismatch on ${stageDiffs.length} run(s) as of seq ${resolvedCutoff}`);
+  }
+
+  const srcStandingIv = (await sourcePool.query('SELECT coherence.standing_input_version_as_of($1::bigint) AS id', [cutoffStr])).rows[0]?.id ?? null;
+  const rebStandingIv = (await rebuiltPool.query('SELECT coherence.standing_input_version_as_of(NULL) AS id')).rows[0]?.id ?? null;
+  const standingInputMatch = srcStandingIv === rebStandingIv;
+  if (!standingInputMatch) {
+    problems.push(`standing_input_version mismatch as of seq ${resolvedCutoff}`);
+  }
+
+  const [srcOv, rebOv] = await Promise.all([
+    generateOverlayCsv(sourcePool, { asOfSeq: resolvedCutoff }),
+    generateOverlayCsv(rebuiltPool, {}),
+  ]);
+  const standingOverlaySha256Match = srcOv.fingerprint.sha256 === rebOv.fingerprint.sha256
+    && srcOv.headerContract === rebOv.headerContract
+    && srcOv.rowCount === rebOv.rowCount;
+  if (!standingOverlaySha256Match) {
+    problems.push(`standing overlay mismatch as of seq ${resolvedCutoff}`);
+  }
+
+  return {
+    passed: problems.length === 0,
+    cutoffSeq: resolvedCutoff,
+    journalEntriesChecked: srcJeList.length,
+    tablesChecked: EXPORT_TABLE_ORDER.length + 1,
+    runsChecked: srcRuns.length,
+    tableDiffs,
+    stageDiffs,
+    standingInputMatch,
+    standingOverlaySha256Match,
+    sourceOverlaySha256: srcOv.fingerprint.sha256,
+    rebuiltOverlaySha256: rebOv.fingerprint.sha256,
+    problems,
+  };
 }

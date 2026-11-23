@@ -49,11 +49,17 @@ export const POLICY_STATUSES = Object.freeze([
 export const LIVE_DISPOSITIONS = Object.freeze(['CONFIRM', 'CORRECT']);
 
 function toOverlayRecord(row) {
-  const committedAt = row.committed_at_raw
+  const isImported = Boolean(row.imported);
+  const explicitCommittedAt = row.committed_at_raw
     ?? row.committedAtRaw
     ?? row.committed_at
     ?? row.committedAt
-    ?? ((row.decided_at ?? row.decidedAt) ? formatTimestampUtcUs(row.decided_at ?? row.decidedAt) : null);
+    ?? null;
+  const committedAt = explicitCommittedAt !== null
+    ? explicitCommittedAt
+    : (isImported
+      ? null
+      : ((row.decided_at ?? row.decidedAt) ? formatTimestampUtcUs(row.decided_at ?? row.decidedAt) : null));
   return {
     record_id: row.record_id ?? row.recordId ?? null,
     disposition: row.disposition ?? null,
@@ -189,7 +195,7 @@ export async function generateOverlayCsv(
 
   const rowsRes = await db.query(
     `SELECT seq_order, record_id, disposition, agent, agency, policy, book, month, status, note,
-            coherence.format_utc_us(decided_at) AS decided_at, committed_at_raw,
+            coherence.format_utc_us(decided_at) AS decided_at, committed_at_raw, imported,
             approved_amount, approved_agency, approved_agent, approved_agency_from, approved_agent_from
      FROM coherence.decisions_in_commit($1::uuid)
      ORDER BY seq_order ASC`,

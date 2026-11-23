@@ -3,30 +3,43 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { compareDbRuns, compareRunFolders, mapEntitiesCsv } from '../src/compare/run-comparator.mjs';
+import { runHistoryProof } from '../scripts/prove-history.mjs';
+import { compareDatabasesAsOf, exportJournalNdjson, rebuildFromJournalExport } from '../src/commands/journal-export.mjs';
+import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstruction.mjs';
+import { compareCsvExactText, compareDbRuns, compareRunFolders, mapEntitiesCsv } from '../src/compare/run-comparator.mjs';
+import { formatOverlayCsvFromRows, generateOverlayCsv } from '../src/decisions/overlay-generator.mjs';
 import {
-  createCommitBundle,
   buildImportManifest,
+  createCommitBundle,
   executeHistoryImport,
+  loadImportManifestFile,
   parseApprovalsFile,
+  readLegacySqliteSnapshot,
+  readLegacyStatementBatches,
   resolveLiveProofConfig,
 } from '../src/importer/history-importer.mjs';
+import { findLatestPublishedRun } from '../src/readers/downstream-reader.mjs';
 import { buildAttemptWorkspace } from '../src/worker/folder-builder.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
 import {
   createMockEngineMaterializer,
+  createStdlibMockCoherenceRepo,
   createTestOverlayParser,
+  makeCsvFromObjects,
   makeOverlayCsv,
   sampleApprovalRow,
   seedEngineVersion,
   seedStandingInput,
+  SYNTHETIC_BOB_COLUMNS,
+  SYNTHETIC_LEDGER_COLUMNS,
+  SYNTHETIC_RUN_COLUMNS,
 } from './helpers/fixtures.mjs';
-import { checkPgAvailable, createTestEnv } from './helpers/test-db.mjs';
+import { checkPgAvailable, createEmptyMigratedTestDb, createTestEnv } from './helpers/test-db.mjs';
 
 const pgCheck = await checkPgAvailable();
 
@@ -669,4 +682,1677 @@ test('Layer 4 [Engine Commit Bundle]: a commit named by its short id is bundled 
   } finally {
     await rm(work, { recursive: true, force: true });
   }
+});
+
+test('Layer 4 [Historical Overlays, Branching, Layer 2 Reconstruction & G3 Prefix Mismatch]: parses strictly through coherence_overlay_check.py --parse-only, chains decision_commits/replaces_decision_id, attaches divergent branch to deepest ancestor, fails loudly on G3 mismatch, and passes Layer 2 check', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+
+  const r1V1 = {
+    record_id: 'policy:carrier_a:P100#effective:2026-01-01',
+    disposition: 'CORRECT', agent: '11111111', agency: 'Beacon', policy: null,
+    book: null, month: null, status: 'ACTIVE_PAYING', note: 'v1 initial', committed_at: '2026-09-30T10:00:00Z',
+  };
+  const r2V1 = {
+    record_id: 'carrier_a~direct~PAT SAMPLE~100.00~2026-09',
+    disposition: 'CONFIRM', agent: null, agency: null, policy: null,
+    book: null, month: null, status: null, note: 'confirmed', committed_at: '2026-09-30T10:05:00Z',
+  };
+  const r3Rev = sampleApprovalRow({
+    record_id: 'policy:carrier_a:P100#effective:2026-01-01',
+    disposition: 'CORRECT', agent: '22222222', agency: 'Harbor', status: 'ACTIVE_RECON',
+    note: 'revised agency', committed_at: '2026-10-12T11:00:00Z',
+    approved_amount: '100.00', approved_agency: 'Harbor', approved_agent: '22222222',
+  });
+  const r4Adj = sampleApprovalRow({
+    record_id: 'carrier_a~direct~LEE DEMO~50.00~2026-10',
+    disposition: 'CONFIRM', agent: null, agency: null, status: null, note: 'adj ok',
+    committed_at: '2026-10-12T12:00:00Z', approved_amount: '50.00', approved_agency: 'Beacon', approved_agent: '11111111',
+  });
+  const r3AltBranch = sampleApprovalRow({
+    record_id: 'policy:carrier_a:P200#effective:2026-02-01',
+    disposition: 'CORRECT', agent: '33333333', agency: 'Beacon', status: 'ACTIVE_PAYING',
+    note: 'divergent branch', committed_at: '2026-10-12T09:00:00Z',
+    approved_amount: '75.00', approved_agency: 'Beacon', approved_agent: '33333333',
+  });
+
+  const v1Csv = makeOverlayCsv([r1V1, r2V1], { version: 'v1' });
+  const v2PriorCsv = makeOverlayCsv([r1V1, r2V1], { version: 'v2' });
+  const v2BibleCsv = makeOverlayCsv([r1V1, r2V1, r3Rev], { version: 'v2' });
+  const v2AdjCsv = makeOverlayCsv([r1V1, r2V1, r3Rev, r4Adj], { version: 'v2' });
+  const v2BranchCsv = makeOverlayCsv([r1V1, r2V1, r3AltBranch], { version: 'v2' });
+
+  const cohRoot = join(env.tempDir, 'hist-coherence');
+  const dataRoot = join(env.tempDir, 'hist-data');
+
+  // Run 1 (2026-09-30): v1 10-column overlay baseline
+  await writeTree(join(cohRoot, 'runs', '2026-09-30'), {
+    'input/a.csv': 'k\n1\n',
+    'bible.csv': 'record_id,case,subtype,amount\npolicy:carrier_a:P100#effective:2026-01-01,BIBLE,CONFLICT,100.00\n',
+    'overlay.csv': v1Csv,
+    'run.json': JSON.stringify({ date: '2026-09-30', steps: { assign: { at: '2026-09-30T10:00:00', code: 'dirty+' }, bible: { at: '2026-09-30T10:01:00', code: 'dirty+' } } }),
+  });
+
+  // Run 2 (2026-10-12): main branch upgrading v1 -> v2 with Bible save + Adjust save + emits/overlay.csv
+  await writeTree(join(cohRoot, 'runs', '2026-10-12'), {
+    'input/a.csv': 'k\n1\n',
+    'input/Overlay/overlay.csv': v2PriorCsv,
+    'bible.csv': 'record_id,case,subtype,amount\npolicy:carrier_a:P100#effective:2026-01-01,BIBLE,CONFLICT,100.00\n',
+    'adjust.csv': 'record_id,case,subtype,amount\ncarrier_a~direct~LEE DEMO~50.00~2026-10,NEW,NEW_BUSINESS,50.00\n',
+    'overlay.csv': v2AdjCsv,
+    'emits/overlay.csv': v2AdjCsv,
+    'emits/statements_20261012.csv': 'record_id,entity,gross_comm,downline_amount,run_action\n',
+    'run.json': JSON.stringify({ date: '2026-10-12', steps: { assign: { at: '2026-10-12T10:00:00' }, bible: { at: '2026-10-12T10:01:00' }, adjust: { at: '2026-10-12T11:10:00' }, emit: { at: '2026-10-12T12:10:00' } } }),
+  });
+  await writeTree(join(dataRoot, 'coherence-runs', '2026-10-12'), {
+    'bible-review-2026-10-12T11-00-00-000Z.csv': v2BibleCsv,
+    'adjust-review-2026-10-12T12-00-00-000Z.csv': v2AdjCsv,
+  });
+
+  // Run 3 (archive/v2/2026-10-12): divergent branch attaching to deepest matching ancestor ([r1V1, r2V1])
+  await writeTree(join(cohRoot, 'runs', 'archive', 'v2', '2026-10-12'), {
+    'input/a.csv': 'k\n1\n',
+    'bible.csv': 'record_id,case,subtype,amount\npolicy:carrier_a:P200#effective:2026-02-01,BIBLE,CONFLICT,75.00\n',
+    'overlay.csv': v2BranchCsv,
+    'run.json': JSON.stringify({ date: '2026-10-12', steps: { assign: { at: '2026-10-12T08:00:00' }, bible: { at: '2026-10-12T08:01:00' } } }),
+  });
+
+  await writeTree(join(cohRoot, 'input'), {
+    'a.csv': 'k\n1\n',
+    'Overlay/overlay.csv': v2AdjCsv,
+  });
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    coherenceRoot: cohRoot,
+    nusearDataDir: dataRoot,
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+
+  const rep = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: true,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, `Overlay import failed: ${rep.problems.join('; ')}`);
+
+  // Verify decision_commits DAG: divergent archive/v2/2026-10-12 attached to a 2-row ancestor (NOT null, NOT main 4-row commit).
+  const commits = (await env.pool.query(
+    'SELECT id, parent_commit_id, header_contract, added_decision_count, cumulative_decision_count FROM coherence.decision_commits ORDER BY journal_seq ASC, cumulative_decision_count ASC',
+  )).rows;
+  const branchSave = (await env.pool.query(
+    `SELECT rs.decision_commit_id, dc.parent_commit_id, p.cumulative_decision_count AS parent_cum
+     FROM coherence.review_saves rs
+     JOIN coherence.runs r ON r.id = rs.run_id
+     JOIN coherence.decision_commits dc ON dc.id = rs.decision_commit_id
+     LEFT JOIN coherence.decision_commits p ON p.id = dc.parent_commit_id
+     WHERE r.source_folder = 'archive/v2/2026-10-12'`,
+  )).rows[0];
+  assert.ok(branchSave.parent_commit_id, 'divergent branch must attach to deepest matching ancestor, never reset to null');
+  assert.equal(Number(branchSave.parent_cum), 2);
+  assert.ok(commits.some((c) => c.header_contract === 'v1' && Number(c.cumulative_decision_count) === 2));
+
+  // Verify replaces_decision_id linked r3Rev -> r1V1 across commits!
+  const p100Chain = (await env.pool.query(
+    `SELECT id, replaces_decision_id, agency FROM coherence.decisions
+     WHERE record_id = 'policy:carrier_a:P100#effective:2026-01-01'
+     ORDER BY journal_seq ASC, row_order ASC`,
+  )).rows;
+  assert.equal(p100Chain.length, 2);
+  assert.equal(p100Chain[0].replaces_decision_id, null);
+  assert.equal(p100Chain[1].replaces_decision_id, p100Chain[0].id);
+  assert.equal(p100Chain[1].agency, 'Harbor');
+
+  // Layer 2 check: verifyOverlayReconstruction passes across all checkpoints (v1 + v2 + divergent branch + standing head)
+  const l2 = await verifyOverlayReconstruction({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(l2.passed, true, `Layer 2 failed: ${l2.problems.join('; ')}`);
+  assert.ok(l2.checkpointsChecked >= 5, `expected >= 5 checkpoints checked, got ${l2.checkpointsChecked}`);
+  assert.equal(l2.replacementChainViolations, 0);
+  assert.equal(l2.currentParityMismatches, 0);
+  assert.equal(l2.bibleAppliedParityMismatches, 0);
+  const l2CheckRow = (await env.pool.query("SELECT passed FROM coherence.checks WHERE check_kind = 'overlay_reconstruction'")).rows;
+  assert.equal(l2CheckRow.length, 1);
+  assert.equal(l2CheckRow[0].passed, true);
+
+  // G3 Negative Test: prefix mismatch within a run MUST fail loudly with run, checkpoint, and first differing row number (never silent reset).
+  const badEnv = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => badEnv.cleanup());
+  const badCoh = join(badEnv.tempDir, 'bad-coh');
+  const badData = join(badEnv.tempDir, 'bad-data');
+  const r2Tampered = { ...r2V1, note: 'TAMPERED ROW 2' };
+  await writeTree(join(badCoh, 'runs', '2026-10-15'), {
+    'input/Overlay/overlay.csv': v2PriorCsv,
+    'overlay.csv': makeOverlayCsv([r1V1, r2Tampered, r3Rev], { version: 'v2' }),
+    'run.json': JSON.stringify({ date: '2026-10-15', steps: { assign: { at: '2026-10-15T10:00:00' }, bible: { at: '2026-10-15T10:01:00' }, adjust: { at: '2026-10-15T10:02:00' } } }),
+  });
+  await writeTree(join(badData, 'coherence-runs', '2026-10-15'), {
+    'bible-review-2026-10-15T10-05-00-000Z.csv': v2BibleCsv,
+    'adjust-review-2026-10-15T10-10-00-000Z.csv': makeOverlayCsv([r1V1, r2Tampered, r3Rev, r4Adj], { version: 'v2' }),
+  });
+  const badManifest = await buildImportManifest({
+    companySlug: 'acme',
+    coherenceRoot: badCoh,
+    nusearDataDir: badData,
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+  await assert.rejects(
+    () => executeHistoryImport({
+      pool: badEnv.pool,
+      stores: badEnv.stores,
+      commands: badEnv.commands,
+      actor: badEnv.ownerActor,
+      manifest: badManifest,
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      tempBaseDir: badEnv.tempDir,
+    }),
+    (err) => {
+      assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH');
+      assert.equal(err.firstDifferingRow, 2);
+      assert.ok(String(err.message).includes('2026-10-15'));
+      assert.ok(String(err.message).includes('adjust-review-2026-10-15T10-10-00-000Z.csv'));
+      assert.ok(String(err.message).includes('2'));
+      return true;
+    },
+  );
+});
+
+test('Layer 4 [G4 Config-Driven Manifest, All Sources, Company Sent Provenance & Idempotency]: imports standing input, abandoned runs, audit.json, replaced/, finished/, answer-key, local cloud mirror, Incident Report, 8 SQLite tables, preserves 11/11 sent provenance without upgrading unsent runs, routes code only to nusear_code, and re-imports idempotently', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const srcRoot = join(env.tempDir, 'sources');
+
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P1#effective:2026-01-01' });
+  const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
+
+  // Standing input with trailing-space folder + .DS_Store
+  await writeTree(join(srcRoot, 'standing-input'), {
+    'Agent Data/cleanagentdata.csv': 'agent_name,agent_npn,entity,start_date\nSam Seller,11111111,Beacon,01/01/2025\n',
+    'All BOB/TrailingCarrier /book.csv': 'member,policy_number\nPat Sample,P1\n',
+    'Overlay/overlay.csv': ovCsv,
+    '.DS_Store': 'finder-bytes',
+  });
+
+  // Legacy run (2026-11-02)
+  await writeTree(join(srcRoot, 'legacy-runs', '2026-11-02'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/statements_20261102.csv': 'record_id,entity,gross_comm,downline_amount,run_action\n',
+    'run.json': JSON.stringify({ date: '2026-11-02', steps: { assign: { at: '2026-11-02T10:00:00' }, emit: { at: '2026-11-02T10:05:00' } } }),
+  });
+
+  // Company run 2026-11-11: header-only statements, recorded as sent in company-environment audit.json!
+  await writeTree(join(srcRoot, 'company-ws', '2026-11-11', 'runs', '2026-11-11'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/statements_20261111.csv': 'record_id,entity,gross_comm,downline_amount,run_action\n',
+    'run.json': JSON.stringify({ date: '2026-11-11', steps: { assign: { at: '2026-11-11T10:00:00' }, emit: { at: '2026-11-11T10:05:00' } } }),
+  });
+
+  // Company run 2026-11-12: finished emit, NOT recorded as sent in company environment (must never be upgraded!)
+  await writeTree(join(srcRoot, 'company-ws', '2026-11-12', 'runs', '2026-11-12'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/statements_20261112.csv': 'record_id,entity,gross_comm,downline_amount,run_action\n',
+    'run.json': JSON.stringify({ date: '2026-11-12', steps: { assign: { at: '2026-11-12T10:00:00' }, emit: { at: '2026-11-12T10:05:00' } } }),
+  });
+
+  // Abandoned company run (with run.json) + standalone abandoned log
+  await writeTree(join(srcRoot, 'company-abandoned', '2026-11-09'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/statements_20261109.csv': 'record_id,entity,gross_comm,downline_amount,run_action\n',
+    'run.json': JSON.stringify({ date: '2026-11-09', steps: { assign: { at: '2026-11-09T10:00:00' }, emit: { at: '2026-11-09T10:02:00' } } }),
+  });
+  await writeTree(join(srcRoot, 'company-abandoned'), {
+    'orphan-notes.txt': 'abandoned note\n',
+  });
+
+  // Company environment: audit.json (recording 2026-11-11 sent), replaced/, finished/ (with code-bearing .html), answer-key-*.json
+  await writeTree(join(srcRoot, 'company-env'), {
+    'audit.json': JSON.stringify({
+      events: [
+        { id: 'evt-1111', action: 'record_sent', statementDate: '2026-11-11', at: '2026-11-11T15:00:00Z', actor: 'company-operator' },
+      ],
+    }),
+    'answer-key-2026-11-11.json': JSON.stringify({ statementDate: '2026-11-11', totals: { Beacon: '0.00' } }),
+    'replaced/old-carrier.csv': 'k\nold\n',
+    'finished/2026-11-11/summary.csv': 'k\ndone\n',
+    'finished/2026-11-11/viewer.html': '<!doctype html><html><body>legacy viewer</body></html>',
+    'staging/new-upload.csv': 'k\nstaged\n',
+    'documents/memo.txt': 'memo\n',
+    'inventories/inv.json': '{"count":1}\n',
+  });
+
+  // Local cloud mirror folder (zero network!) with valid SHA-256 object + mid-buffer embedded <script> file
+  const cleanObjBytes = Buffer.from('col\nval\n', 'utf8');
+  const cleanObjSha = createHash('sha256').update(cleanObjBytes).digest('hex');
+  const sneakyScriptCsv = `${'a,b\n'.repeat(3000)}<script>alert(1)</script>\n`;
+  await writeTree(join(srcRoot, 'cloud-mirror'), {
+    'lists/standing-list.json': JSON.stringify({ objects: [cleanObjSha] }),
+    [`objects/${cleanObjSha}`]: cleanObjBytes.toString('utf8'),
+    'finished/sneaky.csv': sneakyScriptCsv,
+  });
+
+  // Incident Report with code-bearing .py
+  await writeTree(join(srcRoot, 'incident-report'), {
+    'report.csv': 'k\n1\n',
+    'build_slate.py': 'print("script")\n',
+  });
+
+  // Create real 8-table legacy SQLite database via node:sqlite
+  const sqlitePath = join(srcRoot, 'legacy.sqlite');
+  const { DatabaseSync } = await import('node:sqlite');
+  const sq = new DatabaseSync(sqlitePath);
+  try {
+    sq.exec(`
+      CREATE TABLE coherence_run_records (date TEXT, status TEXT);
+      CREATE TABLE coherence_run_events (id INTEGER PRIMARY KEY, date TEXT, kind TEXT);
+      CREATE TABLE coherence_run_drafts (date TEXT, surface TEXT, body TEXT);
+      CREATE TABLE coherence_run_settings (key TEXT, value TEXT);
+      CREATE TABLE company_run_records (company TEXT, date TEXT, status TEXT, sent_at TEXT);
+      CREATE TABLE company_run_events (id INTEGER PRIMARY KEY, company TEXT, date TEXT, kind TEXT);
+      CREATE TABLE company_run_drafts (company TEXT, date TEXT, surface TEXT, body TEXT);
+      CREATE TABLE company_intake_events (id INTEGER PRIMARY KEY, company TEXT, kind TEXT);
+      INSERT INTO coherence_run_records VALUES ('2026-11-02', 'done');
+      INSERT INTO coherence_run_events VALUES (1, '2026-11-02', 'finished'), (2, '2026-11-02', 'carried');
+      INSERT INTO coherence_run_drafts VALUES ('2026-11-02', 'bible', '[]');
+      INSERT INTO coherence_run_settings VALUES ('mode', 'coherence');
+      INSERT INTO company_run_records VALUES ('acme', '2026-11-11', 'sent', '2026-11-11T15:00:00Z'), ('acme', '2026-11-12', 'done', NULL);
+      INSERT INTO company_run_events VALUES (10, 'acme', '2026-11-11', 'sent');
+      INSERT INTO company_run_drafts VALUES ('acme', '2026-11-12', 'adjust', '[]');
+      INSERT INTO company_intake_events VALUES (20, 'acme', 'upload'), (21, 'acme', 'include');
+    `);
+  } finally {
+    sq.close();
+  }
+
+  // Write config-driven JSON manifest file
+  const manifestPath = join(env.tempDir, 'manifest.json');
+  await writeFile(manifestPath, JSON.stringify({
+    companySlug: 'acme',
+    displayName: 'Acme',
+    defaultEmitMode: 'coherence',
+    coherenceRepo: mockRepo,
+    pythonPath: 'python3',
+    sources: {
+      legacyRunsRoot: 'sources/legacy-runs',
+      standingInputDir: 'sources/standing-input',
+      incidentReportDir: 'sources/incident-report',
+      companyWorkspacesDir: 'sources/company-ws',
+      companyAbandonedDir: 'sources/company-abandoned',
+      companyEnvironmentDir: 'sources/company-env',
+      cloudMirrorDir: 'sources/cloud-mirror',
+      legacySqlitePath: 'sources/legacy.sqlite',
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: true,
+      useCompanyIncomingInput: false,
+      currentInputSourceKind: 'mac_import',
+    },
+  }, null, 2), 'utf8');
+
+  const manifest = await loadImportManifestFile(manifestPath);
+  const rep = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    verifyRebuild: true,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, `G4 import failed: ${rep.problems.join('; ')}`);
+  assert.equal(rep.rebuildChecks.length, 4, 'legacy + 2 company + 1 abandoned run rebuilt');
+  assert.ok(rep.rebuildChecks.every((c) => c.passed));
+  assert.equal(rep.standingInputRebuildCheck.passed, true);
+  assert.equal(rep.incidentReportRebuildCheck.passed, true);
+  assert.equal(rep.standaloneRebuildCheck.passed, true);
+  assert.equal(rep.objectCheck.passed, true);
+  assert.equal(rep.objectCheck.codeInDataStoreCount, 0);
+
+  // Verify all 8 legacy SQLite tables matched exact row counts!
+  assert.deepEqual(rep.sqliteParity.imported, {
+    coherence_run_records: 1,
+    coherence_run_events: 2,
+    coherence_run_drafts: 1,
+    coherence_run_settings: 1,
+    company_run_records: 2,
+    company_run_events: 1,
+    company_run_drafts: 1,
+    company_intake_events: 2,
+  });
+
+  // Verify code-bearing files (viewer.html, build_slate.py, mid-buffer sneaky.csv) went ONLY to nusear_code!
+  const codeRows = (await env.pool.query(
+    `SELECT rel_path, store_kind, artifact_kind FROM coherence.imported_files
+     WHERE rel_path LIKE '%viewer.html' OR rel_path LIKE '%build_slate.py' OR rel_path LIKE '%sneaky.csv'
+     ORDER BY rel_path`,
+  )).rows;
+  assert.equal(codeRows.length, 3);
+  for (const row of codeRows) {
+    assert.equal(row.store_kind, 'nusear_code', `${row.rel_path} must go strictly to nusear_code`);
+    assert.equal(row.artifact_kind, 'code_bearing');
+  }
+
+  // Verify 2026-11-11 company run preserved as company_import WITH sent carry citing audit.json provenance,
+  // while 2026-11-12 company run has NO sent carry (never upgraded!).
+  const sentCarries = (await env.pool.query(
+    `SELECT c.statement_date::text, r.origin, r.source_folder, je.body->'sentProvenance' AS prov
+     FROM coherence.carries c
+     JOIN coherence.runs r ON r.id = c.run_id
+     JOIN coherence.journal_entries je ON je.seq = c.journal_seq
+     WHERE c.carry_kind = 'sent'`,
+  )).rows;
+  assert.equal(sentCarries.length, 1);
+  assert.equal(sentCarries[0].statement_date, '2026-11-11');
+  assert.equal(sentCarries[0].origin, 'company_import');
+  assert.equal(sentCarries[0].prov.source, 'company-environment/audit.json');
+  assert.equal(sentCarries[0].prov.recordId, 'evt-1111');
+
+  // Verify abandoned company run is excluded from findLatestPublishedRun!
+  const latestPub = await findLatestPublishedRun(env.pool);
+  assert.equal(latestPub.statement_date, '2026-11-12');
+
+  // Verify idempotency: re-importing the same manifest adds ZERO new rows across all business tables!
+  const countSnapshot = async () => {
+    const out = {};
+    for (const tbl of ['runs', 'stored_files', 'decision_commits', 'decisions', 'generated_overlays', 'input_versions', 'imported_files', 'carries']) {
+      out[tbl] = Number((await env.pool.query(`SELECT COUNT(*)::int AS n FROM coherence.${tbl}`)).rows[0].n);
+    }
+    return out;
+  };
+  const before = await countSnapshot();
+  const rep2 = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    verifyRebuild: false,
+    recordCheck: false,
+    tempBaseDir: env.tempDir,
+  });
+  const after = await countSnapshot();
+  assert.equal(rep2.passed, true);
+  assert.equal(rep2.importedRuns.length, 0);
+  assert.deepEqual(after, before, 're-importing the same manifest must add zero records or stored files');
+});
+
+test('Layer 4 [Pre-Coherence 5 Sent Dates & 2 Method Corrections]: imports via python/coherence_legacy_statements.py into statement_batches, statement_agency_lines, and statement_upline_lines with exact netting and idempotency', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const stmtDir = join(env.tempDir, 'pre-coherence-statements');
+
+  const plxCols = 'Statement,WritingAgent,WritingAgentNPN,PolicyHolderName,MBI,State,Carrier,EffectiveDate,PlanType,SimplifiedCoverageType,PolicyNumber,CommissionAmount,Note,RevenueType,EarnedDate,PaymentDate,entity,DLTotal,ULTotal';
+  const plxRow = (dt, dl, ul, gross) => `${dt} - CarrierA,Sam Seller,11111111,Pat Sample,1AB2CD3EF45,NC,CarrierA,2026-01-01,MA,MA,POL1,${gross},plx,Commission,${dt},${dt},Beacon,${dl},${ul}`;
+  await writeTree(stmtDir, {
+    'BEA20260325.csv': 'Statement,Carrier,Revenue Type,Commission Amount,Writing Agent NPN,Writing Agent,Policy Holder Name,MBI,Policy Number,Earned Date,Payment Date,Effective Date,Note,State,Plan Type,Simplified Coverage Type\n2026-03-06,CarrierA,Commission,$ 100.00,11111111,Sam Seller,Pat Sample,1AB2CD3EF45,POL1,2026-03-01,2026-03-06,2026-01-01,mar,NC,MA,MA\n',
+    'plxSpark20260429.csv': `${plxCols}\n${plxRow('2026-04-15', '80.00', '20.00', '100.00')}\n`,
+    'plxSpark20260531.csv': `${plxCols}\n${plxRow('2026-05-15', '80.00', '20.00', '100.00')}\n`,
+    'plxSpark20260630.csv': `${plxCols}\n${plxRow('2026-06-15', '80.00', '20.00', '100.00')}\n`,
+    'ALLAGENCY20260731Spark.csv': 'entity,npn,agent,member,mbi,policy_number,carrier,channel,amount,earned,payment,note,state,plan_type,coverage_type,effective,submitted\nBeacon,11111111,Sam Seller,Pat Sample,1AB2CD3EF45,POL1,carriera,spark,100.00,2026-07-01,2026-07-15,jul,NC,MA,MA,2026-01-01,2026-01-01\nAcme,22222222,House Rep,Lee Demo,2CD3EF4GH56,POL2,carriera,spark,50.00,2026-07-01,2026-07-15,jul,NC,MA,MA,2026-01-01,2026-01-01\n',
+  });
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      preCoherenceStatementsDir: stmtDir,
+      methodCorrections: [
+        {
+          kind: 'split_reallocation',
+          statementDate: '2026-08-01',
+          sourceGrammar: 'all_agency',
+          unreversedOnly: false,
+          uplineRate: '0.20',
+          excludeEntities: ['Acme'],
+          expectedAgencyNetCents: -2000,
+          expectedUplineNetCents: 2000,
+          reason: '2026-08-01 80/20 split correction',
+        },
+        {
+          kind: 'upline_takeback',
+          statementDate: '2026-08-31',
+          sourceGrammar: 'plx_layout',
+          expectedAgencyNetCents: 0,
+          expectedUplineNetCents: -6000,
+          reason: '2026-08-31 historical ULTotal take-back',
+        },
+      ],
+    },
+  });
+
+  const rep = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, rep.problems.join('; '));
+  assert.equal(rep.preCoherenceBatchesImported, 5);
+  assert.equal(rep.methodCorrectionBatchesImported, 2);
+
+  const batches = (await env.pool.query(
+    `SELECT batch_kind, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS dt,
+            agency_line_count, agency_net_total::text, upline_line_count, upline_net_total::text
+     FROM coherence.statement_batches
+     ORDER BY statement_date ASC, batch_kind ASC`,
+  )).rows;
+  assert.equal(batches.length, 7);
+  assert.equal(batches.filter((b) => b.batch_kind === 'historical_sent').length, 5);
+  assert.equal(batches.filter((b) => b.batch_kind === 'method_correction').length, 2);
+
+  // Verify cumulative totals through coherence_views:
+  // Beacon: 100 (3/25) + 80*3 (4/29..6/30) + 100 (7/31) - 20 (8/1 split) = 420.00
+  // Acme: 50 (7/31, excluded from 8/1 split) = 50.00
+  // Acme Upline: 20*3 (4/29..6/30) + 20 (8/1 split) - 60 (8/31 take-back) = 20.00
+  const entTotals = (await env.pool.query(
+    `SELECT statement_entity, SUM(net_amount)::numeric(14,2)::text AS total
+     FROM coherence_views.v_entity_statement_date_totals
+     GROUP BY statement_entity
+     ORDER BY statement_entity COLLATE "C"`,
+  )).rows;
+  assert.deepEqual(entTotals, [
+    { statement_entity: 'Acme', total: '50.00' },
+    { statement_entity: 'Acme Upline', total: '20.00' },
+    { statement_entity: 'Beacon', total: '420.00' },
+  ]);
+
+  // Verify idempotency on re-import
+  const rep2 = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    recordCheck: false,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep2.preCoherenceBatchesImported, 0);
+  assert.equal(rep2.methodCorrectionBatchesImported, 0);
+  assert.equal((await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.statement_batches')).rows[0].n, 7);
+});
+
+test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows without $0 agency lines, loud unreversedOnly/agents.lookup failures, Coherence banker rounding, and cent-exact expected totals abort', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const stmtDir = join(env.tempDir, 'legacy-stmts');
+  const sentDir = join(env.tempDir, 'sent-dir');
+  const agentsCsv = join(env.tempDir, 'cleanagentdata.csv');
+
+  const plantedMember = 'Zelda Q. Plantedname';
+  const plxCols = 'Statement,WritingAgent,WritingAgentNPN,PolicyHolderName,MBI,State,Carrier,EffectiveDate,PlanType,SimplifiedCoverageType,PolicyNumber,CommissionAmount,Note,RevenueType,EarnedDate,PaymentDate,entity,DLTotal,ULTotal';
+  await writeTree(stmtDir, {
+    'plxSpark20260429.csv': [
+      plxCols,
+      // Blank DLTotal with non-zero ULTotal -> must emit upline line only, zero agency line
+      `2026-04-15 - CarrierA,Sam Seller,11111111,${plantedMember},1AB2CD3EF45,NC,CarrierA,2026-01-01,MA,MA,POL1,25.00,blank-dl,Commission,2026-04-01,2026-04-15,Beacon,,25.00`,
+      // $0.00 DLTotal with non-zero ULTotal -> must emit upline line only, no $0.00 agency line
+      `2026-04-15 - CarrierA,Sam Seller,11111111,${plantedMember},1AB2CD3EF45,NC,CarrierA,2026-01-01,MA,MA,POL2,15.00,zero-dl,Commission,2026-04-01,2026-04-15,Beacon,0.00,15.00`,
+      // Standard split row
+      `2026-04-15 - CarrierA,Sam Seller,11111111,${plantedMember},1AB2CD3EF45,NC,CarrierA,2026-01-01,MA,MA,POL3,100.00,both,Commission,2026-04-01,2026-04-15,Beacon,80.00,20.00`,
+    ].join('\n') + '\n',
+    'ALLAGENCY20260731Spark.csv': [
+      'entity,npn,agent,member,mbi,policy_number,carrier,channel,amount,earned,payment,note,state,plan_type,coverage_type,effective,submitted',
+      // 0.05 at 50% split: downline = round(0.025) = 0.02 (HALF_EVEN), upline = 0.03 (vs HALF_UP -> 0.02)
+      `Beacon,11111111,Sam Seller,${plantedMember},1AB2CD3EF45,POL4,carriera,spark,0.05,2026-07-01,2026-07-15,half1,NC,MA,MA,2026-01-01,2026-01-01`,
+      // 0.03 at 50% split: downline = round(0.015) = 0.02 (HALF_EVEN), upline = 0.01 (vs round(0.03*0.50)=0.02)
+      `Beacon,11111111,Sam Seller,${plantedMember},1AB2CD3EF45,POL5,carriera,spark,0.03,2026-07-01,2026-07-15,half2,NC,MA,MA,2026-01-01,2026-01-01`,
+      // 0.15 at 70% split (30% upline): downline = round(0.105) = 0.10 (HALF_EVEN), upline = 0.05 (vs HALF_UP -> 0.04)
+      `Beacon,22222222,Pat Rep,${plantedMember},1AB2CD3EF45,POL6,carriera,spark,0.15,2026-07-01,2026-07-15,half3,NC,MA,MA,2026-01-01,2026-01-01`,
+    ].join('\n') + '\n',
+  });
+  await mkdir(sentDir, { recursive: true });
+  await writeFile(
+    agentsCsv,
+    'agent_name,agent_npn,entity,split_percentage\nSam Seller,11111111,Beacon,50%\nPat Rep,22222222,Beacon,70%\n',
+    'utf8',
+  );
+
+  // 1) plx upline-only rows + Coherence rounding + exact expected cents succeed
+  const okParsed = await readLegacyStatementBatches({
+    statementsDir: stmtDir,
+    sentDir,
+    agentsCsvPath: agentsCsv,
+    methodCorrections: [
+      {
+        kind: 'split_reallocation',
+        statementDate: '2026-08-01',
+        sourceGrammar: 'all_agency',
+        unreversedOnly: true,
+        useAgentsSplit: true,
+        expectedAgencyNetCents: -9,
+        expectedUplineNetCents: 9,
+        reason: '2026-08-01 split reallocation',
+      },
+      {
+        kind: 'upline_takeback',
+        statementDate: '2026-08-31',
+        sourceGrammar: 'plx_layout',
+        expectedAgencyNetCents: 0,
+        expectedUplineNetCents: -6000,
+        reason: '2026-08-31 upline take-back',
+      },
+    ],
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    tempBaseDir: env.tempDir,
+  });
+  const plxBatch = okParsed.historicalBatches.find((b) => b.sourceFileName === 'plxSpark20260429.csv');
+  assert.equal(plxBatch.agencyLineCount, 1, 'must emit no $0.00 agency lines for blank or 0.00 DLTotal rows with ULTotal');
+  assert.equal(plxBatch.agencyNetTotal, '80.00');
+  assert.equal(plxBatch.uplineLineCount, 3, 'must capture blank-DLTotal, zero-DLTotal, and split upline lines');
+  assert.equal(plxBatch.uplineNetTotal, '60.00');
+  assert.equal(okParsed.methodCorrectionBatches[0].agencyNetTotal, '-0.09');
+  assert.equal(okParsed.methodCorrectionBatches[0].uplineNetTotal, '0.09');
+  assert.equal(okParsed.methodCorrectionBatches[1].uplineNetTotal, '-60.00');
+
+  // 2) unreversedOnly without readable sentDir must fail loudly
+  await assert.rejects(
+    () => readLegacyStatementBatches({
+      statementsDir: stmtDir,
+      sentDir: null,
+      agentsCsvPath: agentsCsv,
+      methodCorrections: [{
+        kind: 'split_reallocation',
+        statementDate: '2026-08-01',
+        sourceGrammar: 'all_agency',
+        unreversedOnly: true,
+        useAgentsSplit: true,
+        expectedAgencyNetCents: -9,
+        expectedUplineNetCents: 9,
+      }],
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      tempBaseDir: env.tempDir,
+    }),
+    /sentDir|sent folder|unreversedOnly/i,
+  );
+
+  // 3) agents.lookup() finding no agent under useAgentsSplit must fail loudly (no silent skip)
+  const missingAgentCsv = join(env.tempDir, 'missing-agent.csv');
+  await writeFile(missingAgentCsv, 'agent_name,agent_npn,entity,split_percentage\nSam Seller,11111111,Beacon,50%\n', 'utf8');
+  await assert.rejects(
+    () => readLegacyStatementBatches({
+      statementsDir: stmtDir,
+      sentDir,
+      agentsCsvPath: missingAgentCsv,
+      methodCorrections: [{
+        kind: 'split_reallocation',
+        statementDate: '2026-08-01',
+        sourceGrammar: 'all_agency',
+        unreversedOnly: true,
+        useAgentsSplit: true,
+        expectedAgencyNetCents: -9,
+        expectedUplineNetCents: 9,
+      }],
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      tempBaseDir: env.tempDir,
+    }),
+    (err) => {
+      assert.match(err.message, /agent|lookup|useAgentsSplit/i);
+      assert.equal(err.message.includes(plantedMember), false);
+      return true;
+    },
+  );
+
+  // 4) Missing expected totals on a method_correction spec must fail loudly
+  await assert.rejects(
+    () => readLegacyStatementBatches({
+      statementsDir: stmtDir,
+      sentDir,
+      agentsCsvPath: agentsCsv,
+      methodCorrections: [{
+        kind: 'upline_takeback',
+        statementDate: '2026-08-31',
+        sourceGrammar: 'plx_layout',
+      }],
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      tempBaseDir: env.tempDir,
+    }),
+    /expectedAgencyNetCents|expectedUplineNetCents/i,
+  );
+
+  // 5) One-cent difference aborts import loudly naming ONLY the correction and the two totals (no PHI, zero DB batches written)
+  const offByOneManifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      preCoherenceStatementsDir: stmtDir,
+      preCoherenceSentDir: sentDir,
+      preCoherenceAgentsCsv: agentsCsv,
+      methodCorrections: [{
+        kind: 'upline_takeback',
+        statementDate: '2026-08-31',
+        sourceGrammar: 'plx_layout',
+        expectedAgencyNetCents: 0,
+        expectedUplineNetCents: -6001, // 1 cent off from -6000
+        reason: `sensitive reason ${plantedMember}`,
+      }],
+    },
+  });
+  await assert.rejects(
+    () => executeHistoryImport({
+      pool: env.pool,
+      stores: env.stores,
+      commands: env.commands,
+      actor: env.ownerActor,
+      manifest: offByOneManifest,
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      verifyRebuild: false,
+      tempBaseDir: env.tempDir,
+    }),
+    (err) => {
+      assert.ok(err.message.includes('2026-08-31'), 'must name correction date');
+      assert.ok(err.message.includes('upline_takeback'), 'must name correction kind');
+      assert.ok(err.message.includes('-6001'), 'must include expected total');
+      assert.ok(err.message.includes('-6000'), 'must include actual total');
+      assert.equal(err.message.includes(plantedMember), false, 'must never leak member name or extra text');
+      return true;
+    },
+  );
+  assert.equal((await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.statement_batches')).rows[0].n, 0);
+
+  // 6) Fixed-rate split_reallocation (useAgentsSplit: false) also uses Coherence ROUND_HALF_EVEN downline = round(amount * split), upline = amount - downline
+  const fixedRateRes = await readLegacyStatementBatches({
+    statementsDir: stmtDir,
+    sentDir,
+    methodCorrections: [{
+      kind: 'split_reallocation',
+      statementDate: '2026-08-01',
+      sourceGrammar: 'all_agency',
+      unreversedOnly: true,
+      useAgentsSplit: false,
+      uplineRate: '0.50', // 0.05 -> dl 0.02 ul 0.03; 0.03 -> dl 0.02 ul 0.01; 0.15 -> dl 0.08 ul 0.07 => total ul = 0.11
+      expectedAgencyNetCents: -11,
+      expectedUplineNetCents: 11,
+    }],
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(fixedRateRes.methodCorrectionBatches[0].agencyNetTotal, '-0.11');
+  assert.equal(fixedRateRes.methodCorrectionBatches[0].uplineNetTotal, '0.11');
+});
+
+test('Layer 4 [Fix 3 - Consistent SQLite Snapshot & Sidecar Guard]: never reads live WAL DB directly, takes one consistent copy into temp dir, refuses -wal/-shm without consistent copy, and reads counts + all 8 tables from that one copy in one read transaction', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const { DatabaseSync } = await import('node:sqlite');
+  const sqlitePath = join(env.tempDir, 'live-wal.sqlite');
+  const liveDb = new DatabaseSync(sqlitePath);
+  t.after(() => { try { liveDb.close(); } catch {} });
+
+  liveDb.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE coherence_run_records (date TEXT, status TEXT);
+    CREATE TABLE coherence_run_events (id INTEGER PRIMARY KEY, date TEXT, kind TEXT);
+    CREATE TABLE coherence_run_drafts (date TEXT, surface TEXT, body TEXT);
+    CREATE TABLE coherence_run_settings (key TEXT, value TEXT);
+    CREATE TABLE company_run_records (company TEXT, date TEXT, status TEXT, sent_at TEXT);
+    CREATE TABLE company_run_events (id INTEGER PRIMARY KEY, company TEXT, date TEXT, kind TEXT);
+    CREATE TABLE company_run_drafts (company TEXT, date TEXT, surface TEXT, body TEXT);
+    CREATE TABLE company_intake_events (id INTEGER PRIMARY KEY, company TEXT, kind TEXT);
+    INSERT INTO coherence_run_records VALUES ('2026-11-02', 'done');
+    INSERT INTO coherence_run_events VALUES (1, '2026-11-02', 'finished');
+    INSERT INTO coherence_run_drafts VALUES ('2026-11-02', 'bible', '[]');
+    INSERT INTO coherence_run_settings VALUES ('mode', 'coherence');
+    INSERT INTO company_run_records VALUES ('acme', '2026-11-11', 'done', NULL);
+    INSERT INTO company_run_events VALUES (10, 'acme', '2026-11-11', 'sent');
+    INSERT INTO company_run_drafts VALUES ('acme', '2026-11-11', 'adjust', '[]');
+    INSERT INTO company_intake_events VALUES (20, 'acme', 'upload');
+  `);
+  // Leave an active uncommitted transaction open while -wal and -shm exist on disk!
+  liveDb.exec("BEGIN IMMEDIATE; INSERT INTO company_intake_events VALUES (999, 'acme', 'uncommitted');");
+
+  // Direct read without consistent copy MUST refuse when -wal or -shm sidecar exists
+  await assert.rejects(
+    () => readLegacySqliteSnapshot(sqlitePath, {
+      companySlug: 'acme',
+      includeLegacySqliteTables: true,
+      tempBaseDir: env.tempDir,
+      takeConsistentCopy: false,
+    }),
+    (err) => err?.code === 'SQLITE_WAL_SIDECAR_PRESENT',
+  );
+
+  // Consistent copy succeeds even with live WAL + uncommitted writer, seeing committed rows only
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacySqlitePath: sqlitePath },
+    importConfig: { includeLegacyHostHistory: true, includeLegacySqliteTables: true },
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(manifest.sqliteCounts.company_intake_events, 1, 'must see committed WAL row and exclude uncommitted row');
+
+  // Roll back uncommitted tx and commit a NEW row to the live DB AFTER manifest was built:
+  // executeHistoryImport must reuse the single consistent snapshot so counts and rows stay 100% consistent!
+  liveDb.exec("ROLLBACK; INSERT INTO company_intake_events VALUES (21, 'acme', 'later_live_write');");
+
+  const rep = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    verifyRebuild: false,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, `Import failed: ${rep.problems.join('; ')}`);
+  assert.equal(rep.sqliteParity.source.company_intake_events, 1);
+  assert.equal(rep.sqliteParity.imported.company_intake_events, 1);
+});
+
+test('Layer 4 [Fix 4 - Journal Rebuild Topological Ordering]: imported run with 10 chained checkpoints revising the same key in one journal entry rebuilds deterministically every time', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const cohRoot = join(env.tempDir, 'coh-fix4');
+  const dataRoot = join(env.tempDir, 'data-fix4');
+
+  const targetKey = 'policy:carrier_a:P900#effective:2026-01-01';
+  const rows = [];
+  for (let i = 0; i < 10; i++) {
+    rows.push(sampleApprovalRow({
+      record_id: targetKey,
+      disposition: 'CORRECT',
+      agency: i % 2 === 0 ? 'Beacon' : 'Harbor',
+      note: `rev-${i}`,
+      committed_at: `2026-11-15T10:${String(i).padStart(2, '0')}:00Z`,
+    }));
+  }
+
+  // Prior overlay has rev-0; 9 timestamped saves extend it one revision at a time (10 commits + 10 approvals_files in ONE journal entry!)
+  await writeTree(join(cohRoot, 'runs', '2026-11-15'), {
+    'input/a.csv': 'k\n1\n',
+    'input/Overlay/overlay.csv': makeOverlayCsv(rows.slice(0, 1), { version: 'v2' }),
+    'bible.csv': `record_id,case,subtype,amount\n${targetKey},BIBLE,CONFLICT,100.00\n`,
+    'overlay.csv': makeOverlayCsv(rows, { version: 'v2' }),
+    'run.json': JSON.stringify({
+      date: '2026-11-15',
+      steps: {
+        assign: { at: '2026-11-15T09:50:00' },
+        bible: { at: '2026-11-15T09:55:00' },
+      },
+    }),
+  });
+  const saveFiles = {};
+  for (let i = 1; i < 10; i++) {
+    saveFiles[`bible-review-2026-11-15T10-${String(i).padStart(2, '0')}-00-000Z.csv`] = makeOverlayCsv(rows.slice(0, i + 1), { version: 'v2' });
+  }
+  await writeTree(join(dataRoot, 'coherence-runs', '2026-11-15'), saveFiles);
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    coherenceRoot: cohRoot,
+    nusearDataDir: dataRoot,
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+
+  const rep = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, `Import failed: ${rep.problems.join('; ')}`);
+  assert.equal(rep.importedRuns[0].decisionCommits, 10);
+  assert.equal(rep.importedRuns[0].decisions, 10);
+
+  const tipSeq = Number((await env.pool.query('SELECT MAX(seq)::bigint AS s FROM coherence.journal_entries')).rows[0].s);
+  const ndjson = await exportJournalNdjson(env.pool);
+  const emptyDb = await createEmptyMigratedTestDb();
+  t.after(() => emptyDb.cleanup());
+
+  const reb = await rebuildFromJournalExport(emptyDb.pool, ndjson);
+  assert.equal(reb.replayed, tipSeq);
+
+  const cmp = await compareDatabasesAsOf(env.pool, emptyDb.pool, tipSeq);
+  assert.equal(cmp.passed, true, `Layer 4 rebuild comparison failed: ${cmp.problems.join('; ')}`);
+});
+
+test('Layer 4 [Fix 5 - Long Path Command Keys <= 200 chars]: 300-character paths in comparator checks and standalone overlay checkpoints hash safely below 200-char command_key limit', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+
+  // Construct a real filesystem directory whose absolute path is > 300 characters (segments <= 60 chars each for POSIX NAME_MAX safety)
+  const segs = Array.from({ length: 6 }, (_, i) => `segment_${i}_${'x'.repeat(45)}`);
+  const longDir = join(env.tempDir, ...segs);
+  assert.ok(longDir.length > 300, `expected > 300 char path, got ${longDir.length}`);
+
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P500#effective:2026-01-01', note: 'long-path' });
+  const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:P501#effective:2026-01-01', note: 'long-path-cp' });
+  const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
+  const cpCsv = makeOverlayCsv([row0, row1], { version: 'v2' });
+  const longCheckpointPath = join(longDir, 'standalone_overlay_checkpoint.csv');
+  const longRightRunDir = join(longDir, 'ref-run-2026-11-02');
+  const runFiles = {
+    'input/a.csv': 'k\n1\n',
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/canonical_bob.csv': 'policy_id,member,entity,amount,upline_amount\n1,Pat Sample,Beacon,80.00,20.00\n',
+    'emits/coherent_ledger.csv': 'tx_id,record_id,policy_id,member,entity,gross_comm,downline_amount,upline_amount\n1,r1,1,Pat Sample,Beacon,100.00,80.00,20.00\n',
+    'run.json': JSON.stringify({ date: '2026-11-02', steps: { assign: { at: '2026-11-02T10:00:00' }, emit: { at: '2026-11-02T10:05:00' } } }),
+  };
+  await writeTree(longRightRunDir, runFiles);
+  await writeTree(join(env.tempDir, 'runs', '2026-11-02'), runFiles);
+  await writeFile(longCheckpointPath, cpCsv, 'utf8');
+  assert.ok(longCheckpointPath.length > 300);
+  assert.ok(longRightRunDir.length > 300);
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(env.tempDir, 'runs') },
+    overlayCheckpoints: [{ absPath: longCheckpointPath, originalAt: '2026-11-03T10:00:00Z' }],
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+
+  const rep = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, `Import failed: ${rep.problems.join('; ')}`);
+
+  const runId = rep.importedRuns[0].runId;
+  const cmpRep = await compareDbRuns({
+    pool: env.pool,
+    stores: env.stores,
+    leftRunId: runId,
+    rightFolderDir: longRightRunDir,
+    mode: 'substance',
+    requireConservation: true,
+    commands: env.commands,
+    actor: env.ownerActor,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(cmpRep.passed, true, `Comparator failed: ${cmpRep.problems.join('; ')}`);
+
+  const keys = (await env.pool.query('SELECT command_key FROM coherence.journal_entries')).rows.map((r) => r.command_key);
+  assert.ok(keys.length > 0);
+  for (const k of keys) {
+    assert.ok(k.length <= 200, `command_key exceeded 200 chars: ${k.length}`);
+  }
+});
+
+test('Layer 4 [Fix 6 - Chronological Same-Date Runs & Merged Checkpoints]: orders same-date drafts/archives before primary by recorded start and merges manifest overlayCheckpoints by time so valid shorter prefixes always find their ancestor', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const runsRoot = join(env.tempDir, 'runs-fix6');
+  const cpDir = join(env.tempDir, 'cps-fix6');
+
+  const mkRow = (n) => sampleApprovalRow({
+    record_id: `policy:carrier_a:P60${n}#effective:2026-01-01`,
+    note: `step-${n}`,
+    committed_at: `2026-10-1${n}T08:00:00Z`,
+  });
+  const rows = [mkRow(1), mkRow(2), mkRow(3), mkRow(4), mkRow(5), mkRow(6)];
+
+  // Standalone checkpoints that belong BEFORE and BETWEEN runs chronologically
+  const cpEarly = join(cpDir, 'cp-early.csv');
+  const cpMid = join(cpDir, 'cp-mid.csv');
+  await mkdir(cpDir, { recursive: true });
+  await writeFile(cpEarly, makeOverlayCsv(rows.slice(0, 1), { version: 'v2' }), 'utf8');
+  await writeFile(cpMid, makeOverlayCsv(rows.slice(0, 3), { version: 'v2' }), 'utf8');
+
+  // Same-date 2026-10-12: archive/draft1 (started 08:00, 2 rows) must run BEFORE primary 2026-10-12 (started 10:00, 4 rows)
+  // even though "2026-10-12" sorts before "archive/draft1/2026-10-12" lexicographically!
+  await writeTree(join(runsRoot, 'archive', 'draft1', '2026-10-12'), {
+    'input/a.csv': 'k\n1\n',
+    'overlay.csv': makeOverlayCsv(rows.slice(0, 2), { version: 'v2' }),
+    'run.json': JSON.stringify({ date: '2026-10-12', steps: { assign: { at: '2026-10-12T08:00:00Z' }, bible: { at: '2026-10-12T08:05:00Z' } } }),
+  });
+  await writeTree(join(runsRoot, '2026-10-12'), {
+    'input/a.csv': 'k\n1\n',
+    'overlay.csv': makeOverlayCsv(rows.slice(0, 4), { version: 'v2' }),
+    'run.json': JSON.stringify({ date: '2026-10-12', steps: { assign: { at: '2026-10-12T10:00:00Z' }, bible: { at: '2026-10-12T10:05:00Z' } } }),
+  });
+
+  // Same-date 2026-10-14 without step timestamps: archive must still precede primary
+  await writeTree(join(runsRoot, 'archive', 'nots', '2026-10-14'), {
+    'input/a.csv': 'k\n1\n',
+    'overlay.csv': makeOverlayCsv(rows.slice(0, 5), { version: 'v2' }),
+    'run.json': JSON.stringify({ date: '2026-10-14', steps: { assign: {}, bible: {} } }),
+  });
+  await writeTree(join(runsRoot, '2026-10-14'), {
+    'input/a.csv': 'k\n1\n',
+    'overlay.csv': makeOverlayCsv(rows.slice(0, 6), { version: 'v2' }),
+    'run.json': JSON.stringify({ date: '2026-10-14', steps: { assign: {}, bible: {} } }),
+  });
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: runsRoot },
+    overlayCheckpoints: [
+      { label: 'mid-2026-10-12', absPath: cpMid, originalAt: '2026-10-12T09:00:00Z' },
+      { label: 'early-2026-10-10', absPath: cpEarly, originalAt: '2026-10-10T09:00:00Z' },
+    ],
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+
+  const rep = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: true,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, `Import failed: ${rep.problems.join('; ')}`);
+
+  // Verify the single linear parent chain 1 -> 2 -> 3 -> 4 -> 5 -> 6 with zero disjoint roots
+  const commits = (await env.pool.query(
+    'SELECT id, parent_commit_id, cumulative_decision_count FROM coherence.decision_commits ORDER BY cumulative_decision_count ASC',
+  )).rows;
+  assert.deepEqual(commits.map((c) => Number(c.cumulative_decision_count)), [1, 2, 3, 4, 5, 6]);
+  assert.equal(commits[0].parent_commit_id, null);
+  for (let i = 1; i < commits.length; i++) {
+    assert.equal(commits[i].parent_commit_id, commits[i - 1].id, `commit ${i + 1} must extend commit ${i}`);
+  }
+});
+
+test('Layer 4 [Fix 7 & Note 3 - Standing Sent Idempotency & Missing Statements Problem]: re-importing with Sent/statements_<date>.csv already in standing input adds zero rows, and a declared sent record lacking a statements file is listed in problems', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const srcRoot = join(env.tempDir, 'src-fix7');
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P700#effective:2026-01-01' });
+  const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
+  const stmt1111 = 'record_id,entity,gross_comm,downline_amount,run_action\n';
+
+  // Standing input ALREADY holds Sent/statements_20261111.csv!
+  await writeTree(join(srcRoot, 'standing-input'), {
+    'Agent Data/cleanagentdata.csv': 'agent_name,agent_npn,entity\nSam Seller,11111111,Beacon\n',
+    'Overlay/overlay.csv': ovCsv,
+    'Sent/statements_20261111.csv': stmt1111,
+  });
+  await writeTree(join(srcRoot, 'company-ws', '2026-11-11', 'runs', '2026-11-11'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/statements_20261111.csv': stmt1111,
+    'run.json': JSON.stringify({ date: '2026-11-11', steps: { assign: { at: '2026-11-11T10:00:00' }, emit: { at: '2026-11-11T10:05:00' } } }),
+  });
+  await writeTree(join(srcRoot, 'company-env'), {
+    'audit.json': JSON.stringify({
+      events: [{ id: 'evt-1111', action: 'record_sent', statementDate: '2026-11-11', at: '2026-11-11T15:00:00Z' }],
+    }),
+  });
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      standingInputDir: join(srcRoot, 'standing-input'),
+      companyWorkspacesDir: join(srcRoot, 'company-ws'),
+      companyEnvironmentDir: join(srcRoot, 'company-env'),
+    },
+    importConfig: { includeLegacyHostHistory: false, useCompanyIncomingInput: false, currentInputSourceKind: 'company_import' },
+  });
+
+  const rep1 = await executeHistoryImport({
+    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: true, tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep1.passed, true, `First import failed: ${rep1.problems.join('; ')}`);
+  assert.equal(rep1.standingInputRebuildCheck.passed, true);
+
+  const snapCounts = async () => {
+    const out = {};
+    for (const tbl of ['runs', 'stored_files', 'decision_commits', 'decisions', 'generated_overlays', 'input_versions', 'imported_files', 'carries']) {
+      out[tbl] = Number((await env.pool.query(`SELECT COUNT(*)::int AS n FROM coherence.${tbl}`)).rows[0].n);
+    }
+    return out;
+  };
+  const before = await snapCounts();
+
+  // Second import with Sent/statements_20261111.csv present MUST add zero rows and pass rebuild!
+  const rep2 = await executeHistoryImport({
+    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: true, recordCheck: false, tempBaseDir: env.tempDir,
+  });
+  const after = await snapCounts();
+  assert.equal(rep2.passed, true, `Second import failed: ${rep2.problems.join('; ')}`);
+  assert.equal(rep2.standingInputRebuildCheck.passed, true);
+  assert.deepEqual(after, before, 're-importing with Sent/statements_<date>.csv present must add zero rows');
+
+  // Note 3: declared sent record whose company run has no statements file must be listed in problems
+  const envMissing = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => envMissing.cleanup());
+  const missRoot = join(envMissing.tempDir, 'src-missing-stmt');
+  await writeTree(join(missRoot, 'company-ws', '2026-11-11', 'runs', '2026-11-11'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'run.json': JSON.stringify({ date: '2026-11-11', steps: { assign: { at: '2026-11-11T10:00:00' }, emit: { at: '2026-11-11T10:05:00' } } }),
+  });
+  await writeTree(join(missRoot, 'company-env'), {
+    'audit.json': JSON.stringify({
+      events: [{ id: 'evt-1111', action: 'record_sent', statementDate: '2026-11-11', at: '2026-11-11T15:00:00Z' }],
+    }),
+  });
+  const missManifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      companyWorkspacesDir: join(missRoot, 'company-ws'),
+      companyEnvironmentDir: join(missRoot, 'company-env'),
+    },
+    importConfig: { includeLegacyHostHistory: false },
+  });
+  const missRep = await executeHistoryImport({
+    pool: envMissing.pool, stores: envMissing.stores, commands: envMissing.commands, actor: envMissing.ownerActor,
+    manifest: missManifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: envMissing.tempDir,
+  });
+  assert.equal(missRep.passed, false);
+  assert.ok(
+    missRep.problems.some((p) => p.includes('2026-11-11') && /statements/i.test(p)),
+    `expected missing statements problem for 2026-11-11, got: ${JSON.stringify(missRep.problems)}`,
+  );
+});
+
+test('Layer 4 [Fix 8 & Note 1 - Blank committed_at on Imported Rows & Zero-Checkpoint Layer 2 Guard]: imported rows with blank committed_at generate blank (no decided_at fallback) and verifyOverlayReconstruction fails on zero checkpoints for a populated import', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  // Unit check: imported row with null committed_at_raw stays blank; live row still uses decided_at
+  const impFmt = formatOverlayCsvFromRows([{
+    record_id: 'policy:carrier_a:P800#effective:2026-01-01',
+    disposition: 'CONFIRM',
+    decided_at: '2026-11-20T10:00:00.000000Z',
+    committed_at_raw: null,
+    imported: true,
+  }], { headerContract: 'v2' });
+  assert.equal(impFmt.rows[0].committed_at, null, 'imported row with blank committed_at must stay blank');
+
+  const liveFmt = formatOverlayCsvFromRows([{
+    record_id: 'policy:carrier_a:P801#effective:2026-01-01',
+    disposition: 'CONFIRM',
+    decided_at: '2026-11-20T10:00:00.000000Z',
+    committed_at_raw: null,
+    imported: false,
+  }], { headerContract: 'v2' });
+  assert.equal(liveFmt.rows[0].committed_at, '2026-11-20T10:00:00.000000Z', 'live row still uses decided_at');
+
+  // End-to-end Layer 2 reconstruction with blank committed_at on an imported run
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+
+  const blankCommittedRow = sampleApprovalRow({
+    record_id: 'policy:carrier_a:P802#effective:2026-01-01',
+    disposition: 'CORRECT',
+    agency: 'Beacon',
+    committed_at: null,
+    note: 'legacy blank committed_at',
+  });
+  const blankCsv = makeOverlayCsv([blankCommittedRow], { version: 'v2' });
+  await writeTree(join(env.tempDir, 'runs', '2026-11-16'), {
+    'input/a.csv': 'k\n1\n',
+    'bible.csv': 'record_id,case,subtype,amount\npolicy:carrier_a:P802#effective:2026-01-01,BIBLE,CONFLICT,100.00\n',
+    'overlay.csv': blankCsv,
+    'run.json': JSON.stringify({ date: '2026-11-16', steps: { assign: { at: '2026-11-16T10:00:00' }, bible: { at: '2026-11-16T10:01:00' } } }),
+  });
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(env.tempDir, 'runs') },
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+  const rep = await executeHistoryImport({
+    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, rep.problems.join('; '));
+
+  const gen = await generateOverlayCsv(env.pool, { runId: rep.importedRuns[0].runId });
+  assert.equal(gen.rows[0].committed_at, null, 'generated overlay for imported row must keep committed_at blank');
+
+  const l2 = await verifyOverlayReconstruction({
+    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pythonPath: 'python3', coherenceRepo: mockRepo, tempBaseDir: env.tempDir,
+  });
+  assert.equal(l2.passed, true, `Layer 2 failed on blank committed_at: ${l2.problems.join('; ')}`);
+  assert.equal(l2.checkpointsChecked, 1);
+
+  // Note 1: verifyOverlayReconstruction fails when zero checkpoints were checked on a populated import
+  const envEmptyOv = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => envEmptyOv.cleanup());
+  await writeTree(join(envEmptyOv.tempDir, 'runs-no-ov', '2026-11-18'), {
+    'input/a.csv': 'k\n1\n',
+    'run.json': JSON.stringify({ date: '2026-11-18', steps: { assign: { at: '2026-11-18T10:00:00' } } }),
+  });
+  const noOvManifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(envEmptyOv.tempDir, 'runs-no-ov') },
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+  });
+  const noOvRep = await executeHistoryImport({
+    pool: envEmptyOv.pool, stores: envEmptyOv.stores, commands: envEmptyOv.commands, actor: envEmptyOv.ownerActor,
+    manifest: noOvManifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: envEmptyOv.tempDir,
+  });
+  assert.equal(noOvRep.passed, true);
+
+  const l2Zero = await verifyOverlayReconstruction({
+    pool: envEmptyOv.pool, stores: envEmptyOv.stores,
+    pythonPath: 'python3', coherenceRepo: mockRepo, tempBaseDir: envEmptyOv.tempDir,
+  });
+  assert.equal(l2Zero.checkpointsChecked, 0);
+  assert.equal(l2Zero.passed, false, 'verifyOverlayReconstruction must fail when zero checkpoints were checked on a populated import');
+  assert.ok(l2Zero.problems.some((p) => /zero checkpoints/i.test(p)));
+});
+
+test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Rebuild]: abandoned company runs are abandoned in PG (never published, never carried, invisible through entity views), post-import abandonment of normal imports remains refused, and every file of partly finished or zero-step abandoned runs rebuilds byte for byte', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const srcRoot = join(env.tempDir, 'src-fix9');
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P900#effective:2026-01-01' });
+  const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
+  const bobCsv = 'policy_id,member,entity,amount,upline_amount\n1,Pat Sample,Beacon,80.00,20.00\n';
+  const ledCsv = 'tx_id,record_id,policy_id,src_type,member,entity,gross_comm,commission_amount,downline_amount,upline_amount\n1,r1,1,direct,Pat Sample,Beacon,100.00,100.00,80.00,20.00\n';
+  const stmtCsv = 'record_id,entity,gross_comm,downline_amount,upline_amount,run_action\nr1,Beacon,100.00,80.00,20.00,NEW\n';
+
+  // 1) Non-abandoned company run (2026-11-11)
+  await writeTree(join(srcRoot, 'company-ws', '2026-11-11', 'runs', '2026-11-11'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/statements_20261111.csv': stmtCsv,
+    'run.json': JSON.stringify({ date: '2026-11-11', steps: { assign: { at: '2026-11-11T10:00:00' }, emit: { at: '2026-11-11T10:05:00' } } }),
+  });
+
+  // 2) Finished abandoned company run with a LATER date (2026-11-15)
+  await writeTree(join(srcRoot, 'company-abandoned', '2026-11-15'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/canonical_bob.csv': bobCsv,
+    'emits/coherent_ledger.csv': ledCsv,
+    'emits/statements_20261115.csv': stmtCsv,
+    'run.json': JSON.stringify({ date: '2026-11-15', steps: { assign: { at: '2026-11-15T10:00:00' }, emit: { at: '2026-11-15T10:05:00' } } }),
+  });
+
+  // 3) Partly finished abandoned company run (only assign finished, yet bible.csv, adjust.csv, emits/partial.csv, partial viewer.html exist!)
+  await writeTree(join(srcRoot, 'company-abandoned', '2026-11-13'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'working/tx.csv': 'id\n1\n',
+    'bible.csv': 'record_id,case\npolicy:carrier_a:P900#effective:2026-01-01,BIBLE\n',
+    'adjust.csv': 'record_id,case\nr1,NEW\n',
+    'emits/partial_draft.csv': 'x\n1\n',
+    'emits/partial_viewer.html': '<!doctype html><html><body>partial</body></html>',
+    'notes.txt': 'stopped mid-run\n',
+    'run.json': JSON.stringify({ date: '2026-11-13', steps: { assign: { at: '2026-11-13T10:00:00' } } }),
+  });
+
+  // 4) Zero-steps-finished abandoned company run (run.json steps: {} with partial working file & crash log!)
+  await writeTree(join(srcRoot, 'company-abandoned', '2026-11-14'), {
+    'input/a.csv': 'k\n1\n',
+    'working/partial.csv': 'id\n9\n',
+    'crash.log': 'interrupted during assign\n',
+    'run.json': JSON.stringify({ date: '2026-11-14', steps: {} }),
+  });
+
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      companyWorkspacesDir: join(srcRoot, 'company-ws'),
+      companyAbandonedDir: join(srcRoot, 'company-abandoned'),
+    },
+    importConfig: { includeLegacyHostHistory: false },
+  });
+
+  const rep = await executeHistoryImport({
+    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: true, tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, `Import/rebuild failed: ${rep.problems.join('; ')}`);
+  assert.equal(rep.rebuildChecks.length, 4);
+  for (const chk of rep.rebuildChecks) {
+    assert.equal(chk.passed, true, `Layer 1 rebuild failed for ${chk.sourceFolder}: ${JSON.stringify(chk)}`);
+  }
+
+  const runByDate = new Map(rep.importedRuns.map((r) => [r.statementDate, r.runId]));
+  const live1111 = runByDate.get('2026-11-11');
+  const ab1113 = runByDate.get('2026-11-13');
+  const ab1114 = runByDate.get('2026-11-14');
+  const ab1115 = runByDate.get('2026-11-15');
+
+  // Every abandoned company run must have a row in coherence.abandonments and stage = 'abandoned'
+  for (const abId of [ab1113, ab1114, ab1115]) {
+    const abRow = (await env.pool.query('SELECT id FROM coherence.abandonments WHERE run_id = $1::uuid', [abId])).rows;
+    assert.equal(abRow.length, 1, `abandoned run ${abId} must have a row in coherence.abandonments`);
+    const stage = (await env.pool.query('SELECT coherence.run_stage($1::uuid) AS st', [abId])).rows[0].st;
+    assert.equal(stage, 'abandoned');
+  }
+
+  // Never published: findLatestPublishedRun skips 2026-11-15 and returns 2026-11-11; attempt_is_published_run is false!
+  const latestPub = await findLatestPublishedRun(env.pool);
+  assert.equal(latestPub.id, live1111);
+  const abEmitEv = (await env.pool.query(
+    "SELECT id FROM coherence.step_attempt_events WHERE run_id = $1::uuid AND step = 'emit' AND event_kind = 'finished'",
+    [ab1115],
+  )).rows[0].id;
+  const isPub = (await env.pool.query('SELECT coherence.attempt_is_published_run($1::uuid) AS pub', [abEmitEv])).rows[0].pub;
+  assert.equal(isPub, false, 'abandoned imported company run emit attempt must never be published');
+
+  // Never carried: carrySent on abandoned imported company run is refused by PostgreSQL
+  await env.commands.publishInputVersion({
+    actor: env.ownerActor, commandKey: 'seed-standing-fix9', lineKind: 'standing', sourceKind: 'company_import',
+    reason: 'base', entries: [], storedFiles: [],
+  });
+  await assert.rejects(
+    () => env.commands.carrySent({
+      actor: env.ownerActor, commandKey: 'carry-abandoned-1115', runId: ab1115, typedPhrase: 'sent 2026-11-15',
+    }),
+    /abandoned/i,
+  );
+
+  // Never visible through entity views: even if materialized, scoped roles see 0 rows for abandoned run
+  await env.commands.materializeEmit({
+    actor: env.workerActor,
+    commandKey: 'mat-abandoned-1115',
+    runId: ab1115,
+    attemptEventId: abEmitEv,
+    statementDate: '2026-11-15',
+    canonicalBobCsv: bobCsv,
+    coherentLedgerCsv: ledCsv,
+    statementsCsv: stmtCsv,
+  });
+  const c = await env.pool.connect();
+  try {
+    await c.query('BEGIN');
+    await c.query('SET LOCAL ROLE coherence_entity_manager_ro');
+    await c.query("SELECT pg_catalog.set_config('app.access_tier', 'entity_manager', true)");
+    const emBob = (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.v_canonical_bob WHERE run_id = $1::uuid', [ab1115])).rows[0].n;
+    const emLines = (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.v_entity_statement_lines')).rows[0].n;
+    assert.equal(emBob, 0, 'abandoned company run must be invisible in v_canonical_bob');
+    assert.equal(emLines, 0, 'abandoned company run must be invisible in v_entity_statement_lines');
+    await c.query('ROLLBACK');
+  } finally {
+    c.release();
+  }
+
+  // Non-abandoned imported runs still cannot be abandoned after import
+  await assert.rejects(
+    () => env.commands.abandonRun({
+      actor: env.ownerActor, commandKey: 'abandon-live-import-1111', runId: live1111, typedPhrase: 'abandon 2026-11-11', reason: 'not allowed',
+    }),
+    /imported historical runs cannot be abandoned/i,
+  );
+
+  // Layer 4 NDJSON export + rebuild reproduces all runs, abandonments, and partial run files
+  const tipSeq = Number((await env.pool.query('SELECT MAX(seq)::bigint AS s FROM coherence.journal_entries')).rows[0].s);
+  const ndjson = await exportJournalNdjson(env.pool);
+  const emptyDb = await createEmptyMigratedTestDb();
+  t.after(() => emptyDb.cleanup());
+  await rebuildFromJournalExport(emptyDb.pool, ndjson);
+  const cmp = await compareDatabasesAsOf(env.pool, emptyDb.pool, tipSeq);
+  assert.equal(cmp.passed, true, `Layer 4 rebuild failed for abandoned runs: ${cmp.problems.join('; ')}`);
+});
+
+test('Layer 4 [Substance Comparator PHI-Free & Parameterized Columns]: planted name, MBI, address, phone, and record_id in differing cells never appear in report', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'coherence-phi-cmp-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const left = join(dir, 'left');
+  const right = join(dir, 'right');
+  const planted = {
+    name: 'Zelda Q. Plantedname',
+    mbi: '1EG4-TE5-MK72',
+    address: '742 Evergreen Terrace',
+    phone: '555-867-5309',
+    recordId: 'carrier_a~direct~Zelda Q. Plantedname~100.00~2026-11',
+  };
+  await writeTree(left, {
+    'input/a.csv': 'k\n1\n',
+    'emits/canonical_bob.csv': `policy_id,member,mbi,address,phone,entity,amount\n1,${planted.name},${planted.mbi},${planted.address},${planted.phone},Beacon,100.00\n`,
+    'emits/coherent_ledger.csv': `tx_id,record_id,member,entity,gross_comm,downline_amount,upline_amount\n1,${planted.recordId},${planted.name},Beacon,125.00,100.00,25.00\n`,
+    'emits/statements_20261121.csv': `record_id,member,entity,gross_comm,downline_amount,upline_amount,run_action\n${planted.recordId},${planted.name},Beacon,125.00,100.00,25.00,NEW\n`,
+  });
+  await writeTree(right, {
+    'input/a.csv': 'k\n1\n',
+    'emits/canonical_bob.csv': `policy_id,member,mbi,address,phone,entity,amount\n1,Different Person,9ZZ9-YY8-XX76,999 Other Rd,555-000-0000,Harbor,99.99\n`,
+    'emits/coherent_ledger.csv': `tx_id,record_id,member,entity,gross_comm,downline_amount,upline_amount\n1,carrier_a~direct~OTHER~99.99~2026-11,Different Person,Harbor,124.99,99.99,25.00\n`,
+    'emits/statements_20261121.csv': `record_id,member,entity,gross_comm,downline_amount,upline_amount,run_action\ncarrier_a~direct~OTHER~99.99~2026-11,Different Person,Harbor,124.99,99.99,25.00,NEW\n`,
+  });
+
+  const rep = await compareRunFolders(left, right, {
+    mode: 'substance',
+    columns: {
+      bob: ['policy_id', 'member', 'mbi', 'address', 'phone', 'entity', 'amount'],
+      ledger: ['tx_id', 'record_id', 'member', 'entity', 'gross_comm', 'downline_amount', 'upline_amount'],
+      statements: ['record_id', 'member', 'entity', 'gross_comm', 'downline_amount', 'upline_amount', 'run_action'],
+    },
+    requireStatementsDelta: true,
+    requireConservation: true,
+  });
+
+  assert.equal(rep.passed, false);
+  assert.equal(rep.gates.gate1.passed, true);
+  assert.equal(rep.gates.gate2.passed, false);
+  assert.equal(rep.gates.gate3.passed, false);
+  assert.equal(rep.gates.gate4.passed, false);
+  assert.equal(rep.substance.bob.moneyCentDeltas.amount, 1);
+  assert.equal(rep.substance.bob.differingRows[0].rowNumber, 1);
+  assert.ok(rep.substance.bob.differingRows[0].columns.includes('member'));
+  assert.ok(rep.substance.bob.differingRows[0].columns.includes('amount'));
+
+  const json = JSON.stringify(rep);
+  for (const val of Object.values(planted)) {
+    assert.equal(json.includes(val), false, `comparator report must never leak planted value "${val}"`);
+  }
+  assert.equal(json.includes('Different Person'), false);
+  assert.equal(json.includes('9ZZ9-YY8-XX76'), false);
+  assert.equal(json.includes('999 Other Rd'), false);
+  assert.equal(json.includes('555-000-0000'), false);
+
+  // Parameterized column contract check: wrong expected column list must fail headerMatches
+  const badCols = compareCsvExactText('a,b\n1,2\n', 'a,b\n1,2\n', { expectedColumns: ['a', 'c'] });
+  assert.equal(badCols.passed, false);
+  assert.equal(badCols.headerMatches, false);
+  assert.deepEqual(badCols.missingLeftColumns, ['c']);
+});
+
+test('Layer 4 [Fix 1 - compareCsvExactText PHI-free export]: exported compareCsvExactText omits _parsed and JSON.stringify holds no planted name, member id, or record id', () => {
+  const planted = {
+    name: 'Zelda Q. Plantedname',
+    mbi: '1EG4-TE5-MK72',
+    recordId: 'carrier_a~direct~Zelda Q. Plantedname~100.00~2026-11',
+  };
+  const leftCsv = `record_id,member,mbi,amount\n${planted.recordId},${planted.name},${planted.mbi},100.00\n`;
+  const rightCsv = `record_id,member,mbi,amount\n${planted.recordId},${planted.name},${planted.mbi},100.00\n`;
+  const rightDiffCsv = `record_id,member,mbi,amount\ncarrier_a~direct~OTHER~99.00~2026-11,Other Name,9ZZ9-YY8-XX76,99.00\n`;
+
+  for (const res of [
+    compareCsvExactText(leftCsv, rightCsv, { tableName: 'canonical_bob' }),
+    compareCsvExactText(leftCsv, rightDiffCsv, { tableName: 'canonical_bob' }),
+  ]) {
+    assert.equal(Object.hasOwn(res, '_parsed'), false, 'exported compareCsvExactText must not include _parsed');
+    const json = JSON.stringify(res);
+    for (const val of Object.values(planted)) {
+      assert.equal(json.includes(val), false, `compareCsvExactText JSON leaked planted value "${val}"`);
+    }
+  }
+});
+
+test('Layer 4 [Fix 11 - Conservation Rollup & Unparseable Money Cells]: requireConservation requires bobRollupChecked and non-empty unparseable money cell is a violation, never $0.00', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'coherence-cons-fix11-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  // Case A: canonical_bob lacks upline_amount column -> bobRollupChecked is false -> must fail under requireConservation: true
+  const noRollupL = join(dir, 'no-rollup-l');
+  const noRollupR = join(dir, 'no-rollup-r');
+  const noRollupFiles = {
+    'input/a.csv': 'k\n1\n',
+    'emits/canonical_bob.csv': 'policy_id,member,entity,amount\n1,Pat Sample,Beacon,80.00\n',
+    'emits/coherent_ledger.csv': 'tx_id,record_id,policy_id,member,entity,gross_comm,downline_amount,upline_amount\n1,r1,1,Pat Sample,Beacon,100.00,80.00,20.00\n',
+  };
+  await writeTree(noRollupL, noRollupFiles);
+  await writeTree(noRollupR, noRollupFiles);
+  const noRollupRep = await compareRunFolders(noRollupL, noRollupR, { mode: 'substance', requireConservation: true });
+  assert.equal(noRollupRep.substance.ledger.conservation.bobRollupChecked, false);
+  assert.equal(noRollupRep.substance.ledger.conservation.passed, false);
+  assert.equal(noRollupRep.gates.gate3.passed, false);
+  assert.equal(noRollupRep.passed, false);
+
+  // Case B: non-empty unparseable money cell in canonical_bob where treating it as $0.00 would falsely balance
+  const badMoneyL = join(dir, 'bad-money-l');
+  const badMoneyR = join(dir, 'bad-money-r');
+  const badMoneyFiles = {
+    'input/a.csv': 'k\n1\n',
+    'emits/canonical_bob.csv': 'policy_id,member,entity,amount,upline_amount\n1,Pat Sample,Beacon,NOT_MONEY,20.00\n',
+    'emits/coherent_ledger.csv': 'tx_id,record_id,policy_id,member,entity,gross_comm,downline_amount,upline_amount\n1,r1,1,Pat Sample,Beacon,20.00,0.00,20.00\n',
+  };
+  await writeTree(badMoneyL, badMoneyFiles);
+  await writeTree(badMoneyR, badMoneyFiles);
+  const badMoneyRep = await compareRunFolders(badMoneyL, badMoneyR, { mode: 'substance', requireConservation: true });
+  assert.equal(badMoneyRep.substance.ledger.conservation.passed, false);
+  assert.ok(badMoneyRep.substance.ledger.conservation.bobMoneyParseViolationCount >= 1);
+  assert.deepEqual(badMoneyRep.substance.ledger.conservation.bobMoneyParseViolationRowNumbers, [1]);
+  assert.equal(badMoneyRep.gates.gate3.passed, false);
+  assert.equal(badMoneyRep.passed, false);
+  assert.equal(JSON.stringify(badMoneyRep).includes('NOT_MONEY'), false);
+});
+
+test('Layer 4 [Proof Runner CLI scripts/prove-history.mjs]: migrates fresh test_* DB, imports synthetic manifest read-only, passes Layers 0, 1, 2, 4 and comparator with PHI-free stdout, and rejects non-test_* database names', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-prove-cli-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  // Verify non-test_* database name is strictly refused
+  await assert.rejects(
+    () => execFileAsync(process.execPath, ['scripts/prove-history.mjs', '--manifest', join(work, 'none.json'), '--database', 'prod_db'], {
+      cwd: process.cwd(),
+      env: process.env,
+    }),
+    (err) => String(err.stderr || '').includes('INVALID_TEST_DATABASE_NAME'),
+  );
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const plantedMember = 'Zelda Q. Plantedname';
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P1#effective:2026-01-01', note: 'base' });
+  const row1 = sampleApprovalRow({ record_id: `carrier_a~direct~${plantedMember}~100.00~2026-11`, disposition: 'CONFIRM', agent: null, agency: null, status: null, note: 'adj' });
+  const priorCsv = makeOverlayCsv([row0], { version: 'v2' });
+  const finalCsv = makeOverlayCsv([row0, row1], { version: 'v2' });
+
+  const bobCsv = `policy_id,member,entity,amount,upline_amount\n1,${plantedMember},Beacon,80.00,20.00\n`;
+  const ledCsv = `tx_id,record_id,policy_id,member,entity,gross_comm,downline_amount,upline_amount\n1,carrier_a~direct~${plantedMember}~100.00~2026-11,1,${plantedMember},Beacon,100.00,80.00,20.00\n`;
+  const stmtCsv = `record_id,member,entity,gross_comm,downline_amount,upline_amount,run_action\ncarrier_a~direct~${plantedMember}~100.00~2026-11,${plantedMember},Beacon,100.00,80.00,20.00,NEW\n`;
+
+  const runFiles = {
+    'input/Agent Data/cleanagentdata.csv': 'agent_name,agent_npn,entity\nSam Seller,11111111,Beacon\n',
+    'input/Overlay/overlay.csv': priorCsv,
+    'bible.csv': 'record_id,case,subtype,amount\npolicy:carrier_a:P1#effective:2026-01-01,BIBLE,CONFLICT,100.00\n',
+    'overlay.csv': finalCsv,
+    'emits/overlay.csv': finalCsv,
+    'emits/canonical_bob.csv': bobCsv,
+    'emits/coherent_ledger.csv': ledCsv,
+    'emits/statements_20261102.csv': stmtCsv,
+    'run.json': JSON.stringify({ date: '2026-11-02', steps: { assign: { at: '2026-11-02T10:00:00' }, bible: { at: '2026-11-02T10:01:00' }, emit: { at: '2026-11-02T10:05:00' } } }),
+  };
+  await writeTree(join(work, 'src', 'runs', '2026-11-02'), runFiles);
+  await writeTree(join(work, 'src', 'ref-2026-11-02'), runFiles);
+  await writeTree(join(work, 'src', 'input'), {
+    'Agent Data/cleanagentdata.csv': runFiles['input/Agent Data/cleanagentdata.csv'],
+    'Overlay/overlay.csv': finalCsv,
+  });
+
+  const manifestPath = join(work, 'manifest.json');
+  await writeFile(manifestPath, JSON.stringify({
+    companySlug: 'acme',
+    displayName: 'Acme',
+    defaultEmitMode: 'coherence',
+    coherenceRepo: mockRepo,
+    pythonPath: 'python3',
+    sources: {
+      legacyRunsRoot: 'src/runs',
+      standingInputDir: 'src/input',
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      currentInputSourceKind: 'mac_import',
+    },
+    compareTargets: [
+      {
+        label: '2026-11-02 substance parity',
+        leftRunSourceFolder: '2026-11-02',
+        rightDir: 'src/ref-2026-11-02',
+        requireStatementsDelta: true,
+        requireConservation: true,
+      },
+    ],
+  }, null, 2), 'utf8');
+
+  const dbName = `test_prove_cli_${createHash('sha256').update(work).digest('hex').slice(0, 8)}`;
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    ['scripts/prove-history.mjs', '--manifest', manifestPath, '--database', dbName, '--drop-db'],
+    { cwd: process.cwd(), env: process.env, maxBuffer: 8 * 1024 * 1024 },
+  );
+
+  assert.equal(stdout.includes(plantedMember), false, 'proof runner CLI stdout must never contain member names');
+  const summary = JSON.parse(stdout);
+  assert.equal(summary.passed, true, `proof runner failed: ${JSON.stringify(summary.problems)}`);
+  assert.equal(summary.layer0.passed, true);
+  assert.equal(summary.layer0.objects.codeInDataStoreCount, 0);
+  assert.equal(summary.layer1.passed, true);
+  assert.equal(summary.layer1.idempotency.passed, true);
+  assert.equal(summary.layer2.passed, true);
+  assert.ok(summary.layer2.checkpointsChecked >= 2);
+  assert.equal(summary.layer4.passed, true);
+  assert.ok(summary.layer4.moments.length >= 2);
+  assert.equal(summary.comparator.ran, true);
+  assert.equal(summary.comparator.passed, true);
+  assert.equal(summary.comparator.targets[0].gates.gate1.passed, true);
+  assert.equal(summary.comparator.targets[0].gates.gate2.passed, true);
+  assert.equal(summary.comparator.targets[0].gates.gate3.passed, true);
+  assert.equal(summary.comparator.targets[0].gates.gate4.passed, true);
+});
+
+test('Layer 4 [Fix 10 & Note 2 - Proof Runner Missing Right Run, Configured Folders, Local PGHOST & Temp Cleanup]: missing right run fails by name, missing configured folders fail loudly, non-local PGHOST is refused, and proof temp folder is always cleaned up', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-prove-fix10-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  // 1) Non-local PGHOST is strictly refused before touching any DB
+  await assert.rejects(
+    () => execFileAsync(process.execPath, ['scripts/prove-history.mjs', '--manifest', join(work, 'none.json'), '--database', 'test_nonlocal_pg'], {
+      cwd: process.cwd(),
+      env: { ...process.env, PGHOST: '10.20.30.40' },
+    }),
+    (err) => String(err.stderr || '').includes('NON_LOCAL_PGHOST'),
+  );
+
+  // 2) Missing configured source folder in manifest fails loudly (never silently skips)
+  const badFolderManifest = join(work, 'bad-folder-manifest.json');
+  await writeFile(badFolderManifest, JSON.stringify({
+    companySlug: 'acme',
+    sources: {
+      companyWorkspacesDir: 'does-not-exist-ws',
+    },
+  }), 'utf8');
+  await assert.rejects(
+    () => loadImportManifestFile(badFolderManifest),
+    (err) => err?.code === 'MANIFEST_FOLDER_MISSING' && String(err.message).includes('companyWorkspacesDir'),
+  );
+
+  // 3) Comparator target whose right run is missing fails by name AND external storesDir still cleans tempRoot
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P1000#effective:2026-01-01' });
+  const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
+  await writeTree(join(work, 'src', 'runs', '2026-11-02'), {
+    'input/a.csv': 'k\n1\n',
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'emits/canonical_bob.csv': 'policy_id,member,entity,amount,upline_amount\n1,Pat Sample,Beacon,80.00,20.00\n',
+    'emits/coherent_ledger.csv': 'tx_id,record_id,policy_id,member,entity,gross_comm,downline_amount,upline_amount\n1,r1,1,Pat Sample,Beacon,100.00,80.00,20.00\n',
+    'run.json': JSON.stringify({ date: '2026-11-02', steps: { assign: { at: '2026-11-02T10:00:00' }, emit: { at: '2026-11-02T10:05:00' } } }),
+  });
+
+  const missingRightManifest = join(work, 'missing-right-manifest.json');
+  await writeFile(missingRightManifest, JSON.stringify({
+    companySlug: 'acme',
+    coherenceRepo: mockRepo,
+    pythonPath: 'python3',
+    sources: { legacyRunsRoot: 'src/runs' },
+    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    compareTargets: [
+      {
+        label: 'missing-right-target',
+        leftRunSourceFolder: '2026-11-02',
+        rightRunSourceFolder: '2026-11-99-missing',
+      },
+    ],
+  }), 'utf8');
+
+  const scratchRoot = join(work, 'proof-scratch');
+  const extStoresDir = join(work, 'ext-stores');
+  await mkdir(scratchRoot, { recursive: true });
+  const dbName = `test_prove_f10_${createHash('sha256').update(work).digest('hex').slice(0, 8)}`;
+  const summary = await runHistoryProof({
+    manifestPath: missingRightManifest,
+    database: dbName,
+    dropDb: true,
+    storesDir: extStoresDir,
+    tempRoot: scratchRoot,
+  });
+
+  assert.equal(summary.passed, false);
+  assert.equal(summary.comparator.passed, false);
+  assert.equal(summary.comparator.targets.length, 1);
+  assert.equal(summary.comparator.targets[0].passed, false);
+  assert.ok(
+    summary.comparator.targets[0].problems.some((p) => p.includes('2026-11-99-missing')),
+    `expected missing right run named in problems, got: ${JSON.stringify(summary.comparator.targets[0].problems)}`,
+  );
+
+  // Temporary folder inside scratchRoot MUST be completely cleaned even when storesDir was passed!
+  const remainingTemp = await readdir(scratchRoot);
+  assert.deepEqual(remainingTemp, [], `proof runner leaked temporary directories: ${JSON.stringify(remainingTemp)}`);
 });
