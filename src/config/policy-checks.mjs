@@ -55,7 +55,73 @@ export const RLS_PROTECTED_TABLES = Object.freeze([
   'coherent_ledger_rows',
 ]);
 
+export const IAM_IMMUTABLE_TABLES = Object.freeze([
+  'database_context',
+  'tools',
+  'organizations',
+  'people',
+  'rights',
+  'right_retirements',
+  'roles',
+  'role_grant_people',
+  'role_grant_connections',
+]);
+
+export const IAM_VERSIONED_TABLES = Object.freeze([
+  'organization_versions',
+  'organization_edges',
+  'person_versions',
+  'person_contacts',
+  'person_external_identities',
+  'organization_memberships',
+  'agent_affiliations',
+  'supervision_links',
+  'role_versions',
+  'role_rights',
+  'role_grantable_roles',
+  'role_grants',
+  'organization_tool_switches',
+]);
+
+export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
+  'iam.business_today(timestamp with time zone)',
+  'iam.session_context()',
+  'iam.is_viewing_as()',
+  'iam.has_right(text, date)',
+  'iam.effective_wide_org_ids(text, date)',
+  'iam.effective_any_org_ids(text, date)',
+  'iam.effective_narrow_pairs(text, date)',
+  'iam.effective_narrow_person_ids(text, date)',
+  'iam.effective_all_connection_org_ids(text, date)',
+  'iam.effective_explicit_connection_pairs(text, date)',
+  'iam.effective_explicit_connection_ids(text, date)',
+  'iam.can_access_connection(text, uuid, uuid, date)',
+  'iam.assert_can_write(text, uuid, uuid, text, uuid, date)',
+]);
+
+export const PLATFORM_ROLES = Object.freeze([
+  'platform_view_owner',
+  'platform_writer',
+  'platform_versioner',
+  'platform_mask_reader',
+  'platform_app',
+  'platform_worker',
+  'platform_iam_sync',
+  'platform_readonly',
+  'platform_migrator',
+]);
+
+export const CLOUDSQL_BOOTSTRAP_CREATOR_ROLES = Object.freeze([
+  'cloudsqlsuperuser',
+]);
+
+export const CLOUDSQL_IAM_MEMBER_MARKER_ROLES = Object.freeze([
+  'cloudsqliamserviceaccount',
+]);
+
 const FORBIDDEN_BUSINESS_PRIVS = Object.freeze(['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']);
+const ALL_RELATION_PRIVS = Object.freeze(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
+const ALL_COLUMN_PRIVS = Object.freeze(['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']);
 
 export function parsePgHbaConf(text) {
   const rules = [];
@@ -413,6 +479,317 @@ export async function verifyDatabaseConfigInvariants(pool) {
     checkedBusinessTables: ALL_BUSINESS_TABLES.length,
     checkedFunctions: fnRes.rows.length,
     forbiddenBusinessPrivileges: FORBIDDEN_BUSINESS_PRIVS,
+    problems,
+  };
+}
+
+export async function verifyIamConfigInvariants(pool) {
+  const problems = [];
+
+  // 1. All platform_* roles must exist and be non-superuser, NOINHERIT, NOBYPASSRLS.
+  for (const roleName of PLATFORM_ROLES) {
+    const res = await pool.query(
+      'SELECT rolname, rolsuper, rolinherit, rolbypassrls, rolconfig FROM pg_catalog.pg_roles WHERE rolname = $1',
+      [roleName],
+    );
+    if (res.rows.length === 0) {
+      problems.push(`Missing platform role ${roleName}`);
+      continue;
+    }
+    const r = res.rows[0];
+    if (r.rolsuper) problems.push(`Role ${roleName} must not be SUPERUSER`);
+    if (r.rolbypassrls) problems.push(`Role ${roleName} must have NOBYPASSRLS`);
+    if (r.rolinherit) problems.push(`Role ${roleName} must have NOINHERIT`);
+    if (roleName === 'platform_app') {
+      const cfg = Array.isArray(r.rolconfig) ? r.rolconfig : [];
+      if (!cfg.includes('app.session_token=')) {
+        problems.push(`Role platform_app should default app.session_token='' (rolconfig: ${JSON.stringify(cfg)})`);
+      }
+    }
+  }
+
+  // 1b. Audit pg_auth_members: no platform_* role may hold membership in another role (except Cloud SQL's
+  //     cloudsqliamserviceaccount login marker without ADMIN OPTION), and no non-superuser may hold ANY
+  //     membership (including WITH ADMIN OPTION even when INHERIT and SET are false) in any platform_* role
+  //     except Cloud SQL's cloudsqlsuperuser bootstrap CREATEROLE record (INHERIT false, SET false).
+  const platformRoleSet = new Set(PLATFORM_ROLES);
+  const bootstrapCreatorSet = new Set(CLOUDSQL_BOOTSTRAP_CREATOR_ROLES);
+  const iamMarkerSet = new Set(CLOUDSQL_IAM_MEMBER_MARKER_ROLES);
+  const authMemRes = await pool.query(
+    `SELECT r.rolname AS granted_role,
+            r.rolsuper AS granted_is_super,
+            r.rolbypassrls AS granted_bypassrls,
+            r.rolcreaterole AS granted_createrole,
+            m.rolname AS member_role,
+            m.rolsuper AS member_is_super,
+            m.rolcreaterole AS member_createrole,
+            am.admin_option,
+            am.inherit_option,
+            am.set_option
+     FROM pg_catalog.pg_auth_members am
+     JOIN pg_catalog.pg_roles r ON r.oid = am.roleid
+     JOIN pg_catalog.pg_roles m ON m.oid = am.member
+     WHERE r.rolname = ANY($1::text[]) OR m.rolname = ANY($1::text[])
+     ORDER BY r.rolname, m.rolname`,
+    [PLATFORM_ROLES],
+  );
+  for (const row of authMemRes.rows) {
+    if (platformRoleSet.has(row.member_role)) {
+      const allowedCloudSqlIamMarker = iamMarkerSet.has(row.granted_role)
+        && !row.admin_option
+        && !row.granted_is_super
+        && !row.granted_bypassrls
+        && !row.granted_createrole;
+      if (!allowedCloudSqlIamMarker) {
+        problems.push(
+          `pg_auth_members violation: platform role ${row.member_role} must not be a member of ${row.granted_role} (admin=${row.admin_option}, inherit=${row.inherit_option}, set=${row.set_option})`,
+        );
+      }
+    } else if (platformRoleSet.has(row.granted_role) && !row.member_is_super) {
+      const allowedCloudSqlBootstrap = bootstrapCreatorSet.has(row.member_role)
+        && row.member_createrole
+        && !row.inherit_option
+        && !row.set_option;
+      if (!allowedCloudSqlBootstrap) {
+        problems.push(
+          `pg_auth_members violation: non-superuser ${row.member_role} holds membership in ${row.granted_role} (admin=${row.admin_option}, inherit=${row.inherit_option}, set=${row.set_option})`,
+        );
+      }
+    }
+  }
+
+  // 2. PUBLIC must have zero privileges on schemas platform, iam_secret, iam.
+  for (const schema of ['platform', 'iam_secret', 'iam']) {
+    const res = await pool.query(
+      `SELECT pg_catalog.has_schema_privilege('public', $1, 'USAGE') AS u,
+              pg_catalog.has_schema_privilege('public', $1, 'CREATE') AS c`,
+      [schema],
+    );
+    if (res.rows[0].u || res.rows[0].c) {
+      problems.push(`PUBLIC must have zero privileges on schema ${schema}`);
+    }
+  }
+
+  // 3. platform_app and PUBLIC must have ZERO privileges on EVERY base table in iam, iam_secret, platform.
+  const tblRes = await pool.query(
+    `SELECT n.nspname AS table_schema,
+            c.relname AS table_name,
+            c.oid AS table_oid
+     FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname IN ('iam', 'iam_secret', 'platform')
+       AND c.relkind IN ('r', 'p')
+     ORDER BY n.nspname, c.relname`,
+  );
+  for (const row of tblRes.rows) {
+    const fq = `${row.table_schema}.${row.table_name}`;
+    for (const principal of ['platform_app', 'public']) {
+      for (const priv of ALL_RELATION_PRIVS) {
+        const pRes = await pool.query(
+          'SELECT pg_catalog.has_table_privilege($1, $2::oid, $3) AS has_priv',
+          [principal, row.table_oid, priv],
+        );
+        if (pRes.rows[0].has_priv) {
+          problems.push(`${principal} must not hold ${priv} on base table ${fq}`);
+        }
+      }
+      for (const priv of ALL_COLUMN_PRIVS) {
+        const cRes = await pool.query(
+          'SELECT pg_catalog.has_any_column_privilege($1, $2::oid, $3) AS has_priv',
+          [principal, row.table_oid, priv],
+        );
+        if (cRes.rows[0].has_priv) {
+          problems.push(`${principal} must not hold column-level ${priv} on base table ${fq}`);
+        }
+      }
+    }
+  }
+
+  // 4. platform_app must have zero USAGE on iam_secret/platform, zero CREATE on iam/iam_secret/platform,
+  //    and both platform_app and PUBLIC must have ZERO privileges on EVERY view (or materialized view)
+  //    discovered from pg_class across iam, iam_secret, and platform.
+  for (const schema of ['iam', 'iam_secret', 'platform']) {
+    const sRes = await pool.query(
+      `SELECT pg_catalog.has_schema_privilege('platform_app', $1, 'USAGE') AS u,
+              pg_catalog.has_schema_privilege('platform_app', $1, 'CREATE') AS c`,
+      [schema],
+    );
+    if (schema !== 'iam' && sRes.rows[0].u) {
+      problems.push(`platform_app must not hold USAGE on schema ${schema}`);
+    }
+    if (sRes.rows[0].c) {
+      problems.push(`platform_app must not hold CREATE on schema ${schema}`);
+    }
+  }
+  const viewRes = await pool.query(
+    `SELECT n.nspname AS schema_name,
+            c.relname AS view_name,
+            c.oid AS view_oid
+     FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname IN ('iam', 'iam_secret', 'platform')
+       AND c.relkind IN ('v', 'm')
+     ORDER BY n.nspname, c.relname`,
+  );
+  if (viewRes.rows.length === 0) {
+    problems.push('No views found in schemas iam / iam_secret / platform');
+  }
+  for (const row of viewRes.rows) {
+    const fq = `${row.schema_name}.${row.view_name}`;
+    for (const principal of ['platform_app', 'public']) {
+      for (const priv of ALL_RELATION_PRIVS) {
+        const vRes = await pool.query(
+          'SELECT pg_catalog.has_table_privilege($1, $2::oid, $3) AS has_priv',
+          [principal, row.view_oid, priv],
+        );
+        if (vRes.rows[0].has_priv) {
+          problems.push(`${principal} must not hold ${priv} on view ${fq}`);
+        }
+      }
+      for (const priv of ALL_COLUMN_PRIVS) {
+        const cRes = await pool.query(
+          'SELECT pg_catalog.has_any_column_privilege($1, $2::oid, $3) AS has_priv',
+          [principal, row.view_oid, priv],
+        );
+        if (cRes.rows[0].has_priv) {
+          problems.push(`${principal} must not hold column-level ${priv} on view ${fq}`);
+        }
+      }
+    }
+  }
+
+  // 5. Verify every iam base table is covered by IAM_IMMUTABLE_TABLES or IAM_VERSIONED_TABLES (disjoint),
+  //    all iam tables and platform.audit_journal carry ENABLE ALWAYS immutability triggers, and
+  //    all versioned iam tables carry BEFORE INSERT platform_versioner supersession triggers.
+  const immutableSet = new Set(IAM_IMMUTABLE_TABLES);
+  const versionedSet = new Set(IAM_VERSIONED_TABLES);
+  for (const tbl of IAM_IMMUTABLE_TABLES) {
+    if (versionedSet.has(tbl)) {
+      problems.push(`Table iam.${tbl} appears in both IAM_IMMUTABLE_TABLES and IAM_VERSIONED_TABLES`);
+    }
+  }
+  const actualIamTables = new Set(
+    tblRes.rows.filter((r) => r.table_schema === 'iam').map((r) => r.table_name),
+  );
+  for (const tbl of actualIamTables) {
+    if (!immutableSet.has(tbl) && !versionedSet.has(tbl)) {
+      problems.push(`Base table iam.${tbl} is not covered by IAM_IMMUTABLE_TABLES or IAM_VERSIONED_TABLES`);
+    }
+  }
+  for (const tbl of [...IAM_IMMUTABLE_TABLES, ...IAM_VERSIONED_TABLES]) {
+    if (!actualIamTables.has(tbl)) {
+      problems.push(`Expected iam base table iam.${tbl} is missing`);
+    }
+  }
+  const actualPlatformTables = new Set(
+    tblRes.rows.filter((r) => r.table_schema === 'platform').map((r) => r.table_name),
+  );
+  for (const tbl of actualPlatformTables) {
+    if (tbl !== 'audit_journal') {
+      problems.push(`Unexpected base table platform.${tbl} is not covered by platform immutability checks`);
+    }
+  }
+
+  const trigRes = await pool.query(
+    `SELECT n.nspname AS schema_name,
+            c.relname AS table_name,
+            t.tgname AS trigger_name,
+            t.tgenabled,
+            pg_catalog.pg_get_triggerdef(t.oid) AS def
+     FROM pg_catalog.pg_trigger t
+     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname IN ('iam', 'platform') AND NOT t.tgisinternal`,
+  );
+  const trigByKey = new Map(trigRes.rows.map((r) => [`${r.schema_name}.${r.table_name}:${r.trigger_name}`, r]));
+
+  for (const fq of ['platform.audit_journal', ...IAM_IMMUTABLE_TABLES.map((t) => `iam.${t}`)]) {
+    const tr = trigByKey.get(`${fq}:trg_immutable`);
+    if (!tr || tr.tgenabled !== 'A') {
+      problems.push(`Missing ENABLE ALWAYS trg_immutable on ${fq}`);
+    }
+  }
+
+  for (const tbl of IAM_VERSIONED_TABLES) {
+    const fq = `iam.${tbl}`;
+    const trImm = trigByKey.get(`${fq}:trg_immutable`);
+    if (!trImm || trImm.tgenabled !== 'A') {
+      problems.push(`Missing ENABLE ALWAYS trg_immutable on versioned table ${fq}`);
+    }
+    const trTrunc = trigByKey.get(`${fq}:trg_immutable_truncate`);
+    if (!trTrunc || trTrunc.tgenabled !== 'A') {
+      problems.push(`Missing ENABLE ALWAYS trg_immutable_truncate on versioned table ${fq}`);
+    }
+    const trSup = trigByKey.get(`${fq}:trg_01_supersede`);
+    if (!trSup || !trSup.def.includes('BEFORE INSERT') || !trSup.def.includes('platform.stamp_superseded_before_insert')) {
+      problems.push(`Missing BEFORE INSERT trg_01_supersede on versioned table ${fq}`);
+    }
+  }
+
+  // Verify stamp_superseded_before_insert is SECURITY DEFINER owned by platform_versioner.
+  const supFnRes = await pool.query(
+    `SELECT p.prosecdef, r.rolname AS owner_name
+     FROM pg_catalog.pg_proc p
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
+     WHERE n.nspname = 'platform' AND p.proname = 'stamp_superseded_before_insert'`,
+  );
+  if (supFnRes.rows.length !== 1 || !supFnRes.rows[0].prosecdef || supFnRes.rows[0].owner_name !== 'platform_versioner') {
+    problems.push('platform.stamp_superseded_before_insert() must be SECURITY DEFINER owned by platform_versioner');
+  }
+
+  // 6. All functions in platform, iam_secret, iam pin SET search_path = pg_catalog and revoke EXECUTE from PUBLIC;
+  //    platform_app holds EXECUTE strictly on PLATFORM_APP_FUNCTION_WHITELIST and nothing else.
+  const fnRes = await pool.query(
+    `SELECT p.oid,
+            n.nspname,
+            p.proname,
+            pg_catalog.format('%I.%I(%s)', n.nspname, p.proname, pg_catalog.oidvectortypes(p.proargtypes)) AS sig,
+            p.proconfig,
+            pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec,
+            pg_catalog.has_function_privilege('platform_app', p.oid, 'EXECUTE') AS app_exec
+     FROM pg_catalog.pg_proc p
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname IN ('platform', 'iam_secret', 'iam', 'coherence', 'coherence_views')
+     ORDER BY n.nspname, p.proname`,
+  );
+  const iamScopeFns = fnRes.rows.filter((f) => f.nspname === 'platform' || f.nspname === 'iam_secret' || f.nspname === 'iam');
+  if (iamScopeFns.length === 0) {
+    problems.push('No functions found in schemas platform / iam_secret / iam');
+  }
+  const whitelistSet = new Set(PLATFORM_APP_FUNCTION_WHITELIST);
+  const foundWhitelisted = new Set();
+  for (const fn of fnRes.rows) {
+    if (fn.nspname === 'platform' || fn.nspname === 'iam_secret' || fn.nspname === 'iam') {
+      const cfg = Array.isArray(fn.proconfig) ? fn.proconfig : [];
+      if (!cfg.includes('search_path=pg_catalog')) {
+        problems.push(`Function ${fn.sig} does not pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
+      }
+      if (fn.pub_exec) {
+        problems.push(`PUBLIC has EXECUTE privilege on ${fn.sig}`);
+      }
+    }
+    if (whitelistSet.has(fn.sig)) {
+      foundWhitelisted.add(fn.sig);
+      if (!fn.app_exec) {
+        problems.push(`platform_app is missing EXECUTE on whitelisted function ${fn.sig}`);
+      }
+    } else if (fn.app_exec) {
+      problems.push(`platform_app holds forbidden EXECUTE privilege on non-whitelisted function ${fn.sig}`);
+    }
+  }
+  for (const expectedSig of PLATFORM_APP_FUNCTION_WHITELIST) {
+    if (!foundWhitelisted.has(expectedSig)) {
+      problems.push(`Whitelisted platform_app function ${expectedSig} was not found in pg_proc`);
+    }
+  }
+
+  return {
+    passed: problems.length === 0,
+    checkedIamTables: IAM_IMMUTABLE_TABLES.length + IAM_VERSIONED_TABLES.length,
+    checkedBaseTables: tblRes.rows.length,
+    checkedViews: viewRes.rows.length,
+    checkedFunctions: iamScopeFns.length,
     problems,
   };
 }
