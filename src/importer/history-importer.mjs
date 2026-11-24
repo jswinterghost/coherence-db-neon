@@ -273,6 +273,68 @@ function findPinnedCarriedPrior(sourceFolder, carriedPriors) {
   return null;
 }
 
+function collectUnmetOverlayPins(
+  config,
+  { legacyRuns, otherRuns, plainCheckpoints, extendingCheckpoints },
+) {
+  const unmet = [];
+  const freshOverlayRoots = config?.freshOverlayRoots || [];
+  for (let i = 0; i < freshOverlayRoots.length; i++) {
+    const sf = freshOverlayRoots[i].sourceFolder;
+    const key = `importConfig.freshOverlayRoots[${i}].sourceFolder`;
+    if (otherRuns.has(sf)) {
+      unmet.push({
+        key,
+        sourceFolder: sf,
+        planKind: 'wrong_kind_company_run',
+        message: `importConfig.freshOverlayRoots ${sf} names a company run`,
+      });
+    } else if (extendingCheckpoints.has(sf)) {
+      unmet.push({
+        key,
+        sourceFolder: sf,
+        planKind: 'wrong_kind_extending_checkpoint',
+        message: `importConfig.freshOverlayRoots ${sf} names a checkpoint that extends a commit`,
+      });
+    } else if (!legacyRuns.has(sf) && !plainCheckpoints.has(sf)) {
+      unmet.push({
+        key,
+        sourceFolder: sf,
+        planKind: 'run',
+        message: `importConfig.freshOverlayRoots ${sf}`,
+      });
+    }
+  }
+  const carriedPriors = config?.carriedPriors || [];
+  for (let i = 0; i < carriedPriors.length; i++) {
+    const sf = carriedPriors[i].sourceFolder;
+    const key = `importConfig.carriedPriors[${i}].sourceFolder`;
+    if (otherRuns.has(sf)) {
+      unmet.push({
+        key,
+        sourceFolder: sf,
+        planKind: 'wrong_kind_company_run',
+        message: `importConfig.carriedPriors ${sf} names a company run`,
+      });
+    } else if (plainCheckpoints.has(sf) || extendingCheckpoints.has(sf)) {
+      unmet.push({
+        key,
+        sourceFolder: sf,
+        planKind: 'wrong_kind_standalone_checkpoint',
+        message: `importConfig.carriedPriors ${sf} names a standalone checkpoint`,
+      });
+    } else if (!legacyRuns.has(sf)) {
+      unmet.push({
+        key,
+        sourceFolder: sf,
+        planKind: 'run',
+        message: `importConfig.carriedPriors ${sf}`,
+      });
+    }
+  }
+  return unmet;
+}
+
 function normalizeImportConfig(importConfig = {}) {
   if (importConfig.allowDisjointOverlayRoots) {
     throw new AppError(
@@ -1056,9 +1118,10 @@ export async function planImportManifestFile(manifestPath) {
   await checkFileKey('sources.legacySqlitePath', resolvedSources.legacySqlitePath);
 
   const seenPaths = new Map();
-  const discoveredRunSourceFolders = new Set();
-  const discoveredLegacyRunSourceFolders = new Set();
-  const discoveredCheckpointRelPaths = new Set();
+  const legacyRuns = new Set();
+  const otherRuns = new Set();
+  const plainCheckpoints = new Set();
+  const extendingCheckpoints = new Set();
   const emptyArea = (configured) => ({ configured: Boolean(configured), found: false, runs: 0, files: 0, bytes: 0 });
 
   const areas = {
@@ -1085,8 +1148,7 @@ export async function planImportManifestFile(manifestPath) {
     let files = 0;
     let bytes = 0;
     for (const r of runs) {
-      discoveredLegacyRunSourceFolders.add(r.sourceFolder);
-      discoveredRunSourceFolders.add(r.sourceFolder);
+      legacyRuns.add(r.sourceFolder);
       const m = await measureTreeMetadata(r.absPath, { seenPaths });
       files += m.files;
       bytes += m.bytes;
@@ -1101,7 +1163,7 @@ export async function planImportManifestFile(manifestPath) {
     let files = 0;
     let bytes = 0;
     for (const r of runs) {
-      discoveredRunSourceFolders.add(r.sourceFolder);
+      otherRuns.add(r.sourceFolder);
       const m = await measureTreeMetadata(r.absPath, { seenPaths });
       files += m.files;
       bytes += m.bytes;
@@ -1113,7 +1175,7 @@ export async function planImportManifestFile(manifestPath) {
     || (nusearDataDir ? join(nusearDataDir, 'company-abandoned', companySlug) : null);
   if (companyAbandonedDir && await isDir(companyAbandonedDir)) {
     const runs = await discoverAbandonedRunsMetadataOnly(companyAbandonedDir, companySlug);
-    for (const r of runs) discoveredRunSourceFolders.add(r.sourceFolder);
+    for (const r of runs) otherRuns.add(r.sourceFolder);
     const m = await measureTreeMetadata(companyAbandonedDir, { seenPaths });
     areas.abandonedRuns = { configured: Boolean(resolvedSources.companyAbandonedDir), found: true, runs: runs.length, files: m.files, bytes: m.bytes };
   }
@@ -1223,10 +1285,8 @@ export async function planImportManifestFile(manifestPath) {
       if (measured) {
         foundCount += 1;
         bytes += measured.bytes;
-        if (!cp?.extendsCommitId) {
-          const label = cp?.label || cp?.relPath || absPath;
-          discoveredCheckpointRelPaths.add(safeOverlayCheckpointRelPath(label, absPath));
-        }
+        const label = cp?.label || cp?.relPath || absPath;
+        (cp?.extendsCommitId ? extendingCheckpoints : plainCheckpoints).add(safeOverlayCheckpointRelPath(label, absPath));
       } else {
         missing.push({
           key: `overlayCheckpoints[${i}]`,
@@ -1263,7 +1323,7 @@ export async function planImportManifestFile(manifestPath) {
 
     let leftFound = false;
     if (ct.leftRunSourceFolder) {
-      leftFound = discoveredRunSourceFolders.has(ct.leftRunSourceFolder);
+      leftFound = legacyRuns.has(ct.leftRunSourceFolder) || otherRuns.has(ct.leftRunSourceFolder);
       if (!leftFound) missing.push({ key: `compareTargets[${i}].leftRunSourceFolder`, kind: 'run', name });
     } else if (ct.leftDir) {
       leftFound = await isDir(resolveMaybeRelative(baseDir, ct.leftDir));
@@ -1274,7 +1334,7 @@ export async function planImportManifestFile(manifestPath) {
 
     let rightFound = false;
     if (ct.rightRunSourceFolder) {
-      rightFound = discoveredRunSourceFolders.has(ct.rightRunSourceFolder);
+      rightFound = legacyRuns.has(ct.rightRunSourceFolder) || otherRuns.has(ct.rightRunSourceFolder);
       if (!rightFound) missing.push({ key: `compareTargets[${i}].rightRunSourceFolder`, kind: 'run', name });
     } else if (ct.rightDir) {
       rightFound = await isDir(resolveMaybeRelative(baseDir, ct.rightDir));
@@ -1291,28 +1351,17 @@ export async function planImportManifestFile(manifestPath) {
     });
   }
 
-  for (let i = 0; i < config.freshOverlayRoots.length; i++) {
-    const entry = config.freshOverlayRoots[i];
-    if (
-      !discoveredLegacyRunSourceFolders.has(entry.sourceFolder)
-      && !discoveredCheckpointRelPaths.has(entry.sourceFolder)
-    ) {
-      missing.push({
-        key: `importConfig.freshOverlayRoots[${i}].sourceFolder`,
-        kind: 'run',
-        name: entry.sourceFolder,
-      });
-    }
-  }
-  for (let i = 0; i < config.carriedPriors.length; i++) {
-    const entry = config.carriedPriors[i];
-    if (!discoveredLegacyRunSourceFolders.has(entry.sourceFolder)) {
-      missing.push({
-        key: `importConfig.carriedPriors[${i}].sourceFolder`,
-        kind: 'run',
-        name: entry.sourceFolder,
-      });
-    }
+  for (const unmet of collectUnmetOverlayPins(config, {
+    legacyRuns,
+    otherRuns,
+    plainCheckpoints,
+    extendingCheckpoints,
+  })) {
+    missing.push({
+      key: unmet.key,
+      kind: unmet.planKind,
+      name: unmet.sourceFolder,
+    });
   }
 
   let totalBytes = 0;
@@ -3244,19 +3293,12 @@ export async function executeHistoryImport({
       if (e.kind === 'run') (e.item.origin === 'mac_import' ? legacyRuns : otherRuns).add(e.item.sourceFolder);
       else (e.cp.extendsCommitId ? extendingCheckpoints : plainCheckpoints).add(safeOverlayCheckpointRelPath(e.label, e.absPath));
     }
-    const unmetPins = [];
-    for (const pin of effectiveConfig.freshOverlayRoots || []) {
-      const sf = pin.sourceFolder;
-      if (otherRuns.has(sf)) unmetPins.push(`importConfig.freshOverlayRoots ${sf} names a company run`);
-      else if (extendingCheckpoints.has(sf)) unmetPins.push(`importConfig.freshOverlayRoots ${sf} names a checkpoint that extends a commit`);
-      else if (!legacyRuns.has(sf) && !plainCheckpoints.has(sf)) unmetPins.push(`importConfig.freshOverlayRoots ${sf}`);
-    }
-    for (const pin of effectiveConfig.carriedPriors || []) {
-      const sf = pin.sourceFolder;
-      if (otherRuns.has(sf)) unmetPins.push(`importConfig.carriedPriors ${sf} names a company run`);
-      else if (plainCheckpoints.has(sf) || extendingCheckpoints.has(sf)) unmetPins.push(`importConfig.carriedPriors ${sf} names a standalone checkpoint`);
-      else if (!legacyRuns.has(sf)) unmetPins.push(`importConfig.carriedPriors ${sf}`);
-    }
+    const unmetPins = collectUnmetOverlayPins(effectiveConfig, {
+      legacyRuns,
+      otherRuns,
+      plainCheckpoints,
+      extendingCheckpoints,
+    }).map((u) => u.message);
     if (unmetPins.length > 0) {
       const unmet = new AppError(
         `Overlay prefix mismatch: pinned overlay folders not found in this import, or of the wrong kind: ${unmetPins.join('; ')}.`,

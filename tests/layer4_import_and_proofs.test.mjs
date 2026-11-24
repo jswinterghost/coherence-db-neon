@@ -6131,13 +6131,13 @@ test('Layer 4 [Fix6-2 - Plan Check Agrees With Import for Legacy Runs and Standa
     planBad.missing.map((m) => [m.key, m.kind, m.name]),
     [
       ['overlayCheckpoints[1]', 'file', 'missing-cp'],
-      ['importConfig.freshOverlayRoots[0].sourceFolder', 'run', 'company-workspaces/acme/2026-11-03/runs/2026-11-03'],
-      ['importConfig.freshOverlayRoots[1].sourceFolder', 'run', 'company-abandoned/acme/2026-11-09'],
+      ['importConfig.freshOverlayRoots[0].sourceFolder', 'wrong_kind_company_run', 'company-workspaces/acme/2026-11-03/runs/2026-11-03'],
+      ['importConfig.freshOverlayRoots[1].sourceFolder', 'wrong_kind_company_run', 'company-abandoned/acme/2026-11-09'],
       ['importConfig.freshOverlayRoots[2].sourceFolder', 'run', 'overlay-checkpoints/missing-cp'],
-      ['importConfig.freshOverlayRoots[3].sourceFolder', 'run', 'overlay-checkpoints/extends-cp'],
-      ['importConfig.carriedPriors[0].sourceFolder', 'run', 'company-workspaces/acme/2026-11-03/runs/2026-11-03'],
-      ['importConfig.carriedPriors[1].sourceFolder', 'run', 'company-abandoned/acme/2026-11-09'],
-      ['importConfig.carriedPriors[2].sourceFolder', 'run', 'overlay-checkpoints/early-cp'],
+      ['importConfig.freshOverlayRoots[3].sourceFolder', 'wrong_kind_extending_checkpoint', 'overlay-checkpoints/extends-cp'],
+      ['importConfig.carriedPriors[0].sourceFolder', 'wrong_kind_company_run', 'company-workspaces/acme/2026-11-03/runs/2026-11-03'],
+      ['importConfig.carriedPriors[1].sourceFolder', 'wrong_kind_company_run', 'company-abandoned/acme/2026-11-09'],
+      ['importConfig.carriedPriors[2].sourceFolder', 'wrong_kind_standalone_checkpoint', 'overlay-checkpoints/early-cp'],
     ],
   );
 });
@@ -6603,5 +6603,365 @@ test('Layer 4 [Fix7-1 - Pre-Write Pin Checks, Direct Single-Run Guards & Shared-
       },
     );
     await assertNothingWrittenSince(env, before, caseName);
+  }
+});
+
+test('Layer 4 [Fix8 - Plan Check Refuses Shared Pin Keys Across Kinds Exactly As Import Does]: --plan uses the same four target sets and forbidden-kind-first rule as executeHistoryImport for legacy/company runs, legacy/abandoned runs, plain/extending checkpoints, legacy/plain checkpoints, and legacy/extending checkpoints', async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix8-plan-shared-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const shaA = 'a'.repeat(64);
+  const shaB = 'b'.repeat(64);
+  const extCommitId = '00000000-0000-4000-8000-000000000001';
+
+  const makeMetaRun = (date) => ({
+    'input/a.csv': 'k\n1\n',
+    'run.json': JSON.stringify({ date, steps: {} }),
+  });
+
+  const runPlanForCase = async (caseName, manifestObj) => {
+    const manifestPath = join(work, `${caseName}.manifest.json`);
+    await writeFile(manifestPath, JSON.stringify(manifestObj, null, 2), 'utf8');
+    const plan = await runHistoryPlan({ manifestPath });
+    assert.equal(JSON.stringify(plan).includes(work), false, `${caseName}: plan output must not leak raw paths`);
+    return plan;
+  };
+
+  // 1) Fix7-1 shared-key fixture: legacy run + company run sharing company-workspaces/acme/2026-11-03.
+  await t.test('legacy run + company run shared key fails --plan for freshOverlayRoots and carriedPriors', async () => {
+    const dir = join(work, 'legacy-plus-company');
+    const sharedKey = 'company-workspaces/acme/2026-11-03';
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeMetaRun('2026-09-30'));
+    await writeTree(join(dir, 'runs', 'company-workspaces', 'acme', '2026-11-03'), makeMetaRun('2026-11-03'));
+    await writeTree(join(dir, 'company-ws', '2026-11-03'), makeMetaRun('2026-11-03'));
+
+    const sources = {
+      legacyRunsRoot: join(dir, 'runs'),
+      companyWorkspacesDir: join(dir, 'company-ws'),
+    };
+
+    const planFresh = await runPlanForCase('legacy-plus-company-fresh', {
+      companySlug: 'acme',
+      sources,
+      importConfig: {
+        includeLegacyHostHistory: true,
+        freshOverlayRoots: [
+          { sourceFolder: '2026-09-30', sha256: shaA },
+          { sourceFolder: sharedKey, sha256: shaB },
+        ],
+      },
+    });
+    assert.equal(planFresh.passed, false);
+    assert.deepEqual(
+      planFresh.missing.map((m) => [m.key, m.kind, m.name]),
+      [['importConfig.freshOverlayRoots[1].sourceFolder', 'wrong_kind_company_run', sharedKey]],
+    );
+
+    const planCarried = await runPlanForCase('legacy-plus-company-carried', {
+      companySlug: 'acme',
+      sources,
+      importConfig: {
+        includeLegacyHostHistory: true,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: shaA }],
+        carriedPriors: [{ sourceFolder: sharedKey, sha256: shaB, extendsRowCount: 1 }],
+      },
+    });
+    assert.equal(planCarried.passed, false);
+    assert.deepEqual(
+      planCarried.missing.map((m) => [m.key, m.kind, m.name]),
+      [['importConfig.carriedPriors[0].sourceFolder', 'wrong_kind_company_run', sharedKey]],
+    );
+  });
+
+  // 2) Shared-key fixture: legacy run + abandoned company run sharing company-abandoned/acme/2026-11-09.
+  await t.test('legacy run + abandoned run shared key fails --plan for freshOverlayRoots and carriedPriors', async () => {
+    const dir = join(work, 'legacy-plus-abandoned');
+    const sharedKey = 'company-abandoned/acme/2026-11-09';
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeMetaRun('2026-09-30'));
+    await writeTree(join(dir, 'runs', 'company-abandoned', 'acme', '2026-11-09'), makeMetaRun('2026-11-09'));
+    await writeTree(join(dir, 'company-abandoned', '2026-11-09'), makeMetaRun('2026-11-09'));
+
+    const sources = {
+      legacyRunsRoot: join(dir, 'runs'),
+      companyAbandonedDir: join(dir, 'company-abandoned'),
+    };
+
+    const planFresh = await runPlanForCase('legacy-plus-abandoned-fresh', {
+      companySlug: 'acme',
+      sources,
+      importConfig: {
+        includeLegacyHostHistory: true,
+        freshOverlayRoots: [
+          { sourceFolder: '2026-09-30', sha256: shaA },
+          { sourceFolder: sharedKey, sha256: shaB },
+        ],
+      },
+    });
+    assert.equal(planFresh.passed, false);
+    assert.deepEqual(
+      planFresh.missing.map((m) => [m.key, m.kind, m.name]),
+      [['importConfig.freshOverlayRoots[1].sourceFolder', 'wrong_kind_company_run', sharedKey]],
+    );
+
+    const planCarried = await runPlanForCase('legacy-plus-abandoned-carried', {
+      companySlug: 'acme',
+      sources,
+      importConfig: {
+        includeLegacyHostHistory: true,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: shaA }],
+        carriedPriors: [{ sourceFolder: sharedKey, sha256: shaB, extendsRowCount: 1 }],
+      },
+    });
+    assert.equal(planCarried.passed, false);
+    assert.deepEqual(
+      planCarried.missing.map((m) => [m.key, m.kind, m.name]),
+      [['importConfig.carriedPriors[0].sourceFolder', 'wrong_kind_company_run', sharedKey]],
+    );
+  });
+
+  // 3) Fix7-1 shared-key fixture: plain checkpoint + extending checkpoint sharing overlay-checkpoints/shared-cp (both orders).
+  await t.test('plain checkpoint + extending checkpoint shared key fails --plan in both orders', async () => {
+    const dir = join(work, 'plain-plus-extending-cp');
+    const sharedKey = 'overlay-checkpoints/shared-cp';
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeMetaRun('2026-09-30'));
+    await writeTree(join(dir, 'checkpoints'), {
+      'plain.csv': 'record_id,disposition\n',
+      'ext.csv': 'record_id,disposition\n',
+    });
+
+    const plainCp = { label: 'shared-cp', path: join(dir, 'checkpoints', 'plain.csv') };
+    const extCp = { label: 'shared-cp', path: join(dir, 'checkpoints', 'ext.csv'), extendsCommitId: extCommitId };
+
+    for (const [orderName, overlayCheckpoints] of [
+      ['plain-first', [plainCp, extCp]],
+      ['extending-first', [extCp, plainCp]],
+    ]) {
+      const planFresh = await runPlanForCase(`cp-shared-fresh-${orderName}`, {
+        companySlug: 'acme',
+        sources: { legacyRunsRoot: join(dir, 'runs') },
+        overlayCheckpoints,
+        importConfig: {
+          includeLegacyHostHistory: true,
+          freshOverlayRoots: [
+            { sourceFolder: '2026-09-30', sha256: shaA },
+            { sourceFolder: sharedKey, sha256: shaB },
+          ],
+        },
+      });
+      assert.equal(planFresh.passed, false, `${orderName}: freshOverlayRoots must fail --plan`);
+      assert.deepEqual(
+        planFresh.missing.map((m) => [m.key, m.kind, m.name]),
+        [['importConfig.freshOverlayRoots[1].sourceFolder', 'wrong_kind_extending_checkpoint', sharedKey]],
+      );
+
+      const planCarried = await runPlanForCase(`cp-shared-carried-${orderName}`, {
+        companySlug: 'acme',
+        sources: { legacyRunsRoot: join(dir, 'runs') },
+        overlayCheckpoints,
+        importConfig: {
+          includeLegacyHostHistory: true,
+          freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: shaA }],
+          carriedPriors: [{ sourceFolder: sharedKey, sha256: shaB, extendsRowCount: 1 }],
+        },
+      });
+      assert.equal(planCarried.passed, false, `${orderName}: carriedPriors must fail --plan`);
+      assert.deepEqual(
+        planCarried.missing.map((m) => [m.key, m.kind, m.name]),
+        [['importConfig.carriedPriors[0].sourceFolder', 'wrong_kind_standalone_checkpoint', sharedKey]],
+      );
+    }
+  });
+
+  // 4) Fix7-1 shared-key fixture: legacy run + plain standalone checkpoint sharing overlay-checkpoints/2026-10-05.
+  await t.test('legacy run + plain standalone checkpoint shared key fails --plan for carriedPriors and allows freshOverlayRoots', async () => {
+    const dir = join(work, 'legacy-plus-plain-cp');
+    const sharedKey = 'overlay-checkpoints/2026-10-05';
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeMetaRun('2026-09-30'));
+    await writeTree(join(dir, 'runs', 'overlay-checkpoints', '2026-10-05'), makeMetaRun('2026-10-05'));
+    await writeTree(join(dir, 'checkpoints'), { '2026-10-05.csv': 'record_id,disposition\n' });
+
+    const planCarried = await runPlanForCase('legacy-plus-plain-cp-carried', {
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      overlayCheckpoints: [{ label: '2026-10-05', path: join(dir, 'checkpoints', '2026-10-05.csv') }],
+      importConfig: {
+        includeLegacyHostHistory: true,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: shaA }],
+        carriedPriors: [{ sourceFolder: sharedKey, sha256: shaB, extendsRowCount: 1 }],
+      },
+    });
+    assert.equal(planCarried.passed, false);
+    assert.deepEqual(
+      planCarried.missing.map((m) => [m.key, m.kind, m.name]),
+      [['importConfig.carriedPriors[0].sourceFolder', 'wrong_kind_standalone_checkpoint', sharedKey]],
+    );
+
+    const planFreshAllowed = await runPlanForCase('legacy-plus-plain-cp-fresh-ok', {
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      overlayCheckpoints: [{ label: '2026-10-05', path: join(dir, 'checkpoints', '2026-10-05.csv') }],
+      importConfig: {
+        includeLegacyHostHistory: true,
+        freshOverlayRoots: [
+          { sourceFolder: '2026-09-30', sha256: shaA },
+          { sourceFolder: sharedKey, sha256: shaB },
+        ],
+      },
+    });
+    assert.equal(planFreshAllowed.passed, true);
+    assert.deepEqual(planFreshAllowed.missing, []);
+  });
+
+  // 5) Shared-key fixture: legacy run + extending checkpoint sharing overlay-checkpoints/2026-10-05.
+  await t.test('legacy run + extending checkpoint shared key fails --plan for freshOverlayRoots and carriedPriors', async () => {
+    const dir = join(work, 'legacy-plus-extending-cp');
+    const sharedKey = 'overlay-checkpoints/2026-10-05';
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeMetaRun('2026-09-30'));
+    await writeTree(join(dir, 'runs', 'overlay-checkpoints', '2026-10-05'), makeMetaRun('2026-10-05'));
+    await writeTree(join(dir, 'checkpoints'), { '2026-10-05.csv': 'record_id,disposition\n' });
+
+    const cp = {
+      label: '2026-10-05',
+      path: join(dir, 'checkpoints', '2026-10-05.csv'),
+      extendsCommitId: extCommitId,
+    };
+
+    const planFresh = await runPlanForCase('legacy-plus-extending-cp-fresh', {
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      overlayCheckpoints: [cp],
+      importConfig: {
+        includeLegacyHostHistory: true,
+        freshOverlayRoots: [
+          { sourceFolder: '2026-09-30', sha256: shaA },
+          { sourceFolder: sharedKey, sha256: shaB },
+        ],
+      },
+    });
+    assert.equal(planFresh.passed, false);
+    assert.deepEqual(
+      planFresh.missing.map((m) => [m.key, m.kind, m.name]),
+      [['importConfig.freshOverlayRoots[1].sourceFolder', 'wrong_kind_extending_checkpoint', sharedKey]],
+    );
+
+    const planCarried = await runPlanForCase('legacy-plus-extending-cp-carried', {
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      overlayCheckpoints: [cp],
+      importConfig: {
+        includeLegacyHostHistory: true,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: shaA }],
+        carriedPriors: [{ sourceFolder: sharedKey, sha256: shaB, extendsRowCount: 1 }],
+      },
+    });
+    assert.equal(planCarried.passed, false);
+    assert.deepEqual(
+      planCarried.missing.map((m) => [m.key, m.kind, m.name]),
+      [['importConfig.carriedPriors[0].sourceFolder', 'wrong_kind_standalone_checkpoint', sharedKey]],
+    );
+  });
+});
+
+test('Layer 4 [Fix8 - Import Agrees With Plan on Legacy Run Plus Extending Checkpoint]: executeHistoryImport refuses a shared key between a legacy run and an extending checkpoint before any write for both freshOverlayRoots and carriedPriors regardless of timeline order', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix8-import-shared-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:F8_1#effective:2026-01-01', note: 'base-1' });
+  const row2 = sampleApprovalRow({ record_id: 'policy:carrier_a:F8_2#effective:2026-01-01', note: 'ext-2' });
+  const csv1 = makeOverlayCsv([row1], { version: 'v2' });
+  const csv12 = makeOverlayCsv([row1, row2], { version: 'v2' });
+  const sha1 = shaOf(csv1);
+  const sha12 = shaOf(csv12);
+  const extCommitId = '00000000-0000-4000-8000-000000000001';
+  const sharedKey = 'overlay-checkpoints/2026-10-05';
+
+  const makeRun = (date, { priorCsv = null, overlayCsv = null, emitOverlayCsv = null, born }) => ({
+    ...(priorCsv !== null ? { 'input/Overlay/overlay.csv': priorCsv } : {}),
+    'input/a.csv': 'k\n1\n',
+    ...(overlayCsv !== null ? { 'overlay.csv': overlayCsv } : {}),
+    ...(emitOverlayCsv !== null ? { 'emits/overlay.csv': emitOverlayCsv } : {}),
+    'run.json': JSON.stringify({
+      date,
+      born,
+      steps: { assign: { at: born }, emit: { at: born } },
+    }),
+  });
+
+  for (const [orderName, legacyBorn, cpAt] of [
+    ['legacy-before-checkpoint', '2026-10-05T08:00:00Z', '2026-10-05T12:00:00Z'],
+    ['checkpoint-before-legacy', '2026-10-05T12:00:00Z', '2026-10-05T08:00:00Z'],
+  ]) {
+    for (const [pinKind, importConfig, expectedUnmet] of [
+      [
+        'fresh',
+        {
+          freshOverlayRoots: [
+            { sourceFolder: '2026-09-30', sha256: sha1 },
+            { sourceFolder: sharedKey, sha256: sha12 },
+          ],
+        },
+        [`importConfig.freshOverlayRoots ${sharedKey} names a checkpoint that extends a commit`],
+      ],
+      [
+        'carried',
+        {
+          freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+          carriedPriors: [{ sourceFolder: sharedKey, sha256: sha12, extendsRowCount: 1 }],
+        },
+        [`importConfig.carriedPriors ${sharedKey} names a standalone checkpoint`],
+      ],
+    ]) {
+      const caseName = `legacy-plus-extending-cp-${pinKind}-${orderName}`;
+      const dir = join(work, caseName);
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'runs', 'overlay-checkpoints', '2026-10-05'), makeRun('2026-10-05', {
+        priorCsv: csv12,
+        emitOverlayCsv: csv12,
+        born: legacyBorn,
+      }));
+      const cpPath = join(dir, 'checkpoints', '2026-10-05.csv');
+      await mkdir(dirname(cpPath), { recursive: true });
+      await writeFile(cpPath, csv12, 'utf8');
+
+      const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+      t.after(() => env.cleanup());
+      const manifest = await buildImportManifest({
+        companySlug: 'acme',
+        sources: { legacyRunsRoot: join(dir, 'runs') },
+        overlayCheckpoints: [{ label: '2026-10-05', absPath: cpPath, extendsCommitId: extCommitId, originalAt: cpAt }],
+        importConfig: {
+          includeLegacyHostHistory: true,
+          includeLegacySqliteTables: false,
+          useCompanyIncomingInput: false,
+          ...importConfig,
+        },
+        tempBaseDir: work,
+      });
+
+      const before = await snapshotImportWriteState(env);
+      await assert.rejects(
+        () => executeHistoryImport({
+          pool: env.pool,
+          stores: env.stores,
+          commands: env.commands,
+          actor: env.ownerActor,
+          manifest,
+          pythonPath: 'python3',
+          coherenceRepo: mockRepo,
+          verifyRebuild: false,
+          tempBaseDir: work,
+        }),
+        (err) => {
+          assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: got ${err?.code}: ${err?.message}`);
+          assert.deepEqual(err.unmetPins, expectedUnmet);
+          return true;
+        },
+      );
+      await assertNothingWrittenSince(env, before, caseName);
+    }
   }
 });
