@@ -717,6 +717,7 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
         datesChecked: 0,
         filesChecked: 0,
         totalLines: 0,
+        roundingAdjustmentLines: 0,
         perEntityTotals: {},
         entityVariancesCents: {},
         unreconciledEntities: 0,
@@ -785,6 +786,7 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
   );
   const recordMismatchCount = Number(recVarRes.rows[0]?.mismatch_count ?? 0);
 
+  const ROUNDING_ADJUSTMENT_SRC_TYPE = 'rounding_adjustment';
   const totalsRes = await pool.query(
     `SELECT pg_catalog.to_char(t.statement_date, 'YYYY-MM-DD') AS statement_date,
             t.statement_entity, t.account_kind, t.src_type, t.payment_month,
@@ -796,7 +798,12 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
   const distinctDates = new Set();
   const distinctDateEntities = new Set();
   let totalLines = 0;
+  let roundingAdjustmentLines = 0;
   for (const r of totalsRes.rows) {
+    if (r.src_type === ROUNDING_ADJUSTMENT_SRC_TYPE) {
+      roundingAdjustmentLines += Number(r.line_count);
+      continue;
+    }
     distinctDates.add(r.statement_date);
     distinctDateEntities.add(`${r.statement_date}:${r.statement_entity}`);
     totalLines += Number(r.line_count);
@@ -894,6 +901,7 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
     datesChecked: distinctDates.size,
     filesChecked: distinctDateEntities.size,
     totalLines,
+    roundingAdjustmentLines,
     perEntityTotals,
     entityVariancesCents,
     unreconciledEntities,
@@ -1217,6 +1225,7 @@ export async function compareRunFolders(leftDir, rightDir, {
         datesChecked: 0,
         filesChecked: 0,
         totalLines: 0,
+        roundingAdjustmentLines: 0,
         perEntityTotals: {},
         entityVariancesCents: {},
         unreconciledEntities: 0,

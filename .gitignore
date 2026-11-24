@@ -10,3 +10,7 @@ tmp/
 *.tmp
 *.log
 .phalanx-*
+.step5-*
+.review-*
+.real-proof-*
+.history-folders.txt

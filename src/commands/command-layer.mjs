@@ -2601,7 +2601,9 @@ export function createCommandLayer({ pool, companySlug, stores = null }) {
             id: d.id || randomUUID(),
             decisionCommitId: d.decisionCommitId ?? d.decision_commit_id,
             rowOrder: Number(d.rowOrder ?? d.row_order),
-            runId: d.runId === '__THIS_RUN__' || d.attachToRun ? runId : (d.runId ?? d.run_id ?? runId),
+            runId: d.runId === '__THIS_RUN__' || d.attachToRun
+              ? runId
+              : (d.runId !== undefined ? d.runId : (d.run_id !== undefined ? d.run_id : runId)),
             reviewSaveId: resolvedSaveId,
             surface: resolvedSaveId ? (d.surface ?? null) : (d.surface ?? null),
             recordId: String(d.recordId ?? d.record_id),

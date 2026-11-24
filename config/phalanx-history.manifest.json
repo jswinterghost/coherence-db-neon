@@ -1,0 +1,355 @@
+{
+  "companySlug": "phalanx",
+  "displayName": "Phalanx",
+  "defaultEmitMode": "coherence",
+  "coherenceRoot": "/Users/marcsmac/Code/coherence",
+  "coherenceRepo": "/Users/marcsmac/Code/coherence",
+  "nusearDataDir": "/Users/marcsmac/Code/nusear2.com/data",
+  "nusearSqlitePath": "/Users/marcsmac/Code/nusear2.com/private-backups/proof-2026-11-23/nusear2.sqlite",
+  "pythonPath": "/Users/marcsmac/Code/coherence/.venv/bin/python",
+  "overlayCheckPath": "../python/coherence_overlay_check.py",
+  "legacyBridgePath": "../python/coherence_legacy_statements.py",
+  "sources": {
+    "legacyRunsRoot": "/Users/marcsmac/Code/coherence/runs",
+    "standingInputDir": "/Users/marcsmac/Code/coherence/input",
+    "incidentReportDir": "/Users/marcsmac/Code/coherence/runs/Incident Report",
+    "legacyReviewSavesDir": "/Users/marcsmac/Code/nusear2.com/data/coherence-runs",
+    "companyWorkspacesDir": "/Users/marcsmac/Code/nusear2.com/data/company-workspaces/phalanx",
+    "companyAbandonedDir": null,
+    "companyReviewSavesDir": "/Users/marcsmac/Code/nusear2.com/data/company-runs/phalanx",
+    "companyEnvironmentDir": "/Users/marcsmac/Code/nusear2.com/data/company-environments/phalanx",
+    "cloudMirrorDir": null,
+    "legacySqlitePath": "/Users/marcsmac/Code/nusear2.com/private-backups/proof-2026-11-23/nusear2.sqlite",
+    "preCoherenceStatementsDir": "/Users/marcsmac/Code/coherence/input/Phalanx Statements",
+    "preCoherenceSentDir": "/Users/marcsmac/Code/coherence/input/Sent",
+    "preCoherenceAgentsCsv": "/Users/marcsmac/Code/coherence/input/Agent Data/cleanagentdata.csv",
+    "methodCorrections": [
+      {
+        "kind": "split_reallocation",
+        "statementDate": "2026-08-01",
+        "sourceGrammar": "all_agency",
+        "unreversedOnly": true,
+        "useAgentsSplit": false,
+        "uplineRate": "0.20",
+        "excludeEntities": [
+          "Phalanx"
+        ],
+        "expectedAgencyNetCents": 233678,
+        "expectedUplineNetCents": -233678,
+        "reason": "2026-08-01 80/20 override split reallocation on unreversed 2026-07-31 ALLAGENCY lines"
+      },
+      {
+        "kind": "upline_takeback",
+        "statementDate": "2026-08-31",
+        "sourceGrammar": "plx_layout",
+        "expectedAgencyNetCents": 0,
+        "expectedUplineNetCents": -17764809,
+        "reason": "2026-08-31 historical plxSpark ULTotal take-back"
+      }
+    ]
+  },
+  "importConfig": {
+    "includeLegacyHostHistory": true,
+    "includeLegacySqliteTables": true,
+    "useCompanyIncomingInput": false,
+    "currentInputSourceKind": "mac_import",
+    "emitRules": [],
+    "defaultCompanyEmit": {
+      "emitMode": "coherence",
+      "emitDisplay": null,
+      "emitKeep": [],
+      "emitNoManager": []
+    },
+    "allowedMissingCommits": [],
+    "allowDisjointOverlayRoots": false,
+    "freshOverlayRoots": [
+      {
+        "sourceFolder": "2026-07-31",
+        "sha256": "4a316f602bc01f1908c96809786073a2d0156045d1921ec51ebd44804852b601"
+      },
+      {
+        "sourceFolder": "2026-08-25",
+        "sha256": "26f50cbbf6b10638cecbc1300f4a4c53b29d0b1a705c61c54a641569be9a479a"
+      },
+      {
+        "sourceFolder": "2026-08-31",
+        "sha256": "20a4c5f94bac4d49aa564204ec142e637b4fea44a6f68fcdac3f0634a080cb20"
+      },
+      {
+        "sourceFolder": "Historical 2026-08-31/2026-08-31",
+        "sha256": "9bdb4be772aa75308a00fc4fe0980da60a998161e740121bdd08da888b008837"
+      },
+      {
+        "sourceFolder": "archive/v1/2026-07-31",
+        "sha256": "4a316f602bc01f1908c96809786073a2d0156045d1921ec51ebd44804852b601"
+      },
+      {
+        "sourceFolder": "archive/v1/2026-08-25",
+        "sha256": "26f50cbbf6b10638cecbc1300f4a4c53b29d0b1a705c61c54a641569be9a479a"
+      },
+      {
+        "sourceFolder": "archive/v1/2026-08-31",
+        "sha256": "20a4c5f94bac4d49aa564204ec142e637b4fea44a6f68fcdac3f0634a080cb20"
+      },
+      {
+        "sourceFolder": "archive/v1/Historical 2026-08-31/2026-08-31",
+        "sha256": "9bdb4be772aa75308a00fc4fe0980da60a998161e740121bdd08da888b008837"
+      }
+    ],
+    "carriedPriors": [
+      {
+        "sourceFolder": "archive/provisional/2026-10-01",
+        "sha256": "f26f933e2f1d9bb2cc751486bcd28eef0d5d000d2c522b4919f89227a1b66af0",
+        "extendsRowCount": 22334,
+        "reason": "220 CONFIRM references appended to the live approval log between the final 9/30 overlay and the 10/01 freeze, re-keying the same saved 9/30 Bible decisions from temporary #id keys to dated period keys after the Bible key law changed; proved references, not new business decisions (Coherence TODO.md, Replacement 2026-10-11 baseline)"
+      }
+    ],
+    "companySentRecords": {},
+    "legacyStatementConfig": null
+  },
+  "overlayCheckpoints": [],
+  "compareTargets": [
+    {
+      "label": "reference-2026-10-21",
+      "leftRunSourceFolder": "2026-10-21",
+      "rightDir": "/Users/marcsmac/Code/coherence/runs/2026-10-21",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "reference-2026-11-02",
+      "leftRunSourceFolder": "2026-11-02",
+      "rightDir": "/Users/marcsmac/Code/coherence/runs/2026-11-02",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "reference-2026-11-03",
+      "leftRunSourceFolder": "2026-11-03",
+      "rightDir": "/Users/marcsmac/Code/coherence/runs/2026-11-03",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "reference-2026-11-20",
+      "leftRunSourceFolder": "2026-11-20",
+      "rightDir": "/Users/marcsmac/Code/coherence/runs/2026-11-20",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "reference-2026-11-21",
+      "leftRunSourceFolder": "2026-11-21",
+      "rightDir": "/Users/marcsmac/Code/coherence/runs/2026-11-21",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "company-2026-11-03",
+      "leftRunSourceFolder": "company-workspaces/phalanx/2026-11-03/runs/2026-11-03",
+      "rightDir": "/Users/marcsmac/Code/nusear2.com/data/company-workspaces/phalanx/2026-11-03/runs/2026-11-03",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "company-2026-11-04",
+      "leftRunSourceFolder": "company-workspaces/phalanx/2026-11-04/runs/2026-11-04",
+      "rightDir": "/Users/marcsmac/Code/nusear2.com/data/company-workspaces/phalanx/2026-11-04/runs/2026-11-04",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "company-2026-11-11",
+      "leftRunSourceFolder": "company-workspaces/phalanx/2026-11-11/runs/2026-11-11",
+      "rightDir": "/Users/marcsmac/Code/nusear2.com/data/company-workspaces/phalanx/2026-11-11/runs/2026-11-11",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "company-2026-11-12",
+      "leftRunSourceFolder": "company-workspaces/phalanx/2026-11-12/runs/2026-11-12",
+      "rightDir": "/Users/marcsmac/Code/nusear2.com/data/company-workspaces/phalanx/2026-11-12/runs/2026-11-12",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "company-2026-11-20",
+      "leftRunSourceFolder": "company-workspaces/phalanx/2026-11-20/runs/2026-11-20",
+      "rightDir": "/Users/marcsmac/Code/nusear2.com/data/company-workspaces/phalanx/2026-11-20/runs/2026-11-20",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    },
+    {
+      "label": "company-2026-11-21",
+      "leftRunSourceFolder": "company-workspaces/phalanx/2026-11-21/runs/2026-11-21",
+      "rightDir": "/Users/marcsmac/Code/nusear2.com/data/company-workspaces/phalanx/2026-11-21/runs/2026-11-21",
+      "entity": "Phalanx",
+      "uplineAmountColumn": "phalanx_amount",
+      "moneyColumns": [
+        "amount",
+        "gross_comm",
+        "downline_amount",
+        "phalanx_amount",
+        "override_amount",
+        "commission_amount",
+        "hra_amount",
+        "fee_amount",
+        "other_amount"
+      ],
+      "columns": {},
+      "requireStatementsDelta": true,
+      "requireConservation": true,
+      "expectedEntityParity": null
+    }
+  ]
+}

@@ -20,6 +20,7 @@ from coherence.phase4 import feature_membership
 
 CENT = Decimal("0.01")
 _LEGACY_MOD_KEY = "al" + "ex"
+ROUNDING_ADJUSTMENT_TYPE = "rounding_adjustment"
 
 
 class LegacyStatementError(Exception):
@@ -129,6 +130,58 @@ def make_line_common(rec, rid: str, filename: str, sheet_name: str | None, row_n
     }
 
 
+def make_upline_rounding_line(
+    line_no: int,
+    stmt_date: str,
+    filename: str,
+    sheet_name: str | None,
+    rounding_diff: Decimal,
+    exact_rounded: Decimal,
+    lines_sum: Decimal,
+) -> dict:
+    return {
+        "statementDate": stmt_date,
+        "writingNpn": None,
+        "writingAgent": None,
+        "recordId": f"rounding~ultotal~{filename}",
+        "reversalOf": None,
+        "correctsRecordId": None,
+        "sourceFile": filename,
+        "sheetName": sheet_name,
+        "sourceRowNo": 1,
+        "srcType": ROUNDING_ADJUSTMENT_TYPE,
+        "carrier": None,
+        "mbi": None,
+        "member": None,
+        "externalPolicyId": None,
+        "policyId": None,
+        "txId": None,
+        "planType": None,
+        "simplePlanType": None,
+        "state": None,
+        "submissionDate": None,
+        "originEffective": None,
+        "effectiveDate": None,
+        "terminationDate": None,
+        "earnedDate": None,
+        "paymentDate": None,
+        "postedStatementDate": stmt_date,
+        "revenueType": ROUNDING_ADJUSTMENT_TYPE,
+        "reason": "Per-file ULTotal sub-cent rounding adjustment",
+        "notes": (
+            f"Exact ULTotal sum rounded once (ROUND_HALF_UP): {fmt_money(exact_rounded)} "
+            f"vs per-row rounded sum {fmt_money(lines_sum)}"
+        ),
+        "lineNo": line_no,
+        "entryKind": "historical_upline_derived",
+        "runAction": "SENT",
+        "sourceEntity": "Upline",
+        "markedSent": False,
+        "grossComm": fmt_money(rounding_diff),
+        "amount": fmt_money(rounding_diff),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read pre-Coherence sent statements via Coherence's own legacy reader.")
     parser.add_argument("--spec", required=True, help="JSON spec file describing read-only paths and method corrections.")
@@ -183,6 +236,7 @@ def main() -> None:
             # Track parsed row metadata keyed by batch for deterministic method corrections.
             parsed_agency_records = []
             parsed_upline_records = []
+            parsed_upline_files = []
 
             for sf in sent_files:
                 file_path = statements_dir / sf.filename
@@ -204,7 +258,9 @@ def main() -> None:
                 ag_line_no = 0
                 up_line_no = 0
                 ag_net = Decimal("0.00")
-                up_net = Decimal("0.00")
+                up_lines_sum = Decimal("0.00")
+                ul_exact_sum = Decimal("0")
+                has_any_ul = False
 
                 for idx, (rec, raw_row) in enumerate(zip(sf.records, raw_rows, strict=True)):
                     all_legacy_records.append(rec)
@@ -214,6 +270,9 @@ def main() -> None:
                     if grammar == "plx_layout":
                         ul_amount = parse_legacy_money(raw_row.get("ULTotal"))
                         raw_gross = parse_legacy_money(raw_row.get("CommissionAmount"))
+                        if ul_amount is not None:
+                            ul_exact_sum += ul_amount
+                            has_any_ul = True
 
                     dl_amt = rec.amount.quantize(CENT, rounding=ROUND_HALF_UP) if rec.amount is not None else None
                     ul_amt = ul_amount.quantize(CENT, rounding=ROUND_HALF_UP) if ul_amount is not None else None
@@ -257,7 +316,7 @@ def main() -> None:
                     if has_upline:
                         up_line_no += 1
                         up_gross = (raw_gross if raw_gross is not None else ul_amount).quantize(CENT, rounding=ROUND_HALF_UP)
-                        up_net += ul_amt
+                        up_lines_sum += ul_amt
                         up_line = {
                             **common,
                             "lineNo": up_line_no,
@@ -277,6 +336,34 @@ def main() -> None:
                             "recordId": rid,
                             "line": up_line,
                         })
+
+                if grammar == "plx_layout" and has_any_ul:
+                    up_net = ul_exact_sum.quantize(CENT, rounding=ROUND_HALF_UP)
+                    if up_net == Decimal("-0.00"):
+                        up_net = Decimal("0.00")
+                    ul_rounding_diff = up_net - up_lines_sum
+                    if ul_rounding_diff != Decimal("0.00"):
+                        up_line_no += 1
+                        rounding_line = make_upline_rounding_line(
+                            up_line_no, stmt_date, sf.filename, sheet_name, ul_rounding_diff, up_net, up_lines_sum
+                        )
+                        upline_lines.append(rounding_line)
+                        parsed_upline_records.append({
+                            "grammar": grammar,
+                            "statementDate": stmt_date,
+                            "filename": sf.filename,
+                            "eraCancel": True,
+                            "recordId": rounding_line["recordId"],
+                            "line": rounding_line,
+                        })
+                    parsed_upline_files.append({
+                        "grammar": grammar,
+                        "statementDate": stmt_date,
+                        "filename": sf.filename,
+                        "exactTotal": ul_exact_sum,
+                    })
+                else:
+                    up_net = up_lines_sum
 
                 historical_batches.append({
                     "batchKind": "historical_sent",
@@ -467,6 +554,23 @@ def main() -> None:
                             "amount": fmt_money(takeback_amt),
                             "reason": corr_reason,
                         })
+
+                    expected_file_takeback = Decimal("0.00")
+                    for fmeta in parsed_upline_files:
+                        if target_grammar and fmeta["grammar"] != target_grammar:
+                            continue
+                        if target_files and fmeta["filename"] not in target_files:
+                            continue
+                        if fmeta["statementDate"] >= corr_date:
+                            continue
+                        file_tb = (-fmeta["exactTotal"]).quantize(CENT, rounding=ROUND_HALF_UP)
+                        if file_tb == Decimal("-0.00"):
+                            file_tb = Decimal("0.00")
+                        expected_file_takeback += file_tb
+                    if up_net != expected_file_takeback:
+                        raise LegacyStatementError(
+                            f"Method correction {corr_label} per-file ULTotal rounding consistency mismatch."
+                        )
 
                     assert_correction_totals(
                         corr_label,

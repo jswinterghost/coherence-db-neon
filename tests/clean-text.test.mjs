@@ -1,7 +1,8 @@
 // Verifies that every kept repository file stays free of personal names, assistant or model names,
 // workstation-specific host paths, em dashes, and customer or carrier names inside src/.
 import assert from 'node:assert/strict';
-import { readdir, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -10,9 +11,14 @@ const j = (...parts) => parts.join('');
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SKIP_DIRS = new Set(['node_modules', j('.', 'dev', 'in'), '.git']);
 const SKIP_REL_DIRS = new Set([`docs/${j('pha', 'lanx', '-plan')}`]);
-const SKIP_FILE_PREFIXES = ['.pass2-', j('.', 'ne', 'on', '-'), j('.', 'pha', 'lanx', '-')];
-const SKIP_EXACT_FILES = new Set(['package-lock.json', '.git']);
+const SKIP_ROOT_FILE_PREFIXES = ['.pass2-', '.step5-', '.review-step5', j('.', 'ne', 'on', '-'), j('.', 'pha', 'lanx', '-')];
+const SKIP_ROOT_EXACT_FILES = new Set(['package-lock.json', '.git', '.history-folders.txt']);
 const ALLOWED_GITIGNORE_LINES = new Set([j('.', 'dev', 'in', '/'), j('.', 'ne', 'on', '-*')]);
+const HOST_PATH_ALLOWED_FILES = new Set([
+  `config/${j('pha', 'lanx')}-history.manifest.json`,
+  'docs/real-history-proof.md',
+]);
+const HOST_PATH_RULES = new Set(['host-user', 'home-path']);
 
 const FORBIDDEN_EVERYWHERE = [
   { label: 'owner-name', re: new RegExp(`\\b${j('Kai', 'ron')}\\b`, 'i') },
@@ -50,18 +56,21 @@ const FORBIDDEN_IN_SRC = [
   { label: 'customer-col', re: new RegExp(`\\b${j('plx', '_id')}\\b`, 'i') },
 ];
 
-async function walkKeptFiles(dir) {
+async function walkKeptFiles(dir, rootDir = REPO_ROOT) {
   const out = [];
   const entries = await readdir(dir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
-      const relDir = relative(REPO_ROOT, join(dir, entry.name)).split(sep).join('/');
+      const relDir = relative(rootDir, join(dir, entry.name)).split(sep).join('/');
       if (SKIP_REL_DIRS.has(relDir)) continue;
-      out.push(...await walkKeptFiles(join(dir, entry.name)));
+      out.push(...await walkKeptFiles(join(dir, entry.name), rootDir));
     } else if (entry.isFile()) {
-      if (SKIP_FILE_PREFIXES.some((prefix) => entry.name.startsWith(prefix))) continue;
-      if (SKIP_EXACT_FILES.has(entry.name)) continue;
+      const relPath = relative(rootDir, join(dir, entry.name)).split(sep).join('/');
+      if (!relPath.includes('/')) {
+        if (SKIP_ROOT_EXACT_FILES.has(relPath)) continue;
+        if (SKIP_ROOT_FILE_PREFIXES.some((prefix) => relPath.startsWith(prefix))) continue;
+      }
       out.push(join(dir, entry.name));
     }
   }
@@ -82,6 +91,7 @@ test('Clean Text: kept repository files contain no personal names, tool/model na
       const line = lines[i];
       if (relPath === '.gitignore' && ALLOWED_GITIGNORE_LINES.has(line.trim())) continue;
       for (const rule of FORBIDDEN_EVERYWHERE) {
+        if (HOST_PATH_ALLOWED_FILES.has(relPath) && HOST_PATH_RULES.has(rule.label)) continue;
         if (rule.re.test(line)) {
           violations.push(`${relPath}:${i + 1} matched forbidden rule [${rule.label}]`);
         }
@@ -97,4 +107,36 @@ test('Clean Text: kept repository files contain no personal names, tool/model na
   }
 
   assert.deepEqual(violations, [], `Clean-text violations found:\n${violations.join('\n')}`);
+});
+
+test('Clean Text: transient skips apply only at repository root by exact relative path, and .gitignore lists transient patterns', async (t) => {
+  const gitignoreLines = new Set(
+    (await readFile(join(REPO_ROOT, '.gitignore'), 'utf8'))
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean),
+  );
+  for (const pat of ['.step5-*', '.review-*', '.real-proof-*', '.history-folders.txt']) {
+    assert.equal(gitignoreLines.has(pat), true, `.gitignore must list ${pat}`);
+  }
+
+  const tmp = await mkdtemp(join(tmpdir(), 'coherence-clean-text-root-'));
+  t.after(() => rm(tmp, { recursive: true, force: true }));
+  await mkdir(join(tmp, 'src'), { recursive: true });
+  await mkdir(join(tmp, 'docs'), { recursive: true });
+  await writeFile(join(tmp, '.step5-temp.md'), 'root transient\n');
+  await writeFile(join(tmp, '.review-step5-proof.diff'), 'root transient\n');
+  await writeFile(join(tmp, '.history-folders.txt'), 'root transient\n');
+  await writeFile(join(tmp, 'src', '.step5-nested.mjs'), 'nested must be scanned\n');
+  await writeFile(join(tmp, 'docs', '.review-step5-nested.diff'), 'nested must be scanned\n');
+  await writeFile(join(tmp, 'docs', '.history-folders.txt'), 'nested must be scanned\n');
+  await writeFile(join(tmp, 'src', 'kept.mjs'), 'ok\n');
+
+  const found = (await walkKeptFiles(tmp, tmp)).map((p) => relative(tmp, p).split(sep).join('/'));
+  assert.deepEqual(found, [
+    'docs/.history-folders.txt',
+    'docs/.review-step5-nested.diff',
+    'src/.step5-nested.mjs',
+    'src/kept.mjs',
+  ]);
 });

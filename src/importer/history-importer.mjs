@@ -113,7 +113,181 @@ function safeOverlayCheckpointRelPath(label, absPath) {
   return `overlay-checkpoints/${sha256Hex(String(label || absPath)).slice(0, 16)}/${base}`;
 }
 
+function validatePinnedSourceFolder(sourceFolder, configKey) {
+  if (typeof sourceFolder !== 'string' || sourceFolder.length === 0 || sourceFolder !== sourceFolder.trim()) {
+    throw new AppError(
+      `Each ${configKey} entry must declare a non-empty trimmed sourceFolder string.`,
+      400,
+      'INVALID_IMPORT_CONFIG',
+    );
+  }
+  if (
+    sourceFolder.startsWith('/')
+    || sourceFolder.endsWith('/')
+    || sourceFolder.includes('\\')
+    || sourceFolder.includes('//')
+    || /[\x01-\x1f\x7f*?]/.test(sourceFolder)
+    || sourceFolder.split('/').some((seg) => !seg || seg === '.' || seg === '..')
+  ) {
+    throw new AppError(
+      `Invalid sourceFolder in ${configKey}: ${sourceFolder}`,
+      400,
+      'INVALID_IMPORT_CONFIG',
+    );
+  }
+  const lowerSf = sourceFolder.toLowerCase();
+  if (
+    lowerSf === 'standing_input'
+    || lowerSf === 'standing-overlay'
+    || lowerSf === 'input/overlay'
+    || lowerSf === 'input/overlay/overlay.csv'
+    || lowerSf.startsWith('standing-overlay/')
+  ) {
+    throw new AppError(
+      `${configKey} cannot include the standing overlay: ${sourceFolder}`,
+      400,
+      'INVALID_IMPORT_CONFIG',
+    );
+  }
+}
+
+function normalizeFreshOverlayRoots(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    throw new AppError(
+      'importConfig.freshOverlayRoots must be an array of { sourceFolder, sha256 } entries.',
+      400,
+      'INVALID_IMPORT_CONFIG',
+    );
+  }
+  const byFolder = new Map();
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new AppError(
+        'Each entry in importConfig.freshOverlayRoots must be an object with { sourceFolder, sha256 }.',
+        400,
+        'INVALID_IMPORT_CONFIG',
+      );
+    }
+    const { sourceFolder, sha256 } = item;
+    validatePinnedSourceFolder(sourceFolder, 'importConfig.freshOverlayRoots');
+    if (typeof sha256 !== 'string' || !SHA256_HEX_RE.test(sha256)) {
+      throw new AppError(
+        `Invalid sha256 in importConfig.freshOverlayRoots for ${sourceFolder}: must be a 64-character lowercase hex SHA-256 digest.`,
+        400,
+        'INVALID_IMPORT_CONFIG',
+      );
+    }
+    if (byFolder.has(sourceFolder)) {
+      if (byFolder.get(sourceFolder) !== sha256) {
+        throw new AppError(
+          `Conflicting sha256 entries in importConfig.freshOverlayRoots for ${sourceFolder}.`,
+          400,
+          'INVALID_IMPORT_CONFIG',
+        );
+      }
+      continue;
+    }
+    byFolder.set(sourceFolder, sha256);
+    out.push({ sourceFolder, sha256 });
+  }
+  return out;
+}
+
+function findPinnedFreshOverlayRoot(sourceFolder, freshOverlayRoots) {
+  if (!sourceFolder || !Array.isArray(freshOverlayRoots) || freshOverlayRoots.length === 0) return null;
+  const sf = String(sourceFolder);
+  for (const entry of freshOverlayRoots) {
+    if (entry.sourceFolder === sf) return entry;
+  }
+  return null;
+}
+
+function normalizeCarriedPriors(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    throw new AppError(
+      'importConfig.carriedPriors must be an array of { sourceFolder, sha256, extendsRowCount, reason? } entries.',
+      400,
+      'INVALID_IMPORT_CONFIG',
+    );
+  }
+  const byFolder = new Map();
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new AppError(
+        'Each entry in importConfig.carriedPriors must be an object with { sourceFolder, sha256, extendsRowCount, reason? }.',
+        400,
+        'INVALID_IMPORT_CONFIG',
+      );
+    }
+    const { sourceFolder, sha256, extendsRowCount, reason } = item;
+    validatePinnedSourceFolder(sourceFolder, 'importConfig.carriedPriors');
+    if (reason !== undefined && reason !== null && (typeof reason !== 'string' || !reason.trim() || reason.length > 600 || /[\x00-\x1f\x7f]/.test(reason))) {
+      throw new AppError(
+        `Invalid reason in importConfig.carriedPriors for ${sourceFolder}: when given, a reason is one non-empty line of at most 600 characters saying why the reference keeps this prior.`,
+        400,
+        'INVALID_IMPORT_CONFIG',
+      );
+    }
+    if (typeof sha256 !== 'string' || !SHA256_HEX_RE.test(sha256)) {
+      throw new AppError(
+        `Invalid sha256 in importConfig.carriedPriors for ${sourceFolder}: must be a 64-character lowercase hex SHA-256 digest.`,
+        400,
+        'INVALID_IMPORT_CONFIG',
+      );
+    }
+    if (!Number.isInteger(extendsRowCount) || extendsRowCount <= 0) {
+      throw new AppError(
+        `Invalid extendsRowCount in importConfig.carriedPriors for ${sourceFolder}: must be a positive integer.`,
+        400,
+        'INVALID_IMPORT_CONFIG',
+      );
+    }
+    if (byFolder.has(sourceFolder)) {
+      const prev = byFolder.get(sourceFolder);
+      if (prev.sha256 !== sha256 || prev.extendsRowCount !== extendsRowCount || prev.reason !== (reason ?? null)) {
+        throw new AppError(
+          `Conflicting entries in importConfig.carriedPriors for ${sourceFolder}.`,
+          400,
+          'INVALID_IMPORT_CONFIG',
+        );
+      }
+      continue;
+    }
+    const entry = { sourceFolder, sha256, extendsRowCount, reason: reason ?? null };
+    byFolder.set(sourceFolder, entry);
+    out.push(entry);
+  }
+  return out;
+}
+
+function findPinnedCarriedPrior(sourceFolder, carriedPriors) {
+  if (!sourceFolder || !Array.isArray(carriedPriors) || carriedPriors.length === 0) return null;
+  const sf = String(sourceFolder);
+  for (const entry of carriedPriors) {
+    if (entry.sourceFolder === sf) return entry;
+  }
+  return null;
+}
+
 function normalizeImportConfig(importConfig = {}) {
+  if (importConfig.allowDisjointOverlayRoots) {
+    throw new AppError(
+      'importConfig.allowDisjointOverlayRoots cannot be true; pin explicit fresh starts with { sourceFolder, sha256 } in importConfig.freshOverlayRoots instead.',
+      400,
+      'DISJOINT_OVERLAY_ROOTS_FORBIDDEN',
+    );
+  }
+  if (importConfig.allowedDisjointOverlaySourceFolders !== undefined) {
+    throw new AppError(
+      'importConfig.allowedDisjointOverlaySourceFolders has been removed; pin explicit fresh starts with { sourceFolder, sha256 } in importConfig.freshOverlayRoots instead.',
+      400,
+      'INVALID_IMPORT_CONFIG',
+    );
+  }
   const includeLegacyHostHistory = Boolean(importConfig.includeLegacyHostHistory);
   return {
     includeLegacyHostHistory,
@@ -128,7 +302,9 @@ function normalizeImportConfig(importConfig = {}) {
       emitNoManager: [],
     },
     allowedMissingCommits: Array.isArray(importConfig.allowedMissingCommits) ? [...importConfig.allowedMissingCommits] : [],
-    allowDisjointOverlayRoots: Boolean(importConfig.allowDisjointOverlayRoots),
+    allowDisjointOverlayRoots: false,
+    freshOverlayRoots: normalizeFreshOverlayRoots(importConfig.freshOverlayRoots),
+    carriedPriors: normalizeCarriedPriors(importConfig.carriedPriors),
     companySentRecords: importConfig.companySentRecords && typeof importConfig.companySentRecords === 'object'
       ? { ...importConfig.companySentRecords }
       : {},
@@ -731,6 +907,434 @@ function extractAuditSentRecords(auditData, sourceLabel = 'company-environment/a
   return sentByDate;
 }
 
+async function discoverAbandonedRunsMetadataOnly(abandonedDir, companySlug) {
+  const runs = [];
+  if (!(await isDir(abandonedDir))) return runs;
+
+  const scan = async (dir, depth = 0) => {
+    if (depth > 5) return;
+    if (dir !== abandonedDir && await isFile(join(dir, 'run.json'))) {
+      const base = relative(abandonedDir, dir).split(sep).join('/');
+      runs.push({
+        origin: 'company_import',
+        sourceFolder: `company-abandoned/${companySlug}/${base}`,
+        absPath: dir,
+        abandoned: true,
+      });
+      return;
+    }
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        await scan(join(dir, entry.name), depth + 1);
+      }
+    }
+  };
+  await scan(abandonedDir, 0);
+  return runs.sort((a, b) => a.sourceFolder.localeCompare(b.sourceFolder));
+}
+
+async function measureFileMetadata(filePath, seenPaths = null) {
+  const info = await stat(filePath).catch(() => null);
+  if (!info || !info.isFile()) return null;
+  const bytes = Number(info.size || 0);
+  if (seenPaths) seenPaths.set(resolve(filePath), bytes);
+  return { files: 1, bytes };
+}
+
+async function measureTreeMetadata(rootDir, { skipDsStore = false, seenPaths = null } = {}) {
+  let files = 0;
+  let bytes = 0;
+  const walk = async (dir) => {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile()) {
+        if (skipDsStore && entry.name === '.DS_Store') continue;
+        const info = await stat(full).catch(() => null);
+        if (!info || !info.isFile()) continue;
+        const sz = Number(info.size || 0);
+        files += 1;
+        bytes += sz;
+        if (seenPaths) seenPaths.set(resolve(full), sz);
+      }
+    }
+  };
+  await walk(rootDir);
+  return { files, bytes };
+}
+
+async function measureDateDirFilesMetadata(rootDir, seenPaths = null) {
+  let files = 0;
+  let bytes = 0;
+  const dates = await readdir(rootDir, { withFileTypes: true }).catch(() => []);
+  for (const d of dates) {
+    if (!d.isDirectory() || !isValidIsoDate(d.name)) continue;
+    const entries = await readdir(join(rootDir, d.name), { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const measured = await measureFileMetadata(join(rootDir, d.name, entry.name), seenPaths);
+      if (measured) {
+        files += measured.files;
+        bytes += measured.bytes;
+      }
+    }
+  }
+  return { files, bytes };
+}
+
+/**
+ * Reads only the manifest JSON plus directory listings and file sizes (never reading any source
+ * file contents or opening SQLite or PostgreSQL), returning strictly PHI-free counts and names.
+ */
+export async function planImportManifestFile(manifestPath) {
+  const absManifest = resolve(manifestPath);
+  const baseDir = dirname(absManifest);
+  const raw = JSON.parse(await readFile(absManifest, 'utf8'));
+  if (!raw || typeof raw !== 'object' || !raw.companySlug) {
+    throw new AppError('Import manifest JSON must declare companySlug.', 400, 'INVALID_MANIFEST');
+  }
+
+  const companySlug = String(raw.companySlug);
+  const config = normalizeImportConfig(raw.importConfig || {});
+  const sources = raw.sources && typeof raw.sources === 'object' ? raw.sources : {};
+  const resolvedSources = {
+    legacyRunsRoot: resolveMaybeRelative(baseDir, sources.legacyRunsRoot),
+    standingInputDir: resolveMaybeRelative(baseDir, sources.standingInputDir),
+    incidentReportDir: resolveMaybeRelative(baseDir, sources.incidentReportDir),
+    legacyReviewSavesDir: resolveMaybeRelative(baseDir, sources.legacyReviewSavesDir),
+    companyWorkspacesDir: resolveMaybeRelative(baseDir, sources.companyWorkspacesDir),
+    companyAbandonedDir: resolveMaybeRelative(baseDir, sources.companyAbandonedDir),
+    companyReviewSavesDir: resolveMaybeRelative(baseDir, sources.companyReviewSavesDir),
+    companyEnvironmentDir: resolveMaybeRelative(baseDir, sources.companyEnvironmentDir),
+    cloudMirrorDir: resolveMaybeRelative(baseDir, sources.cloudMirrorDir),
+    legacySqlitePath: resolveMaybeRelative(baseDir, sources.legacySqlitePath),
+    preCoherenceStatementsDir: resolveMaybeRelative(baseDir, sources.preCoherenceStatementsDir),
+    preCoherenceSentDir: resolveMaybeRelative(baseDir, sources.preCoherenceSentDir),
+    preCoherenceAgentsCsv: resolveMaybeRelative(baseDir, sources.preCoherenceAgentsCsv),
+    methodCorrections: Array.isArray(sources.methodCorrections) ? sources.methodCorrections : [],
+  };
+
+  const coherenceRoot = resolveMaybeRelative(baseDir, raw.coherenceRoot);
+  const coherenceRepo = resolveMaybeRelative(baseDir, raw.coherenceRepo);
+  const nusearDataDir = resolveMaybeRelative(baseDir, raw.nusearDataDir);
+  const nusearSqlitePath = resolveMaybeRelative(baseDir, raw.nusearSqlitePath);
+  const pythonPath = raw.pythonPath && raw.pythonPath.includes('/')
+    ? resolveMaybeRelative(baseDir, raw.pythonPath)
+    : null;
+  const overlayCheckPath = resolveMaybeRelative(baseDir, raw.overlayCheckPath);
+  const legacyBridgePath = resolveMaybeRelative(baseDir, raw.legacyBridgePath);
+
+  const missing = [];
+  const checkDirKey = async (key, pathVal) => {
+    if (!pathVal) return false;
+    const ok = await isDir(pathVal);
+    if (!ok) missing.push({ key, kind: 'folder' });
+    return ok;
+  };
+  const checkFileKey = async (key, pathVal) => {
+    if (!pathVal) return false;
+    const ok = await isFile(pathVal);
+    if (!ok) missing.push({ key, kind: 'file' });
+    return ok;
+  };
+
+  await checkDirKey('coherenceRoot', coherenceRoot);
+  await checkDirKey('coherenceRepo', coherenceRepo);
+  await checkDirKey('nusearDataDir', nusearDataDir);
+  await checkFileKey('nusearSqlitePath', nusearSqlitePath);
+  await checkFileKey('pythonPath', pythonPath);
+  await checkFileKey('overlayCheckPath', overlayCheckPath);
+  await checkFileKey('legacyBridgePath', legacyBridgePath);
+
+  for (const key of CONFIGURED_SOURCE_DIR_KEYS) {
+    await checkDirKey(`sources.${key}`, resolvedSources[key]);
+  }
+  await checkFileKey('sources.preCoherenceAgentsCsv', resolvedSources.preCoherenceAgentsCsv);
+  await checkFileKey('sources.legacySqlitePath', resolvedSources.legacySqlitePath);
+
+  const seenPaths = new Map();
+  const discoveredRunSourceFolders = new Set();
+  const discoveredLegacyRunSourceFolders = new Set();
+  const discoveredCheckpointRelPaths = new Set();
+  const emptyArea = (configured) => ({ configured: Boolean(configured), found: false, runs: 0, files: 0, bytes: 0 });
+
+  const areas = {
+    legacyRuns: emptyArea(resolvedSources.legacyRunsRoot),
+    companyRuns: emptyArea(resolvedSources.companyWorkspacesDir),
+    abandonedRuns: emptyArea(resolvedSources.companyAbandonedDir),
+    standingInput: emptyArea(resolvedSources.standingInputDir),
+    incidentReport: emptyArea(resolvedSources.incidentReportDir),
+    legacyReviewSaves: emptyArea(resolvedSources.legacyReviewSavesDir),
+    companyReviewSaves: emptyArea(resolvedSources.companyReviewSavesDir),
+    companyEnvironment: emptyArea(resolvedSources.companyEnvironmentDir),
+    cloudMirror: emptyArea(resolvedSources.cloudMirrorDir),
+    preCoherenceStatements: emptyArea(resolvedSources.preCoherenceStatementsDir),
+    preCoherenceSent: emptyArea(resolvedSources.preCoherenceSentDir),
+    preCoherenceAgents: emptyArea(resolvedSources.preCoherenceAgentsCsv),
+    overlayCheckpoints: emptyArea(Array.isArray(raw.overlayCheckpoints) && raw.overlayCheckpoints.length > 0),
+    legacySqlite: emptyArea(resolvedSources.legacySqlitePath || nusearSqlitePath),
+  };
+
+  const legacyRunsRoot = resolvedSources.legacyRunsRoot
+    || (config.includeLegacyHostHistory && coherenceRoot ? join(coherenceRoot, 'runs') : null);
+  if (legacyRunsRoot && await isDir(legacyRunsRoot)) {
+    const runs = await discoverLegacyRunFolders(legacyRunsRoot);
+    let files = 0;
+    let bytes = 0;
+    for (const r of runs) {
+      discoveredLegacyRunSourceFolders.add(r.sourceFolder);
+      discoveredRunSourceFolders.add(r.sourceFolder);
+      const m = await measureTreeMetadata(r.absPath, { seenPaths });
+      files += m.files;
+      bytes += m.bytes;
+    }
+    areas.legacyRuns = { configured: Boolean(resolvedSources.legacyRunsRoot), found: true, runs: runs.length, files, bytes };
+  }
+
+  const companyWsDir = resolvedSources.companyWorkspacesDir
+    || (nusearDataDir ? join(nusearDataDir, 'company-workspaces', companySlug) : null);
+  if (companyWsDir && await isDir(companyWsDir)) {
+    const runs = await discoverCompanyRunFolders(companyWsDir, companySlug);
+    let files = 0;
+    let bytes = 0;
+    for (const r of runs) {
+      discoveredRunSourceFolders.add(r.sourceFolder);
+      const m = await measureTreeMetadata(r.absPath, { seenPaths });
+      files += m.files;
+      bytes += m.bytes;
+    }
+    areas.companyRuns = { configured: Boolean(resolvedSources.companyWorkspacesDir), found: true, runs: runs.length, files, bytes };
+  }
+
+  const companyAbandonedDir = resolvedSources.companyAbandonedDir
+    || (nusearDataDir ? join(nusearDataDir, 'company-abandoned', companySlug) : null);
+  if (companyAbandonedDir && await isDir(companyAbandonedDir)) {
+    const runs = await discoverAbandonedRunsMetadataOnly(companyAbandonedDir, companySlug);
+    for (const r of runs) discoveredRunSourceFolders.add(r.sourceFolder);
+    const m = await measureTreeMetadata(companyAbandonedDir, { seenPaths });
+    areas.abandonedRuns = { configured: Boolean(resolvedSources.companyAbandonedDir), found: true, runs: runs.length, files: m.files, bytes: m.bytes };
+  }
+
+  const compEnvDir = resolvedSources.companyEnvironmentDir
+    || (nusearDataDir ? join(nusearDataDir, 'company-environments', companySlug) : null);
+  const legacyInput = resolvedSources.standingInputDir
+    || (config.includeLegacyHostHistory && coherenceRoot ? join(coherenceRoot, 'input') : null);
+  let effectiveStandingDir = null;
+  if (legacyInput && !config.useCompanyIncomingInput && await isDir(legacyInput)) {
+    effectiveStandingDir = legacyInput;
+  } else if (resolvedSources.standingInputDir && await isDir(resolvedSources.standingInputDir)) {
+    effectiveStandingDir = resolvedSources.standingInputDir;
+  } else if (!resolvedSources.standingInputDir && config.useCompanyIncomingInput && compEnvDir && await isDir(join(compEnvDir, 'incoming'))) {
+    effectiveStandingDir = join(compEnvDir, 'incoming');
+  }
+  if (effectiveStandingDir) {
+    const m = await measureTreeMetadata(effectiveStandingDir, { seenPaths });
+    areas.standingInput = { configured: Boolean(resolvedSources.standingInputDir), found: true, runs: 0, files: m.files, bytes: m.bytes };
+  }
+
+  const incidentRoot = resolvedSources.incidentReportDir
+    || (config.includeLegacyHostHistory && coherenceRoot ? join(coherenceRoot, 'runs', 'Incident Report') : null);
+  if (incidentRoot && await isDir(incidentRoot)) {
+    const m = await measureTreeMetadata(incidentRoot, { seenPaths });
+    areas.incidentReport = { configured: Boolean(resolvedSources.incidentReportDir), found: true, runs: 0, files: m.files, bytes: m.bytes };
+  }
+
+  const legacySavesDir = resolvedSources.legacyReviewSavesDir
+    || (config.includeLegacyHostHistory && nusearDataDir ? join(nusearDataDir, 'coherence-runs') : null);
+  if (legacySavesDir && await isDir(legacySavesDir)) {
+    const m = await measureDateDirFilesMetadata(legacySavesDir, seenPaths);
+    areas.legacyReviewSaves = { configured: Boolean(resolvedSources.legacyReviewSavesDir), found: true, runs: 0, files: m.files, bytes: m.bytes };
+  }
+
+  const companySavesDir = resolvedSources.companyReviewSavesDir
+    || (nusearDataDir ? join(nusearDataDir, 'company-runs', companySlug) : null);
+  if (companySavesDir && await isDir(companySavesDir)) {
+    const m = await measureDateDirFilesMetadata(companySavesDir, seenPaths);
+    areas.companyReviewSaves = { configured: Boolean(resolvedSources.companyReviewSavesDir), found: true, runs: 0, files: m.files, bytes: m.bytes };
+  }
+
+  if (compEnvDir && await isDir(compEnvDir)) {
+    let files = 0;
+    let bytes = 0;
+    for (const sub of ['staging', 'documents', 'inventories', 'replaced', 'finished']) {
+      const subDir = join(compEnvDir, sub);
+      if (await isDir(subDir)) {
+        const m = await measureTreeMetadata(subDir, { seenPaths });
+        files += m.files;
+        bytes += m.bytes;
+      }
+    }
+    const rootEntries = await readdir(compEnvDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of rootEntries) {
+      if (!entry.isFile()) continue;
+      if (entry.name === 'audit.json' || ANSWER_KEY_RE.test(entry.name)) {
+        const m = await measureFileMetadata(join(compEnvDir, entry.name), seenPaths);
+        if (m) {
+          files += m.files;
+          bytes += m.bytes;
+        }
+      }
+    }
+    areas.companyEnvironment = { configured: Boolean(resolvedSources.companyEnvironmentDir), found: true, runs: 0, files, bytes };
+  }
+
+  if (resolvedSources.cloudMirrorDir && await isDir(resolvedSources.cloudMirrorDir)) {
+    const m = await measureTreeMetadata(resolvedSources.cloudMirrorDir, { seenPaths });
+    areas.cloudMirror = { configured: true, found: true, runs: 0, files: m.files, bytes: m.bytes };
+  }
+
+  if (resolvedSources.preCoherenceStatementsDir && await isDir(resolvedSources.preCoherenceStatementsDir)) {
+    const m = await measureTreeMetadata(resolvedSources.preCoherenceStatementsDir, { skipDsStore: true, seenPaths });
+    areas.preCoherenceStatements = { configured: true, found: true, runs: 0, files: m.files, bytes: m.bytes };
+  }
+
+  if (resolvedSources.preCoherenceSentDir && await isDir(resolvedSources.preCoherenceSentDir)) {
+    const m = await measureTreeMetadata(resolvedSources.preCoherenceSentDir, { seenPaths });
+    areas.preCoherenceSent = { configured: true, found: true, runs: 0, files: m.files, bytes: m.bytes };
+  }
+
+  if (resolvedSources.preCoherenceAgentsCsv) {
+    const m = await measureFileMetadata(resolvedSources.preCoherenceAgentsCsv, seenPaths);
+    if (m) {
+      areas.preCoherenceAgents = { configured: true, found: true, runs: 0, files: m.files, bytes: m.bytes };
+    }
+  }
+
+  const rawCheckpoints = Array.isArray(raw.overlayCheckpoints) ? raw.overlayCheckpoints : [];
+  for (let i = 0; i < rawCheckpoints.length; i++) {
+    if (rawCheckpoints[i]?.allowDisjointRoot) {
+      throw new AppError(
+        `overlayCheckpoints[${i}].allowDisjointRoot cannot be true; pin explicit fresh roots in importConfig.freshOverlayRoots instead.`,
+        400,
+        'DISJOINT_OVERLAY_ROOTS_FORBIDDEN',
+      );
+    }
+  }
+  if (rawCheckpoints.length > 0) {
+    let foundCount = 0;
+    let bytes = 0;
+    for (let i = 0; i < rawCheckpoints.length; i++) {
+      const cp = rawCheckpoints[i];
+      const absPath = resolveMaybeRelative(baseDir, cp?.path || cp?.absPath);
+      const measured = absPath ? await measureFileMetadata(absPath, seenPaths) : null;
+      if (measured) {
+        foundCount += 1;
+        bytes += measured.bytes;
+        if (!cp?.extendsCommitId) {
+          const label = cp?.label || cp?.relPath || absPath;
+          discoveredCheckpointRelPaths.add(safeOverlayCheckpointRelPath(label, absPath));
+        }
+      } else {
+        missing.push({
+          key: `overlayCheckpoints[${i}]`,
+          kind: 'file',
+          name: cp?.label || `overlayCheckpoints[${i}]`,
+        });
+      }
+    }
+    areas.overlayCheckpoints = {
+      configured: true,
+      found: foundCount === rawCheckpoints.length,
+      runs: 0,
+      files: foundCount,
+      bytes,
+    };
+  }
+
+  const effectiveSqlitePath = resolvedSources.legacySqlitePath || nusearSqlitePath || null;
+  if (effectiveSqlitePath) {
+    const m = await measureFileMetadata(effectiveSqlitePath, seenPaths);
+    if (m) {
+      areas.legacySqlite = { configured: true, found: true, runs: 0, files: m.files, bytes: m.bytes };
+    }
+  }
+
+  const rawCompareTargets = Array.isArray(raw.compareTargets) ? raw.compareTargets : [];
+  const compareTargets = [];
+  for (let i = 0; i < rawCompareTargets.length; i++) {
+    const ct = rawCompareTargets[i] || {};
+    const name = ct.label
+      || (ct.leftRunSourceFolder && ct.rightRunSourceFolder
+        ? `${ct.leftRunSourceFolder} vs ${ct.rightRunSourceFolder}`
+        : (ct.leftRunSourceFolder || `compareTargets[${i}]`));
+
+    let leftFound = false;
+    if (ct.leftRunSourceFolder) {
+      leftFound = discoveredRunSourceFolders.has(ct.leftRunSourceFolder);
+      if (!leftFound) missing.push({ key: `compareTargets[${i}].leftRunSourceFolder`, kind: 'run', name });
+    } else if (ct.leftDir) {
+      leftFound = await isDir(resolveMaybeRelative(baseDir, ct.leftDir));
+      if (!leftFound) missing.push({ key: `compareTargets[${i}].leftDir`, kind: 'folder', name });
+    } else {
+      missing.push({ key: `compareTargets[${i}].left`, kind: 'target', name });
+    }
+
+    let rightFound = false;
+    if (ct.rightRunSourceFolder) {
+      rightFound = discoveredRunSourceFolders.has(ct.rightRunSourceFolder);
+      if (!rightFound) missing.push({ key: `compareTargets[${i}].rightRunSourceFolder`, kind: 'run', name });
+    } else if (ct.rightDir) {
+      rightFound = await isDir(resolveMaybeRelative(baseDir, ct.rightDir));
+      if (!rightFound) missing.push({ key: `compareTargets[${i}].rightDir`, kind: 'folder', name });
+    } else {
+      missing.push({ key: `compareTargets[${i}].right`, kind: 'target', name });
+    }
+
+    compareTargets.push({
+      name,
+      status: leftFound && rightFound ? 'found' : 'missing',
+      left: leftFound ? 'found' : 'missing',
+      right: rightFound ? 'found' : 'missing',
+    });
+  }
+
+  for (let i = 0; i < config.freshOverlayRoots.length; i++) {
+    const entry = config.freshOverlayRoots[i];
+    if (
+      !discoveredLegacyRunSourceFolders.has(entry.sourceFolder)
+      && !discoveredCheckpointRelPaths.has(entry.sourceFolder)
+    ) {
+      missing.push({
+        key: `importConfig.freshOverlayRoots[${i}].sourceFolder`,
+        kind: 'run',
+        name: entry.sourceFolder,
+      });
+    }
+  }
+  for (let i = 0; i < config.carriedPriors.length; i++) {
+    const entry = config.carriedPriors[i];
+    if (!discoveredLegacyRunSourceFolders.has(entry.sourceFolder)) {
+      missing.push({
+        key: `importConfig.carriedPriors[${i}].sourceFolder`,
+        kind: 'run',
+        name: entry.sourceFolder,
+      });
+    }
+  }
+
+  let totalBytes = 0;
+  for (const sz of seenPaths.values()) totalBytes += sz;
+  const totalRuns = areas.legacyRuns.runs + areas.companyRuns.runs + areas.abandonedRuns.runs;
+
+  return {
+    mode: 'plan',
+    passed: missing.length === 0,
+    companySlug,
+    areas,
+    totals: {
+      runs: totalRuns,
+      files: seenPaths.size,
+      bytes: totalBytes,
+    },
+    methodCorrectionsCount: resolvedSources.methodCorrections.length,
+    compareTargets,
+    missing,
+  };
+}
+
 /**
  * Loads a company-agnostic JSON manifest file describing all read-only history sources
  * and builds the resolved import manifest without hardcoding any company names in code.
@@ -842,6 +1446,13 @@ async function validateConfiguredManifestPaths({ coherenceRoot, nusearDataDir, s
     }
   }
   for (const cp of (overlayCheckpoints || [])) {
+    if (cp?.allowDisjointRoot) {
+      throw new AppError(
+        'overlayCheckpoints entries cannot set allowDisjointRoot: true; pin explicit fresh roots in importConfig.freshOverlayRoots instead.',
+        400,
+        'DISJOINT_OVERLAY_ROOTS_FORBIDDEN',
+      );
+    }
     const absPath = cp?.absPath || cp?.path;
     if (!absPath || !(await isFile(absPath))) {
       throw new AppError(
@@ -1199,6 +1810,29 @@ async function loadDecisionLineageTracker(pool) {
   const commits = [];
   const byId = new Map();
 
+  const priorOnlyEmptyRes = await pool.query(
+    `SELECT DISTINCT dc.id
+     FROM coherence.decision_commits dc
+     WHERE dc.cumulative_decision_count = 0
+       AND EXISTS (
+         SELECT 1 FROM coherence.generated_overlays go
+         WHERE go.decision_commit_id = dc.id AND go.purpose = 'prior_input'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM coherence.generated_overlays go
+         WHERE go.decision_commit_id = dc.id AND go.purpose <> 'prior_input'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM coherence.review_saves rs
+         WHERE rs.decision_commit_id = dc.id
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM coherence.imported_files i
+         WHERE i.metadata->>'decisionCommitId' = dc.id::text
+       )`,
+  );
+  const priorOnlyEmptyIds = new Set(priorOnlyEmptyRes.rows.map((r) => r.id));
+
   const res = await pool.query(
     `SELECT id, parent_commit_id, commit_kind, header_contract, cumulative_decision_count, journal_seq
      FROM coherence.decision_commits
@@ -1223,12 +1857,14 @@ async function loadDecisionLineageTracker(pool) {
     for (const r of decRes.rows) {
       headByRecordId.set(r.record_id, r.id);
     }
+    const cumulativeCount = Number(row.cumulative_decision_count);
     const entry = {
       id: row.id,
       parentCommitId: row.parent_commit_id,
       commitKind: row.commit_kind,
       headerContract: row.header_contract,
-      cumulativeCount: Number(row.cumulative_decision_count),
+      cumulativeCount,
+      priorOnly: cumulativeCount === 0 && priorOnlyEmptyIds.has(row.id),
       rows: normalizedRows,
       signatures,
       headByRecordId,
@@ -1241,11 +1877,60 @@ async function loadDecisionLineageTracker(pool) {
   return {
     commits,
     byId,
-    hasNonEmptyCommits() {
-      return commits.some((c) => c.cumulativeCount > 0);
-    },
     findEmptyCommit(headerContract) {
       return commits.find((c) => c.cumulativeCount === 0 && c.headerContract === headerContract) || null;
+    },
+    markNotPriorOnly(commitId) {
+      const entry = byId.get(commitId);
+      if (entry) entry.priorOnly = false;
+    },
+    findExactMatchingCommit(candidateSigs, preferredHeader) {
+      if (candidateSigs.length === 0 && commits.some((c) => c.cumulativeCount > 0)) {
+        return null;
+      }
+      let best = null;
+      for (const c of commits) {
+        if (c.cumulativeCount !== candidateSigs.length) continue;
+        if (c.cumulativeCount === 0 && c.priorOnly) continue;
+        let matches = true;
+        for (let i = 0; i < c.cumulativeCount; i++) {
+          if (c.signatures[i] !== candidateSigs[i]) {
+            matches = false;
+            break;
+          }
+        }
+        if (!matches) continue;
+        if (
+          !best
+          || (c.headerContract === preferredHeader && best.headerContract !== preferredHeader)
+        ) {
+          best = c;
+        }
+      }
+      return best;
+    },
+    findMatchingAncestorWithRowCount(candidateSigs, expectedRowCount, preferredHeader) {
+      if (!Number.isInteger(expectedRowCount) || expectedRowCount <= 0) return null;
+      if (candidateSigs.length <= expectedRowCount) return null;
+      let best = null;
+      for (const c of commits) {
+        if (c.cumulativeCount !== expectedRowCount) continue;
+        let matches = true;
+        for (let i = 0; i < expectedRowCount; i++) {
+          if (c.signatures[i] !== candidateSigs[i]) {
+            matches = false;
+            break;
+          }
+        }
+        if (!matches) continue;
+        if (
+          !best
+          || (c.headerContract === preferredHeader && best.headerContract !== preferredHeader)
+        ) {
+          best = c;
+        }
+      }
+      return best;
     },
     findDeepestMatchingAncestor(candidateSigs, preferredHeader) {
       let best = null;
@@ -1282,7 +1967,16 @@ async function loadDecisionLineageTracker(pool) {
       }
       return longestPrefix + 1;
     },
-    registerCommit({ id, parentCommitId, commitKind, headerContract, addedRows, addedDecisionIds, persisted = false }) {
+    registerCommit({
+      id,
+      parentCommitId,
+      commitKind,
+      headerContract,
+      addedRows,
+      addedDecisionIds,
+      persisted = false,
+      priorOnly = false,
+    }) {
       const parent = parentCommitId ? byId.get(parentCommitId) : null;
       const rows = [...(parent ? parent.rows : []), ...addedRows.map(normalizeOverlayRow)];
       const signatures = [...(parent ? parent.signatures : []), ...addedRows.map(rowSignature)];
@@ -1296,6 +1990,7 @@ async function loadDecisionLineageTracker(pool) {
         commitKind,
         headerContract,
         cumulativeCount: rows.length,
+        priorOnly: rows.length === 0 && Boolean(priorOnly),
         rows,
         signatures,
         headByRecordId,
@@ -1375,11 +2070,15 @@ function buildDecisionRowsForCommit({
 async function resolveOverlayCheckpoint({
   tracker,
   absPath,
+  fileSha256 = null,
   checkpointLabel,
   runLabel,
+  mode = 'no_prior_run_start',
   requiredParentCommitId = null,
   requiredParentPath = null,
-  allowDisjointRoot = false,
+  freshRootEntry = null,
+  carriedPriorEntry = null,
+  allowEmptyParentReattach = false,
   commitKind = 'historical_overlay',
   runId = '__THIS_RUN__',
   reviewSaveId = null,
@@ -1390,108 +2089,30 @@ async function resolveOverlayCheckpoint({
   parseOpts,
   tempBaseDir,
 }) {
-  if (requiredParentCommitId) {
-    const parent = tracker.byId.get(requiredParentCommitId);
-    if (!parent) {
-      throw new AppError(`Missing parent decision commit for ${runLabel} (${checkpointLabel}).`, 500, 'PARENT_COMMIT_MISSING');
-    }
-    let tempParentDir = null;
-    let parentCsvPath = requiredParentPath;
-    try {
-      if (!parentCsvPath) {
-        tempParentDir = await mkdtemp(join(tempBaseDir, 'coherence-parent-ov-'));
-        parentCsvPath = join(tempParentDir, 'parent-overlay.csv');
-        const formatted = formatOverlayCsvFromRows(parent.rows, { headerContract: parent.headerContract });
-        await writeFile(parentCsvPath, formatted.bytes);
-      }
-      let parsed;
-      try {
-        parsed = await parseOverlay(absPath, { ...parseOpts, parentPath: parentCsvPath });
-      } catch (err) {
-        if (err?.code === 'OVERLAY_PREFIX_MISMATCH') {
-          const firstRow = err.firstDifferingRow ?? 1;
-          const mismatch = new AppError(
-            `Overlay prefix mismatch in run ${runLabel} at checkpoint ${checkpointLabel} (first differing row: ${firstRow}).`,
-            422,
-            'OVERLAY_PREFIX_MISMATCH',
-          );
-          mismatch.run = runLabel;
-          mismatch.checkpoint = checkpointLabel;
-          mismatch.firstDifferingRow = firstRow;
-          throw mismatch;
-        }
-        throw err;
-      }
+  const throwPrefixMismatch = (firstRow, detail) => {
+    const mismatch = new AppError(
+      `Overlay prefix mismatch in run ${runLabel} at checkpoint ${checkpointLabel}${detail ? `: ${detail}` : ''} (first differing row: ${firstRow}).`,
+      422,
+      'OVERLAY_PREFIX_MISMATCH',
+    );
+    mismatch.run = runLabel;
+    mismatch.checkpoint = checkpointLabel;
+    mismatch.firstDifferingRow = firstRow;
+    throw mismatch;
+  };
 
-      if (parsed.addedRows.length === 0 && parsed.headerKind === parent.headerContract) {
-        return {
-          commitId: parent.id,
-          reused: true,
-          headerContract: parsed.headerKind,
-          rowCount: parsed.rowCount,
-          parsed,
-          newCommit: null,
-          newDecisions: [],
-        };
-      }
-
-      const commitId = randomUUID();
-      const { decisionRows, decisionIds } = buildDecisionRowsForCommit({
-        commitId,
-        parentHeadByKey: parent.headByRecordId,
-        addedRows: parsed.addedRows,
-        headerContract: parsed.headerKind,
-        runId,
-        reviewSaveId,
-        surface,
-        decidedBy,
-        originalAt,
-      });
-      const newCommit = {
-        id: commitId,
-        parentCommitId: parent.id,
-        commitKind,
-        headerContract: parsed.headerKind,
-        addedDecisionCount: decisionRows.length,
-        cumulativeDecisionCount: parsed.rowCount,
-        addedDecisionsSha256: hashDecisions(decisionRows),
-        imported: true,
-        originalAt,
-      };
-      tracker.registerCommit({
-        id: commitId,
-        parentCommitId: parent.id,
-        commitKind,
-        headerContract: parsed.headerKind,
-        addedRows: parsed.addedRows,
-        addedDecisionIds: decisionIds,
-        persisted: false,
-      });
-      return {
-        commitId,
-        reused: false,
-        headerContract: parsed.headerKind,
-        rowCount: parsed.rowCount,
-        parsed,
-        newCommit,
-        newDecisions: decisionRows,
-      };
-    } finally {
-      if (tempParentDir) await rm(tempParentDir, { recursive: true, force: true }).catch(() => {});
-    }
-  }
-
-  // No required within-run parent: parse standalone and attach to deepest matching ancestor commit in the DAG.
-  const fullParsed = await parseOverlay(absPath, { ...parseOpts, parentPath: null });
-  const allRows = fullParsed.addedRows;
-  const sigs = allRows.map(rowSignature);
-
-  if (allRows.length === 0) {
+  const getOrCreateEmptyCommit = (fullParsed, { priorOnly = false } = {}) => {
     const existingEmpty = tracker.findEmptyCommit(fullParsed.headerKind);
     if (existingEmpty) {
+      if (!priorOnly) tracker.markNotPriorOnly(existingEmpty.id);
       return {
         commitId: existingEmpty.id,
         reused: true,
+        isFreshRoot: false,
+        isCarriedPrior: false,
+        resolvedRootCommitId: null,
+        parsedAgainstRequiredParent: false,
+        verifiedFreshRootPin: false,
         headerContract: fullParsed.headerKind,
         rowCount: 0,
         parsed: fullParsed,
@@ -1519,58 +2140,293 @@ async function resolveOverlayCheckpoint({
       addedRows: [],
       addedDecisionIds: [],
       persisted: false,
+      priorOnly,
     });
     return {
       commitId,
       reused: false,
+      isFreshRoot: false,
+      isCarriedPrior: false,
+      resolvedRootCommitId: null,
+      parsedAgainstRequiredParent: false,
+      verifiedFreshRootPin: false,
       headerContract: fullParsed.headerKind,
       rowCount: 0,
       parsed: fullParsed,
       newCommit,
       newDecisions: [],
     };
+  };
+
+  const extendSpecificParent = async (
+    parent,
+    parentPath,
+    {
+      parsedAgainstRequiredParent,
+      requireExactZeroAdded = false,
+      runIdOverride = undefined,
+      decidedByOverride = undefined,
+    },
+  ) => {
+    let tempParentDir = null;
+    let parentCsvPath = parentPath;
+    try {
+      if (!parentCsvPath) {
+        tempParentDir = await mkdtemp(join(tempBaseDir, 'coherence-parent-ov-'));
+        parentCsvPath = join(tempParentDir, 'parent-overlay.csv');
+        const formatted = formatOverlayCsvFromRows(parent.rows, { headerContract: parent.headerContract });
+        await writeFile(parentCsvPath, formatted.bytes);
+      }
+      let parsed;
+      try {
+        parsed = await parseOverlay(absPath, { ...parseOpts, parentPath: parentCsvPath });
+      } catch (err) {
+        if (err?.code === 'OVERLAY_PREFIX_MISMATCH') {
+          throwPrefixMismatch(err.firstDifferingRow ?? 1, null);
+        }
+        throw err;
+      }
+      if (requireExactZeroAdded && parsed.addedRows.length !== 0) {
+        throwPrefixMismatch(parent.cumulativeCount + 1, 'does not equal any known decision commit');
+      }
+      if (parsed.addedRows.length === 0 && parsed.headerKind === parent.headerContract) {
+        if (!requireExactZeroAdded) tracker.markNotPriorOnly(parent.id);
+        return {
+          commitId: parent.id,
+          reused: true,
+          isFreshRoot: false,
+          isCarriedPrior: false,
+          resolvedRootCommitId: null,
+          parsedAgainstRequiredParent,
+          verifiedFreshRootPin: false,
+          headerContract: parsed.headerKind,
+          rowCount: parsed.rowCount,
+          parsed,
+          newCommit: null,
+          newDecisions: [],
+        };
+      }
+      const commitId = randomUUID();
+      const { decisionRows, decisionIds } = buildDecisionRowsForCommit({
+        commitId,
+        parentHeadByKey: parent.headByRecordId,
+        addedRows: parsed.addedRows,
+        headerContract: parsed.headerKind,
+        runId: runIdOverride !== undefined ? runIdOverride : runId,
+        reviewSaveId,
+        surface,
+        decidedBy: decidedByOverride !== undefined ? decidedByOverride : decidedBy,
+        originalAt,
+      });
+      const newCommit = {
+        id: commitId,
+        parentCommitId: parent.id,
+        commitKind,
+        headerContract: parsed.headerKind,
+        addedDecisionCount: decisionRows.length,
+        cumulativeDecisionCount: parsed.rowCount,
+        addedDecisionsSha256: hashDecisions(decisionRows),
+        imported: true,
+        originalAt,
+      };
+      tracker.registerCommit({
+        id: commitId,
+        parentCommitId: parent.id,
+        commitKind,
+        headerContract: parsed.headerKind,
+        addedRows: parsed.addedRows,
+        addedDecisionIds: decisionIds,
+        persisted: false,
+        priorOnly: false,
+      });
+      return {
+        commitId,
+        reused: false,
+        isFreshRoot: false,
+        isCarriedPrior: false,
+        resolvedRootCommitId: null,
+        parsedAgainstRequiredParent,
+        verifiedFreshRootPin: false,
+        headerContract: parsed.headerKind,
+        rowCount: parsed.rowCount,
+        parsed,
+        newCommit,
+        newDecisions: decisionRows,
+      };
+    } finally {
+      if (tempParentDir) await rm(tempParentDir, { recursive: true, force: true }).catch(() => {});
+    }
+  };
+
+  let preParsedStandalone = null;
+
+  if (mode === 'extend_run_parent') {
+    const parent = requiredParentCommitId ? tracker.byId.get(requiredParentCommitId) : null;
+    if (!parent) {
+      throw new AppError(`Missing parent decision commit for ${runLabel} (${checkpointLabel}).`, 500, 'PARENT_COMMIT_MISSING');
+    }
+    if (parent.cumulativeCount > 0) {
+      if (freshRootEntry) {
+        throwPrefixMismatch(1, `cannot apply importConfig.freshOverlayRoots (${freshRootEntry.sourceFolder}) after a non-empty parent commit`);
+      }
+      return extendSpecificParent(parent, requiredParentPath, { parsedAgainstRequiredParent: true });
+    }
+    if (freshRootEntry && (!fileSha256 || freshRootEntry.sha256 !== fileSha256)) {
+      throwPrefixMismatch(1, `SHA-256 mismatch against importConfig.freshOverlayRoots for ${freshRootEntry.sourceFolder}`);
+    }
+    const verifiedFreshRootPin = Boolean(freshRootEntry);
+    if (!allowEmptyParentReattach) {
+      const ext = await extendSpecificParent(parent, requiredParentPath, { parsedAgainstRequiredParent: true });
+      return { ...ext, verifiedFreshRootPin };
+    }
+    // Empty prior (0 rows): the run's files extend nothing, so empty files stay empty and
+    // non-empty files either match/extend a known commit or start a fresh root only under rule 2.
+    preParsedStandalone = await parseOverlay(absPath, { ...parseOpts, parentPath: null });
+    if (preParsedStandalone.addedRows.length === 0) {
+      return { ...getOrCreateEmptyCommit(preParsedStandalone, { priorOnly: false }), verifiedFreshRootPin };
+    }
+  } else if (mode === 'exact_known_commit' || mode === 'legacy_frozen_prior') {
+    const fullParsed = await parseOverlay(absPath, { ...parseOpts, parentPath: null });
+    const allRows = fullParsed.addedRows;
+    const sigs = allRows.map(rowSignature);
+
+    if (mode === 'legacy_frozen_prior' && carriedPriorEntry) {
+      if (!fileSha256 || carriedPriorEntry.sha256 !== fileSha256) {
+        const firstRow = allRows.length === 0 ? 1 : tracker.findClosestMismatchRow(sigs);
+        throwPrefixMismatch(firstRow, `SHA-256 mismatch against importConfig.carriedPriors for ${carriedPriorEntry.sourceFolder}`);
+      }
+    }
+
+    if (allRows.length === 0 && mode === 'legacy_frozen_prior') {
+      if (carriedPriorEntry) {
+        throwPrefixMismatch(
+          1,
+          `does not extend a known decision commit of exactly ${carriedPriorEntry.extendsRowCount} rows as configured in importConfig.carriedPriors for ${carriedPriorEntry.sourceFolder}`,
+        );
+      }
+      return getOrCreateEmptyCommit(fullParsed, { priorOnly: true });
+    }
+
+    const exactCommit = tracker.findExactMatchingCommit(sigs, fullParsed.headerKind);
+    if (!exactCommit) {
+      if (mode === 'legacy_frozen_prior' && carriedPriorEntry) {
+        const carriedParent = tracker.findMatchingAncestorWithRowCount(
+          sigs,
+          carriedPriorEntry.extendsRowCount,
+          fullParsed.headerKind,
+        );
+        if (!carriedParent) {
+          const firstRow = allRows.length === 0 ? 1 : tracker.findClosestMismatchRow(sigs);
+          throwPrefixMismatch(
+            firstRow,
+            `does not extend a known decision commit of exactly ${carriedPriorEntry.extendsRowCount} rows as configured in importConfig.carriedPriors for ${carriedPriorEntry.sourceFolder}`,
+          );
+        }
+        const carriedRes = await extendSpecificParent(carriedParent, null, {
+          parsedAgainstRequiredParent: false,
+          runIdOverride: null,
+          decidedByOverride: 'historical_import_reference_append',
+        });
+        return {
+          ...carriedRes,
+          isCarriedPrior: true,
+          parentCommitId: carriedParent.id,
+          addedRowCount: carriedRes.parsed.addedRows.length,
+        };
+      }
+      const firstRow = allRows.length === 0 ? 1 : tracker.findClosestMismatchRow(sigs);
+      throwPrefixMismatch(firstRow, 'does not equal any known decision commit');
+    }
+    if (exactCommit.cumulativeCount === 0) {
+      if (exactCommit.headerContract === fullParsed.headerKind) {
+        return {
+          commitId: exactCommit.id,
+          reused: true,
+          isFreshRoot: false,
+          isCarriedPrior: false,
+          resolvedRootCommitId: null,
+          parsedAgainstRequiredParent: false,
+          verifiedFreshRootPin: false,
+          headerContract: fullParsed.headerKind,
+          rowCount: 0,
+          parsed: fullParsed,
+          newCommit: null,
+          newDecisions: [],
+        };
+      }
+      const commitId = randomUUID();
+      const newCommit = {
+        id: commitId,
+        parentCommitId: exactCommit.id,
+        commitKind,
+        headerContract: fullParsed.headerKind,
+        addedDecisionCount: 0,
+        cumulativeDecisionCount: 0,
+        addedDecisionsSha256: hashDecisions([]),
+        imported: true,
+        originalAt,
+      };
+      tracker.registerCommit({
+        id: commitId,
+        parentCommitId: exactCommit.id,
+        commitKind,
+        headerContract: fullParsed.headerKind,
+        addedRows: [],
+        addedDecisionIds: [],
+        persisted: false,
+        priorOnly: false,
+      });
+      return {
+        commitId,
+        reused: false,
+        isFreshRoot: false,
+        isCarriedPrior: false,
+        resolvedRootCommitId: null,
+        parsedAgainstRequiredParent: false,
+        verifiedFreshRootPin: false,
+        headerContract: fullParsed.headerKind,
+        rowCount: 0,
+        parsed: fullParsed,
+        newCommit,
+        newDecisions: [],
+      };
+    }
+    return extendSpecificParent(exactCommit, null, {
+      parsedAgainstRequiredParent: false,
+      requireExactZeroAdded: true,
+    });
+  }
+
+  // No-prior run start (or first non-empty file after an empty 0-row prior).
+  if (freshRootEntry && (!fileSha256 || freshRootEntry.sha256 !== fileSha256)) {
+    throwPrefixMismatch(1, `SHA-256 mismatch against importConfig.freshOverlayRoots for ${freshRootEntry.sourceFolder}`);
+  }
+  const verifiedFreshRootPin = Boolean(freshRootEntry);
+
+  const fullParsed = preParsedStandalone || await parseOverlay(absPath, { ...parseOpts, parentPath: null });
+  const allRows = fullParsed.addedRows;
+  const sigs = allRows.map(rowSignature);
+
+  if (allRows.length === 0) {
+    return { ...getOrCreateEmptyCommit(fullParsed, { priorOnly: false }), verifiedFreshRootPin };
   }
 
   const ancestor = tracker.findDeepestMatchingAncestor(sigs, fullParsed.headerKind);
   if (ancestor) {
-    // Re-validate strictly through Coherence's Python reader against the matched ancestor CSV.
-    return resolveOverlayCheckpoint({
-      tracker,
-      absPath,
-      checkpointLabel,
-      runLabel,
-      requiredParentCommitId: ancestor.id,
-      requiredParentPath: null,
-      allowDisjointRoot,
-      commitKind,
-      runId,
-      reviewSaveId,
-      surface,
-      decidedBy,
-      originalAt,
-      parseOverlay,
-      parseOpts,
-      tempBaseDir,
-    });
+    const extended = await extendSpecificParent(ancestor, null, { parsedAgainstRequiredParent: false });
+    if (extended.reused && ancestor.parentCommitId === null && ancestor.cumulativeCount > 0) {
+      return { ...extended, resolvedRootCommitId: ancestor.id, verifiedFreshRootPin };
+    }
+    return { ...extended, verifiedFreshRootPin };
   }
 
-  if (tracker.hasNonEmptyCommits() && !allowDisjointRoot) {
+  if (!freshRootEntry) {
     const firstRow = tracker.findClosestMismatchRow(sigs);
-    const mismatch = new AppError(
-      `Overlay prefix mismatch in run ${runLabel} at checkpoint ${checkpointLabel}: does not extend any known decision commit (first differing row: ${firstRow}).`,
-      422,
-      'OVERLAY_PREFIX_MISMATCH',
-    );
-    mismatch.run = runLabel;
-    mismatch.checkpoint = checkpointLabel;
-    mismatch.firstDifferingRow = firstRow;
-    throw mismatch;
+    throwPrefixMismatch(firstRow, 'does not extend any known decision commit and is not listed in importConfig.freshOverlayRoots');
   }
 
   const commitId = randomUUID();
-  const rootKind = !tracker.hasNonEmptyCommits() && commitKind === 'historical_overlay'
-    ? 'historical_baseline'
-    : commitKind;
+  const rootKind = 'historical_overlay';
   const { decisionRows, decisionIds } = buildDecisionRowsForCommit({
     commitId,
     parentHeadByKey: null,
@@ -1601,10 +2457,16 @@ async function resolveOverlayCheckpoint({
     addedRows: allRows,
     addedDecisionIds: decisionIds,
     persisted: false,
+    priorOnly: false,
   });
   return {
     commitId,
     reused: false,
+    isFreshRoot: true,
+    isCarriedPrior: false,
+    resolvedRootCommitId: null,
+    parsedAgainstRequiredParent: false,
+    verifiedFreshRootPin: true,
     headerContract: fullParsed.headerKind,
     rowCount: allRows.length,
     parsed: fullParsed,
@@ -1631,6 +2493,43 @@ export async function importSingleRunFolder({
   allowedMissingCommits = [],
   tempBaseDir = tmpdir(),
 }) {
+  const effectiveConfig = normalizeImportConfig(importConfig);
+
+  const pinnedFreshRoot = findPinnedFreshOverlayRoot(
+    runItem.sourceFolder,
+    effectiveConfig.freshOverlayRoots,
+  );
+  const pinnedCarriedPrior = findPinnedCarriedPrior(
+    runItem.sourceFolder,
+    effectiveConfig.carriedPriors,
+  );
+  const runLabel = `${runItem.origin}:${runItem.sourceFolder}`;
+  const throwRunPrefixMismatch = (checkpointLabel, firstRow, detail) => {
+    const mismatch = new AppError(
+      `Overlay prefix mismatch in run ${runLabel} at checkpoint ${checkpointLabel}${detail ? `: ${detail}` : ''} (first differing row: ${firstRow}).`,
+      422,
+      'OVERLAY_PREFIX_MISMATCH',
+    );
+    mismatch.run = runLabel;
+    mismatch.checkpoint = checkpointLabel;
+    mismatch.firstDifferingRow = firstRow;
+    throw mismatch;
+  };
+  if (pinnedCarriedPrior && runItem.origin === 'company_import') {
+    throwRunPrefixMismatch(
+      'input/Overlay/overlay.csv',
+      1,
+      `importConfig.carriedPriors applies only to legacy runs and cannot list company_import run ${pinnedCarriedPrior.sourceFolder}`,
+    );
+  }
+  if (pinnedFreshRoot && runItem.origin === 'company_import') {
+    throwRunPrefixMismatch(
+      'overlay.csv',
+      1,
+      `importConfig.freshOverlayRoots applies only to legacy runs and standalone checkpoints and cannot list company_import run ${pinnedFreshRoot.sourceFolder}`,
+    );
+  }
+
   // Check idempotency early before promoting bytes unnecessarily
   const existing = await pool.query(
     'SELECT id FROM coherence.runs WHERE origin = $1 AND source_folder = $2',
@@ -1645,10 +2544,12 @@ export async function importSingleRunFolder({
       origin: runItem.origin,
       abandoned: Boolean(runItem.abandoned),
       commitArchiveFailures: [],
+      overlayRoots: [],
+      resolvedOverlayRoots: [],
+      carriedPriors: [],
     };
   }
 
-  const effectiveConfig = normalizeImportConfig(importConfig);
   const tracker = lineageTracker || await loadDecisionLineageTracker(pool);
 
   const runJsonRaw = await readFile(join(runItem.absPath, 'run.json'), 'utf8');
@@ -1695,6 +2596,27 @@ export async function importSingleRunFolder({
   const inputEntries = [];
 
   const inputFiles = allFiles.filter((rel) => rel.startsWith('input/'));
+  const hasPriorOverlayInput = inputFiles.some(
+    (fullRel) => normalizeMacKey(fullRel.slice('input/'.length)) === 'overlay/overlay.csv',
+  );
+  if (pinnedCarriedPrior && !hasPriorOverlayInput) {
+    throwRunPrefixMismatch(
+      'input/Overlay/overlay.csv',
+      1,
+      `missing frozen prior input/Overlay/overlay.csv required by importConfig.carriedPriors for ${pinnedCarriedPrior.sourceFolder}`,
+    );
+  }
+  const hasRunOverlayCheckpoints = nusearSaves.length > 0 || allFiles.some((rel) => {
+    const k = normalizeMacKey(rel);
+    return k === 'overlay.csv' || k === 'emits/overlay.csv';
+  });
+  if (runItem.origin === 'company_import' && !hasPriorOverlayInput && hasRunOverlayCheckpoints) {
+    throwRunPrefixMismatch(
+      'input/Overlay/overlay.csv',
+      1,
+      `company_import run ${runItem.sourceFolder} has overlay checkpoint(s) without a frozen prior input/Overlay/overlay.csv`,
+    );
+  }
   let priorOverlayAbsPath = null;
   let priorOverlaySha = null;
   for (const fullRel of inputFiles) {
@@ -1717,13 +2639,19 @@ export async function importSingleRunFolder({
   const decisions = [];
   const generatedOverlays = [];
   const reviewSaves = [];
+  const overlayRoots = [];
+  const resolvedOverlayRoots = [];
+  const carriedPriors = [];
+  const extraImportedFiles = [];
+  const safeSourceFolder = String(runItem.sourceFolder || '').replace(/^\/+/, '').replace(/\/+/g, '/').replace(/\/+$/, '');
 
   let prevRunCommitId = null;
   let prevRunOverlayPath = null;
   let prevRunOverlaySha = null;
+  let prevRunOverlayRowCount = 0;
   let priorDecisionCommitId = null;
+  let freshRootVerified = false;
   const parseOpts = { pythonPath, coherenceRepo, overlayCheckPath, tempBaseDir };
-  const runLabel = `${runItem.origin}:${runItem.sourceFolder}`;
 
   const ingestCheckpoint = async ({
     absPath,
@@ -1735,17 +2663,32 @@ export async function importSingleRunFolder({
     reviewSaveId = null,
     originalAt = null,
     isRunStart = false,
+    isPrior = false,
   }) => {
-    const requireParentId = isRunStart ? null : prevRunCommitId;
-    const requireParentPath = isRunStart ? null : prevRunOverlayPath;
+    if (!isPrior && isRunStart && runItem.origin === 'company_import') {
+      throwRunPrefixMismatch(
+        checkpointLabel,
+        1,
+        `company_import run ${runItem.sourceFolder} is missing frozen prior input/Overlay/overlay.csv`,
+      );
+    }
+    const mode = isPrior
+      ? (runItem.origin === 'company_import' ? 'exact_known_commit' : 'legacy_frozen_prior')
+      : (isRunStart ? 'no_prior_run_start' : 'extend_run_parent');
+    const requireParentId = mode === 'extend_run_parent' ? prevRunCommitId : null;
+    const requireParentPath = mode === 'extend_run_parent' ? prevRunOverlayPath : null;
     const res = await resolveOverlayCheckpoint({
       tracker,
       absPath,
+      fileSha256: promotedFile.sha256,
       checkpointLabel,
       runLabel,
+      mode,
       requiredParentCommitId: requireParentId,
       requiredParentPath: requireParentPath,
-      allowDisjointRoot: effectiveConfig.allowDisjointOverlayRoots,
+      freshRootEntry: !isPrior && !freshRootVerified ? pinnedFreshRoot : null,
+      carriedPriorEntry: isPrior && runItem.origin !== 'company_import' ? pinnedCarriedPrior : null,
+      allowEmptyParentReattach: runItem.origin !== 'company_import',
       commitKind: 'historical_overlay',
       runId: '__THIS_RUN__',
       reviewSaveId,
@@ -1756,15 +2699,67 @@ export async function importSingleRunFolder({
       parseOpts,
       tempBaseDir,
     });
+    if (res.verifiedFreshRootPin) freshRootVerified = true;
 
     if (res.newCommit) decisionCommits.push(res.newCommit);
     if (res.newDecisions.length) decisions.push(...res.newDecisions);
+    if (res.isFreshRoot) {
+      overlayRoots.push({
+        folder: runItem.sourceFolder,
+        folders: [runItem.sourceFolder],
+        commitId: res.commitId,
+        sha256: promotedFile.sha256,
+        rowCount: res.rowCount,
+      });
+    } else if (res.resolvedRootCommitId) {
+      resolvedOverlayRoots.push({
+        folder: runItem.sourceFolder,
+        commitId: res.resolvedRootCommitId,
+        sha256: promotedFile.sha256,
+        rowCount: res.rowCount,
+      });
+    }
+    if (res.isCarriedPrior) {
+      carriedPriors.push({
+        folder: runItem.sourceFolder,
+        commitId: res.commitId,
+        parentCommitId: res.parentCommitId,
+        sha256: promotedFile.sha256,
+        rowsAdded: res.addedRowCount,
+      });
+      extraImportedFiles.push({
+        area: 'other',
+        relPath: `carried-priors/${safeSourceFolder}/overlay.csv`,
+        artifactKind: 'data',
+        storeKind: STORE_KINDS.DATA,
+        fileSha256: promotedFile.sha256,
+        originalAt,
+        metadata: {
+          carriedPrior: true,
+          referenceAppend: true,
+          reason: pinnedCarriedPrior?.reason ?? null,
+          sourceFolder: runItem.sourceFolder,
+          decisionCommitId: res.commitId,
+          parentCommitId: res.parentCommitId,
+          extendsRowCount: pinnedCarriedPrior?.extendsRowCount ?? null,
+          rowsAdded: res.addedRowCount,
+          rowCount: res.rowCount,
+          headerContract: res.headerContract,
+        },
+      });
+    }
 
-    // Keep legacy approvals_files populated strictly without any silent prefix reset.
+    // Keep legacy approvals_files populated strictly without any silent prefix reset or invalid extends_sha256.
     if (!approvalsFiles.some((af) => af.fileSha256 === promotedFile.sha256)) {
-      const sameRunExtends = !isRunStart && prevRunOverlaySha && prevRunOverlaySha !== promotedFile.sha256
-        ? prevRunOverlaySha
-        : null;
+      const canExtendPrevRunFile = Boolean(
+        !isRunStart
+        && prevRunOverlaySha
+        && prevRunOverlaySha !== promotedFile.sha256
+        && prevRunOverlayRowCount > 0
+        && res.parsedAgainstRequiredParent
+        && res.parsed.sharedRowCount === prevRunOverlayRowCount,
+      );
+      const sameRunExtends = canExtendPrevRunFile ? prevRunOverlaySha : null;
       const afParsed = sameRunExtends
         ? res.parsed
         : await parseOverlay(absPath, { ...parseOpts, parentPath: null });
@@ -1791,6 +2786,7 @@ export async function importSingleRunFolder({
     prevRunCommitId = res.commitId;
     prevRunOverlayPath = absPath;
     prevRunOverlaySha = promotedFile.sha256;
+    prevRunOverlayRowCount = res.rowCount;
     return res;
   };
 
@@ -1804,7 +2800,15 @@ export async function importSingleRunFolder({
       purpose: 'prior_input',
       originalAt: priorInfo.mtime.toISOString(),
       isRunStart: true,
+      isPrior: true,
     });
+    if (pinnedFreshRoot && priorRes.rowCount > 0) {
+      throwRunPrefixMismatch(
+        'input/Overlay/overlay.csv',
+        1,
+        `folder listed in importConfig.freshOverlayRoots (${pinnedFreshRoot.sourceFolder}) cannot have a non-empty frozen prior`,
+      );
+    }
     priorDecisionCommitId = priorRes.commitId;
   }
 
@@ -1896,7 +2900,6 @@ export async function importSingleRunFolder({
   const byStep = partitionRunFilesByStep(allFiles, stepsDone);
   const stepAttempts = [];
   const reviewQueueItems = [];
-  const extraImportedFiles = [];
 
   if (stepsDone.length === 0) {
     // Partly finished run where no step completed in run.json: retain every non-input file
@@ -1909,6 +2912,22 @@ export async function importSingleRunFolder({
       const bytes = await readFile(absPath);
       const promoted = await stores.promoteArtifact(relPath, bytes, { checksPassed: true });
       storedFiles.push(promoted);
+      if (relPath === 'emits/overlay.csv') {
+        const alreadyRecordedEmitReceipt = generatedOverlays.some(
+          (go) => go.purpose === 'emit_output' && go.fileSha256 === promoted.sha256,
+        );
+        if (!alreadyRecordedEmitReceipt) {
+          await ingestCheckpoint({
+            absPath,
+            promotedFile: promoted,
+            checkpointLabel: 'emits/overlay.csv',
+            purpose: 'emit_output',
+            attemptStep: null,
+            originalAt: info.mtime.toISOString(),
+            isRunStart: prevRunCommitId === null,
+          });
+        }
+      }
       const safeSource = String(runItem.sourceFolder || '').replace(/^\/+/, '').replace(/\/+/g, '/').replace(/\/+$/, '');
       extraImportedFiles.push({
         area: 'other',
@@ -1974,6 +2993,14 @@ export async function importSingleRunFolder({
     });
   }
 
+  if (pinnedFreshRoot && !freshRootVerified) {
+    throwRunPrefixMismatch(
+      'overlay.csv',
+      1,
+      `folder listed in importConfig.freshOverlayRoots (${pinnedFreshRoot.sourceFolder}) finished without any checkpoint verified against its pinned SHA-256`,
+    );
+  }
+
   const emitSettings = inferEmitSettings(runItem, allFiles, effectiveConfig);
   const cmdKey = makeHashedCommandKey('import-run', [runItem.origin, runItem.sourceFolder]);
   const abandonmentSpec = runItem.abandoned && runItem.origin === 'company_import'
@@ -2024,6 +3051,9 @@ export async function importSingleRunFolder({
     generatedOverlays: generatedOverlays.length,
     journalSeq: res.journalSeq,
     commitArchiveFailures,
+    overlayRoots,
+    resolvedOverlayRoots,
+    carriedPriors,
   };
 }
 
@@ -2082,6 +3112,8 @@ export async function executeHistoryImport({
     importedRuns: [],
     skippedRuns: [],
     commitArchiveFailures: [],
+    overlayRoots: [],
+    carriedPriors: [],
     companySentCarries: [],
     currentInputVersionId: null,
     standingDecisionCommitId: null,
@@ -2176,6 +3208,65 @@ export async function executeHistoryImport({
   };
   const runIdBySource = new Map();
   const standaloneOverlayArchive = [];
+  const overlayRootsByCommitId = new Map();
+  const recordCreatedRoot = (root) => {
+    const existing = overlayRootsByCommitId.get(root.commitId);
+    if (existing) {
+      for (const f of (root.folders && root.folders.length ? root.folders : [root.folder])) {
+        if (!existing.folders.includes(f)) existing.folders.push(f);
+      }
+      return;
+    }
+    const entry = {
+      folder: root.folder,
+      folders: [...new Set(root.folders && root.folders.length ? root.folders : [root.folder])],
+      commitId: root.commitId,
+      sha256: root.sha256,
+      rowCount: root.rowCount,
+    };
+    overlayRootsByCommitId.set(root.commitId, entry);
+    report.overlayRoots.push(entry);
+  };
+  const recordResolvedRoot = (resolved) => {
+    const existing = overlayRootsByCommitId.get(resolved.commitId);
+    if (existing && !existing.folders.includes(resolved.folder)) {
+      existing.folders.push(resolved.folder);
+    }
+  };
+
+  // PIN TARGETS, BEFORE ANY WRITE (the round 5 and 6 reviews, matching --plan): every freshOverlayRoots pin names a legacy run or a
+  // standalone checkpoint that does not extend a commit, and every carriedPriors pin names a legacy run. A pin naming nothing found
+  // (a missing folder or one that lost its run.json) or the wrong kind fails here, before any file or row is written.
+  {
+    // Sets of every target of each kind, so a key that two items share is judged by all of them, whatever the timeline order.
+    const legacyRuns = new Set(), otherRuns = new Set(), plainCheckpoints = new Set(), extendingCheckpoints = new Set();
+    for (const e of timelineItems) {
+      if (e.kind === 'run') (e.item.origin === 'mac_import' ? legacyRuns : otherRuns).add(e.item.sourceFolder);
+      else (e.cp.extendsCommitId ? extendingCheckpoints : plainCheckpoints).add(safeOverlayCheckpointRelPath(e.label, e.absPath));
+    }
+    const unmetPins = [];
+    for (const pin of effectiveConfig.freshOverlayRoots || []) {
+      const sf = pin.sourceFolder;
+      if (otherRuns.has(sf)) unmetPins.push(`importConfig.freshOverlayRoots ${sf} names a company run`);
+      else if (extendingCheckpoints.has(sf)) unmetPins.push(`importConfig.freshOverlayRoots ${sf} names a checkpoint that extends a commit`);
+      else if (!legacyRuns.has(sf) && !plainCheckpoints.has(sf)) unmetPins.push(`importConfig.freshOverlayRoots ${sf}`);
+    }
+    for (const pin of effectiveConfig.carriedPriors || []) {
+      const sf = pin.sourceFolder;
+      if (otherRuns.has(sf)) unmetPins.push(`importConfig.carriedPriors ${sf} names a company run`);
+      else if (plainCheckpoints.has(sf) || extendingCheckpoints.has(sf)) unmetPins.push(`importConfig.carriedPriors ${sf} names a standalone checkpoint`);
+      else if (!legacyRuns.has(sf)) unmetPins.push(`importConfig.carriedPriors ${sf}`);
+    }
+    if (unmetPins.length > 0) {
+      const unmet = new AppError(
+        `Overlay prefix mismatch: pinned overlay folders not found in this import, or of the wrong kind: ${unmetPins.join('; ')}.`,
+        422,
+        'OVERLAY_PREFIX_MISMATCH',
+      );
+      unmet.unmetPins = unmetPins;
+      throw unmet;
+    }
+  }
 
   for (const entry of timelineItems) {
     if (entry.kind === 'run') {
@@ -2199,6 +3290,15 @@ export async function executeHistoryImport({
         tempBaseDir,
       });
       runIdBySource.set(`${item.origin}:${item.sourceFolder}`, res);
+      if (res.overlayRoots && res.overlayRoots.length > 0) {
+        for (const root of res.overlayRoots) recordCreatedRoot(root);
+      }
+      if (res.resolvedOverlayRoots && res.resolvedOverlayRoots.length > 0) {
+        for (const resolved of res.resolvedOverlayRoots) recordResolvedRoot(resolved);
+      }
+      if (res.carriedPriors && res.carriedPriors.length > 0) {
+        report.carriedPriors.push(...res.carriedPriors);
+      }
       if (res.commitArchiveFailures && res.commitArchiveFailures.length > 0) {
         report.commitArchiveFailures.push(...res.commitArchiveFailures);
         for (const fail of res.commitArchiveFailures) {
@@ -2209,7 +3309,38 @@ export async function executeHistoryImport({
       else report.importedRuns.push(res);
     } else {
       const { cp, absPath, label, originalAtIso } = entry;
+      if (cp?.allowDisjointRoot) {
+        throw new AppError(
+          'overlayCheckpoints entries cannot set allowDisjointRoot: true; pin explicit fresh roots in importConfig.freshOverlayRoots instead.',
+          400,
+          'DISJOINT_OVERLAY_ROOTS_FORBIDDEN',
+        );
+      }
       const relArchivePath = safeOverlayCheckpointRelPath(label, absPath);
+      const cpPinnedCarriedPrior = findPinnedCarriedPrior(relArchivePath, effectiveConfig.carriedPriors);
+      if (cpPinnedCarriedPrior) {
+        const mismatch = new AppError(
+          `Overlay prefix mismatch in run ${cp.runLabel || 'manifest_checkpoint'} at checkpoint ${label}: importConfig.carriedPriors applies only to legacy runs and cannot list standalone checkpoint ${cpPinnedCarriedPrior.sourceFolder} (first differing row: 1).`,
+          422,
+          'OVERLAY_PREFIX_MISMATCH',
+        );
+        mismatch.run = cp.runLabel || 'manifest_checkpoint';
+        mismatch.checkpoint = label;
+        mismatch.firstDifferingRow = 1;
+        throw mismatch;
+      }
+      const cpPinnedFreshRoot = findPinnedFreshOverlayRoot(relArchivePath, effectiveConfig.freshOverlayRoots);
+      if (cp.extendsCommitId && cpPinnedFreshRoot) {
+        const mismatch = new AppError(
+          `Overlay prefix mismatch in run ${cp.runLabel || 'manifest_checkpoint'} at checkpoint ${label}: checkpoint with extendsCommitId cannot be listed in importConfig.freshOverlayRoots (${cpPinnedFreshRoot.sourceFolder}) (first differing row: 1).`,
+          422,
+          'OVERLAY_PREFIX_MISMATCH',
+        );
+        mismatch.run = cp.runLabel || 'manifest_checkpoint';
+        mismatch.checkpoint = label;
+        mismatch.firstDifferingRow = 1;
+        throw mismatch;
+      }
       const bytes = await readFile(absPath);
       const promoted = await stores.dataStore.promoteBytes(bytes, { relPath: 'overlay.csv', checksPassed: true });
 
@@ -2219,14 +3350,18 @@ export async function executeHistoryImport({
       );
       if (existingImp.rows.length > 0) continue;
 
+      const cpFreshRootEntry = cp.extendsCommitId ? null : cpPinnedFreshRoot;
       const res = await resolveOverlayCheckpoint({
         tracker: lineageTracker,
         absPath,
+        fileSha256: promoted.sha256,
         checkpointLabel: label,
         runLabel: cp.runLabel || 'manifest_checkpoint',
+        mode: cp.extendsCommitId ? 'extend_run_parent' : 'no_prior_run_start',
         requiredParentCommitId: cp.extendsCommitId || null,
-        allowDisjointRoot: effectiveConfig.allowDisjointOverlayRoots || Boolean(cp.allowDisjointRoot),
-        commitKind: cp.commitKind || 'historical_overlay',
+        freshRootEntry: cpFreshRootEntry,
+        allowEmptyParentReattach: false,
+        commitKind: 'historical_overlay',
         runId: null,
         reviewSaveId: null,
         surface: null,
@@ -2236,6 +3371,23 @@ export async function executeHistoryImport({
         parseOpts,
         tempBaseDir,
       });
+
+      if (res.isFreshRoot) {
+        recordCreatedRoot({
+          folder: relArchivePath,
+          folders: [relArchivePath],
+          commitId: res.commitId,
+          sha256: promoted.sha256,
+          rowCount: res.rowCount,
+        });
+      } else if (res.resolvedRootCommitId) {
+        recordResolvedRoot({
+          folder: relArchivePath,
+          commitId: res.resolvedRootCommitId,
+          sha256: promoted.sha256,
+          rowCount: res.rowCount,
+        });
+      }
 
       if (res.newCommit) {
         await commands.recordDecisionBaseline({
@@ -2369,32 +3521,23 @@ export async function executeHistoryImport({
     }
     if (overlayAbs && overlayStored) {
       const info = await stat(overlayAbs);
-      const parsed = await parseOverlay(overlayAbs, { ...parseOpts, parentPath: null });
-      await commands.registerApprovalsFile({
-        actor,
-        commandKey: `import-current-overlay:${manifest.companySlug}:${overlayStored.sha256}`,
-        storedFile: overlayStored,
-        headerKind: parsed.headerKind,
-        rowCount: parsed.rowCount,
-        extendsSha256: null,
-        sharedRowCount: 0,
-        addedRows: parsed.addedRows,
-      });
-
       const existingStandingCommit = await pool.query(
         "SELECT metadata->>'decisionCommitId' AS commit_id FROM coherence.imported_files WHERE area = 'other' AND rel_path = 'standing-overlay/overlay.csv' AND file_sha256 = $1",
         [overlayStored.sha256],
       );
+      let expectedStandingCommitId;
       if (existingStandingCommit.rows.length > 0 && existingStandingCommit.rows[0].commit_id) {
-        report.standingDecisionCommitId = existingStandingCommit.rows[0].commit_id;
+        expectedStandingCommitId = existingStandingCommit.rows[0].commit_id;
       } else {
         const standingRes = await resolveOverlayCheckpoint({
           tracker: lineageTracker,
           absPath: overlayAbs,
+          fileSha256: overlayStored.sha256,
           checkpointLabel: 'standing:input/Overlay/overlay.csv',
           runLabel: 'standing_input',
+          mode: 'exact_known_commit',
           requiredParentCommitId: null,
-          allowDisjointRoot: effectiveConfig.allowDisjointOverlayRoots,
+          freshRootEntry: null,
           commitKind: 'historical_baseline',
           runId: null,
           reviewSaveId: null,
@@ -2404,6 +3547,17 @@ export async function executeHistoryImport({
           parseOverlay,
           parseOpts,
           tempBaseDir,
+        });
+        const parsed = await parseOverlay(overlayAbs, { ...parseOpts, parentPath: null });
+        await commands.registerApprovalsFile({
+          actor,
+          commandKey: `import-current-overlay:${manifest.companySlug}:${overlayStored.sha256}`,
+          storedFile: overlayStored,
+          headerKind: parsed.headerKind,
+          rowCount: parsed.rowCount,
+          extendsSha256: null,
+          sharedRowCount: 0,
+          addedRows: parsed.addedRows,
         });
         let standingCommitId = standingRes.commitId;
         if (standingRes.newCommit) {
@@ -2446,7 +3600,7 @@ export async function executeHistoryImport({
             });
           }
         }
-        report.standingDecisionCommitId = standingCommitId;
+        expectedStandingCommitId = standingCommitId;
         await commands.importStandaloneFiles({
           actor,
           commandKey: `import-standing-overlay-receipt:${manifest.companySlug}:${overlayStored.sha256}`,
@@ -2468,6 +3622,15 @@ export async function executeHistoryImport({
           storedFiles: [overlayStored],
         });
       }
+      const verifiedStandingHead = (await pool.query('SELECT coherence.standing_decision_head_as_of(NULL) AS id')).rows[0]?.id ?? null;
+      if (verifiedStandingHead !== expectedStandingCommitId) {
+        throw new AppError(
+          `Standing decision head mismatch: standing_decision_head_as_of(NULL) returned ${verifiedStandingHead ?? 'NULL'}, expected ${expectedStandingCommitId}.`,
+          422,
+          'STANDING_DECISION_HEAD_MISMATCH',
+        );
+      }
+      report.standingDecisionCommitId = verifiedStandingHead;
     }
 
     const baseEntries = entries.filter((e) => !declaredSentKeys.has(normalizeMacKey(e.relPath)));

@@ -3,12 +3,12 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { assertLocalPgHost, runHistoryProof } from '../scripts/prove-history.mjs';
+import { assertLocalPgHost, assertSafeStoresDir, runHistoryPlan, runHistoryProof } from '../scripts/prove-history.mjs';
 import { createCommandLayer } from '../src/commands/command-layer.mjs';
 import { compareDatabasesAsOf, exportJournalNdjson, rebuildFromJournalExport, verifyChain, verifyCommitments } from '../src/commands/journal-export.mjs';
 import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstruction.mjs';
@@ -19,6 +19,7 @@ import {
   buildImportManifest,
   createCommitBundle,
   executeHistoryImport,
+  importSingleRunFolder,
   loadImportManifestFile,
   parseApprovalsFile,
   readLegacySqliteSnapshot,
@@ -46,12 +47,45 @@ import { checkPgAvailable, createEmptyMigratedTestDb, createTestEnv } from './he
 
 const pgCheck = await checkPgAvailable();
 
+function sha256Utf8(text) {
+  return createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+}
+
 async function writeTree(baseDir, files) {
   for (const [rel, content] of Object.entries(files)) {
     const full = join(baseDir, ...rel.split('/'));
     await mkdir(dirname(full), { recursive: true });
     await writeFile(full, content, 'utf8');
   }
+}
+
+async function snapshotImportWriteState(env) {
+  const [runsRes, commitsRes, journalRes] = await Promise.all([
+    env.pool.query('SELECT id FROM coherence.runs ORDER BY id'),
+    env.pool.query('SELECT id FROM coherence.decision_commits ORDER BY id'),
+    env.pool.query('SELECT seq::text AS seq, command_kind, command_key, entry_hash FROM coherence.journal_entries ORDER BY seq'),
+  ]);
+  return {
+    runIds: runsRes.rows.map((r) => r.id),
+    commitIds: commitsRes.rows.map((r) => r.id),
+    journalRows: journalRes.rows,
+    codeObjects: env.codeBackend.listObjectNames(),
+    dataObjects: env.dataBackend.listObjectNames(),
+  };
+}
+
+async function assertNothingWrittenSince(env, before, label, { expectEmptyCommits = true } = {}) {
+  const after = await snapshotImportWriteState(env);
+  assert.ok(before.journalRows.length >= 1, `${label}: expected pre-existing journal entry before import call`);
+  assert.equal(after.runIds.length, 0, `${label}: coherence.runs must hold no rows, got ${after.runIds.length}`);
+  if (expectEmptyCommits) {
+    assert.equal(after.commitIds.length, 0, `${label}: coherence.decision_commits must hold no rows, got ${after.commitIds.length}`);
+  } else {
+    assert.deepEqual(after.commitIds, before.commitIds, `${label}: coherence.decision_commits must hold what it held before the call`);
+  }
+  assert.deepEqual(after.journalRows, before.journalRows, `${label}: coherence.journal_entries must hold what it held before the call`);
+  assert.deepEqual(after.codeObjects, [], `${label}: env.codeBackend must hold no objects`);
+  assert.deepEqual(after.dataObjects, [], `${label}: env.dataBackend must hold no objects`);
 }
 
 test('Layer 4 [Import, Rebuild, Replay & Working-Table Verification]: read-only import keeps working tables bytes, idempotent re-import adds nothing, byte-for-byte rebuild and replay pass, and on-demand working rebuild verifies SHA-256', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
@@ -153,7 +187,11 @@ test('Layer 4 [Import, Rebuild, Replay & Working-Table Verification]: read-only 
     companySlug: env.companySlug,
     coherenceRoot: fakeCoherence,
     nusearDataDir: fakeNusearData,
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha256Utf8(priorCsv) }],
+    },
   });
   assert.equal(manifest.macRuns.length, 2);
   assert.equal(manifest.nusearMacSaves['2026-11-21'].length, 2);
@@ -427,9 +465,10 @@ test('Layer 4 [Importer Safety & Config]: Python-only overlay parsing, failed gi
 
   const legacyRoot = join(dir, 'legacy-host');
   const dataDir = join(dir, 'nusear-data');
+  const safeOvCsv = makeOverlayCsv([row0]);
   await writeTree(join(legacyRoot, 'runs', '2026-11-21'), {
-    'input/Overlay/overlay.csv': makeOverlayCsv([row0]),
-    'overlay.csv': makeOverlayCsv([row0]),
+    'input/a.csv': 'x\n1\n',
+    'overlay.csv': safeOvCsv,
     'run.json': JSON.stringify({ date: '2026-11-21', born: '2026-11-21T10:00:00.000000001', steps: { assign: { at: '2026-11-21T10:00:01', code: 'deadbeef', seconds: 1 } } }),
   });
   await writeTree(join(legacyRoot, 'input'), { 'a.csv': 'x\n1\n' });
@@ -445,7 +484,11 @@ test('Layer 4 [Importer Safety & Config]: Python-only overlay parsing, failed gi
     companySlug: 'acme',
     coherenceRoot: legacyRoot,
     nusearDataDir: dataDir,
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-11-21', sha256: sha256Utf8(safeOvCsv) }],
+    },
   });
   assert.equal(acmeManifest.macRuns.length, 1);
   assert.equal(acmeManifest.currentInputDir, join(legacyRoot, 'input'));
@@ -772,7 +815,11 @@ test('Layer 4 [Historical Overlays, Branching, Layer 2 Reconstruction & G3 Prefi
     companySlug: 'acme',
     coherenceRoot: cohRoot,
     nusearDataDir: dataRoot,
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha256Utf8(v1Csv) }],
+    },
   });
 
   const rep = await executeHistoryImport({
@@ -840,6 +887,11 @@ test('Layer 4 [Historical Overlays, Branching, Layer 2 Reconstruction & G3 Prefi
   const badCoh = join(badEnv.tempDir, 'bad-coh');
   const badData = join(badEnv.tempDir, 'bad-data');
   const r2Tampered = { ...r2V1, note: 'TAMPERED ROW 2' };
+  await writeTree(join(badCoh, 'runs', '2026-10-12'), {
+    'input/a.csv': 'k\n1\n',
+    'overlay.csv': v2PriorCsv,
+    'run.json': JSON.stringify({ date: '2026-10-12', steps: { assign: { at: '2026-10-12T10:00:00' }, bible: { at: '2026-10-12T10:01:00' } } }),
+  });
   await writeTree(join(badCoh, 'runs', '2026-10-15'), {
     'input/Overlay/overlay.csv': v2PriorCsv,
     'overlay.csv': makeOverlayCsv([r1V1, r2Tampered, r3Rev], { version: 'v2' }),
@@ -853,7 +905,11 @@ test('Layer 4 [Historical Overlays, Branching, Layer 2 Reconstruction & G3 Prefi
     companySlug: 'acme',
     coherenceRoot: badCoh,
     nusearDataDir: badData,
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-10-12', sha256: sha256Utf8(v2PriorCsv) }],
+    },
   });
   await assert.rejects(
     () => executeHistoryImport({
@@ -896,9 +952,9 @@ test('Layer 4 [G4 Config-Driven Manifest, All Sources, Company Sent Provenance &
     '.DS_Store': 'finder-bytes',
   });
 
-  // Legacy run (2026-11-02)
+  // Legacy run (2026-11-02): pinned fresh root with no frozen prior
   await writeTree(join(srcRoot, 'legacy-runs', '2026-11-02'), {
-    'input/Overlay/overlay.csv': ovCsv,
+    'input/a.csv': 'k\n1\n',
     'overlay.csv': ovCsv,
     'emits/overlay.csv': ovCsv,
     'emits/statements_20261102.csv': 'record_id,entity,gross_comm,downline_amount,run_action\n',
@@ -1016,6 +1072,7 @@ test('Layer 4 [G4 Config-Driven Manifest, All Sources, Company Sent Provenance &
       includeLegacySqliteTables: true,
       useCompanyIncomingInput: false,
       currentInputSourceKind: 'mac_import',
+      freshOverlayRoots: [{ sourceFolder: '2026-11-02', sha256: sha256Utf8(ovCsv) }],
     },
   }, null, 2), 'utf8');
 
@@ -1465,6 +1522,936 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
   assert.deepEqual(fixedRateRes.methodCorrectionBatches[1].uplineLines.map((l) => l.amount), ['-0.02', '-0.07', '-0.01']);
 });
 
+test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves split_reallocation sign follows unreversed ALLAGENCY net sign, reconciles to Coherent Ledger at $0.00 variance, rejects inverted signs at COMMIT, and proves upline_takeback negates historical plx ULTotal', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const allAgencyHdr = 'entity,npn,agent,member,mbi,policy_number,carrier,channel,amount,earned,payment,note,state,plan_type,coverage_type,effective,submitted';
+  const plxHdr = 'Statement,WritingAgent,WritingAgentNPN,PolicyHolderName,MBI,State,Carrier,EffectiveDate,PlanType,SimplifiedCoverageType,PolicyNumber,CommissionAmount,Note,RevenueType,EarnedDate,PaymentDate,entity,DLTotal,ULTotal';
+  const sentHdr = 'record_id,entity,writing_npn,gross_comm,run_action,reversal_of,statement_name';
+
+  // 1) Positive-net unreversed ALLAGENCY lines after Sent/ reversal settlement -> agency -, upline +
+  const envPos = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => envPos.cleanup());
+  const mockRepoPos = join(envPos.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepoPos);
+  const posStmtDir = join(envPos.tempDir, 'pos-stmts');
+  const posSentDir = join(envPos.tempDir, 'pos-sent');
+  await writeTree(posStmtDir, {
+    'ALLAGENCY20260731Spark.csv': [
+      allAgencyHdr,
+      // Reversed in Sent/ below (must be excluded by unreversedOnly: true)
+      'Beacon,11111111,Sam Seller,Pat Sample,1AB2CD3EF45,POL101,carriera,spark,250.00,2026-07-01,2026-07-15,rev,NC,MA,MA,2026-01-01,2026-01-01',
+      // Surviving positive +150.00 -> downline +120.00, upline +30.00 (agency -30.00, upline +30.00)
+      'Beacon,11111111,Sam Seller,Lee Demo,2CD3EF4GH56,POL102,carriera,spark,150.00,2026-07-01,2026-07-15,pos,NC,MA,MA,2026-01-01,2026-01-01',
+      // Surviving chargeback -50.00 -> downline -40.00, upline -10.00 (agency +10.00, upline -10.00)
+      'Harbor,22222222,Pat Rep,Kim Test,3EF4GH5JK67,POL103,carriera,spark,-50.00,2026-07-01,2026-07-15,cb,NC,MA,MA,2026-01-01,2026-01-01',
+      // House entity excluded by excludeEntities: ['Acme']
+      'Acme,33333333,House Rep,Max Sample,4GH5JK6LM78,POL104,carriera,spark,80.00,2026-07-01,2026-07-15,house,NC,MA,MA,2026-01-01,2026-01-01',
+    ].join('\n') + '\n',
+    'plxSpark20260429.csv': [
+      plxHdr,
+      '2026-04-15 - CarrierA,Sam Seller,11111111,Lee Demo,2CD3EF4GH56,NC,CarrierA,2026-01-01,MA,MA,POL102,300.00,pos-ul,Commission,2026-04-01,2026-04-15,Beacon,240.00,60.00',
+      '2026-04-15 - CarrierA,Pat Rep,22222222,Kim Test,3EF4GH5JK67,NC,CarrierA,2026-01-01,MA,MA,POL103,-75.00,neg-ul,Commission,2026-04-01,2026-04-15,Harbor,-60.00,-15.00',
+    ].join('\n') + '\n',
+  });
+  await writeTree(posSentDir, {
+    'statements_20260831.csv': [
+      sentHdr,
+      'carriera~spark~1AB2CD3EF45~250.00~2026-07,Beacon,11111111,-250.00,REVERSAL,carriera~spark~1AB2CD3EF45~250.00~2026-07,ALLAGENCY20260731Spark.csv',
+    ].join('\n') + '\n',
+  });
+  const posRes = await readLegacyStatementBatches({
+    statementsDir: posStmtDir,
+    sentDir: posSentDir,
+    methodCorrections: [
+      {
+        kind: 'split_reallocation',
+        statementDate: '2026-08-01',
+        sourceGrammar: 'all_agency',
+        unreversedOnly: true,
+        useAgentsSplit: false,
+        uplineRate: '0.20',
+        excludeEntities: ['Acme'],
+        expectedAgencyNetCents: -2000,
+        expectedUplineNetCents: 2000,
+        reason: '80/20 split on positive-net unreversed ALLAGENCY lines',
+      },
+      {
+        kind: 'upline_takeback',
+        statementDate: '2026-08-31',
+        sourceGrammar: 'plx_layout',
+        expectedAgencyNetCents: 0,
+        expectedUplineNetCents: -4500,
+        reason: 'historical plx ULTotal take-back',
+      },
+    ],
+    pythonPath: 'python3',
+    coherenceRepo: mockRepoPos,
+    tempBaseDir: envPos.tempDir,
+  });
+  assert.equal(posRes.methodCorrectionBatches[0].agencyNetTotal, '-20.00');
+  assert.equal(posRes.methodCorrectionBatches[0].uplineNetTotal, '20.00');
+  assert.deepEqual(
+    posRes.methodCorrectionBatches[0].agencyLines.map((l) => [l.entity, l.amount]),
+    [['Beacon', '-30.00'], ['Harbor', '10.00']],
+  );
+  assert.deepEqual(
+    posRes.methodCorrectionBatches[0].uplineLines.map((l) => [l.sourceEntity, l.amount]),
+    [['Beacon', '30.00'], ['Harbor', '-10.00']],
+  );
+  assert.equal(posRes.methodCorrectionBatches[1].agencyNetTotal, '0.00');
+  assert.equal(posRes.methodCorrectionBatches[1].uplineNetTotal, '-45.00');
+  assert.deepEqual(
+    posRes.methodCorrectionBatches[1].uplineLines.map((l) => l.amount),
+    ['-60.00', '15.00'],
+  );
+
+  // 2) Negative-net unreversed ALLAGENCY lines (chargebacks > commissions after Sent/ reversals)
+  //    reproduce the exact opposite-sign mismatch and prove agency + / upline - is required for $0.00 Ledger tie-out.
+  const negAllAgencyCsv = [
+    allAgencyHdr,
+    // Reversed in Sent/ below (excluded by unreversedOnly: true)
+    'Beacon,11111111,Sam Seller,Pat Sample,1AB2CD3EF45,POL201,carriera,spark,500.00,2026-07-01,2026-07-15,rev,NC,MA,MA,2026-01-01,2026-01-01',
+    // Surviving positive +40.00 -> downline +32.00, upline +8.00 (8/1: agency -8.00, upline +8.00)
+    'Beacon,11111111,Sam Seller,Lee Demo,2CD3EF4GH56,POL202,carriera,spark,40.00,2026-07-01,2026-07-15,pos,NC,MA,MA,2026-01-01,2026-01-01',
+    // Surviving chargeback -140.00 -> downline -112.00, upline -28.00 (8/1: agency +28.00, upline -28.00)
+    'Harbor,22222222,Pat Rep,Kim Test,3EF4GH5JK67,POL203,carriera,spark,-140.00,2026-07-01,2026-07-15,cb,NC,MA,MA,2026-01-01,2026-01-01',
+    // House entity excluded by excludeEntities: ['Acme']
+    'Acme,33333333,House Rep,Max Sample,4GH5JK6LM78,POL204,carriera,spark,75.00,2026-07-01,2026-07-15,house,NC,MA,MA,2026-01-01,2026-01-01',
+  ].join('\n') + '\n';
+  const negSentCsv = [
+    sentHdr,
+    'carriera~spark~1AB2CD3EF45~500.00~2026-07,Beacon,11111111,-500.00,CANCEL,carriera~spark~1AB2CD3EF45~500.00~2026-07,ALLAGENCY20260731Spark.csv',
+  ].join('\n') + '\n';
+
+  const negStmtDir = join(envPos.tempDir, 'neg-stmts');
+  const negSentDir = join(envPos.tempDir, 'neg-sent');
+  await writeTree(negStmtDir, { 'ALLAGENCY20260731Spark.csv': negAllAgencyCsv });
+  await writeTree(negSentDir, { 'statements_20260831.csv': negSentCsv });
+
+  // Expecting agency - / upline + against negative-net surviving lines produces the exact opposite-sign error
+  await assert.rejects(
+    () => readLegacyStatementBatches({
+      statementsDir: negStmtDir,
+      sentDir: negSentDir,
+      methodCorrections: [{
+        kind: 'split_reallocation',
+        statementDate: '2026-08-01',
+        sourceGrammar: 'all_agency',
+        unreversedOnly: true,
+        useAgentsSplit: false,
+        uplineRate: '0.20',
+        excludeEntities: ['Acme'],
+        expectedAgencyNetCents: -2000,
+        expectedUplineNetCents: 2000,
+      }],
+      pythonPath: 'python3',
+      coherenceRepo: mockRepoPos,
+      tempBaseDir: envPos.tempDir,
+    }),
+    (err) => {
+      assert.equal(err.code, 'LEGACY_STATEMENT_READ_FAILED');
+      assert.ok(err.message.includes('agency expected -2000 cents vs 2000 cents; upline expected 2000 cents vs -2000 cents.'));
+      return true;
+    },
+  );
+
+  // End-to-end PostgreSQL conservation proof: agency +20.00 / upline -20.00 reconciles at $0.00 variance,
+  // while the inverted direction (-20.00 / +20.00) is rejected by trg_run_materializations_verify_deferred.
+  const runNegConservationCheck = async (invertCorrectionSign) => {
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const { engineVersionId } = await seedEngineVersion(env);
+    await seedStandingInput(env, { commandKey: `neg-standing-${invertCorrectionSign}` });
+
+    const parsed = await readLegacyStatementBatches({
+      statementsDir: negStmtDir,
+      sentDir: negSentDir,
+      methodCorrections: [{
+        kind: 'split_reallocation',
+        statementDate: '2026-08-01',
+        sourceGrammar: 'all_agency',
+        unreversedOnly: true,
+        useAgentsSplit: false,
+        uplineRate: '0.20',
+        excludeEntities: ['Acme'],
+        expectedAgencyNetCents: 2000,
+        expectedUplineNetCents: -2000,
+      }],
+      pythonPath: 'python3',
+      coherenceRepo: mockRepoPos,
+      tempBaseDir: env.tempDir,
+    });
+
+    const histBatch = parsed.historicalBatches[0];
+    const corrBatch = parsed.methodCorrectionBatches[0];
+    const histStored = await env.dataStore.promoteBytes(Buffer.from(negAllAgencyCsv, 'utf8'), {
+      relPath: 'Prior Statements/ALLAGENCY20260731Spark.csv',
+      checksPassed: true,
+    });
+    await env.commands.recordStatementBatch({
+      actor: env.ownerActor,
+      commandKey: 'hist-allagency-20260731',
+      batchKind: 'historical_sent',
+      statementDate: '2026-07-31',
+      sourceFileName: 'ALLAGENCY20260731Spark.csv',
+      sourceFile: histStored,
+      reason: 'Imported 2026-07-31 ALLAGENCY statement',
+      agencyLines: histBatch.agencyLines,
+      uplineLines: histBatch.uplineLines,
+    });
+
+    const flipAmt = (s) => (s.startsWith('-') ? s.slice(1) : `-${s}`);
+    const corrAgLines = invertCorrectionSign
+      ? corrBatch.agencyLines.map((l) => ({ ...l, amount: flipAmt(l.amount) }))
+      : corrBatch.agencyLines;
+    const corrUpLines = invertCorrectionSign
+      ? corrBatch.uplineLines.map((l) => ({ ...l, amount: flipAmt(l.amount) }))
+      : corrBatch.uplineLines;
+    await env.commands.recordStatementBatch({
+      actor: env.ownerActor,
+      commandKey: 'corr-allagency-20260801',
+      batchKind: 'method_correction',
+      statementDate: '2026-08-01',
+      reason: '2026-08-01 80/20 split reallocation on unreversed ALLAGENCY lines',
+      agencyLines: corrAgLines,
+      uplineLines: corrUpLines,
+    });
+
+    const standingId = (await env.pool.query('SELECT coherence.standing_input_version_as_of(NULL) AS id')).rows[0].id;
+    const curEntries = (await env.pool.query(
+      'SELECT rel_path, file_sha256 FROM coherence.input_entries WHERE input_version_id = $1::uuid',
+      [standingId],
+    )).rows;
+    await env.commands.publishInputVersion({
+      actor: env.ownerActor,
+      commandKey: 'include-allagency-input',
+      lineKind: 'standing',
+      sourceKind: 'include',
+      reason: 'Include pre-Coherence ALLAGENCY file',
+      entries: [
+        ...curEntries.map((e) => ({ relPath: e.rel_path, fileSha256: e.file_sha256 })),
+        { relPath: 'Prior Statements/ALLAGENCY20260731Spark.csv', fileSha256: histStored.sha256 },
+      ],
+    });
+
+    const launch = await env.commands.launchRun({
+      actor: env.ownerActor,
+      commandKey: 'launch-20260831',
+      statementDate: '2026-08-31',
+      origin: 'app',
+      engineVersionId,
+    });
+    const runId = launch.result.runId;
+    const worker = env.registerWorker(createEngineWorker({
+      pool: env.pool,
+      pgConfig: env.pgConfig,
+      companySlug: env.companySlug,
+      stores: env.stores,
+      commands: env.commands,
+      workerActor: env.workerActor,
+      materializeEngine: createMockEngineMaterializer(),
+      tempBaseDir: env.tempDir,
+    }));
+    for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
+    let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
+    await env.commands.saveReviewDecisions({
+      actor: env.ownerActor,
+      commandKey: 'bible-20260831',
+      expectedJournalSeq: seq,
+      runId,
+      surface: 'bible',
+      decisions: [
+        { recordId: 'policy:carrier_a:P10001#effective:2026-01-01', disposition: 'CONFIRM' },
+        { recordId: (await env.pool.query("SELECT record_id FROM coherence.review_queue_items WHERE run_id = $1::uuid AND surface = 'bible' AND item_order = 2", [runId])).rows[0].record_id, disposition: 'CONFIRM' },
+      ],
+    });
+    assert.equal((await worker.runOnce()).action, 'step_finished');
+    seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
+    const adjSave = await env.commands.saveReviewDecisions({
+      actor: env.ownerActor,
+      commandKey: 'adjust-20260831',
+      expectedJournalSeq: seq,
+      runId,
+      surface: 'adjust',
+      decisions: [{ recordId: 'carrier_a~direct~P10001~100.00~2026-11', disposition: 'CONFIRM' }],
+    });
+    seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
+    await env.commands.confirmEmit({
+      actor: env.ownerActor,
+      commandKey: 'confirm-20260831',
+      expectedJournalSeq: seq,
+      runId,
+      adjustReviewSaveId: adjSave.result.reviewSaveId,
+      typedPhrase: 'create statements for 2026-08-31',
+    });
+    assert.equal((await worker.runOnce()).action, 'step_finished');
+
+    // Coherent Ledger holds exact 80/20 splits for the 3 surviving lines (POL201 was cancelled).
+    const bobCsv = makeCsvFromObjects(SYNTHETIC_BOB_COLUMNS, [
+      {
+        external_policy_id: 'POL202', policy_id: '202', carrier_policy_number: 'POL202', crm_policy_number: '',
+        enrollment_code: '', carrier: 'carriera', plan_type: 'MA', plan_name: 'MA', simple_plan_type: 'MA',
+        mbi: '2CD3EF4GH56', member: 'Demo Lee', dob: '', phone: '', email: '', address: '', county: '', state: 'NC',
+        submission_date: '2026-01-01', origin_effective: '2026-01-01', effective_date: '2026-01-01', termination_date: '',
+        min_date: '2026-01-01', anchor_date: '2026-01-01', amount: '32.00', upline_amount: '8.00',
+        writing_npn: '11111111', writing_agent: 'Sam Seller', entity: 'Beacon', agency_id: '', status: 'ACTIVE',
+        conflicts: '', spine_source: 'tx', confidence_level: '1',
+      },
+      {
+        external_policy_id: 'POL203', policy_id: '203', carrier_policy_number: 'POL203', crm_policy_number: '',
+        enrollment_code: '', carrier: 'carriera', plan_type: 'MA', plan_name: 'MA', simple_plan_type: 'MA',
+        mbi: '3EF4GH5JK67', member: 'Kim Test', dob: '', phone: '', email: '', address: '', county: '', state: 'NC',
+        submission_date: '2026-01-01', origin_effective: '2026-01-01', effective_date: '2026-01-01', termination_date: '',
+        min_date: '2026-01-01', anchor_date: '2026-01-01', amount: '-112.00', upline_amount: '-28.00',
+        writing_npn: '22222222', writing_agent: 'Pat Rep', entity: 'Harbor', agency_id: '', status: 'ACTIVE',
+        conflicts: '', spine_source: 'tx', confidence_level: '1',
+      },
+      {
+        external_policy_id: 'POL204', policy_id: '204', carrier_policy_number: 'POL204', crm_policy_number: '',
+        enrollment_code: '', carrier: 'carriera', plan_type: 'MA', plan_name: 'MA', simple_plan_type: 'MA',
+        mbi: '4GH5JK6LM78', member: 'Max Sample', dob: '', phone: '', email: '', address: '', county: '', state: 'NC',
+        submission_date: '2026-01-01', origin_effective: '2026-01-01', effective_date: '2026-01-01', termination_date: '',
+        min_date: '2026-01-01', anchor_date: '2026-01-01', amount: '75.00', upline_amount: '0.00',
+        writing_npn: '33333333', writing_agent: 'House Rep', entity: 'Acme', agency_id: '', status: 'ACTIVE',
+        conflicts: '', spine_source: 'tx', confidence_level: '1',
+      },
+    ]);
+    const ledgerCsv = makeCsvFromObjects(SYNTHETIC_LEDGER_COLUMNS, [
+      {
+        record_id: 'carriera~spark~2CD3EF4GH56~40.00~2026-07', external_policy_id: 'POL202', policy_id: '202', tx_id: '202',
+        statement_name: 'ALLAGENCY20260731Spark.csv', src_type: 'spark', carrier: 'carriera', mbi: '2CD3EF4GH56', member: 'Demo Lee',
+        state: 'NC', plan_type: 'MA', simple_plan_type: 'MA', submission_date: '2026-01-01', origin_effective: '2026-01-01',
+        effective_date: '2026-01-01', termination_date: '', earned_date: '2026-07-01', payment_date: '2026-07-15',
+        statement_date: '2026-07-31', min_date: '2026-01-01', gross_comm: '40.00', revenue_type: 'override',
+        override_amount: '40.00', commission_amount: '', hra_amount: '', fee_amount: '', other_amount: '',
+        downline_amount: '32.00', upline_amount: '8.00', writing_npn: '11111111', writing_agent: 'Sam Seller',
+        entity: 'Beacon', payee_npn: '', agency_id: '', status: 'ACTIVE', policy_status: 'active',
+        cbob_c: 'false', cbob_s: 'false', sf: 'false', notes: 'pos', coherent_notes: '',
+      },
+      {
+        record_id: 'carriera~spark~3EF4GH5JK67~-140.00~2026-07', external_policy_id: 'POL203', policy_id: '203', tx_id: '203',
+        statement_name: 'ALLAGENCY20260731Spark.csv', src_type: 'spark', carrier: 'carriera', mbi: '3EF4GH5JK67', member: 'Kim Test',
+        state: 'NC', plan_type: 'MA', simple_plan_type: 'MA', submission_date: '2026-01-01', origin_effective: '2026-01-01',
+        effective_date: '2026-01-01', termination_date: '', earned_date: '2026-07-01', payment_date: '2026-07-15',
+        statement_date: '2026-07-31', min_date: '2026-01-01', gross_comm: '-140.00', revenue_type: 'override',
+        override_amount: '-140.00', commission_amount: '', hra_amount: '', fee_amount: '', other_amount: '',
+        downline_amount: '-112.00', upline_amount: '-28.00', writing_npn: '22222222', writing_agent: 'Pat Rep',
+        entity: 'Harbor', payee_npn: '', agency_id: '', status: 'ACTIVE', policy_status: 'active',
+        cbob_c: 'false', cbob_s: 'false', sf: 'false', notes: 'cb', coherent_notes: '',
+      },
+      {
+        record_id: 'carriera~spark~4GH5JK6LM78~75.00~2026-07', external_policy_id: 'POL204', policy_id: '204', tx_id: '204',
+        statement_name: 'ALLAGENCY20260731Spark.csv', src_type: 'spark', carrier: 'carriera', mbi: '4GH5JK6LM78', member: 'Max Sample',
+        state: 'NC', plan_type: 'MA', simple_plan_type: 'MA', submission_date: '2026-01-01', origin_effective: '2026-01-01',
+        effective_date: '2026-01-01', termination_date: '', earned_date: '2026-07-01', payment_date: '2026-07-15',
+        statement_date: '2026-07-31', min_date: '2026-01-01', gross_comm: '75.00', revenue_type: 'override',
+        override_amount: '75.00', commission_amount: '', hra_amount: '', fee_amount: '', other_amount: '',
+        downline_amount: '75.00', upline_amount: '0.00', writing_npn: '33333333', writing_agent: 'House Rep',
+        entity: 'Acme', payee_npn: '', agency_id: '', status: 'ACTIVE', policy_status: 'active',
+        cbob_c: 'false', cbob_s: 'false', sf: 'false', notes: 'house', coherent_notes: '',
+      },
+    ]);
+    const stmtCsv = makeCsvFromObjects(SYNTHETIC_RUN_COLUMNS, [{
+      record_id: 'carriera~spark~1AB2CD3EF45~500.00~2026-07', external_policy_id: '', policy_id: '', tx_id: '',
+      statement_name: 'ALLAGENCY20260731Spark.csv', src_type: 'spark', carrier: 'carriera', mbi: '1AB2CD3EF45', member: 'Pat Sample',
+      state: 'NC', plan_type: 'MA', simple_plan_type: 'MA', submission_date: '', origin_effective: '',
+      effective_date: '', termination_date: '', earned_date: '2026-07-01', payment_date: '2026-07-15',
+      statement_date: '', min_date: '', gross_comm: '-500.00', revenue_type: 'override',
+      override_amount: '-500.00', commission_amount: '', hra_amount: '', fee_amount: '', other_amount: '',
+      downline_amount: '', upline_amount: '', writing_npn: '11111111', writing_agent: 'Sam Seller',
+      entity: 'Beacon', payee_npn: '', agency_id: '', status: '', policy_status: '',
+      cbob_c: 'false', cbob_s: 'false', sf: 'false', notes: 'rev', coherent_notes: 'CANCEL',
+      run_action: 'CANCEL', run_statement_date: '2026-08-31',
+      reversal_of: 'carriera~spark~1AB2CD3EF45~500.00~2026-07', reason: 'cancel reversed ALLAGENCY line',
+    }]);
+
+    return {
+      env,
+      runId,
+      materialize: () => env.commands.materializeEmit({
+        actor: env.ownerActor,
+        commandKey: 'mat-20260831',
+        runId,
+        canonicalBobCsv: bobCsv,
+        coherentLedgerCsv: ledgerCsv,
+        statementsCsv: stmtCsv,
+      }),
+    };
+  };
+
+  // Correct direction (agency +20.00, upline -20.00) passes deferred conservation trigger with $0.00 variance
+  const good = await runNegConservationCheck(false);
+  await good.materialize();
+  const recon = (await good.env.pool.query(
+    'SELECT statement_entity, statement_total::text, ledger_total::text, variance::text, reconciled FROM coherence_views.v_entity_statement_reconciliation($1::uuid)',
+    [good.runId],
+  )).rows;
+  assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'));
+  const byEnt = Object.fromEntries(recon.map((r) => [r.statement_entity, r.statement_total]));
+  assert.deepEqual(byEnt, {
+    Acme: '75.00',
+    'Acme Upline': '-20.00',
+    Beacon: '32.00',
+    Harbor: '-112.00',
+  });
+
+  // Inverted direction (agency -20.00, upline +20.00) is rejected by PostgreSQL conservation trigger
+  const bad = await runNegConservationCheck(true);
+  await assert.rejects(() => bad.materialize(), /conservation violation/i);
+});
+
+test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal values and rounds once per statement file (ROUND_HALF_UP), keeps each line amount as Coherence shows it, preserves 8/1 split and all other totals, and passes PostgreSQL conservation', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const mockRepo = join(env.tempDir, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const stmtDir = join(env.tempDir, 'subcent-stmts');
+  const sentDir = join(env.tempDir, 'subcent-sent');
+
+  const plxCols = 'Statement,WritingAgent,WritingAgentNPN,PolicyHolderName,MBI,State,Carrier,EffectiveDate,PlanType,SimplifiedCoverageType,PolicyNumber,CommissionAmount,Note,RevenueType,EarnedDate,PaymentDate,entity,DLTotal,ULTotal';
+  const plxRow = (dt, pol, mbi, entity, dl, ul, gross, note) =>
+    `${dt} - CarrierA,Sam Seller,11111111,Pat Sample,${mbi},NC,CarrierA,2026-01-01,MA,MA,${pol},${gross},${note},Commission,${dt},${dt},${entity},${dl},${ul}`;
+  const allAgencyHdr = 'entity,npn,agent,member,mbi,policy_number,carrier,channel,amount,earned,payment,note,state,plan_type,coverage_type,effective,submitted';
+  const sentHdr = 'record_id,entity,writing_npn,gross_comm,run_action,reversal_of,statement_name';
+
+  // Three plx files with sub-cent ULTotal values where per-cell rounding differs from rounding once per file:
+  // 1) plxSpark20260429.csv: 5 rows of ULTotal 20.005 -> exact sum 100.025 -> ROUND_HALF_UP = 100.03
+  //    (per-cell ROUND_HALF_UP sums to 100.05; ROUND_HALF_EVEN would give 100.02; rounding diff = -0.02)
+  // 2) plxSpark20260531.csv: 3 rows of 10.005 + 1 row of 10.006 -> exact sum 40.021 -> ROUND_HALF_UP = 40.02
+  //    (per-cell ROUND_HALF_UP sums to 40.04; rounding diff = -0.02)
+  // 3) plxSpark20260630.csv: 3 rows of 10.004 + 1 blank-DL row of 0.004 -> exact sum 30.016 -> ROUND_HALF_UP = 30.02
+  //    (per-cell ROUND_HALF_UP sums to 30.00; rounding diff = +0.02)
+  // Combined exact-per-file upline = 100.03 + 40.02 + 30.02 = 170.07 (take-back = -17007 cents),
+  // whereas per-cell rounding gives 100.05 + 40.04 + 30.00 = 170.09 (take-back = -17009 cents).
+  await writeTree(stmtDir, {
+    'BEA20260325.csv': 'Statement,Carrier,Revenue Type,Commission Amount,Writing Agent NPN,Writing Agent,Policy Holder Name,MBI,Policy Number,Earned Date,Payment Date,Effective Date,Note,State,Plan Type,Simplified Coverage Type\n2026-03-06,CarrierA,Commission,$ 125.00,11111111,Sam Seller,Pat Sample,1AB2CD3EF45,POL1,2026-03-01,2026-03-06,2026-01-01,mar,NC,MA,MA\n',
+    'plxSpark20260429.csv': [
+      plxCols,
+      plxRow('2026-04-15', 'P401', '1AB2CD3EF41', 'Beacon', '80.00', '20.005', '100.005', 'r1'),
+      plxRow('2026-04-15', 'P402', '1AB2CD3EF42', 'Beacon', '80.00', '20.005', '100.005', 'r2'),
+      plxRow('2026-04-15', 'P403', '1AB2CD3EF43', 'Beacon', '80.00', '20.005', '100.005', 'r3'),
+      plxRow('2026-04-15', 'P404', '1AB2CD3EF44', 'Harbor', '80.00', '20.005', '100.005', 'r4'),
+      plxRow('2026-04-15', 'P405', '1AB2CD3EF45', 'Harbor', '80.00', '20.005', '100.005', 'r5'),
+    ].join('\n') + '\n',
+    'plxSpark20260531.csv': [
+      plxCols,
+      plxRow('2026-05-15', 'P501', '2AB2CD3EF51', 'Beacon', '40.00', '10.005', '50.005', 'm1'),
+      plxRow('2026-05-15', 'P502', '2AB2CD3EF52', 'Beacon', '40.00', '10.005', '50.005', 'm2'),
+      plxRow('2026-05-15', 'P503', '2AB2CD3EF53', 'Harbor', '40.00', '10.005', '50.005', 'm3'),
+      plxRow('2026-05-15', 'P504', '2AB2CD3EF54', 'Harbor', '40.00', '10.006', '50.006', 'm4'),
+    ].join('\n') + '\n',
+    'plxSpark20260630.csv': [
+      plxCols,
+      plxRow('2026-06-15', 'P601', '3AB2CD3EF61', 'Beacon', '40.00', '10.004', '50.004', 'j1'),
+      plxRow('2026-06-15', 'P602', '3AB2CD3EF62', 'Beacon', '40.00', '10.004', '50.004', 'j2'),
+      plxRow('2026-06-15', 'P603', '3AB2CD3EF63', 'Harbor', '40.00', '10.004', '50.004', 'j3'),
+      // Sub-cent ULTotal that rounds to 0.00 on its own must still contribute to the file's exact ULTotal sum
+      plxRow('2026-06-15', 'P604', '3AB2CD3EF64', 'Harbor', '', '0.004', '0.004', 'j4'),
+    ].join('\n') + '\n',
+    'ALLAGENCY20260731Spark.csv': [
+      allAgencyHdr,
+      'Beacon,11111111,Sam Seller,Pat Sample,4AB2CD3EF71,POL701,carriera,spark,200.00,2026-07-01,2026-07-15,rev,NC,MA,MA,2026-01-01,2026-01-01',
+      'Beacon,11111111,Sam Seller,Lee Demo,4AB2CD3EF72,POL702,carriera,spark,100.00,2026-07-01,2026-07-15,pos,NC,MA,MA,2026-01-01,2026-01-01',
+      'Harbor,22222222,Pat Rep,Kim Test,4AB2CD3EF73,POL703,carriera,spark,-40.00,2026-07-01,2026-07-15,cb,NC,MA,MA,2026-01-01,2026-01-01',
+      'Acme,33333333,House Rep,Max Sample,4AB2CD3EF74,POL704,carriera,spark,50.00,2026-07-01,2026-07-15,house,NC,MA,MA,2026-01-01,2026-01-01',
+    ].join('\n') + '\n',
+  });
+  await writeTree(sentDir, {
+    'statements_20260831.csv': [
+      sentHdr,
+      'carriera~spark~4AB2CD3EF71~200.00~2026-07,Beacon,11111111,-200.00,REVERSAL,carriera~spark~4AB2CD3EF71~200.00~2026-07,ALLAGENCY20260731Spark.csv',
+    ].join('\n') + '\n',
+  });
+
+  const corrections = [
+    {
+      kind: 'split_reallocation',
+      statementDate: '2026-08-01',
+      sourceGrammar: 'all_agency',
+      unreversedOnly: true,
+      useAgentsSplit: false,
+      uplineRate: '0.20',
+      excludeEntities: ['Acme'],
+      // Surviving non-Acme: Beacon +100 -> -20/+20, Harbor -40 -> +8/-8 => agency -12.00, upline +12.00
+      expectedAgencyNetCents: -1200,
+      expectedUplineNetCents: 1200,
+      reason: '2026-08-01 80/20 split correction',
+    },
+    {
+      kind: 'upline_takeback',
+      statementDate: '2026-08-31',
+      sourceGrammar: 'plx_layout',
+      expectedAgencyNetCents: 0,
+      expectedUplineNetCents: -17007,
+      reason: '2026-08-31 historical plx ULTotal take-back',
+    },
+  ];
+
+  // Old per-cell rounded total (-17009 cents vs exact-per-file -17007 cents) must be rejected.
+  await assert.rejects(
+    () => readLegacyStatementBatches({
+      statementsDir: stmtDir,
+      sentDir,
+      methodCorrections: [
+        corrections[0],
+        { ...corrections[1], expectedUplineNetCents: -17009 },
+      ],
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      tempBaseDir: env.tempDir,
+    }),
+    (err) => {
+      assert.equal(err.code, 'LEGACY_STATEMENT_READ_FAILED');
+      assert.ok(String(err.message).includes('-17009'), `expected -17009 in message, got: ${err.message}`);
+      assert.ok(String(err.message).includes('-17007'), `expected -17007 in message, got: ${err.message}`);
+      return true;
+    },
+  );
+
+  const parsed = await readLegacyStatementBatches({
+    statementsDir: stmtDir,
+    sentDir,
+    methodCorrections: corrections,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    tempBaseDir: env.tempDir,
+  });
+
+  const byFile = Object.fromEntries(parsed.historicalBatches.map((b) => [b.sourceFileName, b]));
+
+  // Verify every non-ULTotal batch and every agency total is completely unchanged
+  assert.equal(byFile['BEA20260325.csv'].agencyNetTotal, '125.00');
+  assert.equal(byFile['BEA20260325.csv'].uplineNetTotal, '0.00');
+  assert.equal(byFile['plxSpark20260429.csv'].agencyNetTotal, '400.00');
+  assert.equal(byFile['plxSpark20260531.csv'].agencyNetTotal, '160.00');
+  assert.equal(byFile['plxSpark20260630.csv'].agencyNetTotal, '120.00');
+  assert.equal(byFile['ALLAGENCY20260731Spark.csv'].agencyNetTotal, '310.00');
+  assert.equal(byFile['ALLAGENCY20260731Spark.csv'].uplineNetTotal, '0.00');
+
+  const isRoundingLine = (l) => l.srcType === 'rounding_adjustment';
+
+  // Verify each plx file rounds exact ULTotal once (ROUND_HALF_UP) while keeping each row's own amount,
+  // and marks rounding adjustments via typed fields (srcType / revenueType = 'rounding_adjustment'), never a FILE_ROUNDING name.
+  assert.equal(byFile['plxSpark20260429.csv'].uplineNetTotal, '100.03');
+  assert.deepEqual(
+    byFile['plxSpark20260429.csv'].uplineLines.filter((l) => !isRoundingLine(l)).map((l) => l.amount),
+    ['20.01', '20.01', '20.01', '20.01', '20.01'],
+    'each row line must keep its own rounded-to-cent amount as Coherence shows it',
+  );
+  assert.deepEqual(
+    byFile['plxSpark20260429.csv'].uplineLines.filter(isRoundingLine).map((l) => l.amount),
+    ['-0.02'],
+  );
+
+  assert.equal(byFile['plxSpark20260531.csv'].uplineNetTotal, '40.02');
+  assert.deepEqual(
+    byFile['plxSpark20260531.csv'].uplineLines.filter((l) => !isRoundingLine(l)).map((l) => l.amount),
+    ['10.01', '10.01', '10.01', '10.01'],
+  );
+  assert.deepEqual(
+    byFile['plxSpark20260531.csv'].uplineLines.filter(isRoundingLine).map((l) => l.amount),
+    ['-0.02'],
+  );
+
+  assert.equal(byFile['plxSpark20260630.csv'].uplineNetTotal, '30.02');
+  assert.deepEqual(
+    byFile['plxSpark20260630.csv'].uplineLines.filter((l) => !isRoundingLine(l)).map((l) => l.amount),
+    ['10.00', '10.00', '10.00'],
+  );
+  assert.deepEqual(
+    byFile['plxSpark20260630.csv'].uplineLines.filter(isRoundingLine).map((l) => l.amount),
+    ['0.02'],
+  );
+
+  // Verify 8/1 split_reallocation is unchanged
+  const splitBatch = parsed.methodCorrectionBatches[0];
+  assert.equal(splitBatch.agencyNetTotal, '-12.00');
+  assert.equal(splitBatch.uplineNetTotal, '12.00');
+  assert.deepEqual(splitBatch.agencyLines.map((l) => [l.entity, l.amount]), [['Beacon', '-20.00'], ['Harbor', '8.00']]);
+  assert.deepEqual(splitBatch.uplineLines.map((l) => [l.sourceEntity, l.amount]), [['Beacon', '20.00'], ['Harbor', '-8.00']]);
+
+  // Verify 8/31 upline_takeback totals -170.07 while keeping each row's negated line amount
+  const takebackBatch = parsed.methodCorrectionBatches[1];
+  assert.equal(takebackBatch.agencyNetTotal, '0.00');
+  assert.equal(takebackBatch.uplineNetTotal, '-170.07');
+  assert.deepEqual(
+    takebackBatch.uplineLines.filter((l) => !isRoundingLine(l)).map((l) => l.amount),
+    ['-20.01', '-20.01', '-20.01', '-20.01', '-20.01', '-10.01', '-10.01', '-10.01', '-10.01', '-10.00', '-10.00', '-10.00'],
+  );
+  assert.deepEqual(
+    takebackBatch.uplineLines.filter(isRoundingLine).map((l) => l.amount),
+    ['0.02', '0.02', '-0.02'],
+  );
+  for (const b of [byFile['plxSpark20260429.csv'], byFile['plxSpark20260531.csv'], byFile['plxSpark20260630.csv'], takebackBatch]) {
+    for (const l of b.uplineLines) {
+      assert.notEqual(l.sourceEntity, 'FILE_ROUNDING', 'rounding lines must not rely on a FILE_ROUNDING entity name');
+      if (isRoundingLine(l)) {
+        assert.equal(l.revenueType, 'rounding_adjustment');
+      }
+    }
+  }
+
+  // Verify negative half-cent tie (ROUND_HALF_UP away from zero) and per-file vs cross-file rounding
+  const edgeDir = join(env.tempDir, 'subcent-edge');
+  await writeTree(edgeDir, {
+    // 5 rows of -10.005 -> exact -50.025 -> ROUND_HALF_UP = -50.03 (per-cell -50.05; HALF_EVEN -50.02)
+    'plxSpark20260429.csv': [
+      plxCols,
+      plxRow('2026-04-15', 'N1', '5AB2CD3EF81', 'Beacon', '-40.00', '-10.005', '-50.005', 'n1'),
+      plxRow('2026-04-15', 'N2', '5AB2CD3EF82', 'Beacon', '-40.00', '-10.005', '-50.005', 'n2'),
+      plxRow('2026-04-15', 'N3', '5AB2CD3EF83', 'Beacon', '-40.00', '-10.005', '-50.005', 'n3'),
+      plxRow('2026-04-15', 'N4', '5AB2CD3EF84', 'Beacon', '-40.00', '-10.005', '-50.005', 'n4'),
+      plxRow('2026-04-15', 'N5', '5AB2CD3EF85', 'Beacon', '-40.00', '-10.005', '-50.005', 'n5'),
+    ].join('\n') + '\n',
+    // Two files each with exact sum 10.004 -> rounded once per statement file: 10.00 + 10.00 = 20.00
+    // (NOT 20.01 as cross-file rounding of 20.008 would yield), with zero extra rounding lines
+    'plxSpark20260531.csv': [
+      plxCols,
+      plxRow('2026-05-15', 'F1', '5AB2CD3EF86', 'Beacon', '40.00', '10.004', '50.004', 'f1'),
+    ].join('\n') + '\n',
+    'plxSpark20260630.csv': [
+      plxCols,
+      plxRow('2026-06-15', 'F2', '5AB2CD3EF87', 'Beacon', '40.00', '10.004', '50.004', 'f2'),
+    ].join('\n') + '\n',
+  });
+  const edgeParsed = await readLegacyStatementBatches({
+    statementsDir: edgeDir,
+    methodCorrections: [{
+      kind: 'upline_takeback',
+      statementDate: '2026-08-31',
+      sourceGrammar: 'plx_layout',
+      // -(-50.03 + 10.00 + 10.00) = +30.03 (+3003 cents)
+      expectedAgencyNetCents: 0,
+      expectedUplineNetCents: 3003,
+      reason: 'negative half-cent tie and per-file rounding take-back',
+    }],
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    tempBaseDir: env.tempDir,
+  });
+  const edgeByFile = Object.fromEntries(edgeParsed.historicalBatches.map((b) => [b.sourceFileName, b]));
+  assert.equal(edgeByFile['plxSpark20260429.csv'].uplineNetTotal, '-50.03');
+  assert.equal(edgeByFile['plxSpark20260531.csv'].uplineNetTotal, '10.00');
+  assert.equal(edgeByFile['plxSpark20260531.csv'].uplineLineCount, 1, 'no rounding adjustment line when per-file rounded equals line sum');
+  assert.equal(edgeByFile['plxSpark20260630.csv'].uplineNetTotal, '10.00');
+  assert.equal(edgeByFile['plxSpark20260630.csv'].uplineLineCount, 1, 'no rounding adjustment line when per-file rounded equals line sum');
+  assert.equal(edgeParsed.methodCorrectionBatches[0].uplineNetTotal, '30.03');
+
+  // End-to-end PostgreSQL import: passes trg_statement_batches_verify_deferred, nets historical plx upline + 8/31 take-back
+  // to $0.00 across both batch totals and per-record_id balances, and stays idempotent on re-import.
+  const manifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      preCoherenceStatementsDir: stmtDir,
+      preCoherenceSentDir: sentDir,
+      methodCorrections: corrections,
+    },
+  });
+  const rep = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep.passed, true, rep.problems.join('; '));
+  assert.equal(rep.preCoherenceBatchesImported, 5);
+  assert.equal(rep.methodCorrectionBatchesImported, 2);
+
+  // Verify every date's upline total in PostgreSQL matches exact-per-file rounded totals and cumulative upline equals 8/1 split (+12.00)
+  const uplineByDate = (await env.pool.query(
+    `SELECT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS dt, net_amount::text AS total
+     FROM coherence_views.v_entity_statement_date_totals
+     WHERE account_kind = 'upline'
+     ORDER BY statement_date ASC`,
+  )).rows;
+  assert.deepEqual(uplineByDate, [
+    { dt: '2026-04-29', total: '100.03' },
+    { dt: '2026-05-31', total: '40.02' },
+    { dt: '2026-06-30', total: '30.02' },
+    { dt: '2026-08-01', total: '12.00' },
+    { dt: '2026-08-31', total: '-170.07' },
+  ]);
+
+  // Verify every plx record_id (both row lines and per-file rounding adjustment lines) nets to exact 0.00 in statement_upline_lines
+  const nonzeroPlxRecords = (await env.pool.query(
+    `SELECT record_id, SUM(amount)::numeric(14,2)::text AS net
+     FROM coherence.statement_upline_lines
+     WHERE source_file LIKE 'plxSpark%'
+     GROUP BY record_id
+     HAVING SUM(amount) <> 0.00`,
+  )).rows;
+  assert.deepEqual(nonzeroPlxRecords, [], 'every plxSpark upline record_id (including rounding lines) must net to 0.00 after 8/31 take-back');
+
+  // Verify cumulative entity totals across all batches
+  const entTotals = (await env.pool.query(
+    `SELECT statement_entity, SUM(net_amount)::numeric(14,2)::text AS total
+     FROM coherence_views.v_entity_statement_date_totals
+     GROUP BY statement_entity
+     ORDER BY statement_entity COLLATE "C"`,
+  )).rows;
+  // Acme: 50.00 (7/31)
+  // Acme Upline: 100.03 + 40.02 + 30.02 + 12.00 - 170.07 = 12.00
+  // Beacon: 125 (3/25) + 240 (4/29) + 80 (5/31) + 80 (6/30) + 300 (7/31) - 20 (8/1) = 805.00
+  // Harbor: 160 (4/29) + 80 (5/31) + 40 (6/30) - 40 (7/31) + 8 (8/1) = 248.00
+  assert.deepEqual(entTotals, [
+    { statement_entity: 'Acme', total: '50.00' },
+    { statement_entity: 'Acme Upline', total: '12.00' },
+    { statement_entity: 'Beacon', total: '805.00' },
+    { statement_entity: 'Harbor', total: '248.00' },
+  ]);
+
+  // Verify idempotency on re-import
+  const rep2 = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    recordCheck: false,
+    tempBaseDir: env.tempDir,
+  });
+  assert.equal(rep2.preCoherenceBatchesImported, 0);
+  assert.equal(rep2.methodCorrectionBatchesImported, 0);
+
+  // Full PostgreSQL Emit conservation check (trg_run_materializations_verify_deferred + v_entity_statement_reconciliation)
+  // proving that sub-cent plxSpark historical upline + 8/31 take-back (including rounding lines) tie out at $0.00 variance
+  // both in aggregate and record-by-record.
+  const envMat = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => envMat.cleanup());
+  const { engineVersionId } = await seedEngineVersion(envMat);
+  await seedStandingInput(envMat, { commandKey: 'subcent-standing' });
+
+  const matStmtDir = join(envMat.tempDir, 'mat-stmts');
+  const matPlxCsv = [
+    plxCols,
+    plxRow('2026-04-15', 'P901', '9AB2CD3EF91', 'Beacon', '80.00', '20.005', '100.005', 'm1'),
+    plxRow('2026-04-15', 'P902', '9AB2CD3EF92', 'Beacon', '80.00', '20.005', '100.005', 'm2'),
+    plxRow('2026-04-15', 'P903', '9AB2CD3EF93', 'Beacon', '80.00', '20.005', '100.005', 'm3'),
+    plxRow('2026-04-15', 'P904', '9AB2CD3EF94', 'Beacon', '80.00', '20.005', '100.005', 'm4'),
+    plxRow('2026-04-15', 'P905', '9AB2CD3EF95', 'Beacon', '80.00', '20.005', '100.005', 'm5'),
+  ].join('\n') + '\n';
+  await writeTree(matStmtDir, { 'plxSpark20260429.csv': matPlxCsv });
+
+  const matParsed = await readLegacyStatementBatches({
+    statementsDir: matStmtDir,
+    methodCorrections: [{
+      kind: 'upline_takeback',
+      statementDate: '2026-08-31',
+      sourceGrammar: 'plx_layout',
+      expectedAgencyNetCents: 0,
+      expectedUplineNetCents: -10003,
+      reason: '2026-08-31 plx ULTotal take-back',
+    }],
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    tempBaseDir: envMat.tempDir,
+  });
+  const matPlxStored = await envMat.dataStore.promoteBytes(Buffer.from(matPlxCsv, 'utf8'), {
+    relPath: 'Prior Statements/plxSpark20260429.csv',
+    checksPassed: true,
+  });
+  await envMat.commands.recordStatementBatch({
+    actor: envMat.ownerActor,
+    commandKey: 'hist-plx-20260429',
+    batchKind: 'historical_sent',
+    statementDate: '2026-04-29',
+    sourceFileName: 'plxSpark20260429.csv',
+    sourceFile: matPlxStored,
+    reason: 'Imported 2026-04-29 plx statement',
+    agencyLines: matParsed.historicalBatches[0].agencyLines,
+    uplineLines: matParsed.historicalBatches[0].uplineLines,
+  });
+  await envMat.commands.recordStatementBatch({
+    actor: envMat.ownerActor,
+    commandKey: 'corr-plx-takeback-20260831',
+    batchKind: 'method_correction',
+    statementDate: '2026-08-31',
+    reason: '2026-08-31 plx ULTotal take-back',
+    agencyLines: matParsed.methodCorrectionBatches[0].agencyLines,
+    uplineLines: matParsed.methodCorrectionBatches[0].uplineLines,
+  });
+
+  const standingId = (await envMat.pool.query('SELECT coherence.standing_input_version_as_of(NULL) AS id')).rows[0].id;
+  const curEntries = (await envMat.pool.query(
+    'SELECT rel_path, file_sha256 FROM coherence.input_entries WHERE input_version_id = $1::uuid',
+    [standingId],
+  )).rows;
+  await envMat.commands.publishInputVersion({
+    actor: envMat.ownerActor,
+    commandKey: 'include-plx-input',
+    lineKind: 'standing',
+    sourceKind: 'include',
+    reason: 'Include pre-Coherence plx file',
+    entries: [
+      ...curEntries.map((e) => ({ relPath: e.rel_path, fileSha256: e.file_sha256 })),
+      { relPath: 'Prior Statements/plxSpark20260429.csv', fileSha256: matPlxStored.sha256 },
+    ],
+  });
+
+  const launch = await envMat.commands.launchRun({
+    actor: envMat.ownerActor,
+    commandKey: 'launch-subcent-20260831',
+    statementDate: '2026-08-31',
+    origin: 'app',
+    engineVersionId,
+  });
+  const runId = launch.result.runId;
+  const worker = envMat.registerWorker(createEngineWorker({
+    pool: envMat.pool,
+    pgConfig: envMat.pgConfig,
+    companySlug: envMat.companySlug,
+    stores: envMat.stores,
+    commands: envMat.commands,
+    workerActor: envMat.workerActor,
+    materializeEngine: createMockEngineMaterializer(),
+    tempBaseDir: envMat.tempDir,
+  }));
+  for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
+  let seq = Number((await envMat.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
+  await envMat.commands.saveReviewDecisions({
+    actor: envMat.ownerActor,
+    commandKey: 'bible-subcent-20260831',
+    expectedJournalSeq: seq,
+    runId,
+    surface: 'bible',
+    decisions: [
+      { recordId: 'policy:carrier_a:P10001#effective:2026-01-01', disposition: 'CONFIRM' },
+      { recordId: (await envMat.pool.query("SELECT record_id FROM coherence.review_queue_items WHERE run_id = $1::uuid AND surface = 'bible' AND item_order = 2", [runId])).rows[0].record_id, disposition: 'CONFIRM' },
+    ],
+  });
+  assert.equal((await worker.runOnce()).action, 'step_finished');
+  seq = Number((await envMat.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
+  const adjSave = await envMat.commands.saveReviewDecisions({
+    actor: envMat.ownerActor,
+    commandKey: 'adjust-subcent-20260831',
+    expectedJournalSeq: seq,
+    runId,
+    surface: 'adjust',
+    decisions: [{ recordId: 'carrier_a~direct~P10001~100.00~2026-11', disposition: 'CONFIRM' }],
+  });
+  seq = Number((await envMat.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
+  await envMat.commands.confirmEmit({
+    actor: envMat.ownerActor,
+    commandKey: 'confirm-subcent-20260831',
+    expectedJournalSeq: seq,
+    runId,
+    adjustReviewSaveId: adjSave.result.reviewSaveId,
+    typedPhrase: 'create statements for 2026-08-31',
+  });
+  assert.equal((await worker.runOnce()).action, 'step_finished');
+
+  const bobCsv = makeCsvFromObjects(SYNTHETIC_BOB_COLUMNS, [{
+    external_policy_id: 'P999', policy_id: '999', carrier_policy_number: 'P999', crm_policy_number: '',
+    enrollment_code: '', carrier: 'carriera', plan_type: 'MA', plan_name: 'MA', simple_plan_type: 'MA',
+    mbi: '9AB2CD3EF99', member: 'Pat Sample', dob: '', phone: '', email: '', address: '', county: '', state: 'NC',
+    submission_date: '2026-01-01', origin_effective: '2026-01-01', effective_date: '2026-01-01', termination_date: '',
+    min_date: '2026-01-01', anchor_date: '2026-01-01', amount: '400.00', upline_amount: '100.00',
+    writing_npn: '11111111', writing_agent: 'Sam Seller', entity: 'Beacon', agency_id: '', status: 'ACTIVE',
+    conflicts: '', spine_source: 'tx', confidence_level: '1',
+  }]);
+  const ledgerCsv = makeCsvFromObjects(SYNTHETIC_LEDGER_COLUMNS, [{
+    record_id: 'carriera~spark~9AB2CD3EF99~500.00~2026-08', external_policy_id: 'P999', policy_id: '999', tx_id: '999',
+    statement_name: 'statements_20260831.csv', src_type: 'spark', carrier: 'carriera', mbi: '9AB2CD3EF99', member: 'Pat Sample',
+    state: 'NC', plan_type: 'MA', simple_plan_type: 'MA', submission_date: '2026-01-01', origin_effective: '2026-01-01',
+    effective_date: '2026-01-01', termination_date: '', earned_date: '2026-08-01', payment_date: '2026-08-15',
+    statement_date: '2026-08-31', min_date: '2026-01-01', gross_comm: '500.00', revenue_type: 'commission',
+    override_amount: '', commission_amount: '500.00', hra_amount: '', fee_amount: '', other_amount: '',
+    downline_amount: '400.00', upline_amount: '100.00', writing_npn: '11111111', writing_agent: 'Sam Seller',
+    entity: 'Beacon', payee_npn: '', agency_id: '', status: 'ACTIVE', policy_status: 'active',
+    cbob_c: 'false', cbob_s: 'false', sf: 'false', notes: 'rep', coherent_notes: '',
+  }]);
+  const cancelRows = matParsed.historicalBatches[0].agencyLines.map((al) => ({
+    record_id: al.recordId, external_policy_id: al.externalPolicyId, policy_id: '', tx_id: '',
+    statement_name: 'plxSpark20260429.csv', src_type: 'spark', carrier: 'carriera', mbi: al.mbi, member: al.member,
+    state: 'NC', plan_type: 'MA', simple_plan_type: 'MA', submission_date: '', origin_effective: '',
+    effective_date: '', termination_date: '', earned_date: '2026-04-15', payment_date: '2026-04-15',
+    statement_date: '', min_date: '', gross_comm: '-80.00', revenue_type: 'commission',
+    override_amount: '', commission_amount: '-80.00', hra_amount: '', fee_amount: '', other_amount: '',
+    downline_amount: '-80.00', upline_amount: '0.00', writing_npn: '11111111', writing_agent: 'Sam Seller',
+    entity: 'Beacon', payee_npn: '', agency_id: '', status: '', policy_status: '',
+    cbob_c: 'false', cbob_s: 'false', sf: 'false', notes: 'cancel', coherent_notes: 'CANCEL',
+    run_action: 'CANCEL', run_statement_date: '2026-08-31',
+    reversal_of: al.recordId, reason: 'era cancel plxSpark row',
+  }));
+  const stmtCsv = makeCsvFromObjects(SYNTHETIC_RUN_COLUMNS, [
+    ...cancelRows,
+    {
+      record_id: 'carriera~spark~9AB2CD3EF99~500.00~2026-08', external_policy_id: 'P999', policy_id: '999', tx_id: '999',
+      statement_name: 'statements_20260831.csv', src_type: 'spark', carrier: 'carriera', mbi: '9AB2CD3EF99', member: 'Pat Sample',
+      state: 'NC', plan_type: 'MA', simple_plan_type: 'MA', submission_date: '2026-01-01', origin_effective: '2026-01-01',
+      effective_date: '2026-01-01', termination_date: '', earned_date: '2026-08-01', payment_date: '2026-08-15',
+      statement_date: '2026-08-31', min_date: '2026-01-01', gross_comm: '500.00', revenue_type: 'commission',
+      override_amount: '', commission_amount: '500.00', hra_amount: '', fee_amount: '', other_amount: '',
+      downline_amount: '400.00', upline_amount: '100.00', writing_npn: '11111111', writing_agent: 'Sam Seller',
+      entity: 'Beacon', payee_npn: '', agency_id: '', status: 'ACTIVE', policy_status: 'active',
+      cbob_c: 'false', cbob_s: 'false', sf: 'false', notes: 'rep', coherent_notes: '',
+      run_action: 'NEW', run_statement_date: '2026-08-31',
+      reversal_of: '', reason: 'replacement ledger row',
+    },
+  ]);
+
+  await envMat.commands.materializeEmit({
+    actor: envMat.ownerActor,
+    commandKey: 'mat-subcent-20260831',
+    runId,
+    canonicalBobCsv: bobCsv,
+    coherentLedgerCsv: ledgerCsv,
+    statementsCsv: stmtCsv,
+  });
+
+  const recon = (await envMat.pool.query(
+    'SELECT statement_entity, statement_total::text, ledger_total::text, variance::text, reconciled FROM coherence_views.v_entity_statement_reconciliation($1::uuid)',
+    [runId],
+  )).rows;
+  assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'));
+  assert.deepEqual(
+    Object.fromEntries(recon.map((r) => [r.statement_entity, r.statement_total])),
+    { 'Acme Upline': '100.00', Beacon: '400.00' },
+  );
+
+  // Verify v_entity_statement_totals separates typed rounding_adjustment rows from statement (src_type, payment_month) rows,
+  // and Layer 3 run-comparator line counts exclude synthetic rounding adjustments while keeping exact entity parity.
+  const viewTotals = (await envMat.pool.query(
+    `SELECT t.account_kind, t.src_type, t.payment_month, t.line_count::int AS line_count, t.net_amount::text AS net_amount
+     FROM coherence_views.v_entity_statement_totals t
+     JOIN coherence.run_effective_statement_batches($1::uuid) eff ON eff.batch_id = t.batch_id
+     WHERE t.src_type = 'rounding_adjustment'
+     ORDER BY t.statement_date ASC`,
+    [runId],
+  )).rows;
+  assert.deepEqual(viewTotals, [
+    { account_kind: 'upline', src_type: 'rounding_adjustment', payment_month: null, line_count: 1, net_amount: '-0.02' },
+    { account_kind: 'upline', src_type: 'rounding_adjustment', payment_month: null, line_count: 1, net_amount: '0.02' },
+  ]);
+
+  const cmpParity = await compareDbRuns({
+    pool: envMat.pool,
+    stores: envMat.stores,
+    leftRunId: runId,
+    rightRunId: runId,
+    mode: 'substance',
+    expectedEntityParity: {
+      datesChecked: 2,
+      filesChecked: 4,
+      totalLines: 22,
+      ledgerGrossTotal: '500.00',
+      perEntityTotals: { 'Acme Upline': '100.00', Beacon: '400.00' },
+    },
+    tempBaseDir: envMat.tempDir,
+  });
+  assert.equal(cmpParity.passed, true, `Layer 3 comparator parity failed: ${cmpParity.problems.join('; ')}`);
+  assert.equal(cmpParity.gates.gate4.entityStatements.dbReconciliation.totalLines, 22);
+  assert.equal(cmpParity.gates.gate4.entityStatements.dbReconciliation.roundingAdjustmentLines, 2);
+});
+
 test('Layer 4 [Fix 3 - Consistent SQLite Snapshot & Sidecar Guard]: never reads live WAL DB directly, takes one consistent copy into temp dir, refuses -wal/-shm without consistent copy, and reads counts + all 8 tables from that one copy in one read transaction', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
   t.after(() => env.cleanup());
@@ -1555,10 +2542,10 @@ test('Layer 4 [Fix 4 - Journal Rebuild Topological Ordering]: imported run with 
     }));
   }
 
-  // Prior overlay has rev-0; 9 timestamped saves extend it one revision at a time (10 commits + 10 approvals_files in ONE journal entry!)
+  // 10 timestamped saves starting from a pinned fresh root (10 commits + 10 approvals_files in ONE journal entry!)
+  const save0Csv = makeOverlayCsv(rows.slice(0, 1), { version: 'v2' });
   await writeTree(join(cohRoot, 'runs', '2026-11-15'), {
     'input/a.csv': 'k\n1\n',
-    'input/Overlay/overlay.csv': makeOverlayCsv(rows.slice(0, 1), { version: 'v2' }),
     'bible.csv': `record_id,case,subtype,amount\n${targetKey},BIBLE,CONFLICT,100.00\n`,
     'overlay.csv': makeOverlayCsv(rows, { version: 'v2' }),
     'run.json': JSON.stringify({
@@ -1570,7 +2557,7 @@ test('Layer 4 [Fix 4 - Journal Rebuild Topological Ordering]: imported run with 
     }),
   });
   const saveFiles = {};
-  for (let i = 1; i < 10; i++) {
+  for (let i = 0; i < 10; i++) {
     saveFiles[`bible-review-2026-11-15T10-${String(i).padStart(2, '0')}-00-000Z.csv`] = makeOverlayCsv(rows.slice(0, i + 1), { version: 'v2' });
   }
   await writeTree(join(dataRoot, 'coherence-runs', '2026-11-15'), saveFiles);
@@ -1579,7 +2566,11 @@ test('Layer 4 [Fix 4 - Journal Rebuild Topological Ordering]: imported run with 
     companySlug: 'acme',
     coherenceRoot: cohRoot,
     nusearDataDir: dataRoot,
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-11-15', sha256: sha256Utf8(save0Csv) }],
+    },
   });
 
   const rep = await executeHistoryImport({
@@ -1629,7 +2620,6 @@ test('Layer 4 [Fix 5 - Long Path Command Keys <= 200 chars]: 300-character paths
   const longRightRunDir = join(longDir, 'ref-run-2026-11-02');
   const runFiles = {
     'input/a.csv': 'k\n1\n',
-    'input/Overlay/overlay.csv': ovCsv,
     'overlay.csv': ovCsv,
     'emits/overlay.csv': ovCsv,
     'emits/canonical_bob.csv': 'policy_id,member,entity,amount,upline_amount\n1,Pat Sample,Beacon,80.00,20.00\n',
@@ -1646,7 +2636,11 @@ test('Layer 4 [Fix 5 - Long Path Command Keys <= 200 chars]: 300-character paths
     companySlug: 'acme',
     sources: { legacyRunsRoot: join(env.tempDir, 'runs') },
     overlayCheckpoints: [{ absPath: longCheckpointPath, originalAt: '2026-11-03T10:00:00Z' }],
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-11-02', sha256: sha256Utf8(ovCsv) }],
+    },
   });
 
   const rep = await executeHistoryImport({
@@ -1702,8 +2696,9 @@ test('Layer 4 [Fix 6 - Chronological Same-Date Runs & Merged Checkpoints]: order
   // Standalone checkpoints that belong BEFORE and BETWEEN runs chronologically
   const cpEarly = join(cpDir, 'cp-early.csv');
   const cpMid = join(cpDir, 'cp-mid.csv');
+  const cpEarlyCsv = makeOverlayCsv(rows.slice(0, 1), { version: 'v2' });
   await mkdir(cpDir, { recursive: true });
-  await writeFile(cpEarly, makeOverlayCsv(rows.slice(0, 1), { version: 'v2' }), 'utf8');
+  await writeFile(cpEarly, cpEarlyCsv, 'utf8');
   await writeFile(cpMid, makeOverlayCsv(rows.slice(0, 3), { version: 'v2' }), 'utf8');
 
   // Same-date 2026-10-12: archive/draft1 (started 08:00, 2 rows) must run BEFORE primary 2026-10-12 (started 10:00, 4 rows)
@@ -1738,7 +2733,11 @@ test('Layer 4 [Fix 6 - Chronological Same-Date Runs & Merged Checkpoints]: order
       { label: 'mid-2026-10-12', absPath: cpMid, originalAt: '2026-10-12T09:00:00Z' },
       { label: 'early-2026-10-10', absPath: cpEarly, originalAt: '2026-10-10T09:00:00Z' },
     ],
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: 'overlay-checkpoints/early-2026-10-10', sha256: sha256Utf8(cpEarlyCsv) }],
+    },
   });
 
   const rep = await executeHistoryImport({
@@ -1795,6 +2794,15 @@ test('Layer 4 [Fix 7 & Note 3 - Standing Sent Idempotency & Missing Statements P
     }),
   });
 
+  await env.commands.recordDecisionBaseline({
+    actor: env.ownerActor,
+    commandKey: 'seed-fix7-baseline',
+    commitKind: 'historical_baseline',
+    headerContract: 'v2',
+    imported: true,
+    decisions: [row0],
+  });
+
   const manifest = await buildImportManifest({
     companySlug: 'acme',
     sources: {
@@ -1844,6 +2852,14 @@ test('Layer 4 [Fix 7 & Note 3 - Standing Sent Idempotency & Missing Statements P
     'audit.json': JSON.stringify({
       events: [{ id: 'evt-1111', action: 'record_sent', statementDate: '2026-11-11', at: '2026-11-11T15:00:00Z' }],
     }),
+  });
+  await envMissing.commands.recordDecisionBaseline({
+    actor: envMissing.ownerActor,
+    commandKey: 'seed-fix7-missing-baseline',
+    commitKind: 'historical_baseline',
+    headerContract: 'v2',
+    imported: true,
+    decisions: [row0],
   });
   const missManifest = await buildImportManifest({
     companySlug: 'acme',
@@ -1908,7 +2924,11 @@ test('Layer 4 [Fix 8 & Note 1 - Blank committed_at on Imported Rows & Zero-Check
   const manifest = await buildImportManifest({
     companySlug: 'acme',
     sources: { legacyRunsRoot: join(env.tempDir, 'runs') },
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-11-16', sha256: sha256Utf8(blankCsv) }],
+    },
   });
   const rep = await executeHistoryImport({
     pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
@@ -2004,6 +3024,15 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
     'working/partial.csv': 'id\n9\n',
     'crash.log': 'interrupted during assign\n',
     'run.json': JSON.stringify({ date: '2026-11-14', steps: {} }),
+  });
+
+  await env.commands.recordDecisionBaseline({
+    actor: env.ownerActor,
+    commandKey: 'seed-fix9-baseline',
+    commitKind: 'historical_baseline',
+    headerContract: 'v2',
+    imported: true,
+    decisions: [row0],
   });
 
   const manifest = await buildImportManifest({
@@ -2264,6 +3293,12 @@ test('Layer 4 [Proof Runner CLI scripts/prove-history.mjs]: migrates fresh test_
     'emits/statements_20261102.csv': stmtCsv,
     'run.json': JSON.stringify({ date: '2026-11-02', steps: { assign: { at: '2026-11-02T10:00:00' }, bible: { at: '2026-11-02T10:01:00' }, emit: { at: '2026-11-02T10:05:00' } } }),
   };
+  await writeTree(join(work, 'src', 'runs', '2026-10-12'), {
+    'input/a.csv': 'k\n1\n',
+    'overlay.csv': priorCsv,
+    'emits/overlay.csv': priorCsv,
+    'run.json': JSON.stringify({ date: '2026-10-12', steps: { assign: { at: '2026-10-12T10:00:00' }, emit: { at: '2026-10-12T10:05:00' } } }),
+  });
   await writeTree(join(work, 'src', 'runs', '2026-11-02'), runFiles);
   await writeTree(join(work, 'src', 'ref-2026-11-02'), runFiles);
   await writeTree(join(work, 'src', 'input'), {
@@ -2286,6 +3321,7 @@ test('Layer 4 [Proof Runner CLI scripts/prove-history.mjs]: migrates fresh test_
       includeLegacyHostHistory: true,
       useCompanyIncomingInput: false,
       currentInputSourceKind: 'mac_import',
+      freshOverlayRoots: [{ sourceFolder: '2026-10-12', sha256: sha256Utf8(priorCsv) }],
     },
     compareTargets: [
       {
@@ -2357,7 +3393,6 @@ test('Layer 4 [Fix 10 & Note 2 - Proof Runner Missing Right Run, Configured Fold
   const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
   await writeTree(join(work, 'src', 'runs', '2026-11-02'), {
     'input/a.csv': 'k\n1\n',
-    'input/Overlay/overlay.csv': ovCsv,
     'overlay.csv': ovCsv,
     'emits/overlay.csv': ovCsv,
     'emits/canonical_bob.csv': 'policy_id,member,entity,amount,upline_amount\n1,Pat Sample,Beacon,80.00,20.00\n',
@@ -2371,7 +3406,11 @@ test('Layer 4 [Fix 10 & Note 2 - Proof Runner Missing Right Run, Configured Fold
     coherenceRepo: mockRepo,
     pythonPath: 'python3',
     sources: { legacyRunsRoot: 'src/runs' },
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-11-02', sha256: sha256Utf8(ovCsv) }],
+    },
     compareTargets: [
       {
         label: 'missing-right-target',
@@ -2434,7 +3473,7 @@ test('Layer 4 [Fix2-2 - Gate 4 Non-Vacuous Entity Parity]: fails naming missing 
   ].join('\n') + '\n';
 
   const runFiles = {
-    'input/Overlay/overlay.csv': ovCsv,
+    'input/a.csv': 'k\n1\n',
     'overlay.csv': ovCsv,
     'emits/overlay.csv': ovCsv,
     'emits/canonical_bob.csv': bobCsv,
@@ -2449,7 +3488,11 @@ test('Layer 4 [Fix2-2 - Gate 4 Non-Vacuous Entity Parity]: fails naming missing 
   const manifest = await buildImportManifest({
     companySlug: 'acme',
     sources: { legacyRunsRoot: join(srcRoot, 'runs') },
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-11-02', sha256: sha256Utf8(ovCsv) }],
+    },
   });
   const imp = await executeHistoryImport({
     pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
@@ -2592,11 +3635,12 @@ test('Layer 4 [Fix2-3 - Zone-Less Timestamps on Non-UTC Session]: normalizes man
   const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:PZ1#effective:2026-01-01', note: 'cp' });
   const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:PZ2#effective:2026-01-01', note: 'run' });
   const cpPath = join(srcRoot, 'cp-zoneless.csv');
+  const cpCsv = makeOverlayCsv([row0], { version: 'v2' });
   await mkdir(srcRoot, { recursive: true });
-  await writeFile(cpPath, makeOverlayCsv([row0], { version: 'v2' }), 'utf8');
+  await writeFile(cpPath, cpCsv, 'utf8');
   await writeTree(join(srcRoot, 'runs', '2026-10-16'), {
     'input/a.csv': 'k\n1\n',
-    'input/Overlay/overlay.csv': makeOverlayCsv([row0], { version: 'v2' }),
+    'input/Overlay/overlay.csv': cpCsv,
     'overlay.csv': makeOverlayCsv([row0, row1], { version: 'v2' }),
     'run.json': JSON.stringify({ date: '2026-10-16', steps: { assign: { at: zonelessTs } } }),
   });
@@ -2605,7 +3649,11 @@ test('Layer 4 [Fix2-3 - Zone-Less Timestamps on Non-UTC Session]: normalizes man
     companySlug: 'acme',
     sources: { legacyRunsRoot: join(srcRoot, 'runs') },
     overlayCheckpoints: [{ label: 'zoneless-cp', absPath: cpPath, originalAt: zonelessTs }],
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: 'overlay-checkpoints/zoneless-cp', sha256: sha256Utf8(cpCsv) }],
+    },
   });
 
   const imp = await executeHistoryImport({
@@ -2676,7 +3724,6 @@ test('Layer 4 [Fix2-4a - Proof Runner /cloudsql Refusal & Local Mode Pinning]: r
   const ovCsv = makeOverlayCsv([row0], { version: 'v2' });
   await writeTree(join(work, 'src', 'runs', '2026-11-02'), {
     'input/a.csv': 'k\n1\n',
-    'input/Overlay/overlay.csv': ovCsv,
     'overlay.csv': ovCsv,
     'emits/overlay.csv': ovCsv,
     'run.json': JSON.stringify({ date: '2026-11-02', steps: { assign: { at: '2026-11-02T10:00:00' }, emit: { at: '2026-11-02T10:05:00' } } }),
@@ -2687,7 +3734,11 @@ test('Layer 4 [Fix2-4a - Proof Runner /cloudsql Refusal & Local Mode Pinning]: r
     coherenceRepo: mockRepo,
     pythonPath: 'python3',
     sources: { legacyRunsRoot: 'src/runs' },
-    importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-11-02', sha256: sha256Utf8(ovCsv) }],
+    },
   }), 'utf8');
 
   const dbName = `test_prove_pin_${createHash('sha256').update(work).digest('hex').slice(0, 8)}`;
@@ -2702,4 +3753,2855 @@ test('Layer 4 [Fix2-4a - Proof Runner /cloudsql Refusal & Local Mode Pinning]: r
   );
   const summary = JSON.parse(stdout);
   assert.equal(summary.passed, true, `proof runner should succeed in pinned local mode despite COHERENCE_PG_MODE=cloudsql: ${JSON.stringify(summary.problems)}`);
+});
+
+test('Layer 4 [Proof Runner --plan Mode]: counts runs/files/bytes accurately across all areas without reading file contents or touching a database, counts unreadable files, and prints only counts and names', async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-prove-plan-ok-'));
+  const unreadablePaths = [];
+  t.after(async () => {
+    for (const p of unreadablePaths) {
+      await chmod(p, 0o600).catch(() => {});
+    }
+    await rm(work, { recursive: true, force: true });
+  });
+
+  const secretContent = 'SECRET_MEMBER_CONTENT_DO_NOT_READ_888\n';
+  const secretFilename = 'Pat_Sample_SecretFile_999.csv';
+
+  const legacyRun1Files = {
+    'run.json': '{"date":"2026-10-21"}\n',
+    [`input/${secretFilename}`]: secretContent,
+    'emits/statements_20261021.csv': 'record_id,amount\n',
+  };
+  const legacyRun2Files = {
+    'run.json': '{"date":"2026-08-31"}\n',
+    'overlay.csv': 'record_id,disposition\n',
+  };
+  const incidentFiles = {
+    '2026-11-03/report.csv': 'k\n1\n',
+    '2026-11-03/helper.py': 'print("ok")\n',
+  };
+  const standingFiles = {
+    'Agent Data/cleanagentdata.csv': 'agent_name,agent_npn\nSam,11111111\n',
+    [`All BOB/TrailingCarrier /${secretFilename}`]: secretContent,
+    'Overlay/overlay.csv': 'record_id,disposition\n',
+    'PreStatements/stmt_20260325.csv': 'a,b\n1,2\n',
+    'PreStatements/.DS_Store': 'ignored-by-pre-coherence',
+    'Sent/statements_20260831.csv': 'record_id\n',
+  };
+  const companyRunFiles = {
+    'run.json': '{"date":"2026-11-03"}\n',
+    'emits/canonical_bob.csv': 'policy_id,amount\n1,10.00\n',
+  };
+  const abandonedRunFiles = {
+    'run.json': 'NOT_EVEN_VALID_JSON_BECAUSE_PLAN_NEVER_READS_IT',
+    'working/tx.csv': 'id\n1\n',
+  };
+  const abandonedStandalone = { 'orphan-notes.txt': 'abandoned-note\n' };
+  const legacySavesFiles = {
+    '2026-10-21/bible-review-2026-10-21T10-00-00-000Z.csv': 'record_id\n',
+    '2026-10-21/run.log': 'log-line\n',
+  };
+  const companySavesFiles = {
+    '2026-11-03/adjust-review-2026-11-03T10-00-00-000Z.csv': 'record_id\n',
+  };
+  const companyEnvFiles = {
+    'audit.json': 'INVALID_JSON_MUST_NEVER_BE_READ',
+    'answer-key-2026-11-03.json': '{"ok":true}\n',
+    'finished/2026-11-03/summary.csv': 'k\n1\n',
+    'replaced/old.csv': 'k\n0\n',
+    'incoming/ignored-when-not-standing.csv': 'ignored\n',
+  };
+  const cloudMirrorFiles = {
+    'lists/standing.json': '{"files":[]}\n',
+    'objects/deadbeef': 'bytes\n',
+  };
+  const checkpointBytes = 'record_id,disposition\n';
+  const sqliteFakeBytes = 'NOT_A_REAL_SQLITE_FILE_MUST_NEVER_BE_OPENED';
+
+  const byteLen = (obj) => Object.values(obj).reduce((sum, s) => sum + Buffer.byteLength(s, 'utf8'), 0);
+
+  await writeTree(join(work, 'coherence', 'runs', '2026-10-21'), legacyRun1Files);
+  await writeTree(join(work, 'coherence', 'runs', 'archive', 'v1', '2026-08-31'), legacyRun2Files);
+  await writeTree(join(work, 'coherence', 'runs', 'Incident Report'), incidentFiles);
+  await writeTree(join(work, 'coherence', 'input'), standingFiles);
+  await writeTree(join(work, 'nusear', 'company-workspaces', 'acme', '2026-11-03', 'runs', '2026-11-03'), companyRunFiles);
+  await writeTree(join(work, 'nusear', 'company-abandoned', 'acme', 'abandoned-no-date'), abandonedRunFiles);
+  await writeTree(join(work, 'nusear', 'company-abandoned', 'acme'), abandonedStandalone);
+  await writeTree(join(work, 'nusear', 'coherence-runs'), legacySavesFiles);
+  await writeTree(join(work, 'nusear', 'company-runs', 'acme'), companySavesFiles);
+  await writeTree(join(work, 'nusear', 'company-environments', 'acme'), companyEnvFiles);
+  await writeTree(join(work, 'cloud-mirror'), cloudMirrorFiles);
+  await writeTree(join(work, 'checkpoints'), { 'pre-1021.csv': checkpointBytes });
+  await writeTree(join(work, 'backups'), { 'nusear2.sqlite': sqliteFakeBytes });
+  await writeTree(join(work, 'ref-2026-10-21'), legacyRun1Files);
+
+  // Make multiple files unreadable (mode 000): stat/readdir succeed while any file read would fail with EACCES.
+  const toLock = [
+    join(work, 'coherence', 'runs', '2026-10-21', 'run.json'),
+    join(work, 'coherence', 'runs', '2026-10-21', 'input', secretFilename),
+    join(work, 'coherence', 'input', 'Agent Data', 'cleanagentdata.csv'),
+    join(work, 'coherence', 'input', 'All BOB', 'TrailingCarrier ', secretFilename),
+    join(work, 'nusear', 'company-environments', 'acme', 'audit.json'),
+    join(work, 'checkpoints', 'pre-1021.csv'),
+    join(work, 'backups', 'nusear2.sqlite'),
+  ];
+  for (const p of toLock) {
+    await chmod(p, 0o000);
+    unreadablePaths.push(p);
+  }
+
+  const manifestPath = join(work, 'plan-manifest.json');
+  await writeFile(manifestPath, JSON.stringify({
+    companySlug: 'acme',
+    displayName: 'Acme',
+    coherenceRoot: 'coherence',
+    coherenceRepo: 'coherence',
+    nusearDataDir: 'nusear',
+    nusearSqlitePath: 'backups/nusear2.sqlite',
+    pythonPath: 'python3',
+    sources: {
+      legacyRunsRoot: 'coherence/runs',
+      standingInputDir: 'coherence/input',
+      incidentReportDir: 'coherence/runs/Incident Report',
+      legacyReviewSavesDir: 'nusear/coherence-runs',
+      companyWorkspacesDir: 'nusear/company-workspaces/acme',
+      companyAbandonedDir: 'nusear/company-abandoned/acme',
+      companyReviewSavesDir: 'nusear/company-runs/acme',
+      companyEnvironmentDir: 'nusear/company-environments/acme',
+      cloudMirrorDir: 'cloud-mirror',
+      legacySqlitePath: 'backups/nusear2.sqlite',
+      preCoherenceStatementsDir: 'coherence/input/PreStatements',
+      preCoherenceSentDir: 'coherence/input/Sent',
+      preCoherenceAgentsCsv: 'coherence/input/Agent Data/cleanagentdata.csv',
+      methodCorrections: [
+        { kind: 'split_reallocation', statementDate: '2026-08-01', expectedAgencyNetCents: -100, expectedUplineNetCents: 100 },
+      ],
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: true,
+      useCompanyIncomingInput: false,
+    },
+    overlayCheckpoints: [
+      { label: 'pre-1021-checkpoint', path: 'checkpoints/pre-1021.csv' },
+    ],
+    compareTargets: [
+      {
+        label: 'ref-2026-10-21',
+        leftRunSourceFolder: '2026-10-21',
+        rightDir: 'ref-2026-10-21',
+      },
+      {
+        label: 'company-2026-11-03',
+        leftRunSourceFolder: 'company-workspaces/acme/2026-11-03/runs/2026-11-03',
+        rightDir: 'nusear/company-workspaces/acme/2026-11-03/runs/2026-11-03',
+      },
+    ],
+  }, null, 2), 'utf8');
+
+  // Run via CLI with unreachable PGHOST/PGPORT to prove --plan touches no database.
+  const { stdout, stderr } = await execFileAsync(
+    process.execPath,
+    ['scripts/prove-history.mjs', '--manifest', manifestPath, '--plan'],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, PGHOST: '10.20.30.40', PGPORT: '1' },
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+  assert.equal(stderr, '');
+
+  // Nothing printed except counts and names (zero file contents, zero inner filenames, zero temp paths).
+  assert.equal(stdout.includes(secretContent.trim()), false, '--plan must never print file contents');
+  assert.equal(stdout.includes(secretFilename), false, '--plan must never print source filenames');
+  assert.equal(stdout.includes(work), false, '--plan must never print filesystem paths');
+  assert.equal(stdout.includes('NOT_EVEN_VALID_JSON'), false);
+  assert.equal(stdout.includes('NOT_A_REAL_SQLITE'), false);
+
+  const summary = JSON.parse(stdout);
+  assert.deepEqual(Object.keys(summary).sort(), [
+    'areas',
+    'companySlug',
+    'compareTargets',
+    'methodCorrectionsCount',
+    'missing',
+    'mode',
+    'passed',
+    'totals',
+  ]);
+  assert.equal(summary.mode, 'plan');
+  assert.equal(summary.passed, true);
+  assert.equal(summary.companySlug, 'acme');
+  assert.equal(summary.methodCorrectionsCount, 1);
+  assert.deepEqual(summary.missing, []);
+
+  assert.deepEqual(summary.areas.legacyRuns, {
+    configured: true,
+    found: true,
+    runs: 2,
+    files: Object.keys(legacyRun1Files).length + Object.keys(legacyRun2Files).length,
+    bytes: byteLen(legacyRun1Files) + byteLen(legacyRun2Files),
+  });
+  assert.deepEqual(summary.areas.companyRuns, {
+    configured: true,
+    found: true,
+    runs: 1,
+    files: Object.keys(companyRunFiles).length,
+    bytes: byteLen(companyRunFiles),
+  });
+  assert.deepEqual(summary.areas.abandonedRuns, {
+    configured: true,
+    found: true,
+    runs: 1,
+    files: Object.keys(abandonedRunFiles).length + Object.keys(abandonedStandalone).length,
+    bytes: byteLen(abandonedRunFiles) + byteLen(abandonedStandalone),
+  });
+  assert.deepEqual(summary.areas.standingInput, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: Object.keys(standingFiles).length,
+    bytes: byteLen(standingFiles),
+  });
+  assert.deepEqual(summary.areas.incidentReport, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: Object.keys(incidentFiles).length,
+    bytes: byteLen(incidentFiles),
+  });
+  assert.deepEqual(summary.areas.legacyReviewSaves, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: Object.keys(legacySavesFiles).length,
+    bytes: byteLen(legacySavesFiles),
+  });
+  assert.deepEqual(summary.areas.companyReviewSaves, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: Object.keys(companySavesFiles).length,
+    bytes: byteLen(companySavesFiles),
+  });
+  const countedCompEnv = {
+    'audit.json': companyEnvFiles['audit.json'],
+    'answer-key-2026-11-03.json': companyEnvFiles['answer-key-2026-11-03.json'],
+    'finished/2026-11-03/summary.csv': companyEnvFiles['finished/2026-11-03/summary.csv'],
+    'replaced/old.csv': companyEnvFiles['replaced/old.csv'],
+  };
+  assert.deepEqual(summary.areas.companyEnvironment, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: Object.keys(countedCompEnv).length,
+    bytes: byteLen(countedCompEnv),
+  });
+  assert.deepEqual(summary.areas.cloudMirror, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: Object.keys(cloudMirrorFiles).length,
+    bytes: byteLen(cloudMirrorFiles),
+  });
+  assert.deepEqual(summary.areas.preCoherenceStatements, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: 1,
+    bytes: Buffer.byteLength(standingFiles['PreStatements/stmt_20260325.csv'], 'utf8'),
+  });
+  assert.deepEqual(summary.areas.preCoherenceSent, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: 1,
+    bytes: Buffer.byteLength(standingFiles['Sent/statements_20260831.csv'], 'utf8'),
+  });
+  assert.deepEqual(summary.areas.preCoherenceAgents, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: 1,
+    bytes: Buffer.byteLength(standingFiles['Agent Data/cleanagentdata.csv'], 'utf8'),
+  });
+  assert.deepEqual(summary.areas.overlayCheckpoints, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: 1,
+    bytes: Buffer.byteLength(checkpointBytes, 'utf8'),
+  });
+  assert.deepEqual(summary.areas.legacySqlite, {
+    configured: true,
+    found: true,
+    runs: 0,
+    files: 1,
+    bytes: Buffer.byteLength(sqliteFakeBytes, 'utf8'),
+  });
+
+  // Totals deduplicate overlapping subpaths under standingInput (PreStatements, Sent, Agent Data).
+  const expectedUniqueFiles = summary.areas.legacyRuns.files
+    + summary.areas.companyRuns.files
+    + summary.areas.abandonedRuns.files
+    + summary.areas.standingInput.files
+    + summary.areas.incidentReport.files
+    + summary.areas.legacyReviewSaves.files
+    + summary.areas.companyReviewSaves.files
+    + summary.areas.companyEnvironment.files
+    + summary.areas.cloudMirror.files
+    + summary.areas.overlayCheckpoints.files
+    + summary.areas.legacySqlite.files;
+  const expectedUniqueBytes = summary.areas.legacyRuns.bytes
+    + summary.areas.companyRuns.bytes
+    + summary.areas.abandonedRuns.bytes
+    + summary.areas.standingInput.bytes
+    + summary.areas.incidentReport.bytes
+    + summary.areas.legacyReviewSaves.bytes
+    + summary.areas.companyReviewSaves.bytes
+    + summary.areas.companyEnvironment.bytes
+    + summary.areas.cloudMirror.bytes
+    + summary.areas.overlayCheckpoints.bytes
+    + summary.areas.legacySqlite.bytes;
+  assert.deepEqual(summary.totals, {
+    runs: 4,
+    files: expectedUniqueFiles,
+    bytes: expectedUniqueBytes,
+  });
+
+  assert.deepEqual(summary.compareTargets, [
+    { name: 'ref-2026-10-21', status: 'found', left: 'found', right: 'found' },
+    { name: 'company-2026-11-03', status: 'found', left: 'found', right: 'found' },
+  ]);
+
+  // Direct API call returns the identical structure.
+  const direct = await runHistoryPlan({ manifestPath });
+  assert.deepEqual(direct, summary);
+});
+
+test('Layer 4 [Proof Runner --plan Missing Sources & Targets]: exits 1 and names every missing configured folder, file, checkpoint, and comparison target by manifest key', async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-prove-plan-miss-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  await writeTree(join(work, 'runs', '2026-11-02'), {
+    'run.json': '{"date":"2026-11-02"}\n',
+    'overlay.csv': 'record_id\n',
+  });
+  await writeTree(join(work, 'ref-ok'), {
+    'run.json': '{"date":"2026-11-02"}\n',
+  });
+
+  const manifestPath = join(work, 'missing-manifest.json');
+  await writeFile(manifestPath, JSON.stringify({
+    companySlug: 'acme',
+    pythonPath: 'venv/bin/missing-python',
+    sources: {
+      legacyRunsRoot: 'runs',
+      companyWorkspacesDir: 'missing-company-ws',
+      preCoherenceStatementsDir: 'missing-pre-statements',
+      legacySqlitePath: 'missing-backup.sqlite',
+    },
+    overlayCheckpoints: [
+      { label: 'missing-cp', path: 'missing-overlay.csv' },
+    ],
+    compareTargets: [
+      {
+        label: 'target-missing-right-dir',
+        leftRunSourceFolder: '2026-11-02',
+        rightDir: 'no-such-right-dir',
+      },
+      {
+        label: 'target-missing-left-run',
+        leftRunSourceFolder: '2026-11-99-absent',
+        rightDir: 'ref-ok',
+      },
+      {
+        label: 'target-present',
+        leftRunSourceFolder: '2026-11-02',
+        rightDir: 'ref-ok',
+      },
+    ],
+  }, null, 2), 'utf8');
+
+  let exitCode = 0;
+  let stdout = '';
+  try {
+    await execFileAsync(
+      process.execPath,
+      ['scripts/prove-history.mjs', '--manifest', manifestPath, '--plan'],
+      { cwd: process.cwd(), env: { ...process.env, PGHOST: '10.20.30.40' } },
+    );
+  } catch (err) {
+    exitCode = err.code;
+    stdout = String(err.stdout || '');
+  }
+
+  assert.equal(exitCode, 1, '--plan must exit with code 1 when any configured folder, file, or target is missing');
+  assert.equal(stdout.includes(work), false, '--plan error output must not print raw filesystem paths');
+
+  const summary = JSON.parse(stdout);
+  assert.equal(summary.mode, 'plan');
+  assert.equal(summary.passed, false);
+  assert.equal(summary.areas.legacyRuns.runs, 1);
+  assert.equal(summary.areas.legacyRuns.files, 2);
+  assert.equal(summary.areas.companyRuns.configured, true);
+  assert.equal(summary.areas.companyRuns.found, false);
+
+  assert.deepEqual(summary.compareTargets, [
+    { name: 'target-missing-right-dir', status: 'missing', left: 'found', right: 'missing' },
+    { name: 'target-missing-left-run', status: 'missing', left: 'missing', right: 'found' },
+    { name: 'target-present', status: 'found', left: 'found', right: 'found' },
+  ]);
+
+  const missingKeys = summary.missing.map((m) => m.key);
+  assert.deepEqual(missingKeys, [
+    'pythonPath',
+    'sources.companyWorkspacesDir',
+    'sources.preCoherenceStatementsDir',
+    'sources.legacySqlitePath',
+    'overlayCheckpoints[0]',
+    'compareTargets[0].rightDir',
+    'compareTargets[1].leftRunSourceFolder',
+  ]);
+});
+
+test('Layer 4 [Real-History Manifest Schema]: config manifest declares every key read by loadImportManifestFile without touching live folders', async () => {
+  const manifestRaw = JSON.parse(await readFile(join(process.cwd(), 'config', 'phalanx-history.manifest.json'), 'utf8'));
+  assert.equal(manifestRaw.companySlug, 'phalanx');
+  assert.equal(manifestRaw.displayName, 'Phalanx');
+  assert.equal(manifestRaw.defaultEmitMode, 'coherence');
+  assert.equal(typeof manifestRaw.coherenceRoot, 'string');
+  assert.equal(typeof manifestRaw.coherenceRepo, 'string');
+  assert.equal(typeof manifestRaw.nusearDataDir, 'string');
+  assert.equal(typeof manifestRaw.nusearSqlitePath, 'string');
+  assert.equal(manifestRaw.nusearSqlitePath.includes('/data/nusear2.sqlite'), false, 'must point to consistent backup copy, never live data/nusear2.sqlite');
+  assert.equal(manifestRaw.sources.legacySqlitePath, manifestRaw.nusearSqlitePath);
+  assert.equal(typeof manifestRaw.pythonPath, 'string');
+  assert.equal(typeof manifestRaw.overlayCheckPath, 'string');
+  assert.equal(typeof manifestRaw.legacyBridgePath, 'string');
+
+  const expectedSourceKeys = [
+    'legacyRunsRoot',
+    'standingInputDir',
+    'incidentReportDir',
+    'legacyReviewSavesDir',
+    'companyWorkspacesDir',
+    'companyAbandonedDir',
+    'companyReviewSavesDir',
+    'companyEnvironmentDir',
+    'cloudMirrorDir',
+    'legacySqlitePath',
+    'preCoherenceStatementsDir',
+    'preCoherenceSentDir',
+    'preCoherenceAgentsCsv',
+    'methodCorrections',
+  ];
+  for (const key of expectedSourceKeys) {
+    assert.equal(Object.prototype.hasOwnProperty.call(manifestRaw.sources, key), true, `manifest.sources missing key ${key}`);
+  }
+  assert.equal(manifestRaw.sources.methodCorrections.length, 2);
+  for (const corr of manifestRaw.sources.methodCorrections) {
+    assert.equal(Number.isInteger(corr.expectedAgencyNetCents), true);
+    assert.equal(Number.isInteger(corr.expectedUplineNetCents), true);
+  }
+  const corr0801 = manifestRaw.sources.methodCorrections.find((c) => c.statementDate === '2026-08-01');
+  const corr0831 = manifestRaw.sources.methodCorrections.find((c) => c.statementDate === '2026-08-31');
+  assert.ok(corr0801, 'manifest must declare 2026-08-01 method correction');
+  assert.equal(corr0801.expectedAgencyNetCents, 233678);
+  assert.equal(corr0801.expectedUplineNetCents, -233678);
+  assert.ok(corr0831, 'manifest must declare 2026-08-31 method correction');
+  assert.equal(corr0831.expectedAgencyNetCents, 0);
+  assert.equal(corr0831.expectedUplineNetCents, -17764809);
+  assert.equal(manifestRaw.importConfig.includeLegacyHostHistory, true);
+  assert.equal(manifestRaw.importConfig.includeLegacySqliteTables, true);
+  assert.equal(manifestRaw.importConfig.useCompanyIncomingInput, false);
+  assert.equal(manifestRaw.importConfig.allowDisjointOverlayRoots, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(manifestRaw.importConfig, 'allowedDisjointOverlaySourceFolders'), false);
+  assert.deepEqual(manifestRaw.importConfig.freshOverlayRoots, [
+    {
+      sourceFolder: '2026-07-31',
+      sha256: '4a316f602bc01f1908c96809786073a2d0156045d1921ec51ebd44804852b601',
+    },
+    {
+      sourceFolder: '2026-08-25',
+      sha256: '26f50cbbf6b10638cecbc1300f4a4c53b29d0b1a705c61c54a641569be9a479a',
+    },
+    {
+      sourceFolder: '2026-08-31',
+      sha256: '20a4c5f94bac4d49aa564204ec142e637b4fea44a6f68fcdac3f0634a080cb20',
+    },
+    {
+      sourceFolder: 'Historical 2026-08-31/2026-08-31',
+      sha256: '9bdb4be772aa75308a00fc4fe0980da60a998161e740121bdd08da888b008837',
+    },
+    {
+      sourceFolder: 'archive/v1/2026-07-31',
+      sha256: '4a316f602bc01f1908c96809786073a2d0156045d1921ec51ebd44804852b601',
+    },
+    {
+      sourceFolder: 'archive/v1/2026-08-25',
+      sha256: '26f50cbbf6b10638cecbc1300f4a4c53b29d0b1a705c61c54a641569be9a479a',
+    },
+    {
+      sourceFolder: 'archive/v1/2026-08-31',
+      sha256: '20a4c5f94bac4d49aa564204ec142e637b4fea44a6f68fcdac3f0634a080cb20',
+    },
+    {
+      sourceFolder: 'archive/v1/Historical 2026-08-31/2026-08-31',
+      sha256: '9bdb4be772aa75308a00fc4fe0980da60a998161e740121bdd08da888b008837',
+    },
+  ]);
+  assert.deepEqual(manifestRaw.importConfig.carriedPriors, [
+    {
+      sourceFolder: 'archive/provisional/2026-10-01',
+      sha256: 'f26f933e2f1d9bb2cc751486bcd28eef0d5d000d2c522b4919f89227a1b66af0',
+      extendsRowCount: 22334,
+      reason: '220 CONFIRM references appended to the live approval log between the final 9/30 overlay and the 10/01 freeze, re-keying the same saved 9/30 Bible decisions from temporary #id keys to dated period keys after the Bible key law changed; proved references, not new business decisions (Coherence TODO.md, Replacement 2026-10-11 baseline)',
+    },
+  ]);
+  assert.equal(Array.isArray(manifestRaw.overlayCheckpoints), true);
+  assert.equal(manifestRaw.compareTargets.length, 11);
+  for (const target of manifestRaw.compareTargets) {
+    assert.equal(typeof target.label, 'string');
+    assert.equal(typeof target.leftRunSourceFolder, 'string');
+    assert.equal(typeof target.rightDir, 'string');
+    assert.equal(target.requireStatementsDelta, true);
+    assert.equal(target.requireConservation, true);
+  }
+});
+
+test('Layer 4 [Fix3-6 - Proof Runner Refuses Unsafe --stores-dir]: refuses --stores-dir equal to or inside coherenceRoot, coherenceRepo, nusearDataDir, or any configured source path without creating folders', async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix3-storesdir-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const cohRoot = join(work, 'coherence');
+  const cohRepo = join(work, 'coherence-repo');
+  const nusearDir = join(work, 'nusear-data');
+  const extLegacyRuns = join(work, 'extra-legacy-runs');
+  const extStanding = join(work, 'extra-standing');
+  const extRightDir = join(work, 'extra-compare-right');
+  for (const d of [cohRoot, cohRepo, nusearDir, extLegacyRuns, extStanding, extRightDir]) {
+    await mkdir(d, { recursive: true });
+  }
+
+  const manifestPath = join(work, 'manifest.json');
+  await writeFile(manifestPath, JSON.stringify({
+    companySlug: 'acme',
+    coherenceRoot: cohRoot,
+    coherenceRepo: cohRepo,
+    nusearDataDir: nusearDir,
+    sources: {
+      legacyRunsRoot: extLegacyRuns,
+      standingInputDir: extStanding,
+    },
+    compareTargets: [
+      { label: 't1', leftRunSourceFolder: '2026-11-02', rightDir: extRightDir },
+    ],
+  }, null, 2), 'utf8');
+
+  const unsafeDirs = [
+    cohRoot,
+    join(cohRoot, 'stores'),
+    cohRepo,
+    join(cohRepo, 'sub', 'stores'),
+    nusearDir,
+    join(nusearDir, 'stores'),
+    extLegacyRuns,
+    join(extLegacyRuns, 'stores'),
+    extStanding,
+    join(extStanding, 'stores'),
+    extRightDir,
+    join(extRightDir, 'stores'),
+  ];
+
+  for (const badStoresDir of unsafeDirs) {
+    await assert.rejects(
+      () => runHistoryProof({
+        manifestPath,
+        database: 'test_unsafe_stores_dir',
+        storesDir: badStoresDir,
+        tempRoot: work,
+      }),
+      (err) => {
+        assert.equal(err.code, 'UNSAFE_STORES_DIR', `expected UNSAFE_STORES_DIR for ${badStoresDir}, got ${err?.code}: ${err?.message}`);
+        return true;
+      },
+      `must refuse unsafe storesDir ${badStoresDir}`,
+    );
+  }
+
+  // CLI check: refuses --stores-dir inside coherenceRoot and creates no directory inside it.
+  const cliBadStores = join(cohRoot, 'should-not-be-created');
+  await assert.rejects(
+    () => execFileAsync(
+      process.execPath,
+      ['scripts/prove-history.mjs', '--manifest', manifestPath, '--database', 'test_unsafe_stores_cli', '--stores-dir', cliBadStores],
+      { cwd: process.cwd(), env: { ...process.env, PGHOST: '/tmp', PGPORT: '5433' } },
+    ),
+    (err) => {
+      assert.ok(String(err.stderr || '').includes('UNSAFE_STORES_DIR'), `expected UNSAFE_STORES_DIR on stderr, got: ${err.stderr}`);
+      return true;
+    },
+  );
+  const cohEntries = await readdir(cohRoot);
+  assert.deepEqual(cohEntries, [], 'refused --stores-dir must never create any file or folder inside coherenceRoot');
+
+  // Symlink pointing inside coherenceRoot must also be refused, while a sibling with a shared name prefix is allowed.
+  const linkToCoh = join(work, 'symlink-to-coh');
+  await symlink(cohRoot, linkToCoh);
+  await assert.rejects(
+    () => assertSafeStoresDir(join(linkToCoh, 'stores'), manifestPath),
+    (err) => err.code === 'UNSAFE_STORES_DIR',
+    'symlink pointing inside coherenceRoot must be refused',
+  );
+  await assertSafeStoresDir(join(work, 'coherence-stores'), manifestPath);
+});
+
+test('Layer 4 [Fix4-1 - Overlay Lineage Law & Pinned freshOverlayRoots]: four kinds of fresh root succeed only when listed with exact SHA-256, byte-identical archive/v1 copies make no new root, v2 extends v1 prior, branching from shared prior succeeds, every root is reported with folder/commitId/sha256/rowCount, and wrong SHA-256, unlisted fresh root, non-extending run files, or unmatched standing/company priors fail closed', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix4-lineage-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const mkV1Row = (id, note, at = '2026-08-01T10:00:00Z') => ({
+    record_id: id,
+    disposition: 'CORRECT',
+    agent: '11111111',
+    agency: 'Beacon',
+    policy: null,
+    book: null,
+    month: null,
+    status: 'ACTIVE_PAYING',
+    note,
+    committed_at: at,
+  });
+  const mkV2Row = (id, note, at = '2026-10-19T10:00:00Z') => sampleApprovalRow({
+    record_id: id,
+    disposition: 'CONFIRM',
+    agent: null,
+    agency: null,
+    status: null,
+    note,
+    committed_at: at,
+    approved_amount: '100.00',
+    approved_agency: 'Beacon',
+    approved_agent: '11111111',
+  });
+
+  // Four distinct fresh-start v1 overlays (zero shared leading rows).
+  const root0731Rows = [
+    mkV1Row('policy:carrier_a:R0731_1#effective:2026-01-01', 'root-0731-1'),
+  ];
+  const root0825Rows = [
+    mkV1Row('policy:carrier_a:R0825_1#effective:2026-01-01', 'root-0825-1'),
+    mkV1Row('policy:carrier_a:R0825_2#effective:2026-01-01', 'root-0825-2'),
+  ];
+  const root0831Rows = [
+    mkV1Row('policy:carrier_a:R0831_1#effective:2026-01-01', 'root-0831-1'),
+    mkV1Row('policy:carrier_a:R0831_2#effective:2026-01-01', 'root-0831-2'),
+    mkV1Row('policy:carrier_a:R0831_3#effective:2026-01-01', 'root-0831-3'),
+  ];
+  const rootHist0831Rows = [
+    mkV1Row('policy:carrier_a:RHIST_1#effective:2026-01-01', 'root-hist-1'),
+    mkV1Row('policy:carrier_a:RHIST_2#effective:2026-01-01', 'root-hist-2'),
+  ];
+
+  const row0930 = mkV1Row('policy:carrier_a:R0930_1#effective:2026-01-01', 'sep30-added', '2026-09-30T10:00:00Z');
+  const row1012 = mkV1Row('policy:carrier_a:R1012_1#effective:2026-01-01', 'oct12-added', '2026-10-12T10:00:00Z');
+  const row1019 = mkV2Row('carrier_a~direct~P1019~100.00~2026-10', 'oct19-v2', '2026-10-19T10:00:00Z');
+  const row1021 = mkV2Row('carrier_a~direct~P1021~100.00~2026-10', 'oct21-v2', '2026-10-21T10:00:00Z');
+  const row1102 = mkV2Row('carrier_a~direct~P1102~100.00~2026-11', 'nov02-v2', '2026-11-02T10:00:00Z');
+  const row1103 = mkV2Row('carrier_a~direct~P1103~100.00~2026-11', 'nov03-co', '2026-11-03T10:00:00Z');
+  const wrongRow = mkV2Row('policy:carrier_a:WRONG#effective:2026-01-01', 'wrong');
+
+  const csv0731 = makeOverlayCsv(root0731Rows, { version: 'v1' });
+  const csv0825 = makeOverlayCsv(root0825Rows, { version: 'v1' });
+  const csv0831 = makeOverlayCsv(root0831Rows, { version: 'v1' });
+  const csvHist0831 = makeOverlayCsv(rootHist0831Rows, { version: 'v1' });
+  const csv0930 = makeOverlayCsv([...root0831Rows, row0930], { version: 'v1' });
+  const csv1012 = makeOverlayCsv([...root0831Rows, row0930, row1012], { version: 'v1' });
+  // v2 files extending v1 10/12 prior (first 5 rows have empty approval fact columns, matching overlay._read of v1).
+  const csv1019 = makeOverlayCsv([...root0831Rows, row0930, row1012, row1019], { version: 'v2' });
+  const csv1021 = makeOverlayCsv([...root0831Rows, row0930, row1012, row1021], { version: 'v2' });
+  const csv1102 = makeOverlayCsv([...root0831Rows, row0930, row1012, row1102], { version: 'v2' });
+  const csv1103 = makeOverlayCsv([...root0831Rows, row0930, row1012, row1102, row1103], { version: 'v2' });
+  const csvWrong = makeOverlayCsv([wrongRow], { version: 'v2' });
+
+  const sha0731 = shaOf(csv0731);
+  const sha0825 = shaOf(csv0825);
+  const sha0831 = shaOf(csv0831);
+  const shaHist0831 = shaOf(csvHist0831);
+
+  const validFreshRoots = [
+    { sourceFolder: '2026-07-31', sha256: sha0731 },
+    { sourceFolder: '2026-08-25', sha256: sha0825 },
+    { sourceFolder: '2026-08-31', sha256: sha0831 },
+    { sourceFolder: 'Historical 2026-08-31/2026-08-31', sha256: shaHist0831 },
+    { sourceFolder: 'archive/v1/2026-07-31', sha256: sha0731 },
+    { sourceFolder: 'archive/v1/2026-08-25', sha256: sha0825 },
+    { sourceFolder: 'archive/v1/2026-08-31', sha256: sha0831 },
+    { sourceFolder: 'archive/v1/Historical 2026-08-31/2026-08-31', sha256: shaHist0831 },
+  ];
+
+  const makeRun = (date, { priorCsv = null, overlayCsv = null, emitOverlayCsv = null, born }) => ({
+    ...(priorCsv !== null ? { 'input/Overlay/overlay.csv': priorCsv } : {}),
+    'input/a.csv': 'k\n1\n',
+    ...(overlayCsv !== null ? { 'overlay.csv': overlayCsv } : {}),
+    ...(emitOverlayCsv !== null ? { 'emits/overlay.csv': emitOverlayCsv } : {}),
+    'emits/canonical_bob.csv': 'policy_id,member,entity,amount,upline_amount\n1,Pat Sample,Beacon,80.00,20.00\n',
+    'emits/coherent_ledger.csv': 'tx_id,record_id,policy_id,member,entity,gross_comm,downline_amount,upline_amount\n1,r1,1,Pat Sample,Beacon,100.00,80.00,20.00\n',
+    'run.json': JSON.stringify({ date, born, steps: { assign: { at: born }, emit: { at: born } } }),
+  });
+
+  // 1) Refuse allowDisjointOverlayRoots: true and removed allowedDisjointOverlaySourceFolders in plan and import.
+  const cfgCheckRoot = join(work, 'cfg-check');
+  await writeTree(join(cfgCheckRoot, 'runs', '2026-07-31'), makeRun('2026-07-31', { overlayCsv: csv0731, born: '2026-07-31T10:00:00Z' }));
+  const forbidTruePath = join(cfgCheckRoot, 'forbid-true.json');
+  await writeFile(forbidTruePath, JSON.stringify({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: 'runs' },
+    importConfig: { includeLegacyHostHistory: true, allowDisjointOverlayRoots: true },
+  }), 'utf8');
+  await assert.rejects(() => runHistoryPlan({ manifestPath: forbidTruePath }), (err) => err.code === 'DISJOINT_OVERLAY_ROOTS_FORBIDDEN');
+  await assert.rejects(() => loadImportManifestFile(forbidTruePath, { tempBaseDir: work }), (err) => err.code === 'DISJOINT_OVERLAY_ROOTS_FORBIDDEN');
+
+  const removedKeyPath = join(cfgCheckRoot, 'removed-key.json');
+  await writeFile(removedKeyPath, JSON.stringify({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: 'runs' },
+    importConfig: { includeLegacyHostHistory: true, allowedDisjointOverlaySourceFolders: ['archive/v1'] },
+  }), 'utf8');
+  await assert.rejects(() => runHistoryPlan({ manifestPath: removedKeyPath }), (err) => err.code === 'INVALID_IMPORT_CONFIG');
+
+  // 2) Full happy path: all 4 fresh roots + all 4 byte-identical archive/v1 copies + v1 chain (08/31 -> 09/30 -> 10/12)
+  //    + v2 branching from v1 10/12 prior (10/19, 10/21, 11/02) + company run 11/03 extending 11/02 + standing overlay.
+  const okRoot = join(work, 'ok-full');
+  await writeTree(join(okRoot, 'runs', '2026-07-31'), makeRun('2026-07-31', { overlayCsv: csv0731, emitOverlayCsv: csv0731, born: '2026-07-31T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', 'archive', 'v1', '2026-07-31'), makeRun('2026-07-31', { overlayCsv: csv0731, emitOverlayCsv: csv0731, born: '2026-07-31T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', '2026-08-25'), makeRun('2026-08-25', { overlayCsv: csv0825, emitOverlayCsv: csv0825, born: '2026-08-25T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', 'archive', 'v1', '2026-08-25'), makeRun('2026-08-25', { overlayCsv: csv0825, emitOverlayCsv: csv0825, born: '2026-08-25T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, emitOverlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', 'archive', 'v1', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, emitOverlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', 'Historical 2026-08-31', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csvHist0831, emitOverlayCsv: csvHist0831, born: '2026-08-31T09:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', 'archive', 'v1', 'Historical 2026-08-31', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csvHist0831, emitOverlayCsv: csvHist0831, born: '2026-08-31T09:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', '2026-09-30'), makeRun('2026-09-30', { priorCsv: csv0831, overlayCsv: csv0930, emitOverlayCsv: csv0930, born: '2026-09-30T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', '2026-10-12'), makeRun('2026-10-12', { priorCsv: csv0930, overlayCsv: csv1012, emitOverlayCsv: csv1012, born: '2026-10-12T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', '2026-10-19'), makeRun('2026-10-19', { priorCsv: csv1012, overlayCsv: csv1019, emitOverlayCsv: csv1019, born: '2026-10-19T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', '2026-10-21'), makeRun('2026-10-21', { priorCsv: csv1012, overlayCsv: csv1021, emitOverlayCsv: csv1021, born: '2026-10-21T10:00:00Z' }));
+  await writeTree(join(okRoot, 'runs', '2026-11-02'), makeRun('2026-11-02', { priorCsv: csv1012, overlayCsv: csv1102, emitOverlayCsv: csv1102, born: '2026-11-02T10:00:00Z' }));
+  await writeTree(join(okRoot, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { priorCsv: csv1102, overlayCsv: csv1103, emitOverlayCsv: csv1103, born: '2026-11-03T10:00:00Z' }));
+  await writeTree(join(okRoot, 'standing-input'), { 'Overlay/overlay.csv': csv1103 });
+
+  const okManifestPath = join(okRoot, 'manifest.json');
+  await writeFile(okManifestPath, JSON.stringify({
+    companySlug: 'acme',
+    coherenceRepo: mockRepo,
+    pythonPath: 'python3',
+    sources: {
+      legacyRunsRoot: 'runs',
+      standingInputDir: 'standing-input',
+      companyWorkspacesDir: 'company-ws',
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+      allowDisjointOverlayRoots: false,
+      freshOverlayRoots: validFreshRoots,
+    },
+  }, null, 2), 'utf8');
+
+  const okPlan = await runHistoryPlan({ manifestPath: okManifestPath });
+  assert.equal(okPlan.passed, true);
+
+  const proofDb = `test_fix4_full_${createHash('sha256').update(okRoot).digest('hex').slice(0, 8)}`;
+  const proofSummary = await runHistoryProof({
+    manifestPath: okManifestPath,
+    database: proofDb,
+    dropDb: true,
+    tempRoot: work,
+  });
+  assert.equal(proofSummary.passed, true, `proof failed: ${JSON.stringify(proofSummary.problems)}`);
+  assert.equal(proofSummary.layer2.passed, true);
+  // Byte-identical archive/v1 copies must resolve to the same commit and make NO new root -> exactly 4 roots total!
+  assert.equal(proofSummary.layer1.overlayRootCount, 4, 'byte-identical archive copies must make no new root');
+  assert.equal(proofSummary.layer1.overlayRoots.length, 4);
+  const reportedBySha = new Map(proofSummary.layer1.overlayRoots.map((r) => [r.sha256, r]));
+  assert.equal(reportedBySha.get(sha0731)?.rowCount, 1);
+  assert.equal(reportedBySha.get(sha0825)?.rowCount, 2);
+  assert.equal(reportedBySha.get(sha0831)?.rowCount, 3);
+  assert.equal(reportedBySha.get(shaHist0831)?.rowCount, 2);
+  assert.deepEqual(reportedBySha.get(sha0731)?.folders, ['archive/v1/2026-07-31', '2026-07-31']);
+  assert.deepEqual(reportedBySha.get(sha0825)?.folders, ['archive/v1/2026-08-25', '2026-08-25']);
+  assert.deepEqual(reportedBySha.get(sha0831)?.folders, ['archive/v1/2026-08-31', '2026-08-31']);
+  assert.deepEqual(
+    [...(reportedBySha.get(shaHist0831)?.folders || [])].sort(),
+    ['Historical 2026-08-31/2026-08-31', 'archive/v1/Historical 2026-08-31/2026-08-31'],
+  );
+  assert.equal(proofSummary.layer1.carriedPriorCount, 0);
+  assert.deepEqual(proofSummary.layer1.carriedPriors, []);
+  for (const r of proofSummary.layer1.overlayRoots) {
+    assert.equal(typeof r.folder, 'string');
+    assert.equal(Array.isArray(r.folders) && r.folders.length >= 1, true);
+    assert.equal(r.folders[0], r.folder);
+    assert.match(r.commitId, /^[0-9a-f-]{36}$/);
+    assert.match(r.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(Number.isInteger(r.rowCount) && r.rowCount > 0, true);
+  }
+
+  // Helper to assert OVERLAY_PREFIX_MISMATCH on negative cases.
+  const expectPrefixMismatch = async (caseName, freshOverlayRoots, setupTree) => {
+    const dir = join(work, caseName);
+    await mkdir(join(dir, 'runs'), { recursive: true });
+    await mkdir(join(dir, 'company-ws'), { recursive: true });
+    await mkdir(join(dir, 'standing-input'), { recursive: true });
+    await setupTree(dir);
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: {
+        legacyRunsRoot: join(dir, 'runs'),
+        companyWorkspacesDir: join(dir, 'company-ws'),
+        standingInputDir: join(dir, 'standing-input'),
+      },
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        allowDisjointOverlayRoots: false,
+        freshOverlayRoots,
+      },
+      tempBaseDir: work,
+    });
+    await assert.rejects(
+      () => executeHistoryImport({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        manifest,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        verifyRebuild: false,
+        tempBaseDir: work,
+      }),
+      (err) => {
+        assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: expected OVERLAY_PREFIX_MISMATCH, got ${err?.code}: ${err?.message}`);
+        return true;
+      },
+      `${caseName} must fail with OVERLAY_PREFIX_MISMATCH`,
+    );
+  };
+
+  // 3) Each of the 4 fresh root kinds fails when unlisted OR when its SHA-256 is wrong.
+  const fourCases = [
+    ['unlisted-0731', '2026-07-31', csv0731, '2026-07-31T10:00:00Z'],
+    ['unlisted-0825', '2026-08-25', csv0825, '2026-08-25T10:00:00Z'],
+    ['unlisted-0831', '2026-08-31', csv0831, '2026-08-31T10:00:00Z'],
+    ['unlisted-hist', 'Historical 2026-08-31/2026-08-31', csvHist0831, '2026-08-31T09:00:00Z'],
+  ];
+  for (const [label, folder, csvText, born] of fourCases) {
+    const date = folder.slice(-10);
+    await expectPrefixMismatch(label, [], async (dir) => {
+      await writeTree(join(dir, 'runs', ...folder.split('/')), makeRun(date, { overlayCsv: csvText, born }));
+    });
+    const wrongSha = shaOf(`${csvText}#tampered`);
+    await expectPrefixMismatch(`${label}-wrong-sha`, [{ sourceFolder: folder, sha256: wrongSha }], async (dir) => {
+      await writeTree(join(dir, 'runs', ...folder.split('/')), makeRun(date, { overlayCsv: csvText, born }));
+    });
+  }
+
+  // Exact folder matching only: parent prefix "archive/v1" must never match "archive/v1/2026-07-31".
+  await expectPrefixMismatch('prefix-folder-does-not-match-fresh-root', [{ sourceFolder: 'archive/v1', sha256: sha0731 }], async (dir) => {
+    await writeTree(join(dir, 'runs', 'archive', 'v1', '2026-07-31'), makeRun('2026-07-31', { overlayCsv: csv0731, born: '2026-07-31T10:00:00Z' }));
+  });
+
+  // 4) Run WITH a prior whose overlay.csv OR emits/overlay.csv does not extend that prior fails,
+  //    including a v2 file that alters a v1 prior row's fact column.
+  await expectPrefixMismatch('run-overlay-does-not-extend-prior', [{ sourceFolder: '2026-08-31', sha256: sha0831 }], async (dir) => {
+    await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { priorCsv: csv0831, overlayCsv: csvWrong, emitOverlayCsv: csvWrong, born: '2026-09-30T10:00:00Z' }));
+  });
+  await expectPrefixMismatch('run-emit-overlay-does-not-extend-prior', [{ sourceFolder: '2026-08-31', sha256: sha0831 }], async (dir) => {
+    await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { priorCsv: csv0831, overlayCsv: csv0930, emitOverlayCsv: csvWrong, born: '2026-09-30T10:00:00Z' }));
+  });
+  const csvV2AlteredV1Row = makeOverlayCsv([
+    { ...root0831Rows[0], approved_amount: '99.00' },
+    root0831Rows[1],
+    root0831Rows[2],
+    row1019,
+  ], { version: 'v2' });
+  await expectPrefixMismatch('run-v2-alters-v1-prior-fact', [{ sourceFolder: '2026-08-31', sha256: sha0831 }], async (dir) => {
+    await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+    await writeTree(join(dir, 'runs', '2026-10-19'), makeRun('2026-10-19', { priorCsv: csv0831, overlayCsv: csvV2AlteredV1Row, emitOverlayCsv: csvV2AlteredV1Row, born: '2026-10-19T10:00:00Z' }));
+  });
+
+  // 5) Run WITH a prior that does NOT equal a known commit (extended beyond known commit, truncated, or unknown) fails.
+  const csvTruncated0831 = makeOverlayCsv(root0831Rows.slice(0, 2), { version: 'v1' });
+  await expectPrefixMismatch('prior-extends-rather-than-equals-commit', [{ sourceFolder: '2026-08-31', sha256: sha0831 }], async (dir) => {
+    await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { priorCsv: csv0930, overlayCsv: csv0930, born: '2026-09-30T10:00:00Z' }));
+  });
+  await expectPrefixMismatch('prior-truncated-below-commit', [{ sourceFolder: '2026-08-31', sha256: sha0831 }], async (dir) => {
+    await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { priorCsv: csvTruncated0831, overlayCsv: csv0831, born: '2026-09-30T10:00:00Z' }));
+  });
+
+  // 6) Standing overlay that matches no commit fails (both when commits exist and when none exist).
+  await expectPrefixMismatch('standing-matches-no-commit', [{ sourceFolder: '2026-08-31', sha256: sha0831 }], async (dir) => {
+    await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+    await writeTree(join(dir, 'standing-input'), { 'Overlay/overlay.csv': csv0930 });
+  });
+  await expectPrefixMismatch('standing-alone-cannot-be-root', [], async (dir) => {
+    await writeTree(join(dir, 'standing-input'), { 'Overlay/overlay.csv': csv0831 });
+  });
+
+  // 7) Company run prior that matches no commit fails (both when commits exist and when none exist).
+  await expectPrefixMismatch('company-prior-matches-no-commit', [{ sourceFolder: '2026-08-31', sha256: sha0831 }], async (dir) => {
+    await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+    await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { priorCsv: csv0930, overlayCsv: csv0930, born: '2026-11-03T10:00:00Z' }));
+  });
+  await expectPrefixMismatch('company-prior-alone-cannot-be-root', [], async (dir) => {
+    await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { priorCsv: csv0831, overlayCsv: csv0831, born: '2026-11-03T10:00:00Z' }));
+  });
+});
+
+test('Layer 4 [Fix4-2 - Empty Prior approvals_files, Same-Date Draft Sorting & importSingleRunFolder Early Config Check]: empty starting prior followed by extending or fresh-root overlay does not violate approvals_files trigger, same-date draft/historical folder sorting before committed run does not falsely reject it, and importSingleRunFolder validates config before early return', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix4-r2-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:E1#effective:2026-01-01', note: 'r1' });
+  const row2 = sampleApprovalRow({ record_id: 'policy:carrier_a:E2#effective:2026-01-01', note: 'r2' });
+  const rowDraft = sampleApprovalRow({ record_id: 'policy:carrier_a:DR1#effective:2026-01-01', note: 'draft' });
+  const rowFresh = sampleApprovalRow({ record_id: 'policy:carrier_a:FR1#effective:2026-01-01', note: 'fresh' });
+
+  const emptyCsv = makeOverlayCsv([], { version: 'v2' });
+  const csv1 = makeOverlayCsv([row1], { version: 'v2' });
+  const csv12 = makeOverlayCsv([row1, row2], { version: 'v2' });
+  const csvDraft = makeOverlayCsv([rowDraft], { version: 'v2' });
+  const csvFresh = makeOverlayCsv([rowFresh], { version: 'v2' });
+
+  const makeRun = (date, { priorCsv = null, overlayCsv = null, born }) => ({
+    ...(priorCsv !== null ? { 'input/Overlay/overlay.csv': priorCsv } : {}),
+    'input/a.csv': 'k\n1\n',
+    ...(overlayCsv !== null ? { 'overlay.csv': overlayCsv, 'emits/overlay.csv': overlayCsv } : {}),
+    'run.json': JSON.stringify({ date, born, steps: { assign: { at: born }, emit: { at: born } } }),
+  });
+
+  // Case 1: Empty starting prior followed by an overlay extending a known earlier commit (must NOT fail trg_approvals_files_before
+  //         by setting extends_sha256 to the 0-row prior with shared_row_count = 1).
+  const emptyExtDir = join(work, 'empty-prior-extends');
+  await writeTree(join(emptyExtDir, 'runs', '2026-08-25'), makeRun('2026-08-25', { overlayCsv: csv1, born: '2026-08-25T10:00:00Z' }));
+  await writeTree(join(emptyExtDir, 'runs', '2026-08-31'), makeRun('2026-08-31', { priorCsv: emptyCsv, overlayCsv: csv12, born: '2026-08-31T10:00:00Z' }));
+
+  const env1 = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env1.cleanup());
+  const manifest1 = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(emptyExtDir, 'runs') },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-08-25', sha256: shaOf(csv1) }],
+    },
+    tempBaseDir: work,
+  });
+  const rep1 = await executeHistoryImport({
+    pool: env1.pool,
+    stores: env1.stores,
+    commands: env1.commands,
+    actor: env1.ownerActor,
+    manifest: manifest1,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: work,
+  });
+  assert.equal(rep1.passed, true, rep1.problems.join('; '));
+  const af12 = (await env1.pool.query(
+    'SELECT row_count, extends_sha256, shared_row_count FROM coherence.approvals_files WHERE file_sha256 = $1',
+    [shaOf(csv12)],
+  )).rows[0];
+  assert.equal(Number(af12.row_count), 2);
+  assert.equal(af12.extends_sha256, null, 'approvals_files row after empty prior must not claim extends_sha256 with mismatched shared_row_count');
+  assert.equal(Number(af12.shared_row_count), 0);
+
+  // Case 2: Same-date draft/historical folder sorting BEFORE the committed run (2026-08-31) whose starting prior is empty
+  //         and whose overlay.csv is either a pinned fresh root (succeeds) or unlisted (fails closed).
+  const sameDateDir = join(work, 'same-date-draft');
+  await writeTree(join(sameDateDir, 'runs', 'Historical 2026-08-31', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csvDraft, born: '2026-08-31T08:00:00Z' }));
+  await writeTree(join(sameDateDir, 'runs', '2026-08-31'), makeRun('2026-08-31', { priorCsv: emptyCsv, overlayCsv: csvFresh, born: '2026-08-31T10:00:00Z' }));
+
+  const env2 = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env2.cleanup());
+  const manifest2 = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(sameDateDir, 'runs') },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [
+        { sourceFolder: 'Historical 2026-08-31/2026-08-31', sha256: shaOf(csvDraft) },
+        { sourceFolder: '2026-08-31', sha256: shaOf(csvFresh) },
+      ],
+    },
+    tempBaseDir: work,
+  });
+  const rep2 = await executeHistoryImport({
+    pool: env2.pool,
+    stores: env2.stores,
+    commands: env2.commands,
+    actor: env2.ownerActor,
+    manifest: manifest2,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: work,
+  });
+  assert.equal(rep2.passed, true, rep2.problems.join('; '));
+  assert.equal(rep2.overlayRoots.length, 2);
+
+  // Same-date draft before committed run with empty prior AND empty overlay.csv must also not be falsely rejected.
+  const sameDateEmptyDir = join(work, 'same-date-empty');
+  await writeTree(join(sameDateEmptyDir, 'runs', 'Historical 2026-08-31', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csvDraft, born: '2026-08-31T08:00:00Z' }));
+  await writeTree(join(sameDateEmptyDir, 'runs', '2026-08-31'), makeRun('2026-08-31', { priorCsv: emptyCsv, overlayCsv: emptyCsv, born: '2026-08-31T10:00:00Z' }));
+  const env2b = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env2b.cleanup());
+  const manifest2b = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(sameDateEmptyDir, 'runs') },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: 'Historical 2026-08-31/2026-08-31', sha256: shaOf(csvDraft) }],
+    },
+    tempBaseDir: work,
+  });
+  const rep2b = await executeHistoryImport({
+    pool: env2b.pool,
+    stores: env2b.stores,
+    commands: env2b.commands,
+    actor: env2b.ownerActor,
+    manifest: manifest2b,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: work,
+  });
+  assert.equal(rep2b.passed, true, rep2b.problems.join('; '));
+
+  // Unlisted fresh root after empty prior MUST fail closed with OVERLAY_PREFIX_MISMATCH.
+  const env2c = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env2c.cleanup());
+  const manifest2c = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(sameDateDir, 'runs') },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: 'Historical 2026-08-31/2026-08-31', sha256: shaOf(csvDraft) }],
+    },
+    tempBaseDir: work,
+  });
+  await assert.rejects(
+    () => executeHistoryImport({
+      pool: env2c.pool,
+      stores: env2c.stores,
+      commands: env2c.commands,
+      actor: env2c.ownerActor,
+      manifest: manifest2c,
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      verifyRebuild: false,
+      tempBaseDir: work,
+    }),
+    (err) => err.code === 'OVERLAY_PREFIX_MISMATCH',
+  );
+
+  // Case 3: importSingleRunFolder must call normalizeImportConfig BEFORE its already-imported early return.
+  const alreadyRunItem = manifest1.macRuns.find((r) => r.sourceFolder === '2026-08-25');
+  await assert.rejects(
+    () => importSingleRunFolder({
+      pool: env1.pool,
+      stores: env1.stores,
+      commands: env1.commands,
+      actor: env1.ownerActor,
+      companySlug: 'acme',
+      runItem: alreadyRunItem,
+      importConfig: { allowDisjointOverlayRoots: true },
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      tempBaseDir: work,
+    }),
+    (err) => err.code === 'DISJOINT_OVERLAY_ROOTS_FORBIDDEN',
+    'importSingleRunFolder must validate importConfig before its early return for already-imported runs',
+  );
+});
+
+test('Layer 4 [Fix4-3 - Proof Runner Path Safety (..stores and code/data Containment)]: treats ..stores inside a protected path as inside and refuses --stores-dir whose code or data folder equals or contains any protected path', async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix4-storesdir-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const nusearRepo = join(work, 'nusear-repo');
+  const nusearData = join(nusearRepo, 'data');
+  const cohRoot = join(work, 'coherence');
+  const parentOfCode = join(work, 'parent-of-code');
+  const nestedCohRepo = join(parentOfCode, 'code', 'coherence');
+  const parentOfData = join(work, 'parent-of-data');
+  const nestedRuns = join(parentOfData, 'data', 'runs');
+  for (const d of [nusearData, cohRoot, nestedCohRepo, nestedRuns]) {
+    await mkdir(d, { recursive: true });
+  }
+
+  const manifestPath = join(work, 'manifest.json');
+  await writeFile(manifestPath, JSON.stringify({
+    companySlug: 'acme',
+    coherenceRoot: cohRoot,
+    coherenceRepo: nestedCohRepo,
+    nusearDataDir: nusearData,
+    sources: {
+      legacyRunsRoot: nestedRuns,
+    },
+  }, null, 2), 'utf8');
+
+  // 1) ..stores inside a protected folder must be treated as INSIDE, never allowed.
+  await assert.rejects(
+    () => assertSafeStoresDir(join(cohRoot, '..stores'), manifestPath),
+    (err) => err.code === 'UNSAFE_STORES_DIR',
+    '..stores inside coherenceRoot must be refused as UNSAFE_STORES_DIR',
+  );
+  await assert.rejects(
+    () => assertSafeStoresDir(join(nusearData, '..stores', 'sub'), manifestPath),
+    (err) => err.code === 'UNSAFE_STORES_DIR',
+    '..stores/sub inside nusearDataDir must be refused as UNSAFE_STORES_DIR',
+  );
+
+  // 2) --stores-dir set to the Nusear repo root would write into nusearRepo/data (== nusearDataDir) -> must be refused.
+  await assert.rejects(
+    () => assertSafeStoresDir(nusearRepo, manifestPath),
+    (err) => err.code === 'UNSAFE_STORES_DIR',
+    'Nusear repo root as --stores-dir must be refused because its data/ folder equals nusearDataDir',
+  );
+
+  // 3) --stores-dir whose code/ or data/ subfolder CONTAINS a protected path -> must be refused.
+  await assert.rejects(
+    () => assertSafeStoresDir(parentOfCode, manifestPath),
+    (err) => err.code === 'UNSAFE_STORES_DIR',
+    '--stores-dir whose code/ folder contains coherenceRepo must be refused',
+  );
+  await assert.rejects(
+    () => assertSafeStoresDir(parentOfData, manifestPath),
+    (err) => err.code === 'UNSAFE_STORES_DIR',
+    '--stores-dir whose data/ folder contains sources.legacyRunsRoot must be refused',
+  );
+
+  // 4) Symlink at <storesDir>/data pointing to nusearDataDir -> must be refused.
+  const symlinkStores = join(work, 'symlink-stores');
+  await mkdir(symlinkStores, { recursive: true });
+  await symlink(nusearData, join(symlinkStores, 'data'));
+  await assert.rejects(
+    () => assertSafeStoresDir(symlinkStores, manifestPath),
+    (err) => err.code === 'UNSAFE_STORES_DIR',
+    'symlink at <storesDir>/data pointing to nusearDataDir must be refused',
+  );
+
+  // 5) Genuine sibling ..stores outside protected paths remains allowed.
+  await assertSafeStoresDir(join(work, '..stores'), manifestPath);
+});
+
+test('Layer 4 [Fix5-1 - Carried Priors & --plan Validation]: accepts a frozen prior holding a reference append made outside any run only with exact folder, SHA-256 and extendsRowCount, records it as a reference append with its reason, reports it in summary, lets a later byte-identical prior equal it, and checks freshOverlayRoots and carriedPriors folders in --plan', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const CARRIED_REASON = 'Made-up reference append: two CONFIRM references re-keying earlier decisions, appended outside any run.';
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix5-carried-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const mkV1Row = (id, note, at = '2026-09-30T10:00:00Z') => ({
+    record_id: id,
+    disposition: 'CORRECT',
+    agent: '11111111',
+    agency: 'Beacon',
+    policy: null,
+    book: null,
+    month: null,
+    status: 'ACTIVE_PAYING',
+    note,
+    committed_at: at,
+  });
+
+  const rows0930 = [
+    mkV1Row('policy:carrier_a:C0930_1#effective:2026-01-01', 'sep30-1'),
+    mkV1Row('policy:carrier_a:C0930_2#effective:2026-01-01', 'sep30-2'),
+    mkV1Row('policy:carrier_a:C0930_3#effective:2026-01-01', 'sep30-3'),
+  ];
+  const referenceRows = [
+    mkV1Row('policy:carrier_a:REFERENCE_1#effective:2026-01-01', 'reference-1', '2026-10-01T08:00:00Z'),
+    mkV1Row('policy:carrier_a:REFERENCE_2#effective:2026-01-01', 'reference-2', '2026-10-01T08:05:00Z'),
+  ];
+  const row1001Final = mkV1Row('policy:carrier_a:C1001_1#effective:2026-01-01', 'oct01-final', '2026-10-01T14:00:00Z');
+
+  const csv0930 = makeOverlayCsv(rows0930, { version: 'v1' });
+  const csvCarried = makeOverlayCsv([...rows0930, ...referenceRows], { version: 'v1' });
+  const csv1001Final = makeOverlayCsv([...rows0930, ...referenceRows, row1001Final], { version: 'v1' });
+  const csvEmptyV1 = makeOverlayCsv([], { version: 'v1' });
+
+  const sha0930 = shaOf(csv0930);
+  const shaCarried = shaOf(csvCarried);
+
+  const makeRun = (date, { priorCsv = null, overlayCsv = null, emitOverlayCsv = null, born }) => ({
+    ...(priorCsv !== null ? { 'input/Overlay/overlay.csv': priorCsv } : {}),
+    'input/a.csv': 'k\n1\n',
+    ...(overlayCsv !== null ? { 'overlay.csv': overlayCsv } : {}),
+    ...(emitOverlayCsv !== null ? { 'emits/overlay.csv': emitOverlayCsv } : {}),
+    'run.json': JSON.stringify({ date, born, steps: { assign: { at: born }, emit: { at: born } } }),
+  });
+
+  // 1) Happy path via full proof runner (Layers 0, 1, 2, 4 + idempotency).
+  const okRoot = join(work, 'ok-carried');
+  await writeTree(join(okRoot, 'runs', '2026-09-30'), makeRun('2026-09-30', {
+    overlayCsv: csv0930,
+    emitOverlayCsv: csv0930,
+    born: '2026-09-30T10:00:00Z',
+  }));
+  await writeTree(join(okRoot, 'runs', 'archive', 'provisional', '2026-10-01'), makeRun('2026-10-01', {
+    priorCsv: csvCarried,
+    emitOverlayCsv: csvCarried,
+    born: '2026-10-01T09:00:00Z',
+  }));
+  await writeTree(join(okRoot, 'runs', '2026-10-01'), makeRun('2026-10-01', {
+    priorCsv: csvCarried,
+    overlayCsv: csv1001Final,
+    emitOverlayCsv: csv1001Final,
+    born: '2026-10-01T12:00:00Z',
+  }));
+  await writeTree(join(okRoot, 'standing-input'), { 'Overlay/overlay.csv': csv1001Final });
+
+  const okManifestPath = join(okRoot, 'manifest.json');
+  await writeFile(okManifestPath, JSON.stringify({
+    companySlug: 'acme',
+    coherenceRepo: mockRepo,
+    pythonPath: 'python3',
+    sources: {
+      legacyRunsRoot: 'runs',
+      standingInputDir: 'standing-input',
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+      allowDisjointOverlayRoots: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha0930 }],
+      carriedPriors: [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: CARRIED_REASON }],
+    },
+  }, null, 2), 'utf8');
+
+  const planOk = await runHistoryPlan({ manifestPath: okManifestPath });
+  assert.equal(planOk.passed, true, `plan should pass: ${JSON.stringify(planOk.missing)}`);
+  assert.deepEqual(planOk.missing, []);
+
+  const proofDb = `test_fix5_carried_${createHash('sha256').update(okRoot).digest('hex').slice(0, 8)}`;
+  const summary = await runHistoryProof({
+    manifestPath: okManifestPath,
+    database: proofDb,
+    dropDb: false,
+    tempRoot: work,
+  });
+  t.after(async () => {
+    const admin = await createPool({
+      mode: 'local',
+      host: process.env.PGHOST || '/tmp',
+      port: Number(process.env.PGPORT || 5432),
+      database: 'postgres',
+      user: process.env.PGUSER || undefined,
+    });
+    try {
+      await admin.query('SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()', [proofDb]);
+      await admin.query(`DROP DATABASE IF EXISTS "${proofDb}"`);
+    } finally {
+      await admin.end();
+    }
+  });
+
+  assert.equal(summary.passed, true, `proof failed: ${JSON.stringify(summary.problems)}`);
+  assert.equal(summary.layer1.carriedPriorCount, 1);
+  assert.equal(summary.layer1.carriedPriors.length, 1);
+  const cpEntry = summary.layer1.carriedPriors[0];
+  assert.equal(cpEntry.folder, 'archive/provisional/2026-10-01');
+  assert.match(cpEntry.commitId, /^[0-9a-f-]{36}$/);
+  assert.match(cpEntry.parentCommitId, /^[0-9a-f-]{36}$/);
+  assert.equal(cpEntry.sha256, shaCarried);
+  assert.equal(cpEntry.rowsAdded, 2);
+
+  // Verify DB records: child commit of 9/30 with kind historical_overlay, marked as a reference append,
+  // and 2026-10-01's prior equals that exact commit.
+  const verifyPool = await createPool({
+    mode: 'local',
+    host: process.env.PGHOST || '/tmp',
+    port: Number(process.env.PGPORT || 5432),
+    database: proofDb,
+    user: process.env.PGUSER || undefined,
+  });
+  try {
+    const dcRow = (await verifyPool.query(
+      'SELECT id, parent_commit_id, commit_kind, added_decision_count, cumulative_decision_count FROM coherence.decision_commits WHERE id = $1::uuid',
+      [cpEntry.commitId],
+    )).rows[0];
+    assert.ok(dcRow);
+    assert.equal(dcRow.parent_commit_id, cpEntry.parentCommitId);
+    assert.equal(dcRow.commit_kind, 'historical_overlay');
+    assert.equal(Number(dcRow.added_decision_count), 2);
+    assert.equal(Number(dcRow.cumulative_decision_count), 5);
+
+    const decRows = (await verifyPool.query(
+      'SELECT run_id, decided_by FROM coherence.decisions WHERE decision_commit_id = $1::uuid ORDER BY row_order ASC',
+      [cpEntry.commitId],
+    )).rows;
+    assert.equal(decRows.length, 2);
+    for (const d of decRows) {
+      assert.equal(d.run_id, null, 'a reference append made outside any run must not be attributed to the carrying run');
+      assert.equal(d.decided_by, 'historical_import_reference_append');
+    }
+
+    const impRow = (await verifyPool.query(
+      "SELECT metadata FROM coherence.imported_files WHERE area = 'other' AND rel_path = 'carried-priors/archive/provisional/2026-10-01/overlay.csv'",
+    )).rows[0];
+    assert.ok(impRow, 'carried prior provenance record must exist in imported_files');
+    assert.equal(impRow.metadata.carriedPrior, true);
+    assert.equal(impRow.metadata.referenceAppend, true);
+    assert.equal(impRow.metadata.reason, CARRIED_REASON, 'the pinned reason is kept verbatim in the provenance record');
+    assert.equal(impRow.metadata.decisionCommitId, cpEntry.commitId);
+    assert.equal(impRow.metadata.parentCommitId, cpEntry.parentCommitId);
+    assert.equal(impRow.metadata.rowsAdded, 2);
+
+    const run1001 = (await verifyPool.query(
+      "SELECT prior_decision_commit_id FROM coherence.runs WHERE source_folder = '2026-10-01'",
+    )).rows[0];
+    assert.equal(run1001.prior_decision_commit_id, cpEntry.commitId, '2026-10-01 prior must equal the carried prior commit');
+  } finally {
+    await verifyPool.end();
+  }
+
+  // 2) Negative cases: unlisted folder, wrong SHA-256, wrong extendsRowCount, header-only prior in carriedPriors folder, bad leading prefix.
+  const expectCarriedFail = async (caseName, carriedPriors, provPriorCsv = csvCarried, assertErr = null, extraFreshRoots = [], { expectNoWrites = false } = {}) => {
+    const dir = join(work, caseName);
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', {
+      overlayCsv: csv0930,
+      emitOverlayCsv: csv0930,
+      born: '2026-09-30T10:00:00Z',
+    }));
+    await writeTree(join(dir, 'runs', 'archive', 'provisional', '2026-10-01'), makeRun('2026-10-01', {
+      priorCsv: provPriorCsv,
+      emitOverlayCsv: provPriorCsv,
+      born: '2026-10-01T09:00:00Z',
+    }));
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha0930 }, ...extraFreshRoots],
+        carriedPriors,
+      },
+      tempBaseDir: work,
+    });
+    const before = expectNoWrites ? await snapshotImportWriteState(env) : null;
+    await assert.rejects(
+      () => executeHistoryImport({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        manifest,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        verifyRebuild: false,
+        tempBaseDir: work,
+      }),
+      (err) => {
+        assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: got ${err?.code}: ${err?.message}`);
+        if (assertErr) assertErr(err);
+        return true;
+      },
+    );
+    if (expectNoWrites) {
+      await assertNothingWrittenSince(env, before, caseName);
+    }
+  };
+
+  await expectCarriedFail('carried-unlisted', []);
+  // A pinned folder this import never meets fails before any write, as --plan does (the round 5 and 6 reviews).
+  await expectCarriedFail(
+    'carried-pin-folder-missing',
+    [
+      { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3 },
+      { sourceFolder: 'archive/provisional/2026-10-99', sha256: shaCarried, extendsRowCount: 3 },
+    ],
+    csvCarried,
+    (err) => assert.deepEqual(err.unmetPins, ['importConfig.carriedPriors archive/provisional/2026-10-99']),
+    [],
+    { expectNoWrites: true },
+  );
+  await expectCarriedFail(
+    'fresh-pin-folder-missing',
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3 }],
+    csvCarried,
+    (err) => assert.deepEqual(err.unmetPins, ['importConfig.freshOverlayRoots archive/v1/2026-09-99']),
+    [{ sourceFolder: 'archive/v1/2026-09-99', sha256: sha0930 }],
+    { expectNoWrites: true },
+  );
+  await expectCarriedFail('carried-wrong-folder', [
+    { sourceFolder: '2026-10-01', sha256: shaCarried, extendsRowCount: 3 },
+  ]);
+  await expectCarriedFail('carried-wrong-sha', [
+    { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaOf(`${csvCarried}#bad`), extendsRowCount: 3 },
+  ]);
+  await expectCarriedFail('carried-wrong-count-low', [
+    { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 2 },
+  ]);
+  await expectCarriedFail('carried-wrong-count-equal', [
+    { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 5 },
+  ]);
+  await expectCarriedFail(
+    'carried-header-only-prior',
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaOf(csvEmptyV1), extendsRowCount: 3 }],
+    csvEmptyV1,
+    (err) => {
+      assert.equal(String(err.message).includes('SHA-256 mismatch'), false, `expected empty-prior guard, not SHA mismatch: ${err.message}`);
+      assert.ok(String(err.message).includes('does not extend a known decision commit of exactly 3 rows'), err.message);
+    },
+  );
+  const csvCarriedBadPrefix = makeOverlayCsv([
+    rows0930[0],
+    { ...rows0930[1], note: 'altered-leading-row-2' },
+    rows0930[2],
+    ...referenceRows,
+  ], { version: 'v1' });
+  await expectCarriedFail(
+    'carried-bad-prefix',
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaOf(csvCarriedBadPrefix), extendsRowCount: 3 }],
+    csvCarriedBadPrefix,
+    (err) => {
+      assert.equal(String(err.message).includes('SHA-256 mismatch'), false, `expected leading-prefix mismatch, not SHA mismatch: ${err.message}`);
+      assert.equal(err.firstDifferingRow, 2);
+      assert.ok(String(err.message).includes('does not extend a known decision commit of exactly 3 rows'), err.message);
+    },
+  );
+
+  // 3) Invalid carriedPriors config entries fail with INVALID_IMPORT_CONFIG.
+  for (const badEntries of [
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 0 }],
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: -1 }],
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: '3' }],
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: 'not-a-sha', extendsRowCount: 3 }],
+    [{ sourceFolder: 'standing-overlay/overlay.csv', sha256: shaCarried, extendsRowCount: 3 }],
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: '' }],
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: '   ' }],
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: 7 }],
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: 'x'.repeat(601) }],
+    [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: 'two\nlines' }],
+    [
+      { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: CARRIED_REASON },
+      { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: 'A different reason.' },
+    ],
+  ]) {
+    await assert.rejects(
+      () => buildImportManifest({
+        companySlug: 'acme',
+        importConfig: { carriedPriors: badEntries },
+        tempBaseDir: work,
+      }),
+      (err) => err.code === 'INVALID_IMPORT_CONFIG',
+    );
+  }
+
+  // 3b) A repeated entry with the same SHA-256, row count and reason is one pin, not a conflict.
+  const dedupManifest = await buildImportManifest({
+    companySlug: 'acme',
+    importConfig: {
+      carriedPriors: [
+        { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: CARRIED_REASON },
+        { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3, reason: CARRIED_REASON },
+      ],
+    },
+    tempBaseDir: work,
+  });
+  assert.deepEqual(dedupManifest.importConfig?.carriedPriors?.map((pin) => pin.reason), [CARRIED_REASON]);
+
+  // 4) --plan checks that every freshOverlayRoots and carriedPriors folder names a discovered run.
+  const planMissingPath = join(okRoot, 'plan-missing-pins.json');
+  await writeFile(planMissingPath, JSON.stringify({
+    companySlug: 'acme',
+    coherenceRepo: mockRepo,
+    pythonPath: 'python3',
+    sources: {
+      legacyRunsRoot: 'runs',
+      standingInputDir: 'standing-input',
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [
+        { sourceFolder: '2026-09-30', sha256: sha0930 },
+        { sourceFolder: 'archive/v1/2026-09-99', sha256: sha0930 },
+      ],
+      carriedPriors: [
+        { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaCarried, extendsRowCount: 3 },
+        { sourceFolder: 'archive/provisional/2026-10-99', sha256: shaCarried, extendsRowCount: 3 },
+      ],
+    },
+  }, null, 2), 'utf8');
+
+  const planBad = await runHistoryPlan({ manifestPath: planMissingPath });
+  assert.equal(planBad.passed, false);
+  assert.deepEqual(
+    planBad.missing.map((m) => [m.key, m.kind, m.name]),
+    [
+      ['importConfig.freshOverlayRoots[1].sourceFolder', 'run', 'archive/v1/2026-09-99'],
+      ['importConfig.carriedPriors[1].sourceFolder', 'run', 'archive/provisional/2026-10-99'],
+    ],
+  );
+});
+
+test('Layer 4 [Fix5-2 - Header-Only File in Pinned Root Folder Fails]: an empty header-only overlay.csv in a pinned freshOverlayRoots folder is checked against its SHA-256 before any empty-commit early return (both with no prior and with an empty 0-row prior)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix5-empty-root-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:PIN1#effective:2026-01-01', note: 'pinned' });
+  const realCsv = makeOverlayCsv([row1], { version: 'v2' });
+  const headerOnlyCsv = makeOverlayCsv([], { version: 'v2' });
+  const realSha = shaOf(realCsv);
+
+  for (const [label, withEmptyPrior] of [['no-prior', false], ['empty-prior', true]]) {
+    const dir = join(work, label);
+    await writeTree(join(dir, 'runs', '2026-07-31'), {
+      ...(withEmptyPrior ? { 'input/Overlay/overlay.csv': headerOnlyCsv } : {}),
+      'input/a.csv': 'k\n1\n',
+      'overlay.csv': headerOnlyCsv,
+      'emits/overlay.csv': headerOnlyCsv,
+      'run.json': JSON.stringify({ date: '2026-07-31', born: '2026-07-31T10:00:00Z', steps: { assign: { at: '2026-07-31T10:00:00Z' }, emit: { at: '2026-07-31T10:00:00Z' } } }),
+    });
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        freshOverlayRoots: [{ sourceFolder: '2026-07-31', sha256: realSha }],
+      },
+      tempBaseDir: work,
+    });
+    await assert.rejects(
+      () => executeHistoryImport({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        manifest,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        verifyRebuild: false,
+        tempBaseDir: work,
+      }),
+      (err) => {
+        assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${label}: got ${err?.code}: ${err?.message}`);
+        return true;
+      },
+    );
+  }
+});
+
+test('Layer 4 [Fix5-3 - 0-Row Commits Never Satisfy exact_known_commit After Non-Empty Commits & Company Run Does Not Reattach to Non-Empty Ancestor]: an earlier 0-row draft never lets an empty standing overlay or empty company prior pass once any non-empty commit exists, and a company run starting from a 0-row commit extends that 0-row commit rather than attaching to a non-empty ancestor', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix5-zero-row-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:Z1#effective:2026-01-01', note: 'r1' });
+  const row2 = sampleApprovalRow({ record_id: 'policy:carrier_a:Z2#effective:2026-01-01', note: 'r2' });
+  const emptyCsv = makeOverlayCsv([], { version: 'v2' });
+  const csv1 = makeOverlayCsv([row1], { version: 'v2' });
+  const csv12 = makeOverlayCsv([row1, row2], { version: 'v2' });
+
+  const makeRun = (date, { priorCsv = null, overlayCsv = null, born }) => ({
+    ...(priorCsv !== null ? { 'input/Overlay/overlay.csv': priorCsv } : {}),
+    'input/a.csv': 'k\n1\n',
+    ...(overlayCsv !== null ? { 'overlay.csv': overlayCsv, 'emits/overlay.csv': overlayCsv } : {}),
+    'run.json': JSON.stringify({ date, born, steps: { assign: { at: born }, emit: { at: born } } }),
+  });
+
+  // 1) Earlier 0-row draft + non-empty run -> empty standing overlay MUST fail.
+  const standDir = join(work, 'empty-standing');
+  await writeTree(join(standDir, 'runs', 'archive', 'draft', '2026-07-15'), makeRun('2026-07-15', { overlayCsv: emptyCsv, born: '2026-07-15T10:00:00Z' }));
+  await writeTree(join(standDir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv1, born: '2026-08-31T10:00:00Z' }));
+  await writeTree(join(standDir, 'standing-input'), { 'Overlay/overlay.csv': emptyCsv });
+  const env1 = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env1.cleanup());
+  const m1 = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      legacyRunsRoot: join(standDir, 'runs'),
+      standingInputDir: join(standDir, 'standing-input'),
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-08-31', sha256: shaOf(csv1) }],
+    },
+    tempBaseDir: work,
+  });
+  await assert.rejects(
+    () => executeHistoryImport({
+      pool: env1.pool,
+      stores: env1.stores,
+      commands: env1.commands,
+      actor: env1.ownerActor,
+      manifest: m1,
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      verifyRebuild: false,
+      tempBaseDir: work,
+    }),
+    (err) => err.code === 'OVERLAY_PREFIX_MISMATCH',
+    'empty standing overlay must fail once a non-empty commit exists even if an earlier 0-row draft exists',
+  );
+
+  // 2) Earlier 0-row draft + non-empty run -> company run with empty prior MUST fail (both empty overlay and overlay extending non-empty run).
+  for (const [label, compOverlay] of [['company-empty-prior-extends', csv12], ['company-empty-prior-empty-ov', emptyCsv]]) {
+    const dir = join(work, label);
+    await writeTree(join(dir, 'runs', 'archive', 'draft', '2026-07-15'), makeRun('2026-07-15', { overlayCsv: emptyCsv, born: '2026-07-15T10:00:00Z' }));
+    await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv1, born: '2026-08-31T10:00:00Z' }));
+    await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', {
+      priorCsv: emptyCsv,
+      overlayCsv: compOverlay,
+      born: '2026-11-03T10:00:00Z',
+    }));
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: {
+        legacyRunsRoot: join(dir, 'runs'),
+        companyWorkspacesDir: join(dir, 'company-ws'),
+      },
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        freshOverlayRoots: [{ sourceFolder: '2026-08-31', sha256: shaOf(csv1) }],
+      },
+      tempBaseDir: work,
+    });
+    await assert.rejects(
+      () => executeHistoryImport({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        manifest,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        verifyRebuild: false,
+        tempBaseDir: work,
+      }),
+      (err) => err.code === 'OVERLAY_PREFIX_MISMATCH',
+      `${label}: empty company prior must fail once any non-empty commit exists`,
+    );
+  }
+
+  // 3) Company run starting from a 0-row commit when NO non-empty commit exists extends that 0-row commit directly
+  //    (never reattaching to a non-empty ancestor), and a subsequent company run with an empty prior then fails closed.
+  const firstCoDir = join(work, 'first-company-from-zero');
+  await writeTree(join(firstCoDir, 'runs', 'archive', 'draft', '2026-07-15'), makeRun('2026-07-15', { overlayCsv: emptyCsv, born: '2026-07-15T10:00:00Z' }));
+  await writeTree(join(firstCoDir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', {
+    priorCsv: emptyCsv,
+    overlayCsv: csv1,
+    born: '2026-11-03T10:00:00Z',
+  }));
+  const env3 = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env3.cleanup());
+  const m3 = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      legacyRunsRoot: join(firstCoDir, 'runs'),
+      companyWorkspacesDir: join(firstCoDir, 'company-ws'),
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+    },
+    tempBaseDir: work,
+  });
+  const rep3 = await executeHistoryImport({
+    pool: env3.pool,
+    stores: env3.stores,
+    commands: env3.commands,
+    actor: env3.ownerActor,
+    manifest: m3,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: work,
+  });
+  assert.equal(rep3.passed, true, rep3.problems.join('; '));
+  const coRunRow = (await env3.pool.query(
+    "SELECT id, prior_decision_commit_id FROM coherence.runs WHERE source_folder = 'company-workspaces/acme/2026-11-03/runs/2026-11-03'",
+  )).rows[0];
+  const coOverlayCommit = (await env3.pool.query(
+    `SELECT dc.id, dc.parent_commit_id, dc.cumulative_decision_count
+     FROM coherence.generated_overlays go
+     JOIN coherence.decision_commits dc ON dc.id = go.decision_commit_id
+     WHERE go.run_id = $1::uuid AND go.purpose = 'historical_source'`,
+    [coRunRow.id],
+  )).rows[0];
+  assert.equal(coOverlayCommit.parent_commit_id, coRunRow.prior_decision_commit_id, 'company run overlay must extend its own 0-row prior commit');
+  assert.equal(Number(coOverlayCommit.cumulative_decision_count), 1);
+
+  // Now that a non-empty commit exists, adding another company run with an empty prior MUST fail closed.
+  await writeTree(join(firstCoDir, 'company-ws', '2026-11-04', 'runs', '2026-11-04'), makeRun('2026-11-04', {
+    priorCsv: emptyCsv,
+    overlayCsv: csv12,
+    born: '2026-11-04T10:00:00Z',
+  }));
+  const m3b = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      legacyRunsRoot: join(firstCoDir, 'runs'),
+      companyWorkspacesDir: join(firstCoDir, 'company-ws'),
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+    },
+    tempBaseDir: work,
+  });
+  await assert.rejects(
+    () => executeHistoryImport({
+      pool: env3.pool,
+      stores: env3.stores,
+      commands: env3.commands,
+      actor: env3.ownerActor,
+      manifest: m3b,
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      verifyRebuild: false,
+      tempBaseDir: work,
+    }),
+    (err) => err.code === 'OVERLAY_PREFIX_MISMATCH',
+  );
+});
+
+test('Layer 4 [Fix5-4 - Fresh Roots Are historical_overlay & Standing Head Always Verified]: run- and checkpoint-created fresh roots use commit_kind historical_overlay, backfilling a fresh root never moves standing_decision_head_as_of(NULL), and drift in standing_decision_head_as_of(NULL) is caught even when standing-overlay/overlay.csv was already imported', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix5-head-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const row0731 = sampleApprovalRow({ record_id: 'policy:carrier_a:H0731#effective:2026-01-01', note: 'backfill-run' });
+  const rowCp = sampleApprovalRow({ record_id: 'policy:carrier_a:HCP#effective:2026-01-01', note: 'backfill-cp' });
+  const row0831 = sampleApprovalRow({ record_id: 'policy:carrier_a:H0831#effective:2026-01-01', note: 'main-root' });
+  const row0930 = sampleApprovalRow({ record_id: 'policy:carrier_a:H0930#effective:2026-01-01', note: 'main-head' });
+
+  const csv0731 = makeOverlayCsv([row0731], { version: 'v2' });
+  const csvCp = makeOverlayCsv([rowCp], { version: 'v2' });
+  const csv0831 = makeOverlayCsv([row0831], { version: 'v2' });
+  const csv0930 = makeOverlayCsv([row0831, row0930], { version: 'v2' });
+
+  const makeRun = (date, { priorCsv = null, overlayCsv = null, born }) => ({
+    ...(priorCsv !== null ? { 'input/Overlay/overlay.csv': priorCsv } : {}),
+    'input/a.csv': 'k\n1\n',
+    ...(overlayCsv !== null ? { 'overlay.csv': overlayCsv, 'emits/overlay.csv': overlayCsv } : {}),
+    'run.json': JSON.stringify({ date, born, steps: { assign: { at: born }, emit: { at: born } } }),
+  });
+
+  const dir = join(work, 'backfill-test');
+  await writeTree(join(dir, 'runs', '2026-08-31'), makeRun('2026-08-31', { overlayCsv: csv0831, born: '2026-08-31T10:00:00Z' }));
+  await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { priorCsv: csv0831, overlayCsv: csv0930, born: '2026-09-30T10:00:00Z' }));
+  await writeTree(join(dir, 'standing-input'), { 'Overlay/overlay.csv': csv0930 });
+
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const m1 = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      legacyRunsRoot: join(dir, 'runs'),
+      standingInputDir: join(dir, 'standing-input'),
+    },
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: '2026-08-31', sha256: shaOf(csv0831) }],
+    },
+    tempBaseDir: work,
+  });
+  const rep1 = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest: m1,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: work,
+  });
+  assert.equal(rep1.passed, true, rep1.problems.join('; '));
+  assert.equal(rep1.overlayRoots.length, 1);
+
+  const root0831Row = (await env.pool.query(
+    'SELECT commit_kind FROM coherence.decision_commits WHERE id = $1::uuid',
+    [rep1.overlayRoots[0].commitId],
+  )).rows[0];
+  assert.equal(root0831Row.commit_kind, 'historical_overlay', 'run-created fresh root must be historical_overlay, never historical_baseline');
+
+  const head1 = (await env.pool.query('SELECT coherence.standing_decision_head_as_of(NULL) AS id')).rows[0].id;
+  assert.equal(head1, rep1.standingDecisionCommitId);
+  const head1Row = (await env.pool.query(
+    'SELECT commit_kind, cumulative_decision_count FROM coherence.decision_commits WHERE id = $1::uuid',
+    [head1],
+  )).rows[0];
+  assert.equal(head1Row.commit_kind, 'historical_baseline');
+  assert.equal(Number(head1Row.cumulative_decision_count), 2);
+
+  // Backfill an older fresh-root run (2026-07-31) AND a fresh-root standalone checkpoint with the SAME standing overlay.
+  await writeTree(join(dir, 'runs', '2026-07-31'), makeRun('2026-07-31', { overlayCsv: csv0731, born: '2026-07-31T10:00:00Z' }));
+  const cpPath = join(dir, 'backfill-cp.csv');
+  await writeFile(cpPath, csvCp, 'utf8');
+
+  const m2 = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      legacyRunsRoot: join(dir, 'runs'),
+      standingInputDir: join(dir, 'standing-input'),
+    },
+    overlayCheckpoints: [
+      { label: 'backfill-cp', absPath: cpPath, originalAt: '2026-07-20T10:00:00Z', commitKind: 'historical_baseline' },
+    ],
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [
+        { sourceFolder: '2026-08-31', sha256: shaOf(csv0831) },
+        { sourceFolder: '2026-07-31', sha256: shaOf(csv0731) },
+        { sourceFolder: 'overlay-checkpoints/backfill-cp', sha256: shaOf(csvCp) },
+      ],
+    },
+    tempBaseDir: work,
+  });
+  const rep2 = await executeHistoryImport({
+    pool: env.pool,
+    stores: env.stores,
+    commands: env.commands,
+    actor: env.ownerActor,
+    manifest: m2,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: work,
+  });
+  assert.equal(rep2.passed, true, rep2.problems.join('; '));
+  assert.equal(rep2.overlayRoots.length, 2);
+  for (const r of rep2.overlayRoots) {
+    const row = (await env.pool.query(
+      'SELECT commit_kind FROM coherence.decision_commits WHERE id = $1::uuid',
+      [r.commitId],
+    )).rows[0];
+    assert.equal(row.commit_kind, 'historical_overlay', `backfilled root ${r.folder} must be historical_overlay`);
+  }
+
+  const head2 = (await env.pool.query('SELECT coherence.standing_decision_head_as_of(NULL) AS id')).rows[0].id;
+  assert.equal(head2, head1, 'backfilling fresh roots must never move standing_decision_head_as_of(NULL)');
+  assert.equal(rep2.standingDecisionCommitId, head1);
+
+  // Verify that if standing_decision_head_as_of(NULL) drifts away (e.g. an explicit baseline moves it),
+  // re-running executeHistoryImport with the already-imported standing overlay catches it instead of returning stale metadata.
+  await env.commands.recordDecisionBaseline({
+    actor: env.ownerActor,
+    commandKey: 'fix5-explicit-drift-baseline',
+    parentCommitId: null,
+    commitKind: 'historical_baseline',
+    headerContract: 'v2',
+    imported: true,
+    decisions: [row0731],
+  });
+  await assert.rejects(
+    () => executeHistoryImport({
+      pool: env.pool,
+      stores: env.stores,
+      commands: env.commands,
+      actor: env.ownerActor,
+      manifest: m2,
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      verifyRebuild: false,
+      tempBaseDir: work,
+    }),
+    (err) => err.code === 'STANDING_DECISION_HEAD_MISMATCH',
+    'must verify standing_decision_head_as_of(NULL) even when standing-overlay/overlay.csv was already imported',
+  );
+});
+
+test('Layer 4 [Fix6-1 - Pinned Files Cannot Be Bypassed & Company Runs Require Frozen Prior]: carriedPriors without frozen prior or on company_import fails closed, freshOverlayRoots with non-empty prior or no verified checkpoint fails closed, and company_import without frozen prior while having overlay.csv, emits/overlay.csv, or review saves fails closed', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix6-pins-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:F6_1#effective:2026-01-01', note: 'base-1' });
+  const row2 = sampleApprovalRow({ record_id: 'policy:carrier_a:F6_2#effective:2026-01-01', note: 'ext-2' });
+  const row3 = sampleApprovalRow({ record_id: 'policy:carrier_a:F6_3#effective:2026-01-01', note: 'ext-3' });
+
+  const emptyCsv = makeOverlayCsv([], { version: 'v2' });
+  const csv1 = makeOverlayCsv([row1], { version: 'v2' });
+  const csv12 = makeOverlayCsv([row1, row2], { version: 'v2' });
+  const csv123 = makeOverlayCsv([row1, row2, row3], { version: 'v2' });
+
+  const sha1 = shaOf(csv1);
+  const sha12 = shaOf(csv12);
+
+  const makeRun = (date, { priorCsv = null, overlayCsv = null, emitOverlayCsv = null, born, steps = null }) => ({
+    ...(priorCsv !== null ? { 'input/Overlay/overlay.csv': priorCsv } : {}),
+    'input/a.csv': 'k\n1\n',
+    ...(overlayCsv !== null ? { 'overlay.csv': overlayCsv } : {}),
+    ...(emitOverlayCsv !== null ? { 'emits/overlay.csv': emitOverlayCsv } : {}),
+    'run.json': JSON.stringify({
+      date,
+      born,
+      steps: steps || { assign: { at: born }, emit: { at: born } },
+    }),
+  });
+
+  const expectMismatch = async (caseName, { setup, importConfig, overlayCheckpoints = [], assertErr = null, expectNoWrites = false }) => {
+    const dir = join(work, caseName);
+    await mkdir(join(dir, 'runs'), { recursive: true });
+    await mkdir(join(dir, 'company-ws'), { recursive: true });
+    await mkdir(join(dir, 'company-saves'), { recursive: true });
+    await setup(dir);
+
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: {
+        legacyRunsRoot: join(dir, 'runs'),
+        companyWorkspacesDir: join(dir, 'company-ws'),
+        companyReviewSavesDir: join(dir, 'company-saves'),
+      },
+      overlayCheckpoints,
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        ...importConfig,
+      },
+      tempBaseDir: work,
+    });
+
+    const before = expectNoWrites ? await snapshotImportWriteState(env) : null;
+    await assert.rejects(
+      () => executeHistoryImport({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        manifest,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        verifyRebuild: false,
+        tempBaseDir: work,
+      }),
+      (err) => {
+        assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: expected OVERLAY_PREFIX_MISMATCH, got ${err?.code}: ${err?.message}`);
+        if (assertErr) assertErr(err);
+        return true;
+      },
+      `${caseName} must fail closed with OVERLAY_PREFIX_MISMATCH`,
+    );
+    if (expectNoWrites) {
+      await assertNothingWrittenSince(env, before, caseName);
+    }
+  };
+
+  // 1a) carriedPriors folder missing input/Overlay/overlay.csv, with overlay.csv extending known commit (must NOT fall to no_prior_run_start).
+  await expectMismatch('carried-missing-prior-with-overlay', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'runs', 'archive', 'provisional', '2026-10-01'), makeRun('2026-10-01', { overlayCsv: csv12, emitOverlayCsv: csv12, born: '2026-10-01T09:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+      carriedPriors: [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: sha12, extendsRowCount: 1 }],
+    },
+  });
+
+  // 1b) carriedPriors folder missing input/Overlay/overlay.csv and having no overlay files at all.
+  await expectMismatch('carried-missing-prior-no-overlay', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'runs', 'archive', 'provisional', '2026-10-01'), makeRun('2026-10-01', { born: '2026-10-01T09:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+      carriedPriors: [{ sourceFolder: 'archive/provisional/2026-10-01', sha256: sha12, extendsRowCount: 1 }],
+    },
+  });
+
+  // 1c) company_import run listed in carriedPriors (even when its frozen prior equals a known commit!).
+  await expectMismatch('carried-company-run-with-valid-prior', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { priorCsv: csv1, overlayCsv: csv12, emitOverlayCsv: csv12, born: '2026-11-03T10:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+      carriedPriors: [{ sourceFolder: 'company-workspaces/acme/2026-11-03/runs/2026-11-03', sha256: sha1, extendsRowCount: 1 }],
+    },
+    assertErr: (err) => assert.deepEqual(err.unmetPins, [
+      'importConfig.carriedPriors company-workspaces/acme/2026-11-03/runs/2026-11-03 names a company run',
+    ]),
+    expectNoWrites: true,
+  });
+
+  // 1d) company_import run listed in carriedPriors without a frozen prior.
+  await expectMismatch('carried-company-run-no-prior', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { born: '2026-11-03T10:00:00Z', steps: { assign: { at: '2026-11-03T10:00:00Z' } } }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+      carriedPriors: [{ sourceFolder: 'company-workspaces/acme/2026-11-03/runs/2026-11-03', sha256: sha1, extendsRowCount: 1 }],
+    },
+    assertErr: (err) => assert.deepEqual(err.unmetPins, [
+      'importConfig.carriedPriors company-workspaces/acme/2026-11-03/runs/2026-11-03 names a company run',
+    ]),
+    expectNoWrites: true,
+  });
+
+  // 2a) freshOverlayRoots folder with a non-empty frozen prior AND extending overlay.csv (must NOT bypass pin via parent.cumulativeCount > 0).
+  await expectMismatch('fresh-root-non-empty-prior-with-overlay', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'runs', '2026-10-01'), makeRun('2026-10-01', { priorCsv: csv1, overlayCsv: csv12, emitOverlayCsv: csv12, born: '2026-10-01T10:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [
+        { sourceFolder: '2026-09-30', sha256: sha1 },
+        { sourceFolder: '2026-10-01', sha256: sha12 },
+      ],
+    },
+  });
+
+  // 2b) freshOverlayRoots folder with a non-empty frozen prior and NO run overlay.csv.
+  await expectMismatch('fresh-root-non-empty-prior-no-overlay', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'runs', '2026-10-01'), makeRun('2026-10-01', { priorCsv: csv1, born: '2026-10-01T10:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [
+        { sourceFolder: '2026-09-30', sha256: sha1 },
+        { sourceFolder: '2026-10-01', sha256: sha1 },
+      ],
+    },
+  });
+
+  // 2c) freshOverlayRoots folder with NO overlay checkpoints at all (missing pinned file).
+  await expectMismatch('fresh-root-missing-all-overlays', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-07-31'), makeRun('2026-07-31', { born: '2026-07-31T10:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-07-31', sha256: sha1 }],
+    },
+  });
+
+  // 2d) freshOverlayRoots folder with ONLY an empty 0-row frozen prior and NO run overlay checkpoints.
+  await expectMismatch('fresh-root-only-empty-prior', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-07-31'), makeRun('2026-07-31', { priorCsv: emptyCsv, born: '2026-07-31T10:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-07-31', sha256: sha1 }],
+    },
+  });
+
+  // 2e) company_import run listed in freshOverlayRoots (even starting from a 0-row prior with matching overlay.csv).
+  await expectMismatch('fresh-root-company-run', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', 'archive', 'draft', '2026-07-15'), makeRun('2026-07-15', { overlayCsv: emptyCsv, born: '2026-07-15T10:00:00Z' }));
+      await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { priorCsv: emptyCsv, overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-11-03T10:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: 'company-workspaces/acme/2026-11-03/runs/2026-11-03', sha256: sha1 }],
+    },
+    assertErr: (err) => assert.deepEqual(err.unmetPins, [
+      'importConfig.freshOverlayRoots company-workspaces/acme/2026-11-03/runs/2026-11-03 names a company run',
+    ]),
+    expectNoWrites: true,
+  });
+
+  // 3a) company_import run missing frozen prior while having overlay.csv (even when overlay.csv extends a known commit).
+  await expectMismatch('company-missing-prior-with-root-overlay', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { overlayCsv: csv12, born: '2026-11-03T10:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+    },
+  });
+
+  // 3b) company_import run missing frozen prior while having emits/overlay.csv (even when emits/overlay.csv extends a known commit).
+  await expectMismatch('company-missing-prior-with-emit-overlay', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { emitOverlayCsv: csv12, born: '2026-11-03T10:00:00Z' }));
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+    },
+  });
+
+  // 3c) company_import run missing frozen prior while having timestamped company review saves.
+  await expectMismatch('company-missing-prior-with-review-save', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { born: '2026-11-03T10:00:00Z', steps: { assign: { at: '2026-11-03T10:00:00Z' }, bible: { at: '2026-11-03T10:05:00Z' } } }));
+      await writeTree(join(dir, 'company-saves', '2026-11-03'), {
+        'bible-review-2026-11-03T10-06-00-000Z.csv': csv12,
+      });
+    },
+    importConfig: {
+      freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+    },
+  });
+
+  // 3d) Positive control: company_import run without frozen prior AND without overlay.csv, emits/overlay.csv, or review saves still imports cleanly.
+  const okCoDir = join(work, 'company-assign-only-no-overlays');
+  await writeTree(join(okCoDir, 'company-ws', '2026-11-04', 'runs', '2026-11-04'), makeRun('2026-11-04', {
+    born: '2026-11-04T10:00:00Z',
+    steps: { assign: { at: '2026-11-04T10:00:00Z' } },
+  }));
+  const okCoEnv = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => okCoEnv.cleanup());
+  const okCoManifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { companyWorkspacesDir: join(okCoDir, 'company-ws') },
+    importConfig: { includeLegacyHostHistory: false, includeLegacySqliteTables: false },
+    tempBaseDir: work,
+  });
+  const okCoRep = await executeHistoryImport({
+    pool: okCoEnv.pool,
+    stores: okCoEnv.stores,
+    commands: okCoEnv.commands,
+    actor: okCoEnv.ownerActor,
+    manifest: okCoManifest,
+    pythonPath: 'python3',
+    coherenceRepo: mockRepo,
+    verifyRebuild: false,
+    tempBaseDir: work,
+  });
+  assert.equal(okCoRep.passed, true, okCoRep.problems.join('; '));
+  assert.equal(okCoRep.importedRuns.length, 1);
+
+  // 4) Standalone checkpoint with extendsCommitId listed in freshOverlayRoots fails closed.
+  const cpDir = join(work, 'cp-extends-pinned');
+  const cpPath = join(cpDir, 'ext-cp.csv');
+  await mkdir(cpDir, { recursive: true });
+  await writeFile(cpPath, csv123, 'utf8');
+  await writeTree(join(cpDir, 'runs', '2026-09-30'), makeRun('2026-09-30', {
+    priorCsv: csv12,
+    overlayCsv: csv123,
+    emitOverlayCsv: csv123,
+    born: '2026-09-30T10:00:00Z',
+  }));
+  const cpEnv = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => cpEnv.cleanup());
+  const baseCommit = await cpEnv.commands.recordDecisionBaseline({
+    actor: cpEnv.ownerActor,
+    commandKey: 'fix6-cp-base',
+    commitKind: 'historical_overlay',
+    headerContract: 'v2',
+    imported: true,
+    decisions: [row1, row2],
+  });
+  const cpManifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: { legacyRunsRoot: join(cpDir, 'runs') },
+    overlayCheckpoints: [{
+      label: 'ext-cp',
+      absPath: cpPath,
+      extendsCommitId: baseCommit.result.decisionCommitId,
+      originalAt: '2026-11-05T10:00:00Z',
+    }],
+    importConfig: {
+      includeLegacyHostHistory: true,
+      includeLegacySqliteTables: false,
+      useCompanyIncomingInput: false,
+      freshOverlayRoots: [{ sourceFolder: 'overlay-checkpoints/ext-cp', sha256: shaOf(csv123) }],
+    },
+    tempBaseDir: work,
+  });
+  const beforeCp = await snapshotImportWriteState(cpEnv);
+  await assert.rejects(
+    () => executeHistoryImport({
+      pool: cpEnv.pool,
+      stores: cpEnv.stores,
+      commands: cpEnv.commands,
+      actor: cpEnv.ownerActor,
+      manifest: cpManifest,
+      pythonPath: 'python3',
+      coherenceRepo: mockRepo,
+      verifyRebuild: false,
+      tempBaseDir: work,
+    }),
+    (err) => {
+      assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH');
+      assert.deepEqual(err.unmetPins, [
+        'importConfig.freshOverlayRoots overlay-checkpoints/ext-cp names a checkpoint that extends a commit',
+      ]);
+      return true;
+    },
+    'standalone checkpoint with extendsCommitId must not be accepted in freshOverlayRoots',
+  );
+  await assertNothingWrittenSince(cpEnv, beforeCp, 'cp-extends-pinned', { expectEmptyCommits: false });
+
+  await expectMismatch('cp-extends-pinned-empty-db', {
+    setup: async (dir) => {
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+    },
+    overlayCheckpoints: [{
+      label: 'ext-cp',
+      absPath: cpPath,
+      extendsCommitId: '00000000-0000-4000-8000-000000000001',
+      originalAt: '2026-11-05T10:00:00Z',
+    }],
+    importConfig: {
+      freshOverlayRoots: [
+        { sourceFolder: '2026-09-30', sha256: sha1 },
+        { sourceFolder: 'overlay-checkpoints/ext-cp', sha256: shaOf(csv123) },
+      ],
+    },
+    assertErr: (err) => assert.deepEqual(err.unmetPins, [
+      'importConfig.freshOverlayRoots overlay-checkpoints/ext-cp names a checkpoint that extends a commit',
+    ]),
+    expectNoWrites: true,
+  });
+});
+
+test('Layer 4 [Fix6-2 - Plan Check Agrees With Import for Legacy Runs and Standalone Checkpoints]: --plan tracks legacy runs apart from company and abandoned runs, requires carriedPriors to name discovered legacy runs, allows freshOverlayRoots to name discovered legacy runs or standalone checkpoints by safeOverlayCheckpointRelPath, and keeps compareTargets spanning all run kinds', async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix6-plan-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const shaA = 'a'.repeat(64);
+  const shaB = 'b'.repeat(64);
+  const shaC = 'c'.repeat(64);
+  const cpFallbackLabel = '../unsafe-label';
+  const cpFallbackHash = createHash('sha256').update(cpFallbackLabel, 'utf8').digest('hex').slice(0, 16);
+  const cpFallbackRelPath = `overlay-checkpoints/${cpFallbackHash}/fallback_cp.csv`;
+
+  await writeTree(join(work, 'runs', '2026-09-30'), {
+    'input/a.csv': 'k\n1\n',
+    'run.json': JSON.stringify({ date: '2026-09-30', steps: {} }),
+  });
+  await writeTree(join(work, 'runs', 'archive', 'provisional', '2026-10-01'), {
+    'input/a.csv': 'k\n1\n',
+    'run.json': JSON.stringify({ date: '2026-10-01', steps: {} }),
+  });
+  await writeTree(join(work, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), {
+    'input/a.csv': 'k\n1\n',
+    'run.json': JSON.stringify({ date: '2026-11-03', steps: {} }),
+  });
+  await writeTree(join(work, 'company-abandoned', '2026-11-09'), {
+    'input/a.csv': 'k\n1\n',
+    'run.json': JSON.stringify({ date: '2026-11-09', steps: {} }),
+  });
+  await writeTree(join(work, 'checkpoints'), {
+    'early.csv': 'record_id,disposition\n',
+    'fallback_cp.csv': 'record_id,disposition\n',
+    'extends_cp.csv': 'record_id,disposition\n',
+  });
+
+  const baseSources = {
+    legacyRunsRoot: 'runs',
+    companyWorkspacesDir: 'company-ws',
+    companyAbandonedDir: 'company-abandoned',
+  };
+
+  // 1) Happy path: legacy run + standalone checkpoints (normal label & sanitized fallback) in freshOverlayRoots,
+  //    legacy run in carriedPriors, and compareTargets covering legacy, company, and abandoned runs.
+  const okManifest = join(work, 'plan-ok.json');
+  await writeFile(okManifest, JSON.stringify({
+    companySlug: 'acme',
+    sources: baseSources,
+    overlayCheckpoints: [
+      { label: 'early-cp', path: 'checkpoints/early.csv' },
+      { label: cpFallbackLabel, path: 'checkpoints/fallback_cp.csv' },
+    ],
+    importConfig: {
+      includeLegacyHostHistory: true,
+      freshOverlayRoots: [
+        { sourceFolder: '2026-09-30', sha256: shaA },
+        { sourceFolder: 'overlay-checkpoints/early-cp', sha256: shaB },
+        { sourceFolder: cpFallbackRelPath, sha256: shaC },
+      ],
+      carriedPriors: [
+        { sourceFolder: 'archive/provisional/2026-10-01', sha256: shaA, extendsRowCount: 3 },
+      ],
+    },
+    compareTargets: [
+      { label: 'legacy', leftRunSourceFolder: '2026-09-30', rightDir: 'runs/2026-09-30' },
+      { label: 'company', leftRunSourceFolder: 'company-workspaces/acme/2026-11-03/runs/2026-11-03', rightDir: 'company-ws/2026-11-03/runs/2026-11-03' },
+      { label: 'abandoned', leftRunSourceFolder: 'company-abandoned/acme/2026-11-09', rightDir: 'company-abandoned/2026-11-09' },
+    ],
+  }, null, 2), 'utf8');
+
+  const planOk = await runHistoryPlan({ manifestPath: okManifest });
+  assert.equal(planOk.passed, true, `expected plan to pass, missing: ${JSON.stringify(planOk.missing)}`);
+  assert.deepEqual(planOk.missing, []);
+  assert.equal(planOk.compareTargets.every((c) => c.status === 'found'), true);
+
+  // 2) Negative path: company run, abandoned run, checkpoint with extendsCommitId, or missing checkpoint
+  //    in carriedPriors / freshOverlayRoots must ALL fail --plan.
+  const badManifest = join(work, 'plan-bad.json');
+  await writeFile(badManifest, JSON.stringify({
+    companySlug: 'acme',
+    sources: baseSources,
+    overlayCheckpoints: [
+      { label: 'early-cp', path: 'checkpoints/early.csv' },
+      { label: 'missing-cp', path: 'checkpoints/does-not-exist.csv' },
+      { label: 'extends-cp', path: 'checkpoints/extends_cp.csv', extendsCommitId: '00000000-0000-4000-8000-000000000001' },
+    ],
+    importConfig: {
+      includeLegacyHostHistory: true,
+      freshOverlayRoots: [
+        { sourceFolder: 'company-workspaces/acme/2026-11-03/runs/2026-11-03', sha256: shaA },
+        { sourceFolder: 'company-abandoned/acme/2026-11-09', sha256: shaA },
+        { sourceFolder: 'overlay-checkpoints/missing-cp', sha256: shaB },
+        { sourceFolder: 'overlay-checkpoints/extends-cp', sha256: shaC },
+      ],
+      carriedPriors: [
+        { sourceFolder: 'company-workspaces/acme/2026-11-03/runs/2026-11-03', sha256: shaA, extendsRowCount: 3 },
+        { sourceFolder: 'company-abandoned/acme/2026-11-09', sha256: shaA, extendsRowCount: 3 },
+        { sourceFolder: 'overlay-checkpoints/early-cp', sha256: shaB, extendsRowCount: 3 },
+      ],
+    },
+  }, null, 2), 'utf8');
+
+  const planBad = await runHistoryPlan({ manifestPath: badManifest });
+  assert.equal(planBad.passed, false);
+  assert.deepEqual(
+    planBad.missing.map((m) => [m.key, m.kind, m.name]),
+    [
+      ['overlayCheckpoints[1]', 'file', 'missing-cp'],
+      ['importConfig.freshOverlayRoots[0].sourceFolder', 'run', 'company-workspaces/acme/2026-11-03/runs/2026-11-03'],
+      ['importConfig.freshOverlayRoots[1].sourceFolder', 'run', 'company-abandoned/acme/2026-11-09'],
+      ['importConfig.freshOverlayRoots[2].sourceFolder', 'run', 'overlay-checkpoints/missing-cp'],
+      ['importConfig.freshOverlayRoots[3].sourceFolder', 'run', 'overlay-checkpoints/extends-cp'],
+      ['importConfig.carriedPriors[0].sourceFolder', 'run', 'company-workspaces/acme/2026-11-03/runs/2026-11-03'],
+      ['importConfig.carriedPriors[1].sourceFolder', 'run', 'company-abandoned/acme/2026-11-09'],
+      ['importConfig.carriedPriors[2].sourceFolder', 'run', 'overlay-checkpoints/early-cp'],
+    ],
+  );
+});
+
+test('Layer 4 [Fix7-1 - Pre-Write Pin Checks, Direct Single-Run Guards & Shared-Key Cross-Kind Collisions]: proves zero-write assertions fail if pin checks run after the loop, refuses standalone checkpoints in carriedPriors before any write, exercises direct importSingleRunFolder company_import guards, and refuses shared keys across kinds regardless of timeline order', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const work = await mkdtemp(join(tmpdir(), 'coherence-fix7-pins-'));
+  t.after(() => rm(work, { recursive: true, force: true }));
+
+  const mockRepo = join(work, 'mock-coherence');
+  await createStdlibMockCoherenceRepo(mockRepo);
+  const shaOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  const row1 = sampleApprovalRow({ record_id: 'policy:carrier_a:F7_1#effective:2026-01-01', note: 'base-1' });
+  const row2 = sampleApprovalRow({ record_id: 'policy:carrier_a:F7_2#effective:2026-01-01', note: 'ext-2' });
+  const row3 = sampleApprovalRow({ record_id: 'policy:carrier_a:F7_3#effective:2026-01-01', note: 'ext-3' });
+
+  const csv1 = makeOverlayCsv([row1], { version: 'v2' });
+  const csv12 = makeOverlayCsv([row1, row2], { version: 'v2' });
+  const csv123 = makeOverlayCsv([row1, row2, row3], { version: 'v2' });
+
+  const sha1 = shaOf(csv1);
+  const sha12 = shaOf(csv12);
+  const sha123 = shaOf(csv123);
+
+  const makeRun = (date, { priorCsv = null, overlayCsv = null, emitOverlayCsv = null, born }) => ({
+    ...(priorCsv !== null ? { 'input/Overlay/overlay.csv': priorCsv } : {}),
+    'input/a.csv': 'k\n1\n',
+    ...(overlayCsv !== null ? { 'overlay.csv': overlayCsv } : {}),
+    ...(emitOverlayCsv !== null ? { 'emits/overlay.csv': emitOverlayCsv } : {}),
+    'run.json': JSON.stringify({
+      date,
+      born,
+      steps: { assign: { at: born }, emit: { at: born } },
+    }),
+  });
+
+  const runPostLoopPinCheckScratch = async ({ env, manifest }) => {
+    const runs = [
+      ...(manifest.macRuns || []),
+      ...(manifest.companyRuns || []),
+      ...(manifest.abandonedRuns || []),
+    ].sort((a, b) => a.statementDate.localeCompare(b.statementDate) || a.sourceFolder.localeCompare(b.sourceFolder));
+
+    for (const runItem of runs) {
+      await importSingleRunFolder({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        companySlug: manifest.companySlug,
+        runItem,
+        importConfig: manifest.importConfig,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        tempBaseDir: work,
+      });
+    }
+
+    const legacyRuns = new Set(runs.filter((r) => r.origin === 'mac_import').map((r) => r.sourceFolder));
+    const otherRuns = new Set(runs.filter((r) => r.origin !== 'mac_import').map((r) => r.sourceFolder));
+    const unmetPins = [];
+    for (const pin of manifest.importConfig.freshOverlayRoots || []) {
+      const sf = pin.sourceFolder;
+      if (otherRuns.has(sf)) unmetPins.push(`importConfig.freshOverlayRoots ${sf} names a company run`);
+      else if (!legacyRuns.has(sf)) unmetPins.push(`importConfig.freshOverlayRoots ${sf}`);
+    }
+    for (const pin of manifest.importConfig.carriedPriors || []) {
+      const sf = pin.sourceFolder;
+      if (otherRuns.has(sf)) unmetPins.push(`importConfig.carriedPriors ${sf} names a company run`);
+      else if (!legacyRuns.has(sf)) unmetPins.push(`importConfig.carriedPriors ${sf}`);
+    }
+    if (unmetPins.length > 0) {
+      const err = new Error(`Post-loop pin mismatch: ${unmetPins.join('; ')}`);
+      err.code = 'OVERLAY_PREFIX_MISMATCH';
+      err.unmetPins = unmetPins;
+      throw err;
+    }
+  };
+
+  {
+    const dir = join(work, 'scratch-post-loop-missing');
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+    await writeTree(join(dir, 'runs', 'archive', 'provisional', '2026-10-01'), makeRun('2026-10-01', { priorCsv: csv12, emitOverlayCsv: csv12, born: '2026-10-01T09:00:00Z' }));
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+        carriedPriors: [
+          { sourceFolder: 'archive/provisional/2026-10-01', sha256: sha12, extendsRowCount: 1 },
+          { sourceFolder: 'archive/provisional/2026-10-99', sha256: sha12, extendsRowCount: 1 },
+        ],
+      },
+      tempBaseDir: work,
+    });
+    const before = await snapshotImportWriteState(env);
+    await assert.rejects(
+      () => runPostLoopPinCheckScratch({ env, manifest }),
+      (err) => {
+        assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH');
+        assert.deepEqual(err.unmetPins, ['importConfig.carriedPriors archive/provisional/2026-10-99']);
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => assertNothingWrittenSince(env, before, 'scratch-post-loop-missing'),
+      assert.AssertionError,
+    );
+    const after = await snapshotImportWriteState(env);
+    assert.equal(after.runIds.length, 2);
+    assert.equal(after.commitIds.length, 2);
+    assert.ok(after.journalRows.length > before.journalRows.length);
+    assert.ok(after.dataObjects.length > 0);
+  }
+
+  {
+    const dir = join(work, 'scratch-post-loop-company');
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+    await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', { priorCsv: csv1, overlayCsv: csv12, emitOverlayCsv: csv12, born: '2026-11-03T10:00:00Z' }));
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: {
+        legacyRunsRoot: join(dir, 'runs'),
+        companyWorkspacesDir: join(dir, 'company-ws'),
+      },
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+        carriedPriors: [{ sourceFolder: 'company-workspaces/acme/2026-11-03/runs/2026-11-03', sha256: sha1, extendsRowCount: 1 }],
+      },
+      tempBaseDir: work,
+    });
+    const before = await snapshotImportWriteState(env);
+    await assert.rejects(
+      () => runPostLoopPinCheckScratch({ env, manifest }),
+      (err) => err.code === 'OVERLAY_PREFIX_MISMATCH',
+    );
+    await assert.rejects(
+      () => assertNothingWrittenSince(env, before, 'scratch-post-loop-company'),
+      assert.AssertionError,
+    );
+    const after = await snapshotImportWriteState(env);
+    assert.equal(after.runIds.length, 1);
+    assert.equal(after.commitIds.length, 1);
+    assert.ok(after.journalRows.length > before.journalRows.length);
+    assert.ok(after.dataObjects.length > 0);
+  }
+
+  for (const [caseName, label, extendsCommitId] of [
+    ['carried-standalone-checkpoint-plain', 'standalone-cp', null],
+    ['carried-standalone-checkpoint-extending', 'standalone-ext-cp', '00000000-0000-4000-8000-000000000001'],
+  ]) {
+    const dir = join(work, caseName);
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+    const cpPath = join(dir, 'checkpoints', `${label}.csv`);
+    await mkdir(dirname(cpPath), { recursive: true });
+    await writeFile(cpPath, csv12, 'utf8');
+
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      overlayCheckpoints: [{
+        label,
+        absPath: cpPath,
+        ...(extendsCommitId ? { extendsCommitId } : {}),
+        originalAt: '2026-10-02T10:00:00Z',
+      }],
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+        carriedPriors: [{ sourceFolder: `overlay-checkpoints/${label}`, sha256: sha12, extendsRowCount: 1 }],
+      },
+      tempBaseDir: work,
+    });
+    const before = await snapshotImportWriteState(env);
+    await assert.rejects(
+      () => executeHistoryImport({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        manifest,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        verifyRebuild: false,
+        tempBaseDir: work,
+      }),
+      (err) => {
+        assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: got ${err?.code}: ${err?.message}`);
+        assert.deepEqual(err.unmetPins, [`importConfig.carriedPriors overlay-checkpoints/${label} names a standalone checkpoint`]);
+        return true;
+      },
+    );
+    await assertNothingWrittenSince(env, before, caseName);
+  }
+
+  {
+    const dir = join(work, 'direct-single-run-company');
+    await writeTree(join(dir, 'company-ws', '2026-11-03', 'runs', '2026-11-03'), makeRun('2026-11-03', {
+      priorCsv: csv1,
+      overlayCsv: csv12,
+      emitOverlayCsv: csv12,
+      born: '2026-11-03T10:00:00Z',
+    }));
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: { companyWorkspacesDir: join(dir, 'company-ws') },
+      importConfig: { includeLegacyHostHistory: false, includeLegacySqliteTables: false },
+      tempBaseDir: work,
+    });
+    const companyRunItem = manifest.companyRuns[0];
+    assert.equal(companyRunItem.origin, 'company_import');
+    assert.equal(companyRunItem.sourceFolder, 'company-workspaces/acme/2026-11-03/runs/2026-11-03');
+
+    for (const [caseName, importConfig, expectedCheckpoint, expectedPhrase] of [
+      [
+        'direct-company-fresh-root',
+        { freshOverlayRoots: [{ sourceFolder: companyRunItem.sourceFolder, sha256: sha12 }] },
+        'overlay.csv',
+        'importConfig.freshOverlayRoots',
+      ],
+      [
+        'direct-company-carried-prior',
+        { carriedPriors: [{ sourceFolder: companyRunItem.sourceFolder, sha256: sha1, extendsRowCount: 1 }] },
+        'input/Overlay/overlay.csv',
+        'importConfig.carriedPriors',
+      ],
+    ]) {
+      const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+      t.after(() => env.cleanup());
+      const before = await snapshotImportWriteState(env);
+      await assert.rejects(
+        () => importSingleRunFolder({
+          pool: env.pool,
+          stores: env.stores,
+          commands: env.commands,
+          actor: env.ownerActor,
+          companySlug: 'acme',
+          runItem: companyRunItem,
+          importConfig,
+          pythonPath: 'python3',
+          coherenceRepo: mockRepo,
+          tempBaseDir: work,
+        }),
+        (err) => {
+          assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: got ${err?.code}: ${err?.message}`);
+          assert.equal(err.run, `company_import:${companyRunItem.sourceFolder}`);
+          assert.equal(err.checkpoint, expectedCheckpoint);
+          assert.equal(err.firstDifferingRow, 1);
+          assert.equal(err.unmetPins, undefined);
+          assert.ok(String(err.message).includes(expectedPhrase), err.message);
+          assert.ok(String(err.message).includes('company_import'), err.message);
+          return true;
+        },
+      );
+      await assertNothingWrittenSince(env, before, caseName);
+    }
+  }
+
+  for (const [orderName, legacyBorn, companyBorn] of [
+    ['legacy-before-company', '2026-11-03T08:00:00Z', '2026-11-03T12:00:00Z'],
+    ['company-before-legacy', '2026-11-03T12:00:00Z', '2026-11-03T08:00:00Z'],
+  ]) {
+    const sharedKey = 'company-workspaces/acme/2026-11-03';
+    for (const [pinKind, importConfig, expectedUnmet] of [
+      [
+        'fresh',
+        {
+          freshOverlayRoots: [
+            { sourceFolder: '2026-09-30', sha256: sha1 },
+            { sourceFolder: sharedKey, sha256: sha12 },
+          ],
+        },
+        [`importConfig.freshOverlayRoots ${sharedKey} names a company run`],
+      ],
+      [
+        'carried',
+        {
+          freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+          carriedPriors: [{ sourceFolder: sharedKey, sha256: sha1, extendsRowCount: 1 }],
+        },
+        [`importConfig.carriedPriors ${sharedKey} names a company run`],
+      ],
+    ]) {
+      const caseName = `shared-key-run-${pinKind}-${orderName}`;
+      const dir = join(work, caseName);
+      await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+      await writeTree(join(dir, 'runs', 'company-workspaces', 'acme', '2026-11-03'), makeRun('2026-11-03', {
+        priorCsv: csv1,
+        overlayCsv: csv12,
+        emitOverlayCsv: csv12,
+        born: legacyBorn,
+      }));
+      await writeTree(join(dir, 'company-ws', '2026-11-03'), makeRun('2026-11-03', {
+        priorCsv: csv1,
+        overlayCsv: csv12,
+        emitOverlayCsv: csv12,
+        born: companyBorn,
+      }));
+
+      const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+      t.after(() => env.cleanup());
+      const manifest = await buildImportManifest({
+        companySlug: 'acme',
+        sources: {
+          legacyRunsRoot: join(dir, 'runs'),
+          companyWorkspacesDir: join(dir, 'company-ws'),
+        },
+        importConfig: {
+          includeLegacyHostHistory: true,
+          includeLegacySqliteTables: false,
+          useCompanyIncomingInput: false,
+          ...importConfig,
+        },
+        tempBaseDir: work,
+      });
+      assert.equal(manifest.macRuns.some((r) => r.origin === 'mac_import' && r.sourceFolder === sharedKey), true);
+      assert.equal(manifest.companyRuns.some((r) => r.origin === 'company_import' && r.sourceFolder === sharedKey), true);
+
+      const before = await snapshotImportWriteState(env);
+      await assert.rejects(
+        () => executeHistoryImport({
+          pool: env.pool,
+          stores: env.stores,
+          commands: env.commands,
+          actor: env.ownerActor,
+          manifest,
+          pythonPath: 'python3',
+          coherenceRepo: mockRepo,
+          verifyRebuild: false,
+          tempBaseDir: work,
+        }),
+        (err) => {
+          assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: got ${err?.code}: ${err?.message}`);
+          assert.deepEqual(err.unmetPins, expectedUnmet);
+          return true;
+        },
+      );
+      await assertNothingWrittenSince(env, before, caseName);
+    }
+  }
+
+  for (const [orderName, plainAt, extendingAt, extendingFirst] of [
+    ['plain-before-extending', '2026-11-05T08:00:00Z', '2026-11-05T12:00:00Z', false],
+    ['extending-before-plain', '2026-11-05T12:00:00Z', '2026-11-05T08:00:00Z', true],
+  ]) {
+    const caseName = `shared-key-checkpoint-${orderName}`;
+    const dir = join(work, caseName);
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+    const plainPath = join(dir, 'checkpoints', 'plain.csv');
+    const extPath = join(dir, 'checkpoints', 'ext.csv');
+    await mkdir(dirname(plainPath), { recursive: true });
+    await writeFile(plainPath, csv1, 'utf8');
+    await writeFile(extPath, csv123, 'utf8');
+
+    const plainCp = { label: 'shared-cp', absPath: plainPath, originalAt: plainAt };
+    const extCp = { label: 'shared-cp', absPath: extPath, extendsCommitId: '00000000-0000-4000-8000-000000000001', originalAt: extendingAt };
+    const overlayCheckpoints = extendingFirst ? [extCp, plainCp] : [plainCp, extCp];
+
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      overlayCheckpoints,
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        freshOverlayRoots: [
+          { sourceFolder: '2026-09-30', sha256: sha1 },
+          { sourceFolder: 'overlay-checkpoints/shared-cp', sha256: sha123 },
+        ],
+      },
+      tempBaseDir: work,
+    });
+    const before = await snapshotImportWriteState(env);
+    await assert.rejects(
+      () => executeHistoryImport({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        manifest,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        verifyRebuild: false,
+        tempBaseDir: work,
+      }),
+      (err) => {
+        assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: got ${err?.code}: ${err?.message}`);
+        assert.deepEqual(err.unmetPins, ['importConfig.freshOverlayRoots overlay-checkpoints/shared-cp names a checkpoint that extends a commit']);
+        return true;
+      },
+    );
+    await assertNothingWrittenSince(env, before, caseName);
+  }
+
+  for (const [orderName, legacyBorn, cpAt] of [
+    ['legacy-before-checkpoint', '2026-10-05T08:00:00Z', '2026-10-05T12:00:00Z'],
+    ['checkpoint-before-legacy', '2026-10-05T12:00:00Z', '2026-10-05T08:00:00Z'],
+  ]) {
+    const caseName = `shared-key-legacy-vs-checkpoint-${orderName}`;
+    const sharedKey = 'overlay-checkpoints/2026-10-05';
+    const dir = join(work, caseName);
+    await writeTree(join(dir, 'runs', '2026-09-30'), makeRun('2026-09-30', { overlayCsv: csv1, emitOverlayCsv: csv1, born: '2026-09-30T10:00:00Z' }));
+    await writeTree(join(dir, 'runs', 'overlay-checkpoints', '2026-10-05'), makeRun('2026-10-05', {
+      priorCsv: csv12,
+      emitOverlayCsv: csv12,
+      born: legacyBorn,
+    }));
+    const cpPath = join(dir, 'checkpoints', '2026-10-05.csv');
+    await mkdir(dirname(cpPath), { recursive: true });
+    await writeFile(cpPath, csv12, 'utf8');
+
+    const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+    t.after(() => env.cleanup());
+    const manifest = await buildImportManifest({
+      companySlug: 'acme',
+      sources: { legacyRunsRoot: join(dir, 'runs') },
+      overlayCheckpoints: [{ label: '2026-10-05', absPath: cpPath, originalAt: cpAt }],
+      importConfig: {
+        includeLegacyHostHistory: true,
+        includeLegacySqliteTables: false,
+        useCompanyIncomingInput: false,
+        freshOverlayRoots: [{ sourceFolder: '2026-09-30', sha256: sha1 }],
+        carriedPriors: [{ sourceFolder: sharedKey, sha256: sha12, extendsRowCount: 1 }],
+      },
+      tempBaseDir: work,
+    });
+    assert.equal(manifest.macRuns.some((r) => r.origin === 'mac_import' && r.sourceFolder === sharedKey), true);
+
+    const before = await snapshotImportWriteState(env);
+    await assert.rejects(
+      () => executeHistoryImport({
+        pool: env.pool,
+        stores: env.stores,
+        commands: env.commands,
+        actor: env.ownerActor,
+        manifest,
+        pythonPath: 'python3',
+        coherenceRepo: mockRepo,
+        verifyRebuild: false,
+        tempBaseDir: work,
+      }),
+      (err) => {
+        assert.equal(err.code, 'OVERLAY_PREFIX_MISMATCH', `${caseName}: got ${err?.code}: ${err?.message}`);
+        assert.deepEqual(err.unmetPins, [`importConfig.carriedPriors ${sharedKey} names a standalone checkpoint`]);
+        return true;
+      },
+    );
+    await assertNothingWrittenSince(env, before, caseName);
+  }
 });

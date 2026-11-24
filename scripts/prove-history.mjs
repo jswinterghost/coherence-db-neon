@@ -3,9 +3,9 @@
 // imports a company-agnostic JSON manifest read-only (no network), runs Layers 0, 1, 2, 4 and the
 // substance comparator (Gates 1-4) where inputs exist, and prints only a strictly PHI-free summary.
 import { randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, posix, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCommandLayer } from '../src/commands/command-layer.mjs';
 import {
@@ -20,7 +20,7 @@ import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstructi
 import { compareDbRuns, compareRunFolders } from '../src/compare/run-comparator.mjs';
 import { runMigrations } from '../src/db/migrate.mjs';
 import { createClient, createPool, resolveLocalUser } from '../src/db/pg-client.mjs';
-import { executeHistoryImport, loadImportManifestFile } from '../src/importer/history-importer.mjs';
+import { executeHistoryImport, loadImportManifestFile, planImportManifestFile } from '../src/importer/history-importer.mjs';
 import { createFileObjectStore } from '../src/storage/object-store.mjs';
 import { createCodeStore, createDataStore, createStorePair } from '../src/storage/stores.mjs';
 import { sha256Hex } from '../src/util/crypto.mjs';
@@ -62,6 +62,110 @@ export function assertLocalPgHost(host) {
       400,
       'NON_LOCAL_PGHOST',
     );
+  }
+}
+
+async function resolveCanonicalPath(targetPath) {
+  const abs = resolve(targetPath);
+  const trailing = [];
+  let cur = abs;
+  while (true) {
+    try {
+      const real = await realpath(cur);
+      return trailing.length ? join(real, ...trailing.reverse()) : real;
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return abs;
+      trailing.push(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+export function isSameOrInsidePath(candidatePath, protectedPath) {
+  const norm = (p) => (process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p);
+  const rel = relative(norm(protectedPath), norm(candidatePath));
+  if (rel === '') return true;
+  if (isAbsolute(rel)) return false;
+  return rel !== '..' && !rel.startsWith(`..${sep}`);
+}
+
+export async function assertSafeStoresDir(storesDir, manifestPath) {
+  if (!storesDir) return;
+  const absManifest = resolve(manifestPath);
+  const baseDir = dirname(absManifest);
+  const raw = JSON.parse(await readFile(absManifest, 'utf8'));
+  const resolveManifestPath = (val) => (
+    typeof val === 'string' && val.trim()
+      ? (isAbsolute(val) ? resolve(val) : resolve(baseDir, val))
+      : null
+  );
+
+  const protectedEntries = [];
+  const addProtected = (key, val) => {
+    const resolved = resolveManifestPath(val);
+    if (resolved) protectedEntries.push({ key, path: resolved });
+  };
+
+  addProtected('coherenceRoot', raw?.coherenceRoot);
+  addProtected('coherenceRepo', raw?.coherenceRepo);
+  addProtected('nusearDataDir', raw?.nusearDataDir);
+  addProtected('nusearSqlitePath', raw?.nusearSqlitePath);
+
+  if (raw?.sources && typeof raw.sources === 'object') {
+    for (const [key, val] of Object.entries(raw.sources)) {
+      if (typeof val === 'string') addProtected(`sources.${key}`, val);
+    }
+  }
+  if (Array.isArray(raw?.overlayCheckpoints)) {
+    raw.overlayCheckpoints.forEach((cp, idx) => {
+      addProtected(`overlayCheckpoints[${idx}]`, cp?.path || cp?.absPath);
+    });
+  }
+  if (Array.isArray(raw?.compareTargets)) {
+    raw.compareTargets.forEach((ct, idx) => {
+      addProtected(`compareTargets[${idx}].leftDir`, ct?.leftDir);
+      addProtected(`compareTargets[${idx}].rightDir`, ct?.rightDir);
+    });
+  }
+
+  const candidateResolved = resolve(storesDir);
+  const candidateCanonical = await resolveCanonicalPath(storesDir);
+  const codeResolved = join(candidateResolved, 'code');
+  const dataResolved = join(candidateResolved, 'data');
+  const writeTargets = [
+    { label: '--stores-dir', resolved: candidateResolved, canonical: candidateCanonical, checkContainsProtected: false },
+    { label: '--stores-dir/code', resolved: codeResolved, canonical: await resolveCanonicalPath(codeResolved), checkContainsProtected: true },
+    { label: '--stores-dir/data', resolved: dataResolved, canonical: await resolveCanonicalPath(dataResolved), checkContainsProtected: true },
+  ];
+
+  for (const entry of protectedEntries) {
+    const protectedCanonical = await resolveCanonicalPath(entry.path);
+    for (const target of writeTargets) {
+      if (
+        isSameOrInsidePath(target.resolved, entry.path)
+        || isSameOrInsidePath(target.canonical, protectedCanonical)
+      ) {
+        throw new AppError(
+          `Refusing ${target.label} equal to or inside configured source path (${entry.key}).`,
+          400,
+          'UNSAFE_STORES_DIR',
+        );
+      }
+      if (
+        target.checkContainsProtected
+        && (
+          isSameOrInsidePath(entry.path, target.resolved)
+          || isSameOrInsidePath(protectedCanonical, target.canonical)
+        )
+      ) {
+        throw new AppError(
+          `Refusing --stores-dir because ${target.label} would contain configured source path (${entry.key}).`,
+          400,
+          'UNSAFE_STORES_DIR',
+        );
+      }
+    }
   }
 }
 
@@ -207,6 +311,7 @@ export async function runHistoryProof({
   assertProofDbName(database);
   const adminConfig = getAdminPgConfig();
   assertLocalPgHost(adminConfig.host);
+  await assertSafeStoresDir(storesDir, manifestPath);
 
   const suffix = randomBytes(4).toString('hex');
   const tempBaseDir = await mkdtemp(join(tempRoot, `coherence-proof-${suffix}-`));
@@ -521,6 +626,22 @@ export async function runHistoryProof({
         preCoherenceBatchCount: importReport.preCoherenceBatchesImported,
         methodCorrectionBatchCount: importReport.methodCorrectionBatchesImported,
         standaloneFileCount: importReport.standaloneFilesImported,
+        overlayRootCount: (importReport.overlayRoots || []).length,
+        overlayRoots: (importReport.overlayRoots || []).map((r) => ({
+          folder: r.folder,
+          folders: Array.isArray(r.folders) && r.folders.length ? [...r.folders] : [r.folder],
+          commitId: r.commitId,
+          sha256: r.sha256,
+          rowCount: r.rowCount,
+        })),
+        carriedPriorCount: (importReport.carriedPriors || []).length,
+        carriedPriors: (importReport.carriedPriors || []).map((c) => ({
+          folder: c.folder,
+          commitId: c.commitId,
+          parentCommitId: c.parentCommitId,
+          sha256: c.sha256,
+          rowsAdded: c.rowsAdded,
+        })),
         sqliteParity: importReport.sqliteParity,
         rebuild: {
           runsChecked: importReport.rebuildChecks.length,
@@ -584,10 +705,22 @@ export async function runHistoryProof({
   }
 }
 
+export async function runHistoryPlan({ manifestPath } = {}) {
+  if (!manifestPath) {
+    throw new AppError(
+      'Usage: node scripts/prove-history.mjs --manifest <file> --plan',
+      400,
+      'MISSING_CLI_ARGS',
+    );
+  }
+  return planImportManifestFile(manifestPath);
+}
+
 function parseCliArgs(argv) {
   const args = {
     manifestPath: null,
     database: null,
+    plan: false,
     recreate: false,
     dropDb: false,
     storesDir: null,
@@ -598,6 +731,7 @@ function parseCliArgs(argv) {
     const tok = argv[i];
     if (tok === '--manifest') args.manifestPath = argv[++i];
     else if (tok === '--database') args.database = argv[++i];
+    else if (tok === '--plan') args.plan = true;
     else if (tok === '--stores-dir') args.storesDir = argv[++i];
     else if (tok === '--recreate') args.recreate = true;
     else if (tok === '--drop-db') args.dropDb = true;
@@ -605,9 +739,19 @@ function parseCliArgs(argv) {
     else if (tok === '--skip-idempotency') args.skipIdempotency = true;
     else throw new AppError(`Unknown argument: ${tok}`, 400, 'INVALID_CLI_ARGS');
   }
+  if (args.plan) {
+    if (!args.manifestPath) {
+      throw new AppError(
+        'Usage: node scripts/prove-history.mjs --manifest <file> --plan',
+        400,
+        'MISSING_CLI_ARGS',
+      );
+    }
+    return args;
+  }
   if (!args.manifestPath || !args.database) {
     throw new AppError(
-      'Usage: node scripts/prove-history.mjs --manifest <file> --database test_<name> [--recreate] [--drop-db] [--stores-dir <dir>]',
+      'Usage: node scripts/prove-history.mjs --manifest <file> --database test_<name> [--recreate] [--drop-db] [--stores-dir <dir>] | --manifest <file> --plan',
       400,
       'MISSING_CLI_ARGS',
     );
@@ -618,7 +762,9 @@ function parseCliArgs(argv) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const cli = parseCliArgs(process.argv.slice(2));
-    const summary = await runHistoryProof(cli);
+    const summary = cli.plan
+      ? await runHistoryPlan({ manifestPath: cli.manifestPath })
+      : await runHistoryProof(cli);
     console.log(JSON.stringify(summary, null, 2));
     process.exitCode = summary.passed ? 0 : 1;
   } catch (err) {
