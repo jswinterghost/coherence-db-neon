@@ -2,7 +2,7 @@
 // and database and infrastructure security policies.
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -705,14 +705,144 @@ test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline
   });
   assert.equal((await worker.runOnce()).action, 'step_finished');
 
-  // Before carrySent, agency_manager must see ZERO statement lines (unsent run stays outside official statements)
-  const runScoped = async (role, settings, fn) => {
+  // Seed IAM world and backfill organization_id / writing_person_id FKs (Migration 009 replaced Migration 006 GUCs).
+  const keyId = 'k_l2_2026';
+  const secretBytes = randomBytes(32);
+  const mintTok = (actorPersonId, viewAsPersonId = null) => {
+    const exp = Math.floor(Date.now() / 1000) + 60;
+    const payload = `v1|${keyId}|local|${randomUUID()}|${actorPersonId}|${viewAsPersonId ?? '-'}|${exp}`;
+    const sig = createHmac('sha256', secretBytes).update(payload, 'utf8').digest('hex');
+    return `${payload}|${sig}`;
+  };
+  const iamIds = {
+    rootOrg: randomUUID(), acmeOrg: randomUUID(), beaconOrg: randomUUID(), harborOrg: randomUUID(),
+    entityMgr: randomUUID(), agencyMgr: randomUUID(), agent1: randomUUID(), agent2: randomUUID(),
+    harborAgent: randomUUID(), retentionAgent: randomUUID(), investor: randomUUID(),
+    roleEm: randomUUID(), roleAg: randomUUID(), roleAgent: randomUUID(), roleRet: randomUUID(), roleInv: randomUUID(),
+  };
+  {
+    const c = await env.pool.connect();
+    try {
+      await c.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      const seq = (await c.query(
+        `INSERT INTO platform.audit_journal (environment, recorded_as, command_kind, command_key, request_sha256, body)
+         VALUES ('local', 'service', 'iam.l2_seed', 'l2-seed-1', $1, '{}'::jsonb) RETURNING seq`,
+        [sha256Hex('l2-seed-1')],
+      )).rows[0].seq;
+      for (const [id, kind] of [
+        [iamIds.rootOrg, 'platform_root'], [iamIds.acmeOrg, 'company'],
+        [iamIds.beaconOrg, 'agency'], [iamIds.harborOrg, 'agency'],
+      ]) {
+        await c.query('INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,$2,$3)', [id, kind, seq]);
+      }
+      await c.query(
+        `INSERT INTO iam.database_context (singleton, environment, db_role_kind, tenant_org_id, company_slug, journal_seq)
+         VALUES (true, 'local', 'company_working', $1, 'acme', $2)`,
+        [iamIds.acmeOrg, seq],
+      );
+      await c.query(
+        `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from) VALUES ($1, $2, 'local', pg_catalog.now() - INTERVAL '1 hour')`,
+        [keyId, secretBytes],
+      );
+      await c.query("INSERT INTO iam.tools (id, display_name, journal_seq) VALUES ('coherence', 'Coherence', $1)", [seq]);
+      for (const [id, kind, sens, tbl, col] of [
+        ['act:coherence.bob.read', 'action', 'ordinary', null, null],
+        ['act:coherence.statements.read', 'action', 'ordinary', null, null],
+        ['act:coherence.upline.read', 'action', 'money_upline', null, null],
+        ['act:coherence.ledger.read', 'action', 'money_upline', null, null],
+        ['act:coherence.unpublished.read', 'action', 'ordinary', null, null],
+        ['col:coherence.statement_cash', 'column', 'money_statement', 'bob_policy_financials', 'amount'],
+        ['col:coherence.upline_cash', 'column', 'money_upline', 'bob_policy_financials', 'upline_amount'],
+      ]) {
+        await c.query(
+          `INSERT INTO iam.rights (id, right_kind, tool_id, sensitivity_class, target_schema, target_table, target_column, description, journal_seq)
+           VALUES ($1,$2,'coherence',$3,$4,$5,$6,$1,$7)`,
+          [id, kind, sens, kind === 'column' ? 'coherence' : null, tbl, col, seq],
+        );
+      }
+      for (const [id, slug, name, wide] of [
+        [iamIds.roleEm, 'entity_manager', 'Entity Manager', true],
+        [iamIds.roleAg, 'agency_manager', 'Agency Manager', true],
+        [iamIds.roleAgent, 'selling_agent', 'Selling Agent', false],
+        [iamIds.roleRet, 'retention_agent', 'Retention Agent', true],
+        [iamIds.roleInv, 'investor', 'Investor', true],
+      ]) {
+        await c.query('INSERT INTO iam.roles (id, slug, journal_seq) VALUES ($1,$2,$3)', [id, slug, seq]);
+        await c.query(
+          "INSERT INTO iam.role_versions (id, role_id, display_name, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,$3,$4,'active',$5)",
+          [randomUUID(), id, name, wide, seq],
+        );
+      }
+      for (const [roleId, rights] of [
+        [iamIds.roleEm, ['act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read', 'act:coherence.ledger.read', 'act:coherence.unpublished.read', 'col:coherence.statement_cash', 'col:coherence.upline_cash']],
+        [iamIds.roleAg, ['act:coherence.bob.read', 'act:coherence.statements.read', 'col:coherence.statement_cash']],
+        [iamIds.roleAgent, ['act:coherence.bob.read', 'act:coherence.statements.read']],
+        [iamIds.roleRet, ['act:coherence.bob.read', 'act:coherence.statements.read']],
+        [iamIds.roleInv, ['act:coherence.bob.read', 'col:coherence.statement_cash', 'col:coherence.upline_cash']],
+      ]) {
+        for (const r of rights) {
+          await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)", [randomUUID(), roleId, r, seq]);
+        }
+      }
+      for (const [orgId, slug, name] of [
+        [iamIds.rootOrg, 'nusear', 'Nusear'], [iamIds.acmeOrg, 'acme', 'Acme'],
+        [iamIds.beaconOrg, 'beacon', 'Beacon'], [iamIds.harborOrg, 'harbor', 'Harbor'],
+      ]) {
+        await c.query("INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,$3,$4,'active',$5)", [randomUUID(), orgId, slug, name, seq]);
+      }
+      for (const [child, parent] of [[iamIds.acmeOrg, iamIds.rootOrg], [iamIds.beaconOrg, iamIds.acmeOrg], [iamIds.harborOrg, iamIds.acmeOrg]]) {
+        await c.query("INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), child, parent, seq]);
+      }
+      await c.query("INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','on','active',$3)", [randomUUID(), iamIds.acmeOrg, seq]);
+      for (const [id, name, npn] of [
+        [iamIds.entityMgr, 'Dana Entity', null], [iamIds.agencyMgr, 'Taylor Beacon', null],
+        [iamIds.agent1, 'Sam Seller', '11111111'], [iamIds.agent2, 'Sam Seller', '22222222'],
+        [iamIds.harborAgent, 'Robin Harbor', '33333333'], [iamIds.retentionAgent, 'Jordan Retain', null],
+        [iamIds.investor, 'Avery Investor', null],
+      ]) {
+        await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [id, seq]);
+        await c.query("INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, npn, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)", [randomUUID(), id, name, npn, seq]);
+      }
+      for (const [p, o, cap] of [
+        [iamIds.entityMgr, iamIds.acmeOrg, 'owner'], [iamIds.agencyMgr, iamIds.beaconOrg, 'employee'],
+        [iamIds.retentionAgent, iamIds.harborOrg, 'employee'], [iamIds.investor, iamIds.acmeOrg, 'investor'],
+      ]) {
+        await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), p, o, cap, seq]);
+      }
+      for (const [p, npn, o, fn] of [
+        [iamIds.agent1, '11111111', iamIds.beaconOrg, 'Sam Seller 1'],
+        [iamIds.agent2, '22222222', iamIds.beaconOrg, 'Sam Seller 2'],
+        [iamIds.harborAgent, '33333333', iamIds.harborOrg, 'Robin Harbor'],
+      ]) {
+        await c.query("INSERT INTO iam.agent_affiliations (id, person_id, npn, agency_org_id, split_bps, agent_file_name, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,8000,$5,'[2020-01-01,)'::daterange,'active',$6)", [randomUUID(), p, npn, o, fn, seq]);
+      }
+      for (const [p, r, o, mode] of [
+        [iamIds.entityMgr, iamIds.roleEm, iamIds.acmeOrg, 'org_subtree'],
+        [iamIds.agencyMgr, iamIds.roleAg, iamIds.beaconOrg, 'org_subtree'],
+        [iamIds.agent1, iamIds.roleAgent, iamIds.beaconOrg, 'self'],
+        [iamIds.agent2, iamIds.roleAgent, iamIds.beaconOrg, 'self'],
+        [iamIds.retentionAgent, iamIds.roleRet, iamIds.harborOrg, 'org_subtree'],
+        [iamIds.investor, iamIds.roleInv, iamIds.acmeOrg, 'org_subtree'],
+      ]) {
+        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,$5,'all_in_org','[2020-01-01,)'::daterange,'active',$6)", [randomUUID(), p, r, o, mode, seq]);
+      }
+      await c.query('COMMIT');
+    } catch (err) {
+      await c.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      c.release();
+    }
+  }
+  await env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys()');
+
+  const runAsApp = async (token, fn) => {
     const c = await env.pool.connect();
     try {
       await c.query('BEGIN TRANSACTION READ ONLY');
-      await c.query(`SET LOCAL ROLE ${role}`);
-      for (const [k, v] of Object.entries(settings)) {
-        await c.query('SELECT pg_catalog.set_config($1, $2, true)', [k, v]);
+      await c.query('SET LOCAL ROLE platform_app');
+      if (token !== null) {
+        await c.query("SELECT pg_catalog.set_config('app.session_token', $1, true)", [token]);
       }
       const res = await fn(c);
       await c.query('COMMIT');
@@ -725,39 +855,43 @@ test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline
     }
   };
 
-  const unsentCount = await runScoped('coherence_agency_manager_ro', { 'app.allowed_entities': 'Beacon' }, async (c) => (
-    (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.agency_statement_lines')).rows[0].n
+  // Before carrySent, agency_manager must see ZERO statement lines (unsent run stays outside official statements)
+  const unsentCount = await runAsApp(mintTok(iamIds.agencyMgr), async (c) => (
+    (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n
   ));
   assert.equal(unsentCount, 0, 'unsent run emission must stay hidden from downline agencies until carrySent');
 
   // Record Run 1 as sent
   await env.commands.carrySent({ actor: env.ownerActor, commandKey: 'rls-sent-1', runId: run1Id, typedPhrase: 'sent 2026-10-31' });
 
-  // 1. coherence_agency_manager_ro: sees ONLY Beacon, 0 rows when unset, 42501 on upline/ledger/upline_amount/journal, safe under division-by-zero side-channel
-  await runScoped('coherence_agency_manager_ro', { 'app.allowed_entities': 'Beacon' }, async (c) => {
-    const bob = (await c.query('SELECT entity, policy_id, amount FROM coherence_views.agency_bob ORDER BY policy_id')).rows;
+  // 1. Agency Manager (Beacon): sees ONLY Beacon + agency amount, 0 Harbor, 0 upline, 0 ledger, NULL gross_comm/upline_amount, safe under division-by-zero side-channel
+  await runAsApp(mintTok(iamIds.agencyMgr), async (c) => {
+    const bob = (await c.query('SELECT entity, policy_id, amount, upline_amount FROM app_views.coherence_bob ORDER BY policy_id')).rows;
     assert.equal(bob.length, 2);
-    assert.ok(bob.every((r) => r.entity === 'Beacon'));
-    const lines = (await c.query('SELECT entity, amount FROM coherence_views.agency_statement_lines')).rows;
+    assert.ok(bob.every((r) => r.entity === 'Beacon' && r.upline_amount === null));
+    const lines = (await c.query('SELECT entity, amount, gross_comm FROM app_views.coherence_statement_agency_lines')).rows;
     assert.equal(lines.length, 2);
-    assert.ok(lines.every((r) => r.entity === 'Beacon'));
-    const totals = (await c.query('SELECT entity, net_amount FROM coherence_views.agency_statement_totals')).rows;
+    assert.ok(lines.every((r) => r.entity === 'Beacon' && r.gross_comm === null));
+    const totals = (await c.query('SELECT statement_entity, net_amount FROM app_views.coherence_statement_totals')).rows;
     assert.equal(totals.length, 1);
     assert.equal(totals[0].net_amount, '200.00');
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_upline_lines')).rows[0].n, 0);
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger')).rows[0].n, 0);
 
     // Side-channel security_barrier check: Harbor rows must never reach user WHERE expression
     const sideChannel = (await c.query(
-      "SELECT COUNT(*)::int AS n FROM coherence_views.agency_statement_lines WHERE 1 / CASE WHEN entity = 'Harbor' THEN 0 ELSE 1 END = 1",
+      "SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines WHERE 1 / CASE WHEN entity = 'Harbor' THEN 0 ELSE 1 END = 1",
     )).rows[0].n;
     assert.equal(sideChannel, 2);
   });
 
-  // Fail-closed when app.allowed_entities is unset
-  const agUnset = await runScoped('coherence_agency_manager_ro', {}, async (c) => (
-    (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.agency_statement_lines')).rows[0].n
+  // Fail-closed when app.session_token is unset
+  const agUnset = await runAsApp(null, async (c) => (
+    (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n
   ));
-  assert.equal(agUnset, 0, 'agency manager must see 0 rows when app.allowed_entities is unset');
+  assert.equal(agUnset, 0, 'unset session token must see 0 rows');
 
+  // Direct base-table access MUST return SQLSTATE 42501 for platform_app
   for (const forbiddenSql of [
     'SELECT * FROM coherence.statement_upline_lines',
     'SELECT * FROM coherence.coherent_ledger_rows',
@@ -766,82 +900,52 @@ test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline
     'SELECT * FROM coherence.journal_entries',
   ]) {
     await assert.rejects(
-      () => runScoped('coherence_agency_manager_ro', { 'app.allowed_entities': 'Beacon' }, (c) => c.query(forbiddenSql)),
+      () => runAsApp(mintTok(iamIds.agencyMgr), (c) => c.query(forbiddenSql)),
       (err) => err?.code === '42501',
-      `coherence_agency_manager_ro must get 42501 on: ${forbiddenSql}`,
+      `platform_app must get 42501 on base table: ${forbiddenSql}`,
     );
   }
 
-  // 2. coherence_agent_ro: strictly scoped by NPN (distinguishes same-name agents 11111111 vs 22222222) and zero dollars
-  await runScoped('coherence_agent_ro', { 'app.allowed_entities': 'Beacon', 'app.actor_npn': '11111111' }, async (c) => {
-    const bob = (await c.query('SELECT policy_id, writing_npn, writing_agent FROM coherence_views.agent_bob')).rows;
+  // 2. Selling Agent (NPN 11111111): strictly own NPN (distinguishes same-name 11111111 vs 22222222) and zero dollars
+  await runAsApp(mintTok(iamIds.agent1), async (c) => {
+    const bob = (await c.query('SELECT policy_id, writing_npn, writing_agent, amount, upline_amount FROM app_views.coherence_bob')).rows;
     assert.equal(bob.length, 1);
     assert.equal(bob[0].writing_npn, '11111111');
-    const act = (await c.query('SELECT entity, writing_npn FROM coherence_views.agent_statement_activity')).rows;
+    assert.equal(bob[0].amount, null);
+    assert.equal(bob[0].upline_amount, null);
+    const act = (await c.query('SELECT entity, writing_npn, amount, gross_comm, record_id FROM app_views.coherence_statement_agency_lines')).rows;
     assert.equal(act.length, 1);
     assert.equal(act[0].writing_npn, '11111111');
+    assert.equal(act[0].amount, null);
+    assert.equal(act[0].gross_comm, null);
+    assert.equal(act[0].record_id, null);
   });
-  const agtUnset = await runScoped('coherence_agent_ro', { 'app.allowed_entities': 'Beacon' }, async (c) => (
-    (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.agent_bob')).rows[0].n
-  ));
-  assert.equal(agtUnset, 0, 'agent must see 0 rows when app.actor_npn is unset');
 
-  for (const forbiddenSql of [
-    'SELECT * FROM coherence.bob_policy_financials',
-    'SELECT amount FROM coherence.statement_agency_lines',
-    'SELECT gross_comm FROM coherence.statement_agency_lines',
-    'SELECT * FROM coherence.statement_upline_lines',
-    'SELECT * FROM coherence.coherent_ledger_rows',
-  ]) {
-    await assert.rejects(
-      () => runScoped('coherence_agent_ro', { 'app.allowed_entities': 'Beacon', 'app.actor_npn': '11111111' }, (c) => c.query(forbiddenSql)),
-      (err) => err?.code === '42501',
-      `coherence_agent_ro must get 42501 on: ${forbiddenSql}`,
-    );
-  }
-
-  // 3. coherence_retention_ro: scoped to Harbor, zero dollar access
-  await runScoped('coherence_retention_ro', { 'app.allowed_entities': 'Harbor' }, async (c) => {
-    const bob = (await c.query('SELECT entity FROM coherence_views.retention_bob')).rows;
+  // 3. Retention Agent: scoped to Harbor, zero dollar access
+  await runAsApp(mintTok(iamIds.retentionAgent), async (c) => {
+    const bob = (await c.query('SELECT entity, amount, upline_amount FROM app_views.coherence_bob')).rows;
     assert.equal(bob.length, 1);
     assert.equal(bob[0].entity, 'Harbor');
+    assert.equal(bob[0].amount, null);
+    assert.equal(bob[0].upline_amount, null);
   });
-  await assert.rejects(
-    () => runScoped('coherence_retention_ro', { 'app.allowed_entities': 'Harbor' }, (c) => c.query('SELECT amount FROM coherence.statement_agency_lines')),
-    (err) => err?.code === '42501',
-  );
 
-  // 4. coherence_entity_manager_ro: full BoB, ledger, all entities + Acme Upline, reconciliation view, zero journal/decision access
-  await runScoped('coherence_entity_manager_ro', { 'app.access_tier': 'entity_manager' }, async (c) => {
-    const bob = (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.v_canonical_bob')).rows[0].n;
+  // 4. Entity Manager: full BoB, ledger, all entities + Acme Upline, reconciliation view, zero journal access
+  await runAsApp(mintTok(iamIds.entityMgr), async (c) => {
+    const bob = (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n;
     assert.equal(bob, 3);
-    const recon = (await c.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [run1Id])).rows;
+    const recon = (await c.query('SELECT * FROM app_views.coherence_entity_statement_reconciliation WHERE run_id = $1::uuid', [run1Id])).rows;
     assert.equal(recon.length, 4);
     assert.ok(recon.every((r) => r.reconciled && r.variance === '0.00'));
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_journal')).rows[0].n, 0);
   });
-  const emUnset = await runScoped('coherence_entity_manager_ro', {}, async (c) => (
-    (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.v_canonical_bob')).rows[0].n
-  ));
-  assert.equal(emUnset, 0, 'entity manager must see 0 rows when app.access_tier is unset');
-  await assert.rejects(
-    () => runScoped('coherence_entity_manager_ro', { 'app.access_tier': 'entity_manager' }, (c) => c.query('SELECT * FROM coherence.journal_entries')),
-    (err) => err?.code === '42501',
-  );
 
-  // 5. coherence_investor_ro: BoB only, zero ledger or statement access
-  await runScoped('coherence_investor_ro', { 'app.access_tier': 'investor' }, async (c) => {
-    const bob = (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.investor_bob')).rows[0].n;
+  // 5. Investor: BoB only, zero ledger or statement access
+  await runAsApp(mintTok(iamIds.investor), async (c) => {
+    const bob = (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n;
     assert.equal(bob, 3);
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger')).rows[0].n, 0);
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n, 0);
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_upline_lines')).rows[0].n, 0);
   });
-  for (const forbiddenSql of [
-    'SELECT * FROM coherence.coherent_ledger_rows',
-    'SELECT * FROM coherence.statement_agency_lines',
-    'SELECT * FROM coherence.statement_upline_lines',
-  ]) {
-    await assert.rejects(
-      () => runScoped('coherence_investor_ro', { 'app.access_tier': 'investor' }, (c) => c.query(forbiddenSql)),
-      (err) => err?.code === '42501',
-      `coherence_investor_ro must get 42501 on: ${forbiddenSql}`,
-    );
-  }
 });
