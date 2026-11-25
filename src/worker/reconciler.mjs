@@ -1,5 +1,6 @@
 // Reconciler: marks open attempts left behind by dead workers as interrupted before any new work runs,
 // and deletes expired review drafts.
+import { AppError } from '../util/redact.mjs';
 
 export async function findOpenAttempts(db) {
   const res = await db.query(
@@ -35,8 +36,11 @@ export async function reconcileInterruptedAttempts({
   pool,
   slot = null,
   commands,
-  workerActor,
+  workerToken,
 }) {
+  if (typeof workerToken !== 'string' || !workerToken.trim()) {
+    throw new AppError('Reconciler requires a signed workerToken.', 400, 'MISSING_WORKER_TOKEN');
+  }
   const db = slot ? slot.client : pool;
   const open = await findOpenAttempts(db);
   const interrupted = [];
@@ -44,7 +48,7 @@ export async function reconcileInterruptedAttempts({
   for (const item of open) {
     const record = async (client) => commands.interruptStepAttempt({
       client,
-      actor: workerActor,
+      dbToken: workerToken,
       commandKey: `reconcile-interrupted:${item.startEventId}`,
       runId: item.runId,
       step: item.step,
@@ -64,10 +68,14 @@ export async function reconcileInterruptedAttempts({
     });
   }
 
-  if (!slot) {
-    await commands.expireOldDrafts();
+  const expire = (client) => commands.expireOldDrafts({
+    client,
+    dbToken: workerToken,
+  });
+  if (slot) {
+    await slot.runExclusive((client) => expire(client));
   } else {
-    await slot.runExclusive((client) => client.query('DELETE FROM coherence.review_drafts WHERE expires_at <= pg_catalog.clock_timestamp()'));
+    await expire(null);
   }
 
   return { interrupted };

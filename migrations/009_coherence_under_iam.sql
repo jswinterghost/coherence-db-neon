@@ -213,62 +213,25 @@ BEGIN
 END;
 $$;
 
--- Deterministic tenant-tree resolver for backfill: accepts only company, agency, and team
--- organizations inside this tenant's tree, following each active child's current active edge
--- (valid_range @> iam.business_today()) and each archived child's single latest non-future
--- active edge (never old historical edges from before a move).
+-- Deterministic tenant-tree resolver over iam.v_organization_closure: accepts only company,
+-- agency, and team organizations inside this tenant's organization tree.
 CREATE OR REPLACE FUNCTION coherence._resolve_tenant_tree_org_ids()
 RETURNS UUID[]
 LANGUAGE sql STABLE
 SET search_path = pg_catalog
 AS $$
-  WITH RECURSIVE effective_edges AS (
-    SELECT e.child_org_id, e.parent_org_id
-    FROM iam.organization_edges e
-    JOIN iam.organization_versions cov
-      ON cov.organization_id = e.child_org_id
-     AND cov.superseded_by_id IS NULL
-     AND cov.status = 'active'
-    WHERE e.superseded_by_id IS NULL
-      AND e.status = 'active'
-      AND e.valid_range @> iam.business_today()
-    UNION ALL
-    SELECT arch.child_org_id, arch.parent_org_id
-    FROM (
-      SELECT DISTINCT ON (e.child_org_id)
-        e.child_org_id,
-        e.parent_org_id
-      FROM iam.organization_edges e
-      JOIN iam.organization_versions cov
-        ON cov.organization_id = e.child_org_id
-       AND cov.superseded_by_id IS NULL
-       AND cov.status = 'archived'
-      WHERE e.superseded_by_id IS NULL
-        AND e.status = 'active'
-        AND pg_catalog.lower(e.valid_range) <= iam.business_today()
-      ORDER BY e.child_org_id, pg_catalog.lower(e.valid_range) DESC, e.journal_seq DESC, e.id DESC
-    ) arch
-  ),
-  tenant_tree(org_id, depth) AS (
-    SELECT dc.tenant_org_id, 0
-    FROM iam.database_context dc
-    JOIN iam.organizations o ON o.id = dc.tenant_org_id
-    WHERE dc.singleton = true
-      AND dc.tenant_org_id IS NOT NULL
-      AND o.org_kind IN ('company', 'agency', 'team')
-    UNION ALL
-    SELECT ee.child_org_id, t.depth + 1
-    FROM tenant_tree t
-    JOIN effective_edges ee
-      ON ee.parent_org_id = t.org_id
-    JOIN iam.organizations co
-      ON co.id = ee.child_org_id
-     AND co.org_kind IN ('company', 'agency', 'team')
-    WHERE t.depth < 32
-  ) CYCLE org_id SET is_cycle USING path
-  SELECT COALESCE(pg_catalog.array_agg(DISTINCT org_id), ARRAY[]::uuid[])
-  FROM tenant_tree
-  WHERE NOT is_cycle;
+  SELECT COALESCE(pg_catalog.array_agg(DISTINCT c.descendant_org_id), ARRAY[]::uuid[])
+  FROM iam.database_context dc
+  JOIN iam.organizations root_o
+    ON root_o.id = dc.tenant_org_id
+   AND root_o.org_kind IN ('company', 'agency', 'team')
+  JOIN iam.v_organization_closure c
+    ON c.ancestor_org_id = dc.tenant_org_id
+  JOIN iam.organizations co
+    ON co.id = c.descendant_org_id
+   AND co.org_kind IN ('company', 'agency', 'team')
+  WHERE dc.singleton = true
+    AND dc.tenant_org_id IS NOT NULL;
 $$;
 
 -- Strict deterministic resolver for entity -> iam.organizations(id); accepts only
@@ -532,24 +495,30 @@ ALTER FUNCTION coherence._resolve_entity_org_id(TEXT, TEXT, JSONB) OWNER TO plat
 ALTER FUNCTION coherence._resolve_writing_person_id(TEXT, TEXT, JSONB) OWNER TO platform_versioner;
 ALTER FUNCTION coherence.backfill_iam_foreign_keys(JSONB, JSONB) OWNER TO platform_versioner;
 
--- 3. Replace Migration 006's GUC-based RLS policies and helper functions with IAM-based FORCE RLS.
+-- 3. Replace Migration 006's GUC-based RLS policies, legacy coherence_app/coherence_worker
+-- bypass policies, and helper functions with IAM-based FORCE RLS.
+DROP POLICY IF EXISTS bob_policies_internal_rw ON coherence.bob_policies;
 DROP POLICY IF EXISTS bob_policies_entity_manager ON coherence.bob_policies;
 DROP POLICY IF EXISTS bob_policies_agency_manager ON coherence.bob_policies;
 DROP POLICY IF EXISTS bob_policies_agent ON coherence.bob_policies;
 DROP POLICY IF EXISTS bob_policies_retention ON coherence.bob_policies;
 DROP POLICY IF EXISTS bob_policies_investor ON coherence.bob_policies;
 
+DROP POLICY IF EXISTS bob_policy_financials_internal_rw ON coherence.bob_policy_financials;
 DROP POLICY IF EXISTS bob_policy_financials_entity_manager ON coherence.bob_policy_financials;
 DROP POLICY IF EXISTS bob_policy_financials_agency_manager ON coherence.bob_policy_financials;
 DROP POLICY IF EXISTS bob_policy_financials_investor ON coherence.bob_policy_financials;
 
+DROP POLICY IF EXISTS statement_agency_lines_internal_rw ON coherence.statement_agency_lines;
 DROP POLICY IF EXISTS statement_agency_lines_entity_manager ON coherence.statement_agency_lines;
 DROP POLICY IF EXISTS statement_agency_lines_agency_manager ON coherence.statement_agency_lines;
 DROP POLICY IF EXISTS statement_agency_lines_agent ON coherence.statement_agency_lines;
 DROP POLICY IF EXISTS statement_agency_lines_retention ON coherence.statement_agency_lines;
 
+DROP POLICY IF EXISTS statement_upline_lines_internal_rw ON coherence.statement_upline_lines;
 DROP POLICY IF EXISTS statement_upline_lines_entity_manager ON coherence.statement_upline_lines;
 
+DROP POLICY IF EXISTS coherent_ledger_rows_internal_rw ON coherence.coherent_ledger_rows;
 DROP POLICY IF EXISTS coherent_ledger_rows_entity_manager ON coherence.coherent_ledger_rows;
 
 DROP FUNCTION IF EXISTS coherence.rls_allowed_entities();
@@ -557,8 +526,8 @@ DROP FUNCTION IF EXISTS coherence.rls_actor_npn();
 DROP FUNCTION IF EXISTS coherence.rls_access_tier();
 
 -- Enable and force RLS across ALL 31 Coherence business tables + review_submissions + review_drafts
--- (every Coherence domain table), keeping existing coherence_app/worker/readonly policies and adding
--- platform service-role policies.
+-- (every Coherence domain table), keeping legacy coherence_readonly SELECT policies and adding
+-- platform service-role policies (old coherence_app and coherence_worker policies are gone).
 DO $$
 DECLARE
   v_tbl TEXT;
@@ -608,12 +577,9 @@ BEGIN
       );
     END IF;
 
-    -- Keep legacy coherence_app / coherence_worker / coherence_readonly working on tables newly put under FORCE RLS
+    -- Keep legacy coherence_readonly SELECT policy on tables newly put under FORCE RLS
+    -- (old coherence_app and coherence_worker USING (true) policies are dropped; runtime uses platform_*).
     IF v_tbl NOT IN ('bob_policies', 'bob_policy_financials', 'statement_agency_lines', 'statement_upline_lines', 'coherent_ledger_rows') THEN
-      EXECUTE pg_catalog.format(
-        'CREATE POLICY %I ON coherence.%I FOR ALL TO coherence_app, coherence_worker USING (true) WITH CHECK (true)',
-        v_tbl || '_legacy_internal_rw', v_tbl
-      );
       EXECUTE pg_catalog.format(
         'CREATE POLICY %I ON coherence.%I FOR SELECT TO coherence_readonly USING (true)',
         v_tbl || '_legacy_internal_ro', v_tbl
@@ -638,388 +604,82 @@ BEGIN
 END;
 $$;
 
--- Internal archived-agency historical closure views owned by platform_view_owner.
--- Each active org follows only its current active edge (valid_range @> iam.business_today()), and
--- each archived org follows only its single latest non-future active edge (so an org moved from
--- Agency A to Agency B and then archived appears strictly under B, never under A).
--- An active child whose current active edge points to an archived parent remains reachable from
--- active ancestors above the archived parent (preserving company totals and $0.00 reconciliation)
--- while enforcing the full iam.person_effective_grants rules along the entire ancestor path:
--- tool switches (nearest 'on' and no ancestor 'held'/'off'), right retirements, environment_scope,
--- is_nusear_only, active memberships, include_descendants = true, and View-as intersection.
-GRANT USAGE ON SCHEMA coherence, iam, platform, app_views TO platform_view_owner;
-GRANT SELECT ON
-  iam.database_context,
-  iam.organizations,
-  iam.organization_versions,
-  iam.organization_edges,
-  iam.v_organization_closure_live,
-  iam.v_all_memberships_live,
-  iam.person_versions,
-  iam.role_grants,
-  iam.role_versions,
-  iam.role_rights,
-  iam.rights,
-  iam.right_retirements,
-  iam.tools,
-  iam.organization_tool_switches
-TO platform_view_owner;
-
-CREATE OR REPLACE VIEW coherence.v_org_effective_parent AS
-SELECT e.child_org_id, e.parent_org_id, cov.status AS child_status
-FROM iam.organization_edges e
-JOIN iam.organization_versions cov
-  ON cov.organization_id = e.child_org_id
- AND cov.superseded_by_id IS NULL
- AND cov.status = 'active'
-WHERE e.superseded_by_id IS NULL
-  AND e.status = 'active'
-  AND e.valid_range @> iam.business_today()
-UNION ALL
-SELECT arch.child_org_id, arch.parent_org_id, arch.child_status
-FROM (
-  SELECT DISTINCT ON (e.child_org_id)
-    e.child_org_id,
-    e.parent_org_id,
-    cov.status AS child_status
-  FROM iam.organization_edges e
-  JOIN iam.organization_versions cov
-    ON cov.organization_id = e.child_org_id
-   AND cov.superseded_by_id IS NULL
-   AND cov.status = 'archived'
-  WHERE e.superseded_by_id IS NULL
-    AND e.status = 'active'
-    AND pg_catalog.lower(e.valid_range) <= iam.business_today()
-  ORDER BY e.child_org_id, pg_catalog.lower(e.valid_range) DESC, e.journal_seq DESC, e.id DESC
-) arch;
-
-ALTER VIEW coherence.v_org_effective_parent OWNER TO platform_view_owner;
-REVOKE ALL ON coherence.v_org_effective_parent FROM PUBLIC, platform_app;
-
-CREATE OR REPLACE VIEW coherence.v_org_historical_closure AS
-WITH RECURSIVE tree(ancestor_org_id, descendant_org_id, depth, has_archived) AS (
-  SELECT ov.organization_id, ov.organization_id, 0, (ov.status = 'archived')
-  FROM iam.organization_versions ov
-  WHERE ov.superseded_by_id IS NULL
-  UNION ALL
-  SELECT t.ancestor_org_id, ep.child_org_id, t.depth + 1,
-         (t.has_archived OR ep.child_status = 'archived')
-  FROM tree t
-  JOIN coherence.v_org_effective_parent ep
-    ON ep.parent_org_id = t.descendant_org_id
-  WHERE t.depth < 32
-) CYCLE descendant_org_id SET is_cycle USING path
-SELECT DISTINCT ancestor_org_id, descendant_org_id, depth, has_archived
-FROM tree
-WHERE NOT is_cycle;
-
-ALTER VIEW coherence.v_org_historical_closure OWNER TO platform_view_owner;
-REVOKE ALL ON coherence.v_org_historical_closure FROM PUBLIC, platform_app;
-
-CREATE OR REPLACE VIEW coherence.v_org_archived_descendants AS
-SELECT DISTINCT hc.ancestor_org_id, hc.descendant_org_id
-FROM coherence.v_org_historical_closure hc
-JOIN iam.organization_versions aov
-  ON aov.organization_id = hc.ancestor_org_id
- AND aov.superseded_by_id IS NULL
- AND aov.status = 'active'
-WHERE hc.depth > 0
-  AND hc.has_archived = true;
-
-ALTER VIEW coherence.v_org_archived_descendants OWNER TO platform_view_owner;
-REVOKE ALL ON coherence.v_org_archived_descendants FROM PUBLIC, platform_app;
-
--- Pure-SQL view (zero coherence.* function calls so platform_app needs zero EXECUTE in schema coherence)
--- returning archived-path descendant orgs inside this tenant's historical tree reachable strictly from
--- active ancestors in this tenant's live tree (or live ancestors of tenant_org_id) via live
--- include_descendants=true org_subtree grants, enforcing every iam.person_effective_grants rule
--- (full-path tool switches, right retirements, environment_scope, is_nusear_only, active memberships,
--- and View-as intersection) independently on each grant.
-CREATE OR REPLACE VIEW coherence.v_session_descendant_wide_orgs AS
-WITH ctx AS (SELECT * FROM iam.session_context())
-SELECT DISTINCT rr.right_id, ad.descendant_org_id
-FROM ctx
-JOIN iam.role_grants g
-  ON g.person_id = ctx.actor_person_id
- AND g.superseded_by_id IS NULL
- AND g.status = 'active'
- AND g.include_descendants = true
- AND g.person_scope_mode = 'org_subtree'
- AND g.valid_range @> iam.business_today()
- AND g.data_date_range IS NULL
-JOIN iam.person_versions pv
-  ON pv.person_id = g.person_id
- AND pv.superseded_by_id IS NULL
- AND pv.status = 'active'
-JOIN iam.role_versions rv
-  ON rv.role_id = g.role_id
- AND rv.superseded_by_id IS NULL
- AND rv.status = 'active'
-JOIN iam.role_rights rr
-  ON rr.role_id = g.role_id
- AND rr.superseded_by_id IS NULL
- AND rr.status = 'active'
-JOIN iam.rights r
-  ON r.id = rr.right_id
- AND NOT EXISTS (SELECT 1 FROM iam.right_retirements ret WHERE ret.right_id = r.id)
-JOIN iam.tools t
-  ON t.id = r.tool_id
-JOIN iam.database_context dc
-  ON dc.singleton = true
-JOIN coherence.v_org_archived_descendants ad
-  ON ad.ancestor_org_id = g.organization_id
-JOIN coherence.v_org_historical_closure thc
-  ON thc.ancestor_org_id = dc.tenant_org_id
- AND thc.descendant_org_id = ad.descendant_org_id
- AND thc.has_archived = true
-WHERE ctx.actor_person_id IS NOT NULL
-  AND (rv.is_nusear_internal OR NOT t.is_nusear_only)
-  AND (
-    r.environment_scope = 'both'
-    OR (r.environment_scope = 'prod_only' AND dc.environment = 'prod')
-    OR (r.environment_scope = 'dev_only' AND dc.environment IN ('dev', 'local'))
-  )
-  AND EXISTS (
-    SELECT 1
-    FROM iam.v_organization_closure_live lcg
-    WHERE (lcg.ancestor_org_id = dc.tenant_org_id AND lcg.descendant_org_id = g.organization_id)
-       OR (lcg.ancestor_org_id = g.organization_id AND lcg.descendant_org_id = dc.tenant_org_id)
-  )
-  AND (
-    (rv.is_nusear_internal AND EXISTS (
-      SELECT 1 FROM iam.v_all_memberships_live m
-      JOIN iam.organizations mo ON mo.id = m.organization_id AND mo.org_kind = 'platform_root'
-      WHERE m.person_id = g.person_id AND m.valid_range @> iam.business_today()
-    ))
-    OR (NOT rv.is_nusear_internal AND EXISTS (
-      SELECT 1 FROM iam.v_all_memberships_live m
-      JOIN iam.organizations mo ON mo.id = m.organization_id AND mo.org_kind <> 'platform_root'
-      JOIN iam.v_organization_closure_live mc
-        ON mc.ancestor_org_id = m.organization_id AND mc.descendant_org_id = g.organization_id
-      WHERE m.person_id = g.person_id AND m.valid_range @> iam.business_today()
-    ))
-  )
-  AND (
-    rv.is_nusear_internal
-    OR (
-      (
-        SELECT ts.switch_state
-        FROM iam.organization_tool_switches ts
-        JOIN coherence.v_org_historical_closure tc
-          ON tc.ancestor_org_id = ts.organization_id
-         AND tc.descendant_org_id = ad.descendant_org_id
-        WHERE ts.tool_id = r.tool_id
-          AND ts.superseded_by_id IS NULL
-          AND ts.status = 'active'
-        ORDER BY tc.depth ASC
-        LIMIT 1
-      ) = 'on'
-      AND NOT EXISTS (
-        SELECT 1
-        FROM iam.organization_tool_switches ts
-        JOIN coherence.v_org_historical_closure tc
-          ON tc.ancestor_org_id = ts.organization_id
-         AND tc.descendant_org_id = ad.descendant_org_id
-        WHERE ts.tool_id = r.tool_id
-          AND ts.superseded_by_id IS NULL
-          AND ts.status = 'active'
-          AND ts.switch_state IN ('held', 'off')
-      )
-    )
-  )
-  AND (
-    ctx.view_as_person_id IS NULL
-    OR EXISTS (
-      SELECT 1
-      FROM iam.role_grants vg
-      JOIN iam.person_versions vpv
-        ON vpv.person_id = vg.person_id
-       AND vpv.superseded_by_id IS NULL
-       AND vpv.status = 'active'
-      JOIN iam.role_versions vrv
-        ON vrv.role_id = vg.role_id
-       AND vrv.superseded_by_id IS NULL
-       AND vrv.status = 'active'
-      JOIN iam.role_rights vrr
-        ON vrr.role_id = vg.role_id
-       AND vrr.right_id = rr.right_id
-       AND vrr.superseded_by_id IS NULL
-       AND vrr.status = 'active'
-      JOIN coherence.v_org_archived_descendants vad
-        ON vad.ancestor_org_id = vg.organization_id
-       AND vad.descendant_org_id = ad.descendant_org_id
-      WHERE vg.person_id = ctx.view_as_person_id
-        AND vg.superseded_by_id IS NULL
-        AND vg.status = 'active'
-        AND vg.include_descendants = true
-        AND vg.person_scope_mode = 'org_subtree'
-        AND vg.valid_range @> iam.business_today()
-        AND vg.data_date_range IS NULL
-        AND (vrv.is_nusear_internal OR NOT t.is_nusear_only)
-        AND EXISTS (
-          SELECT 1
-          FROM iam.v_organization_closure_live lcv
-          WHERE (lcv.ancestor_org_id = dc.tenant_org_id AND lcv.descendant_org_id = vg.organization_id)
-             OR (lcv.ancestor_org_id = vg.organization_id AND lcv.descendant_org_id = dc.tenant_org_id)
-        )
-        AND (
-          (vrv.is_nusear_internal AND EXISTS (
-            SELECT 1 FROM iam.v_all_memberships_live vm
-            JOIN iam.organizations vmo ON vmo.id = vm.organization_id AND vmo.org_kind = 'platform_root'
-            WHERE vm.person_id = vg.person_id AND vm.valid_range @> iam.business_today()
-          ))
-          OR (NOT vrv.is_nusear_internal AND EXISTS (
-            SELECT 1 FROM iam.v_all_memberships_live vm
-            JOIN iam.organizations vmo ON vmo.id = vm.organization_id AND vmo.org_kind <> 'platform_root'
-            JOIN iam.v_organization_closure_live vmc
-              ON vmc.ancestor_org_id = vm.organization_id AND vmc.descendant_org_id = vg.organization_id
-            WHERE vm.person_id = vg.person_id AND vm.valid_range @> iam.business_today()
-          ))
-        )
-        AND (
-          vrv.is_nusear_internal
-          OR (
-            (
-              SELECT vts.switch_state
-              FROM iam.organization_tool_switches vts
-              JOIN coherence.v_org_historical_closure vtc
-                ON vtc.ancestor_org_id = vts.organization_id
-               AND vtc.descendant_org_id = ad.descendant_org_id
-              WHERE vts.tool_id = r.tool_id
-                AND vts.superseded_by_id IS NULL
-                AND vts.status = 'active'
-              ORDER BY vtc.depth ASC
-              LIMIT 1
-            ) = 'on'
-            AND NOT EXISTS (
-              SELECT 1
-              FROM iam.organization_tool_switches vts
-              JOIN coherence.v_org_historical_closure vtc
-                ON vtc.ancestor_org_id = vts.organization_id
-               AND vtc.descendant_org_id = ad.descendant_org_id
-              WHERE vts.tool_id = r.tool_id
-                AND vts.superseded_by_id IS NULL
-                AND vts.status = 'active'
-                AND vts.switch_state IN ('held', 'off')
-            )
-          )
-        )
-    )
-  );
-
-ALTER VIEW coherence.v_session_descendant_wide_orgs OWNER TO platform_view_owner;
-REVOKE ALL ON coherence.v_session_descendant_wide_orgs FROM PUBLIC, platform_app;
-
 -- Enable and force RLS on platform.audit_journal so app_views.audit_journal is governed by RLS too.
+-- Tenant bounding and archived-path reachability live once in Migration 008's iam.person_effective_grants().
 ALTER TABLE platform.audit_journal ENABLE ROW LEVEL SECURITY;
 ALTER TABLE platform.audit_journal FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY audit_journal_service_all ON platform.audit_journal
-  FOR ALL TO platform_writer, platform_worker, platform_iam_sync, platform_migrator
+  FOR ALL TO platform_writer, platform_iam_sync, platform_migrator
   USING (true) WITH CHECK (true);
 CREATE POLICY audit_journal_readonly_sel ON platform.audit_journal
-  FOR SELECT TO platform_readonly USING (true);
+  FOR SELECT TO platform_readonly, platform_worker USING (true);
 CREATE POLICY audit_journal_iam_read ON platform.audit_journal
   FOR SELECT TO platform_view_owner
   USING (
     target_org_id = ANY(((SELECT iam.effective_wide_org_ids('act:platform.audit_journal.read')))::uuid[])
-    AND (
-      EXISTS (SELECT 1 FROM iam.database_context dc WHERE dc.singleton = true AND dc.db_role_kind = 'control')
-      OR target_org_id = ANY(COALESCE((
-        SELECT pg_catalog.array_agg(c.descendant_org_id)
-        FROM iam.database_context dc
-        JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-        WHERE dc.singleton = true
-      ), ARRAY[]::uuid[]))
-    )
   );
 
 -- IAM-backed row rules for platform_view_owner on leaf metadata tables (strict DAG: zero cross-table
--- references inside leaf policies; every right check is scoped strictly to this tenant's organization
--- tree so grants on another company never unlock any row in this database).
+-- references inside leaf policies; every iam.effective_* helper is already tenant-bounded in 008).
 CREATE POLICY company_meta_iam_read ON coherence.company_meta
   FOR SELECT TO platform_view_owner
   USING (
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) && (
+    pg_catalog.cardinality(
       ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
-    )
+    ) > 0
   );
 
 CREATE POLICY runs_iam_read ON coherence.runs
   FOR SELECT TO platform_view_owner
   USING (
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) && (
+    pg_catalog.cardinality(
       ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-    )
+    ) > 0
   );
 
 CREATE POLICY step_attempt_events_iam_read ON coherence.step_attempt_events
   FOR SELECT TO platform_view_owner
   USING (
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) && (
+    pg_catalog.cardinality(
       ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-    )
+    ) > 0
   );
 
 CREATE POLICY carries_iam_read ON coherence.carries
   FOR SELECT TO platform_view_owner
   USING (
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) && (
+    pg_catalog.cardinality(
       ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-    )
+    ) > 0
   );
 
 CREATE POLICY abandonments_iam_read ON coherence.abandonments
   FOR SELECT TO platform_view_owner
   USING (
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) && (
+    pg_catalog.cardinality(
       ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
       || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-    )
+    ) > 0
   );
 
 CREATE POLICY input_entries_iam_read ON coherence.input_entries
@@ -1108,23 +768,15 @@ CREATE POLICY emit_confirmations_iam_read ON coherence.emit_confirmations
       = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.runs.read')))::uuid[])
   );
 
--- Level-1 IAM-backed row rules on statement_batches and run_materializations (reference leaf tables only,
--- scoped strictly to this tenant's organization tree).
+-- Level-1 IAM-backed row rules on statement_batches and run_materializations (reference leaf tables only).
 CREATE POLICY statement_batches_iam_read ON coherence.statement_batches
   FOR SELECT TO platform_view_owner
   USING (
-    (
-      COALESCE((
-        SELECT pg_catalog.array_agg(c.descendant_org_id)
-        FROM iam.database_context dc
-        JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-        WHERE dc.singleton = true
-      ), ARRAY[]::uuid[]) && (
-        ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
-        || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
-        || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-      )
-    )
+    pg_catalog.cardinality(
+      ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
+      || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
+      || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
+    ) > 0
     AND (
       batch_kind IN ('historical_sent', 'method_correction')
       OR (
@@ -1136,20 +788,10 @@ CREATE POLICY statement_batches_iam_read ON coherence.statement_batches
             WHERE c.run_id = coherence.statement_batches.run_id AND c.carry_kind = 'sent'
           )
           OR (
-            EXISTS (
-              SELECT 1
-              FROM pg_catalog.unnest(((SELECT iam.effective_any_org_ids('act:coherence.unpublished.read')))::uuid[]) AS u(org_id)
-              WHERE u.org_id = ANY(COALESCE((
-                SELECT pg_catalog.array_agg(c.descendant_org_id)
-                FROM iam.database_context dc
-                JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-                WHERE dc.singleton = true
-              ), ARRAY[]::uuid[]))
-                AND u.org_id = ANY(
-                  ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
-                  || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
-                  || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-                )
+            ((SELECT iam.effective_any_org_ids('act:coherence.unpublished.read')))::uuid[] && (
+              ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
+              || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
+              || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
             )
             AND EXISTS (
               SELECT 1
@@ -1173,20 +815,13 @@ CREATE POLICY statement_batches_iam_read ON coherence.statement_batches
 CREATE POLICY run_materializations_iam_read ON coherence.run_materializations
   FOR SELECT TO platform_view_owner
   USING (
-    (
-      COALESCE((
-        SELECT pg_catalog.array_agg(c.descendant_org_id)
-        FROM iam.database_context dc
-        JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-        WHERE dc.singleton = true
-      ), ARRAY[]::uuid[]) && (
-        ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
-        || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
-        || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
-        || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-        || ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
-      )
-    )
+    pg_catalog.cardinality(
+      ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
+      || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
+      || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
+      || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
+      || ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
+    ) > 0
     AND EXISTS (
       SELECT 1
       FROM coherence.step_attempt_events e
@@ -1194,6 +829,7 @@ CREATE POLICY run_materializations_iam_read ON coherence.run_materializations
       WHERE e.id = coherence.run_materializations.attempt_event_id
         AND e.step = 'emit' AND e.event_kind = 'finished'
         AND r.origin IN ('app', 'company_import')
+        AND (r.source_folder IS NULL OR r.source_folder NOT LIKE 'company-abandoned/%')
         AND NOT EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = r.id)
         AND NOT EXISTS (
           SELECT 1 FROM coherence.step_attempt_events sup
@@ -1202,55 +838,30 @@ CREATE POLICY run_materializations_iam_read ON coherence.run_materializations
         )
         AND (
           EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent')
-          OR EXISTS (
-            SELECT 1
-            FROM pg_catalog.unnest(((SELECT iam.effective_any_org_ids('act:coherence.unpublished.read')))::uuid[]) AS u(org_id)
-            WHERE u.org_id = ANY(COALESCE((
-              SELECT pg_catalog.array_agg(c.descendant_org_id)
-              FROM iam.database_context dc
-              JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-              WHERE dc.singleton = true
-            ), ARRAY[]::uuid[]))
-              AND u.org_id = ANY(
-                ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
-                || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
-                || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
-                || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-                || ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
-              )
+          OR ((SELECT iam.effective_any_org_ids('act:coherence.unpublished.read')))::uuid[] && (
+            ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
+            || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
+            || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
+            || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
+            || ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
           )
         )
     )
   );
 
 -- Level-2 IAM-backed row rules for platform_view_owner on the five core Coherence data tables.
--- Every live branch (effective_wide_org_ids, effective_narrow_pairs) is
--- bounded to organizations in iam.v_organization_closure_live rooted at iam.database_context.tenant_org_id;
--- archived-path descendants inside this tenant's historical tree remain reachable strictly from
--- active ancestors via coherence.v_session_descendant_wide_orgs (which enforces full-path tool
--- switches, right retirements, environment_scope, is_nusear_only, and View-as intersection).
+-- Tenant bounding and archived-path reachability are enforced once in Migration 008's evaluator.
 CREATE POLICY bob_policies_iam_read ON coherence.bob_policies
   FOR SELECT TO platform_view_owner
   USING (
     (
-      (
-        organization_id = ANY(COALESCE((
-          SELECT pg_catalog.array_agg(c.descendant_org_id)
-          FROM iam.database_context dc
-          JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-          WHERE dc.singleton = true
-        ), ARRAY[]::uuid[]))
-        AND (
-          organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
-          OR (
-            writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.bob.read')))::uuid[])
-            AND (organization_id, writing_person_id) IN (
-              SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.bob.read')
-            )
-          )
+      organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
+      OR (
+        writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.bob.read')))::uuid[])
+        AND (organization_id, writing_person_id) IN (
+          SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.bob.read')
         )
       )
-      OR organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.bob.read'), ARRAY[]::uuid[]))
     )
     AND EXISTS (
       SELECT 1
@@ -1266,24 +877,13 @@ CREATE POLICY bob_policies_iam_read ON coherence.bob_policies
             AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
         )
         AND (
-          (
-            coherence.bob_policies.organization_id = ANY(COALESCE((
-              SELECT pg_catalog.array_agg(c.descendant_org_id)
-              FROM iam.database_context dc
-              JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-              WHERE dc.singleton = true
-            ), ARRAY[]::uuid[]))
-            AND (
-              coherence.bob_policies.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
-              OR (
-                coherence.bob_policies.writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.unpublished.read')))::uuid[])
-                AND (coherence.bob_policies.organization_id, coherence.bob_policies.writing_person_id) IN (
-                  SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.unpublished.read')
-                )
-              )
+          coherence.bob_policies.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
+          OR (
+            coherence.bob_policies.writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.unpublished.read')))::uuid[])
+            AND (coherence.bob_policies.organization_id, coherence.bob_policies.writing_person_id) IN (
+              SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.unpublished.read')
             )
           )
-          OR coherence.bob_policies.organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.unpublished.read'), ARRAY[]::uuid[]))
           OR EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent')
         )
     )
@@ -1293,44 +893,22 @@ CREATE POLICY bob_policy_financials_iam_read ON coherence.bob_policy_financials
   FOR SELECT TO platform_view_owner
   USING (
     (
-      (
-        organization_id = ANY(COALESCE((
-          SELECT pg_catalog.array_agg(c.descendant_org_id)
-          FROM iam.database_context dc
-          JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-          WHERE dc.singleton = true
-        ), ARRAY[]::uuid[]))
-        AND (
-          organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
-          OR (
-            writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.bob.read')))::uuid[])
-            AND (organization_id, writing_person_id) IN (
-              SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.bob.read')
-            )
-          )
+      organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
+      OR (
+        writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.bob.read')))::uuid[])
+        AND (organization_id, writing_person_id) IN (
+          SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.bob.read')
         )
       )
-      OR organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.bob.read'), ARRAY[]::uuid[]))
     )
     AND (
-      (
-        organization_id = ANY(COALESCE((
-          SELECT pg_catalog.array_agg(c.descendant_org_id)
-          FROM iam.database_context dc
-          JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-          WHERE dc.singleton = true
-        ), ARRAY[]::uuid[]))
-        AND (
-          organization_id = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[])
-          OR (
-            writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('col:coherence.statement_cash')))::uuid[])
-            AND (organization_id, writing_person_id) IN (
-              SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
-            )
-          )
+      organization_id = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[])
+      OR (
+        writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('col:coherence.statement_cash')))::uuid[])
+        AND (organization_id, writing_person_id) IN (
+          SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
         )
       )
-      OR organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.statement_cash'), ARRAY[]::uuid[]))
     )
     AND EXISTS (
       SELECT 1
@@ -1346,24 +924,13 @@ CREATE POLICY bob_policy_financials_iam_read ON coherence.bob_policy_financials
             AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
         )
         AND (
-          (
-            coherence.bob_policy_financials.organization_id = ANY(COALESCE((
-              SELECT pg_catalog.array_agg(c.descendant_org_id)
-              FROM iam.database_context dc
-              JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-              WHERE dc.singleton = true
-            ), ARRAY[]::uuid[]))
-            AND (
-              coherence.bob_policy_financials.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
-              OR (
-                coherence.bob_policy_financials.writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.unpublished.read')))::uuid[])
-                AND (coherence.bob_policy_financials.organization_id, coherence.bob_policy_financials.writing_person_id) IN (
-                  SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.unpublished.read')
-                )
-              )
+          coherence.bob_policy_financials.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
+          OR (
+            coherence.bob_policy_financials.writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.unpublished.read')))::uuid[])
+            AND (coherence.bob_policy_financials.organization_id, coherence.bob_policy_financials.writing_person_id) IN (
+              SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.unpublished.read')
             )
           )
-          OR coherence.bob_policy_financials.organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.unpublished.read'), ARRAY[]::uuid[]))
           OR EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent')
         )
     )
@@ -1373,24 +940,13 @@ CREATE POLICY statement_agency_lines_iam_read ON coherence.statement_agency_line
   FOR SELECT TO platform_view_owner
   USING (
     (
-      (
-        organization_id = ANY(COALESCE((
-          SELECT pg_catalog.array_agg(c.descendant_org_id)
-          FROM iam.database_context dc
-          JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-          WHERE dc.singleton = true
-        ), ARRAY[]::uuid[]))
-        AND (
-          organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.statements.read')))::uuid[])
-          OR (
-            writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.statements.read')))::uuid[])
-            AND (organization_id, writing_person_id) IN (
-              SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.statements.read')
-            )
-          )
+      organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.statements.read')))::uuid[])
+      OR (
+        writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.statements.read')))::uuid[])
+        AND (organization_id, writing_person_id) IN (
+          SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.statements.read')
         )
       )
-      OR organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.statements.read'), ARRAY[]::uuid[]))
     )
     AND EXISTS (
       SELECT 1
@@ -1405,24 +961,13 @@ CREATE POLICY statement_agency_lines_iam_read ON coherence.statement_agency_line
               EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = sb.run_id AND c.carry_kind = 'sent')
               OR (
                 (
-                  (
-                    coherence.statement_agency_lines.organization_id = ANY(COALESCE((
-                      SELECT pg_catalog.array_agg(c.descendant_org_id)
-                      FROM iam.database_context dc
-                      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-                      WHERE dc.singleton = true
-                    ), ARRAY[]::uuid[]))
-                    AND (
-                      coherence.statement_agency_lines.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
-                      OR (
-                        coherence.statement_agency_lines.writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.unpublished.read')))::uuid[])
-                        AND (coherence.statement_agency_lines.organization_id, coherence.statement_agency_lines.writing_person_id) IN (
-                          SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.unpublished.read')
-                        )
-                      )
+                  coherence.statement_agency_lines.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
+                  OR (
+                    coherence.statement_agency_lines.writing_person_id = ANY(((SELECT iam.effective_narrow_person_ids('act:coherence.unpublished.read')))::uuid[])
+                    AND (coherence.statement_agency_lines.organization_id, coherence.statement_agency_lines.writing_person_id) IN (
+                      SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:coherence.unpublished.read')
                     )
                   )
-                  OR coherence.statement_agency_lines.organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.unpublished.read'), ARRAY[]::uuid[]))
                 )
                 AND EXISTS (
                   SELECT 1
@@ -1451,30 +996,8 @@ CREATE POLICY statement_upline_lines_iam_read ON coherence.statement_upline_line
       = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
     AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
       = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.upline.read')))::uuid[])
-    AND (
-      (
-        organization_id = ANY(COALESCE((
-          SELECT pg_catalog.array_agg(c.descendant_org_id)
-          FROM iam.database_context dc
-          JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-          WHERE dc.singleton = true
-        ), ARRAY[]::uuid[]))
-        AND organization_id = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
-      )
-      OR organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.upline_cash'), ARRAY[]::uuid[]))
-    )
-    AND (
-      (
-        organization_id = ANY(COALESCE((
-          SELECT pg_catalog.array_agg(c.descendant_org_id)
-          FROM iam.database_context dc
-          JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-          WHERE dc.singleton = true
-        ), ARRAY[]::uuid[]))
-        AND organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.upline.read')))::uuid[])
-      )
-      OR organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.upline.read'), ARRAY[]::uuid[]))
-    )
+    AND organization_id = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
+    AND organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.upline.read')))::uuid[])
     AND EXISTS (
       SELECT 1
       FROM coherence.statement_batches sb
@@ -1487,18 +1010,7 @@ CREATE POLICY statement_upline_lines_iam_read ON coherence.statement_upline_line
             AND (
               EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = sb.run_id AND c.carry_kind = 'sent')
               OR (
-                (
-                  (
-                    coherence.statement_upline_lines.organization_id = ANY(COALESCE((
-                      SELECT pg_catalog.array_agg(c.descendant_org_id)
-                      FROM iam.database_context dc
-                      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-                      WHERE dc.singleton = true
-                    ), ARRAY[]::uuid[]))
-                    AND coherence.statement_upline_lines.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
-                  )
-                  OR coherence.statement_upline_lines.organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.unpublished.read'), ARRAY[]::uuid[]))
-                )
+                coherence.statement_upline_lines.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
                 AND EXISTS (
                   SELECT 1
                   FROM coherence.step_attempt_events e
@@ -1522,30 +1034,8 @@ CREATE POLICY statement_upline_lines_iam_read ON coherence.statement_upline_line
 CREATE POLICY coherent_ledger_rows_iam_read ON coherence.coherent_ledger_rows
   FOR SELECT TO platform_view_owner
   USING (
-    (
-      (
-        organization_id = ANY(COALESCE((
-          SELECT pg_catalog.array_agg(c.descendant_org_id)
-          FROM iam.database_context dc
-          JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-          WHERE dc.singleton = true
-        ), ARRAY[]::uuid[]))
-        AND organization_id = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
-      )
-      OR organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.upline_cash'), ARRAY[]::uuid[]))
-    )
-    AND (
-      (
-        organization_id = ANY(COALESCE((
-          SELECT pg_catalog.array_agg(c.descendant_org_id)
-          FROM iam.database_context dc
-          JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-          WHERE dc.singleton = true
-        ), ARRAY[]::uuid[]))
-        AND organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
-      )
-      OR organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.ledger.read'), ARRAY[]::uuid[]))
-    )
+    organization_id = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
+    AND organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
     AND EXISTS (
       SELECT 1
       FROM coherence.step_attempt_events e
@@ -1560,23 +1050,14 @@ CREATE POLICY coherent_ledger_rows_iam_read ON coherence.coherent_ledger_rows
             AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
         )
         AND (
-          (
-            coherence.coherent_ledger_rows.organization_id = ANY(COALESCE((
-              SELECT pg_catalog.array_agg(c.descendant_org_id)
-              FROM iam.database_context dc
-              JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-              WHERE dc.singleton = true
-            ), ARRAY[]::uuid[]))
-            AND coherence.coherent_ledger_rows.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
-          )
-          OR coherence.coherent_ledger_rows.organization_id = ANY(COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.unpublished.read'), ARRAY[]::uuid[]))
+          coherence.coherent_ledger_rows.organization_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
           OR EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent')
         )
     )
   );
 
--- 4. Grant platform_view_owner the exact base-table SELECT privileges it needs under FORCE RLS
--- (zero privileges granted to platform_app or PUBLIC on coherence/coherence_views).
+-- 4. Grant platform_view_owner the exact base-table SELECT and read-helper privileges it needs under
+-- FORCE RLS (zero privileges granted to platform_app or PUBLIC on coherence/coherence_views).
 GRANT USAGE ON SCHEMA coherence, iam, platform, app_views TO platform_view_owner;
 GRANT SELECT ON
   coherence.company_meta,
@@ -1605,7 +1086,13 @@ GRANT SELECT ON
   coherence.emit_confirmations,
   platform.audit_journal,
   iam.database_context,
+  iam.v_organization_closure_live,
   iam.person_versions
+TO platform_view_owner;
+GRANT EXECUTE ON FUNCTION
+  coherence.run_stage(UUID, BIGINT),
+  coherence.step_rank(TEXT),
+  coherence.run_effective_statement_batches(UUID)
 TO platform_view_owner;
 
 -- 5. Security-barrier views in app_views.*, owned by platform_view_owner (security_invoker = false).
@@ -1614,16 +1101,8 @@ CREATE OR REPLACE VIEW app_views.coherence_bob
 WITH (security_barrier = true) AS
 WITH col_scopes AS (
   SELECT
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) AS tenant_live_orgs,
-    ((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[] AS upline_cash_live_orgs,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.upline_cash'), ARRAY[]::uuid[]) AS upline_cash_arch_orgs,
-    ((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[] AS stmt_cash_live_orgs,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.statement_cash'), ARRAY[]::uuid[]) AS stmt_cash_arch_orgs,
+    ((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[] AS upline_cash_orgs,
+    ((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[] AS stmt_cash_orgs,
     ((SELECT iam.effective_narrow_person_ids('col:coherence.statement_cash')))::uuid[] AS stmt_cash_narrow_people
 )
 SELECT
@@ -1635,7 +1114,7 @@ SELECT
   bp.policy_id,
   bp.carrier_policy_number,
   bp.crm_policy_number,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.enrollment_code ELSE NULL END AS enrollment_code,
+  CASE WHEN gate.show_upline THEN bpf.enrollment_code ELSE NULL END AS enrollment_code,
   bp.carrier,
   bp.plan_type,
   bp.plan_name,
@@ -1652,63 +1131,45 @@ SELECT
   bp.origin_effective,
   bp.effective_date,
   bp.termination_date,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.min_date ELSE NULL END AS min_date,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.anchor_date ELSE NULL END AS anchor_date,
-  CASE
-    WHEN (
-      bp.organization_id = ANY(cs.tenant_live_orgs)
-      AND (
-        bp.organization_id = ANY(cs.stmt_cash_live_orgs)
-        OR (
-          bp.writing_person_id = ANY(cs.stmt_cash_narrow_people)
-          AND (bp.organization_id, bp.writing_person_id) IN (
-            SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
-          )
-        )
-      )
-    )
-      OR bp.organization_id = ANY(cs.stmt_cash_arch_orgs)
-      THEN bpf.amount
-    ELSE NULL
-  END AS amount,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.upline_amount ELSE NULL END AS upline_amount,
+  CASE WHEN gate.show_upline THEN bpf.min_date ELSE NULL END AS min_date,
+  CASE WHEN gate.show_upline THEN bpf.anchor_date ELSE NULL END AS anchor_date,
+  CASE WHEN gate.show_stmt THEN bpf.amount ELSE NULL END AS amount,
+  CASE WHEN gate.show_upline THEN bpf.upline_amount ELSE NULL END AS upline_amount,
   bp.writing_npn,
   bp.writing_agent,
   bp.entity,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.agency_id ELSE NULL END AS agency_id,
+  CASE WHEN gate.show_upline THEN bpf.agency_id ELSE NULL END AS agency_id,
   bp.status,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bp.coherent_status ELSE NULL END AS coherent_status,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.conflicts ELSE NULL END AS conflicts,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.spine_source ELSE NULL END AS spine_source,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.confidence_level ELSE NULL END AS confidence_level,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.coherent_trajectory ELSE NULL END AS coherent_trajectory,
+  CASE WHEN gate.show_upline THEN bp.coherent_status ELSE NULL END AS coherent_status,
+  CASE WHEN gate.show_upline THEN bpf.conflicts ELSE NULL END AS conflicts,
+  CASE WHEN gate.show_upline THEN bpf.spine_source ELSE NULL END AS spine_source,
+  CASE WHEN gate.show_upline THEN bpf.confidence_level ELSE NULL END AS confidence_level,
+  CASE WHEN gate.show_upline THEN bpf.coherent_trajectory ELSE NULL END AS coherent_trajectory,
   bp.journal_seq
 FROM coherence.bob_policies bp
 CROSS JOIN col_scopes cs
 LEFT JOIN coherence.bob_policy_financials bpf
-  ON bpf.attempt_event_id = bp.attempt_event_id AND bpf.policy_id = bp.policy_id;
+  ON bpf.attempt_event_id = bp.attempt_event_id AND bpf.policy_id = bp.policy_id
+CROSS JOIN LATERAL (
+  SELECT
+    (bp.organization_id = ANY(cs.upline_cash_orgs)) AS show_upline,
+    (
+      bp.organization_id = ANY(cs.stmt_cash_orgs)
+      OR (
+        bp.writing_person_id = ANY(cs.stmt_cash_narrow_people)
+        AND (bp.organization_id, bp.writing_person_id) IN (
+          SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
+        )
+      )
+    ) AS show_stmt
+) gate;
 
 -- Live view replacing any copied policy_periods table: every sent run stays eligible so a newest
 -- sent run with zero rows for the caller never falls back to a stale older run, while unsent runs
--- are eligible only when they contain policies visible to the caller (preventing mixed-scope grants
--- from picking an empty unsent run).
+-- are eligible only when they contain policies visible to the caller.
 CREATE OR REPLACE VIEW app_views.v_current_policy_periods
 WITH (security_barrier = true) AS
-WITH col_scopes AS (
-  SELECT
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) AS tenant_live_orgs,
-    ((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[] AS upline_cash_live_orgs,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.upline_cash'), ARRAY[]::uuid[]) AS upline_cash_arch_orgs,
-    ((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[] AS stmt_cash_live_orgs,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.statement_cash'), ARRAY[]::uuid[]) AS stmt_cash_arch_orgs,
-    ((SELECT iam.effective_narrow_person_ids('col:coherence.statement_cash')))::uuid[] AS stmt_cash_narrow_people
-),
-latest_rm AS (
+WITH latest_rm AS (
   SELECT rm.attempt_event_id, rm.run_id, rm.statement_date, rm.corpus_tail, rm.agency_start
   FROM coherence.run_materializations rm
   JOIN coherence.runs r ON r.id = rm.run_id
@@ -1727,67 +1188,9 @@ SELECT
   latest_rm.statement_date AS run_statement_date,
   latest_rm.corpus_tail,
   latest_rm.agency_start,
-  bp.attempt_event_id,
-  bp.run_id,
-  bp.organization_id,
-  bp.writing_person_id,
-  bp.external_policy_id,
-  bp.policy_id,
-  bp.carrier_policy_number,
-  bp.crm_policy_number,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.enrollment_code ELSE NULL END AS enrollment_code,
-  bp.carrier,
-  bp.plan_type,
-  bp.plan_name,
-  bp.simple_plan_type,
-  bp.mbi,
-  bp.member,
-  bp.dob,
-  bp.phone,
-  bp.email,
-  bp.address,
-  bp.county,
-  bp.state,
-  bp.submission_date,
-  bp.origin_effective,
-  bp.effective_date,
-  bp.termination_date,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.min_date ELSE NULL END AS min_date,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.anchor_date ELSE NULL END AS anchor_date,
-  CASE
-    WHEN (
-      bp.organization_id = ANY(cs.tenant_live_orgs)
-      AND (
-        bp.organization_id = ANY(cs.stmt_cash_live_orgs)
-        OR (
-          bp.writing_person_id = ANY(cs.stmt_cash_narrow_people)
-          AND (bp.organization_id, bp.writing_person_id) IN (
-            SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
-          )
-        )
-      )
-    )
-      OR bp.organization_id = ANY(cs.stmt_cash_arch_orgs)
-      THEN bpf.amount
-    ELSE NULL
-  END AS amount,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.upline_amount ELSE NULL END AS upline_amount,
-  bp.writing_npn,
-  bp.writing_agent,
-  bp.entity,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.agency_id ELSE NULL END AS agency_id,
-  bp.status,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bp.coherent_status ELSE NULL END AS coherent_status,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.conflicts ELSE NULL END AS conflicts,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.spine_source ELSE NULL END AS spine_source,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.confidence_level ELSE NULL END AS confidence_level,
-  CASE WHEN (bp.organization_id = ANY(cs.tenant_live_orgs) AND bp.organization_id = ANY(cs.upline_cash_live_orgs)) OR bp.organization_id = ANY(cs.upline_cash_arch_orgs) THEN bpf.coherent_trajectory ELSE NULL END AS coherent_trajectory,
-  bp.journal_seq
+  b.*
 FROM latest_rm
-CROSS JOIN col_scopes cs
-JOIN coherence.bob_policies bp ON bp.attempt_event_id = latest_rm.attempt_event_id
-LEFT JOIN coherence.bob_policy_financials bpf
-  ON bpf.attempt_event_id = bp.attempt_event_id AND bpf.policy_id = bp.policy_id;
+JOIN app_views.coherence_bob b ON b.attempt_event_id = latest_rm.attempt_event_id;
 
 CREATE OR REPLACE VIEW app_views.coherence_statement_batches
 WITH (security_barrier = true) AS
@@ -1857,16 +1260,8 @@ CREATE OR REPLACE VIEW app_views.coherence_statement_agency_lines
 WITH (security_barrier = true) AS
 WITH col_scopes AS (
   SELECT
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) AS tenant_live_orgs,
-    ((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[] AS upline_cash_live_orgs,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.upline_cash'), ARRAY[]::uuid[]) AS upline_cash_arch_orgs,
-    ((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[] AS stmt_cash_live_orgs,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.statement_cash'), ARRAY[]::uuid[]) AS stmt_cash_arch_orgs,
+    ((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[] AS upline_cash_orgs,
+    ((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[] AS stmt_cash_orgs,
     ((SELECT iam.effective_narrow_person_ids('col:coherence.statement_cash')))::uuid[] AS stmt_cash_narrow_people
 )
 SELECT
@@ -1880,57 +1275,9 @@ SELECT
   sal.entity,
   sal.writing_npn,
   sal.writing_agent,
-  CASE
-    WHEN (
-      sal.organization_id = ANY(cs.tenant_live_orgs)
-      AND (
-        sal.organization_id = ANY(cs.stmt_cash_live_orgs)
-        OR (
-          sal.writing_person_id = ANY(cs.stmt_cash_narrow_people)
-          AND (sal.organization_id, sal.writing_person_id) IN (
-            SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
-          )
-        )
-      )
-    )
-      OR sal.organization_id = ANY(cs.stmt_cash_arch_orgs)
-      THEN sal.record_id
-    ELSE NULL
-  END AS record_id,
-  CASE
-    WHEN (
-      sal.organization_id = ANY(cs.tenant_live_orgs)
-      AND (
-        sal.organization_id = ANY(cs.stmt_cash_live_orgs)
-        OR (
-          sal.writing_person_id = ANY(cs.stmt_cash_narrow_people)
-          AND (sal.organization_id, sal.writing_person_id) IN (
-            SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
-          )
-        )
-      )
-    )
-      OR sal.organization_id = ANY(cs.stmt_cash_arch_orgs)
-      THEN sal.reversal_of
-    ELSE NULL
-  END AS reversal_of,
-  CASE
-    WHEN (
-      sal.organization_id = ANY(cs.tenant_live_orgs)
-      AND (
-        sal.organization_id = ANY(cs.stmt_cash_live_orgs)
-        OR (
-          sal.writing_person_id = ANY(cs.stmt_cash_narrow_people)
-          AND (sal.organization_id, sal.writing_person_id) IN (
-            SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
-          )
-        )
-      )
-    )
-      OR sal.organization_id = ANY(cs.stmt_cash_arch_orgs)
-      THEN sal.corrects_record_id
-    ELSE NULL
-  END AS corrects_record_id,
+  CASE WHEN gate.show_stmt THEN sal.record_id ELSE NULL END AS record_id,
+  CASE WHEN gate.show_stmt THEN sal.reversal_of ELSE NULL END AS reversal_of,
+  CASE WHEN gate.show_stmt THEN sal.corrects_record_id ELSE NULL END AS corrects_record_id,
   sal.source_file,
   sal.sheet_name,
   sal.source_row_no,
@@ -1940,23 +1287,7 @@ SELECT
   sal.member,
   sal.external_policy_id,
   sal.policy_id,
-  CASE
-    WHEN (
-      sal.organization_id = ANY(cs.tenant_live_orgs)
-      AND (
-        sal.organization_id = ANY(cs.stmt_cash_live_orgs)
-        OR (
-          sal.writing_person_id = ANY(cs.stmt_cash_narrow_people)
-          AND (sal.organization_id, sal.writing_person_id) IN (
-            SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
-          )
-        )
-      )
-    )
-      OR sal.organization_id = ANY(cs.stmt_cash_arch_orgs)
-      THEN sal.tx_id
-    ELSE NULL
-  END AS tx_id,
+  CASE WHEN gate.show_stmt THEN sal.tx_id ELSE NULL END AS tx_id,
   sal.plan_type,
   sal.simple_plan_type,
   sal.state,
@@ -1968,29 +1299,26 @@ SELECT
   sal.payment_date,
   sal.posted_statement_date,
   sal.revenue_type,
-  CASE WHEN (sal.organization_id = ANY(cs.tenant_live_orgs) AND sal.organization_id = ANY(cs.upline_cash_live_orgs)) OR sal.organization_id = ANY(cs.upline_cash_arch_orgs) THEN sal.gross_comm ELSE NULL END AS gross_comm,
-  CASE
-    WHEN (
-      sal.organization_id = ANY(cs.tenant_live_orgs)
-      AND (
-        sal.organization_id = ANY(cs.stmt_cash_live_orgs)
-        OR (
-          sal.writing_person_id = ANY(cs.stmt_cash_narrow_people)
-          AND (sal.organization_id, sal.writing_person_id) IN (
-            SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
-          )
-        )
-      )
-    )
-      OR sal.organization_id = ANY(cs.stmt_cash_arch_orgs)
-      THEN sal.amount
-    ELSE NULL
-  END AS amount,
+  CASE WHEN gate.show_upline THEN sal.gross_comm ELSE NULL END AS gross_comm,
+  CASE WHEN gate.show_stmt THEN sal.amount ELSE NULL END AS amount,
   sal.reason,
   sal.notes,
   sal.journal_seq
 FROM coherence.statement_agency_lines sal
-CROSS JOIN col_scopes cs;
+CROSS JOIN col_scopes cs
+CROSS JOIN LATERAL (
+  SELECT
+    (sal.organization_id = ANY(cs.upline_cash_orgs)) AS show_upline,
+    (
+      sal.organization_id = ANY(cs.stmt_cash_orgs)
+      OR (
+        sal.writing_person_id = ANY(cs.stmt_cash_narrow_people)
+        AND (sal.organization_id, sal.writing_person_id) IN (
+          SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash')
+        )
+      )
+    ) AS show_stmt
+) gate;
 
 -- Upline statement lines report organization_id at the tenant company organization (owning
 -- '<Company> Upline') while preserving the originating agency in source_organization_id.
@@ -2265,134 +1593,84 @@ WITH latest_rm AS (
 )
 SELECT
   latest_rm.statement_date AS run_statement_date,
-  clr.attempt_event_id,
-  clr.tx_id,
-  clr.run_id,
-  clr.organization_id,
-  clr.writing_person_id,
-  clr.record_id,
-  clr.external_policy_id,
-  clr.policy_id,
-  clr.statement_name,
-  clr.src_type,
-  clr.carrier,
-  clr.mbi,
-  clr.member,
-  clr.state,
-  clr.plan_type,
-  clr.simple_plan_type,
-  clr.submission_date,
-  clr.origin_effective,
-  clr.effective_date,
-  clr.termination_date,
-  clr.earned_date,
-  clr.payment_date,
-  clr.statement_date,
-  clr.min_date,
-  clr.gross_comm,
-  clr.revenue_type,
-  clr.override_amount,
-  clr.commission_amount,
-  clr.hra_amount,
-  clr.fee_amount,
-  clr.other_amount,
-  clr.downline_amount,
-  clr.upline_amount,
-  clr.writing_npn,
-  clr.writing_agent,
-  clr.entity,
-  clr.payee_npn,
-  clr.agency_id,
-  clr.status,
-  clr.policy_status,
-  clr.cbob_c,
-  clr.cbob_s,
-  clr.sf,
-  clr.notes,
-  clr.coherent_notes,
-  clr.sheet_name,
-  clr.source_row_no,
-  clr.journal_seq
+  l.*
 FROM latest_rm
-JOIN coherence.coherent_ledger_rows clr
-  ON clr.attempt_event_id = latest_rm.attempt_event_id;
+JOIN app_views.coherence_ledger l
+  ON l.attempt_event_id = latest_rm.attempt_event_id;
+
+-- IAM-gated view-owner wrapper over coherence.run_effective_statement_batches() so
+-- app_views.coherence_entity_statement_reconciliation shares the single SQL batch selector
+-- while platform_app holds zero EXECUTE privileges in schema coherence.
+-- Returns batches strictly for a run visible in coherence.run_materializations under its FORCE RLS
+-- (sent or unpublished.read, not abandoned, app/company_import, finished unsuperseded Emit)
+-- and only when the caller holds ledger.read, statements.read, upline.read,
+-- col:coherence.statement_cash, and col:coherence.upline_cash at the tenant.
+CREATE OR REPLACE FUNCTION app_views.coherence_effective_statement_batches(p_run_id UUID)
+RETURNS TABLE (batch_id UUID)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT eff.batch_id
+  FROM coherence.run_materializations rm
+  CROSS JOIN LATERAL coherence.run_effective_statement_batches(rm.run_id) eff
+  WHERE rm.run_id = p_run_id
+    AND (
+      EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = rm.run_id AND c.carry_kind = 'sent')
+      OR (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
+           = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
+    )
+    AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
+          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
+    AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
+          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.statements.read')))::uuid[])
+    AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
+          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.upline.read')))::uuid[])
+    AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
+          = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[])
+    AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
+          = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[]);
+$$;
+
+ALTER FUNCTION app_views.coherence_effective_statement_batches(UUID) OWNER TO platform_view_owner;
+REVOKE ALL ON FUNCTION app_views.coherence_effective_statement_batches(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_views.coherence_effective_statement_batches(UUID) TO platform_app, platform_readonly;
 
 -- Reconciliation view per materialized run (Entity Manager / Nusear internal only; requires
 -- ledger.read, statements.read, upline.read, col:coherence.statement_cash, and col:coherence.upline_cash,
 -- applying ONE consistent intersected org scope across both statement and ledger sides).
 CREATE OR REPLACE VIEW app_views.coherence_entity_statement_reconciliation
 WITH (security_barrier = true) AS
-WITH tenant_live AS (
+WITH right_scopes AS (
   SELECT
     (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true) AS tenant_org_id,
-    COALESCE((
-      SELECT pg_catalog.array_agg(c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.v_organization_closure_live c ON c.ancestor_org_id = dc.tenant_org_id
-      WHERE dc.singleton = true
-    ), ARRAY[]::uuid[]) AS live_orgs
-),
-right_scopes AS (
-  SELECT
-    tl.tenant_org_id,
-    tl.live_orgs,
-    ((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[] AS led_live,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.ledger.read'), ARRAY[]::uuid[]) AS led_arch,
-    ((SELECT iam.effective_wide_org_ids('act:coherence.statements.read')))::uuid[] AS stmt_live,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.statements.read'), ARRAY[]::uuid[]) AS stmt_arch,
-    ((SELECT iam.effective_wide_org_ids('act:coherence.upline.read')))::uuid[] AS up_live,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.upline.read'), ARRAY[]::uuid[]) AS up_arch,
-    ((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[] AS scash_live,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.statement_cash'), ARRAY[]::uuid[]) AS scash_arch,
-    ((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[] AS ucash_live,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'col:coherence.upline_cash'), ARRAY[]::uuid[]) AS ucash_arch,
-    ((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[] AS unpub_live,
-    COALESCE((SELECT pg_catalog.array_agg(DISTINCT d.descendant_org_id) FROM coherence.v_session_descendant_wide_orgs d WHERE d.right_id = 'act:coherence.unpublished.read'), ARRAY[]::uuid[]) AS unpub_arch
-  FROM tenant_live tl
-),
-sent_scope AS (
-  SELECT
-    rs.tenant_org_id,
-    rs.live_orgs,
-    rs.unpub_live,
-    rs.unpub_arch,
-    COALESCE((
-      SELECT pg_catalog.array_agg(DISTINCT u.org_id)
-      FROM pg_catalog.unnest(rs.live_orgs || rs.led_arch) AS u(org_id)
-      WHERE (
-        (u.org_id = ANY(rs.live_orgs) AND u.org_id = ANY(rs.led_live))
-        OR u.org_id = ANY(rs.led_arch)
-      )
-        AND (
-          (u.org_id = ANY(rs.live_orgs) AND u.org_id = ANY(rs.stmt_live))
-          OR u.org_id = ANY(rs.stmt_arch)
-        )
-        AND (
-          (u.org_id = ANY(rs.live_orgs) AND u.org_id = ANY(rs.up_live))
-          OR u.org_id = ANY(rs.up_arch)
-        )
-        AND (
-          (u.org_id = ANY(rs.live_orgs) AND u.org_id = ANY(rs.scash_live))
-          OR u.org_id = ANY(rs.scash_arch)
-        )
-        AND (
-          (u.org_id = ANY(rs.live_orgs) AND u.org_id = ANY(rs.ucash_live))
-          OR u.org_id = ANY(rs.ucash_arch)
-        )
-    ), ARRAY[]::uuid[]) AS sent_orgs
-  FROM right_scopes rs
+    ((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[] AS led_orgs,
+    ((SELECT iam.effective_wide_org_ids('act:coherence.statements.read')))::uuid[] AS stmt_orgs,
+    ((SELECT iam.effective_wide_org_ids('act:coherence.upline.read')))::uuid[] AS up_orgs,
+    ((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[] AS scash_orgs,
+    ((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[] AS ucash_orgs,
+    ((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[] AS unpub_orgs
 ),
 scope_sets AS (
   SELECT
-    ss.tenant_org_id,
-    ss.sent_orgs,
+    rs.tenant_org_id,
     COALESCE((
       SELECT pg_catalog.array_agg(DISTINCT u.org_id)
-      FROM pg_catalog.unnest(ss.sent_orgs) AS u(org_id)
-      WHERE (u.org_id = ANY(ss.live_orgs) AND u.org_id = ANY(ss.unpub_live))
-         OR u.org_id = ANY(ss.unpub_arch)
+      FROM pg_catalog.unnest(rs.led_orgs) AS u(org_id)
+      WHERE u.org_id = ANY(rs.stmt_orgs)
+        AND u.org_id = ANY(rs.up_orgs)
+        AND u.org_id = ANY(rs.scash_orgs)
+        AND u.org_id = ANY(rs.ucash_orgs)
+    ), ARRAY[]::uuid[]) AS sent_orgs,
+    COALESCE((
+      SELECT pg_catalog.array_agg(DISTINCT u.org_id)
+      FROM pg_catalog.unnest(rs.led_orgs) AS u(org_id)
+      WHERE u.org_id = ANY(rs.stmt_orgs)
+        AND u.org_id = ANY(rs.up_orgs)
+        AND u.org_id = ANY(rs.scash_orgs)
+        AND u.org_id = ANY(rs.ucash_orgs)
+        AND u.org_id = ANY(rs.unpub_orgs)
     ), ARRAY[]::uuid[]) AS unsent_orgs
-  FROM sent_scope ss
+  FROM right_scopes rs
 ),
 scoped_runs AS (
   SELECT
@@ -2400,8 +1678,6 @@ scoped_runs AS (
     rm.attempt_event_id,
     rm.statement_date,
     r.id AS r_id,
-    r.statement_date AS r_statement_date,
-    r.input_version_id,
     sc.tenant_org_id,
     CASE
       WHEN EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent')
@@ -2411,6 +1687,13 @@ scoped_runs AS (
   FROM coherence.run_materializations rm
   JOIN coherence.runs r ON r.id = rm.run_id
   CROSS JOIN scope_sets sc
+  WHERE sc.tenant_org_id = ANY(
+    CASE
+      WHEN EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent')
+        THEN sc.sent_orgs
+      ELSE sc.unsent_orgs
+    END
+  )
 )
 SELECT
   sr.run_id,
@@ -2424,61 +1707,8 @@ SELECT
   (rec.statement_total = rec.ledger_total) AS reconciled
 FROM scoped_runs sr
 JOIN LATERAL (
-  WITH matched_historical AS (
-    SELECT sb.id AS batch_id
-    FROM coherence.statement_batches sb
-    WHERE sb.batch_kind = 'historical_sent'
-      AND sb.statement_date <= sr.r_statement_date
-      AND (
-        (sb.source_file_sha256 IS NOT NULL AND EXISTS (
-          SELECT 1 FROM coherence.input_entries ie
-          WHERE ie.input_version_id = sr.input_version_id AND ie.file_sha256 = sb.source_file_sha256
-        ))
-        OR (sb.source_file_sha256 IS NULL AND sb.source_file_name IS NOT NULL AND EXISTS (
-          SELECT 1 FROM coherence.input_entries ie
-          WHERE ie.input_version_id = sr.input_version_id
-            AND pg_catalog.lower(pg_catalog.split_part(ie.rel_path, '/', pg_catalog.array_length(pg_catalog.string_to_array(ie.rel_path, '/'), 1)))
-                = pg_catalog.lower(sb.source_file_name)
-        ))
-      )
-  ),
-  matched_prior_runs AS (
-    SELECT sb.id AS batch_id
-    FROM coherence.statement_batches sb
-    WHERE sb.batch_kind = 'run_emission'
-      AND sb.run_id <> sr.r_id
-      AND sb.statement_date < sr.r_statement_date
-      AND EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = sb.run_id AND c.carry_kind = 'sent')
-      AND NOT EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = sb.run_id)
-      AND (
-        (sb.source_file_sha256 IS NOT NULL AND EXISTS (
-          SELECT 1 FROM coherence.input_entries ie
-          WHERE ie.input_version_id = sr.input_version_id AND ie.file_sha256 = sb.source_file_sha256
-        ))
-        OR EXISTS (
-          SELECT 1 FROM coherence.input_entries ie
-          WHERE ie.input_version_id = sr.input_version_id
-            AND ie.mac_key = 'sent/statements_' || pg_catalog.to_char(sb.statement_date, 'YYYYMMDD') || '.csv'
-        )
-      )
-  ),
-  matched_corrections AS (
-    SELECT sb.id AS batch_id
-    FROM coherence.statement_batches sb
-    WHERE sb.batch_kind = 'method_correction'
-      AND sb.statement_date <= sr.r_statement_date
-      AND EXISTS (SELECT 1 FROM matched_historical)
-  ),
-  own_batch AS (
-    SELECT sb.id AS batch_id
-    FROM coherence.statement_batches sb
-    WHERE sb.batch_kind = 'run_emission' AND sb.run_id = sr.r_id
-  ),
-  eff AS (
-    SELECT batch_id FROM matched_historical
-    UNION SELECT batch_id FROM matched_prior_runs
-    UNION SELECT batch_id FROM matched_corrections
-    UNION SELECT batch_id FROM own_batch
+  WITH eff AS (
+    SELECT batch_id FROM app_views.coherence_effective_statement_batches(sr.r_id)
   ),
   stmt_ag AS (
     SELECT sal.entity AS statement_entity,
@@ -2525,8 +1755,7 @@ JOIN LATERAL (
   SELECT * FROM ag_joined
   UNION ALL
   SELECT * FROM up_joined
-) rec ON true
-WHERE sr.tenant_org_id = ANY(sr.eff_orgs);
+) rec ON true;
 
 -- Narrow definer-rights helper view owned by read-only platform_readonly (SELECT strictly for
 -- platform_view_owner; zero privileges for platform_app or PUBLIC) so app_views.coherence_runs
@@ -2559,6 +1788,26 @@ ALTER VIEW coherence.v_run_latest_journal_seq OWNER TO platform_readonly;
 REVOKE ALL ON coherence.v_run_latest_journal_seq FROM PUBLIC, platform_app;
 GRANT SELECT ON coherence.v_run_latest_journal_seq TO platform_view_owner;
 
+-- IAM-gated view-owner wrapper over coherence.run_stage(UUID, BIGINT) so app_views.coherence_runs
+-- and historical as-of queries share the single SQL run_stage function while platform_app holds
+-- zero EXECUTE privileges in schema coherence.
+CREATE OR REPLACE FUNCTION app_views.coherence_run_stage(p_run_id UUID, p_as_of_seq BIGINT DEFAULT NULL)
+RETURNS TEXT
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT CASE
+    WHEN (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
+         = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.runs.read')))::uuid[])
+      THEN coherence.run_stage(p_run_id, p_as_of_seq)
+    ELSE NULL
+  END;
+$$;
+
+ALTER FUNCTION app_views.coherence_run_stage(UUID, BIGINT) OWNER TO platform_view_owner;
+REVOKE ALL ON FUNCTION app_views.coherence_run_stage(UUID, BIGINT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_views.coherence_run_stage(UUID, BIGINT) TO platform_app, platform_readonly;
+
 CREATE OR REPLACE VIEW app_views.coherence_runs
 WITH (security_barrier = true) AS
 SELECT
@@ -2580,98 +1829,7 @@ SELECT
   r.source_folder,
   r.journal_seq AS created_journal_seq,
   tip.latest_journal_seq,
-  CASE
-    WHEN EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = r.id) THEN 'abandoned'
-    WHEN EXISTS (
-      SELECT 1 FROM coherence.step_attempt_events s
-      WHERE s.run_id = r.id AND s.event_kind = 'started'
-        AND NOT EXISTS (
-          SELECT 1 FROM coherence.step_attempt_events e
-          WHERE e.run_id = s.run_id AND e.step = s.step AND e.attempt_no = s.attempt_no
-            AND e.event_kind IN ('finished', 'failed', 'interrupted', 'cancelled')
-        )
-    ) THEN (
-      SELECT CASE WHEN s.step = 'emit' THEN 'emitting' ELSE 'running a step' END
-      FROM coherence.step_attempt_events s
-      WHERE s.run_id = r.id AND s.event_kind = 'started'
-        AND NOT EXISTS (
-          SELECT 1 FROM coherence.step_attempt_events e
-          WHERE e.run_id = s.run_id AND e.step = s.step AND e.attempt_no = s.attempt_no
-            AND e.event_kind IN ('finished', 'failed', 'interrupted', 'cancelled')
-        )
-      ORDER BY s.journal_seq DESC LIMIT 1
-    )
-    WHEN EXISTS (
-      SELECT 1 FROM coherence.step_requests sr
-      WHERE sr.run_id = r.id
-        AND NOT EXISTS (SELECT 1 FROM coherence.step_attempt_events s WHERE s.step_request_id = sr.id AND s.event_kind = 'started')
-    ) THEN (
-      SELECT CASE WHEN sr.step = 'emit' THEN 'emitting' ELSE 'preparing' END
-      FROM coherence.step_requests sr
-      WHERE sr.run_id = r.id
-        AND NOT EXISTS (SELECT 1 FROM coherence.step_attempt_events s WHERE s.step_request_id = sr.id AND s.event_kind = 'started')
-      ORDER BY sr.journal_seq DESC LIMIT 1
-    )
-    WHEN (
-      SELECT e.event_kind FROM coherence.step_attempt_events e
-      WHERE e.run_id = r.id AND e.event_kind IN ('finished', 'failed', 'interrupted', 'cancelled')
-        AND NOT EXISTS (
-          SELECT 1 FROM coherence.step_attempt_events sup
-          WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
-        )
-      ORDER BY CASE e.step WHEN 'assign' THEN 1 WHEN 'attribute' THEN 2 WHEN 'bible' THEN 3 WHEN 'adjust' THEN 4 WHEN 'emit' THEN 5 ELSE 0 END DESC,
-               e.attempt_no DESC LIMIT 1
-    ) IN ('failed', 'interrupted', 'cancelled') THEN (
-      SELECT e.event_kind FROM coherence.step_attempt_events e
-      WHERE e.run_id = r.id AND e.event_kind IN ('finished', 'failed', 'interrupted', 'cancelled')
-        AND NOT EXISTS (
-          SELECT 1 FROM coherence.step_attempt_events sup
-          WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
-        )
-      ORDER BY CASE e.step WHEN 'assign' THEN 1 WHEN 'attribute' THEN 2 WHEN 'bible' THEN 3 WHEN 'adjust' THEN 4 WHEN 'emit' THEN 5 ELSE 0 END DESC,
-               e.attempt_no DESC LIMIT 1
-    )
-    WHEN EXISTS (
-      SELECT 1 FROM coherence.step_attempt_events e
-      WHERE e.run_id = r.id AND e.step = 'emit' AND e.event_kind = 'finished'
-        AND NOT EXISTS (
-          SELECT 1 FROM coherence.step_attempt_events sup
-          WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
-        )
-    ) THEN 'done'
-    WHEN EXISTS (
-      SELECT 1 FROM coherence.step_attempt_events e
-      WHERE e.run_id = r.id AND e.step = 'adjust' AND e.event_kind = 'finished'
-        AND NOT EXISTS (
-          SELECT 1 FROM coherence.step_attempt_events sup
-          WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
-        )
-    ) THEN CASE
-      WHEN EXISTS (
-        SELECT 1 FROM coherence.review_saves rs
-        WHERE rs.run_id = r.id AND rs.surface = 'adjust'
-          AND rs.attempt_event_id = (
-            SELECT e.id FROM coherence.step_attempt_events e
-            WHERE e.run_id = r.id AND e.step = 'adjust' AND e.event_kind = 'finished'
-              AND NOT EXISTS (
-                SELECT 1 FROM coherence.step_attempt_events sup
-                WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
-              )
-            ORDER BY e.attempt_no DESC LIMIT 1
-          )
-      ) THEN 'ready to create statements'
-      ELSE 'waiting for Adjust'
-    END
-    WHEN EXISTS (
-      SELECT 1 FROM coherence.step_attempt_events e
-      WHERE e.run_id = r.id AND e.step = 'bible' AND e.event_kind = 'finished'
-        AND NOT EXISTS (
-          SELECT 1 FROM coherence.step_attempt_events sup
-          WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no AND sup.event_kind = 'superseded'
-        )
-    ) THEN 'waiting for Bible'
-    ELSE 'preparing'
-  END AS stage,
+  app_views.coherence_run_stage(r.id, NULL) AS stage,
   EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent') AS sent_recorded,
   EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'approvals') AS approvals_carried,
   EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = r.id) AS abandoned
@@ -2830,14 +1988,17 @@ $$;
 
 GRANT USAGE ON SCHEMA app_views TO platform_app, platform_readonly;
 
--- 6. Internal command helpers owned by platform_writer (never granted to platform_app or PUBLIC).
+-- 6. Internal command helpers owned by platform_writer.
+-- Every write executes through a real signed app.session_token validated by iam.assert_can_write().
 GRANT USAGE ON SCHEMA coherence, iam, platform, app_cmd TO platform_writer;
 GRANT SELECT ON
   iam.database_context,
   iam.people,
+  iam.person_versions,
+  iam.agent_affiliations,
   iam.organizations,
   iam.organization_versions,
-  iam.organization_edges
+  iam.v_organization_closure
 TO platform_writer;
 
 DO $$
@@ -2894,14 +2055,14 @@ BEGIN
   FROM iam.database_context dc
   WHERE dc.singleton = true;
 
-  IF NOT FOUND OR v_dc.tenant_org_id IS NULL THEN
+  IF v_dc.tenant_org_id IS NULL OR v_dc.environment IS NULL THEN
     RAISE EXCEPTION 'FORBIDDEN: database_context is not configured for a company database.'
       USING ERRCODE = '42501';
   END IF;
 
   SELECT a.actor_person_id, a.recorded_as
   INTO v_auth
-  FROM iam.assert_can_write(p_right_id, v_dc.tenant_org_id, NULL, 'nusear_service') a;
+  FROM iam.assert_can_write(p_right_id, v_dc.tenant_org_id) a;
 
   SELECT p.person_kind INTO v_kind FROM iam.people p WHERE p.id = v_auth.actor_person_id;
 
@@ -3098,64 +2259,9 @@ AS $$
   END;
 $$;
 
-CREATE OR REPLACE FUNCTION coherence._cmd_tenant_tree_org_ids()
-RETURNS UUID[]
-LANGUAGE sql STABLE
-SET search_path = pg_catalog
-AS $$
-  WITH RECURSIVE effective_edges AS (
-    SELECT e.child_org_id, e.parent_org_id
-    FROM iam.organization_edges e
-    JOIN iam.organization_versions cov
-      ON cov.organization_id = e.child_org_id
-     AND cov.superseded_by_id IS NULL
-     AND cov.status = 'active'
-    WHERE e.superseded_by_id IS NULL
-      AND e.status = 'active'
-      AND e.valid_range @> iam.business_today()
-    UNION ALL
-    SELECT arch.child_org_id, arch.parent_org_id
-    FROM (
-      SELECT DISTINCT ON (e.child_org_id)
-        e.child_org_id,
-        e.parent_org_id
-      FROM iam.organization_edges e
-      JOIN iam.organization_versions cov
-        ON cov.organization_id = e.child_org_id
-       AND cov.superseded_by_id IS NULL
-       AND cov.status = 'archived'
-      WHERE e.superseded_by_id IS NULL
-        AND e.status = 'active'
-        AND pg_catalog.lower(e.valid_range) <= iam.business_today()
-      ORDER BY e.child_org_id, pg_catalog.lower(e.valid_range) DESC, e.journal_seq DESC, e.id DESC
-    ) arch
-  ),
-  tenant_tree(org_id, depth) AS (
-    SELECT dc.tenant_org_id, 0
-    FROM iam.database_context dc
-    JOIN iam.organizations o ON o.id = dc.tenant_org_id
-    WHERE dc.singleton = true
-      AND dc.tenant_org_id IS NOT NULL
-      AND o.org_kind IN ('company', 'agency', 'team')
-    UNION ALL
-    SELECT ee.child_org_id, t.depth + 1
-    FROM tenant_tree t
-    JOIN effective_edges ee
-      ON ee.parent_org_id = t.org_id
-    JOIN iam.organizations co
-      ON co.id = ee.child_org_id
-     AND co.org_kind IN ('company', 'agency', 'team')
-    WHERE t.depth < 32
-  ) CYCLE org_id SET is_cycle USING path
-  SELECT COALESCE(pg_catalog.array_agg(DISTINCT org_id), ARRAY[]::uuid[])
-  FROM tenant_tree
-  WHERE NOT is_cycle;
-$$;
-
 CREATE OR REPLACE FUNCTION coherence._cmd_assert_tenant_orgs(
   p_rows JSONB,
-  p_table_name TEXT,
-  p_tenant_tree UUID[]
+  p_table_name TEXT
 )
 RETURNS VOID
 LANGUAGE plpgsql STABLE
@@ -3163,6 +2269,7 @@ SET search_path = pg_catalog
 AS $$
 DECLARE
   v_rows JSONB := coherence._cmd_jsonb_array(p_rows);
+  v_tenant_tree UUID[];
   v_elem JSONB;
   v_raw TEXT;
   v_org_id UUID;
@@ -3170,11 +2277,16 @@ BEGIN
   IF pg_catalog.jsonb_typeof(v_rows) <> 'array' THEN
     RAISE EXCEPTION 'INVALID_ROWS: % rows must be a JSON array.', p_table_name USING ERRCODE = '22023';
   END IF;
+  IF pg_catalog.jsonb_array_length(v_rows) = 0 THEN
+    RETURN;
+  END IF;
+
+  v_tenant_tree := coherence._resolve_tenant_tree_org_ids();
+
   FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(v_rows) LOOP
     v_raw := v_elem ->> 'organization_id';
     IF v_raw IS NULL OR pg_catalog.length(pg_catalog.btrim(v_raw)) = 0 THEN
-      RAISE EXCEPTION 'INVALID_ORGANIZATION_ID: coherence.% row requires a company/agency/team organization_id in this tenant tree.', p_table_name
-        USING ERRCODE = '23503';
+      CONTINUE;
     END IF;
     BEGIN
       v_org_id := v_raw::uuid;
@@ -3182,7 +2294,7 @@ BEGIN
       RAISE EXCEPTION 'INVALID_ORGANIZATION_ID: coherence.% organization_id "%" is not a valid UUID.', p_table_name, v_raw
         USING ERRCODE = '22023';
     END;
-    IF NOT (v_org_id = ANY(p_tenant_tree)) THEN
+    IF NOT (v_org_id = ANY(v_tenant_tree)) THEN
       RAISE EXCEPTION 'INVALID_ORGANIZATION_ID: organization_id % for coherence.% is not a company/agency/team organization in this tenant tree.',
         v_org_id, p_table_name
         USING ERRCODE = '23503';
@@ -3197,50 +2309,71 @@ LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog
 AS $$
 DECLARE
-  v_elem JSONB;
-  v_sk TEXT;
-  v_sha TEXT;
-  v_sz BIGINT;
-  v_md5 TEXT;
-  v_crc TEXT;
-  v_obj TEXT;
-  v_ex RECORD;
-  v_seen TEXT[] := ARRAY[]::text[];
-  v_key TEXT;
-  v_out JSONB := '[]'::jsonb;
+  v_conflict_sha TEXT;
+  v_out JSONB;
 BEGIN
   IF p_files IS NULL OR pg_catalog.jsonb_typeof(p_files) <> 'array' THEN
     RETURN '[]'::jsonb;
   END IF;
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(p_files) LOOP
-    v_sk := COALESCE(v_elem ->> 'store_kind', v_elem ->> 'storeKind');
-    v_sha := v_elem ->> 'sha256';
-    v_sz := COALESCE(v_elem ->> 'byte_size', v_elem ->> 'byteSize')::bigint;
-    v_md5 := COALESCE(v_elem ->> 'md5_b64', v_elem ->> 'md5B64');
-    v_crc := COALESCE(v_elem ->> 'crc32c_b64', v_elem ->> 'crc32cB64');
-    v_obj := COALESCE(v_elem ->> 'object_name', v_elem ->> 'objectName', 'objects/' || v_sha);
-    v_key := v_sk || ':' || v_sha;
-    IF v_key = ANY(v_seen) THEN
-      CONTINUE;
-    END IF;
-    v_seen := pg_catalog.array_append(v_seen, v_key);
 
-    SELECT byte_size, md5_b64, crc32c_b64 INTO v_ex
-    FROM coherence.stored_files
-    WHERE store_kind = v_sk AND sha256 = v_sha;
+  WITH dedup AS (
+    SELECT DISTINCT ON (sk, sha)
+      ord, sk, sha, sz, md5, crc, obj
+    FROM (
+      SELECT
+        ord,
+        COALESCE(elem ->> 'store_kind', elem ->> 'storeKind') AS sk,
+        elem ->> 'sha256' AS sha,
+        COALESCE(elem ->> 'byte_size', elem ->> 'byteSize')::bigint AS sz,
+        COALESCE(elem ->> 'md5_b64', elem ->> 'md5B64') AS md5,
+        COALESCE(elem ->> 'crc32c_b64', elem ->> 'crc32cB64') AS crc,
+        COALESCE(elem ->> 'object_name', elem ->> 'objectName', 'objects/' || (elem ->> 'sha256')) AS obj
+      FROM pg_catalog.jsonb_array_elements(p_files) WITH ORDINALITY AS t(elem, ord)
+    ) s
+    ORDER BY sk, sha, ord
+  )
+  SELECT d.sha INTO v_conflict_sha
+  FROM dedup d
+  JOIN coherence.stored_files sf ON sf.store_kind = d.sk AND sf.sha256 = d.sha
+  WHERE sf.byte_size <> d.sz OR sf.md5_b64 <> d.md5 OR sf.crc32c_b64 <> d.crc
+  LIMIT 1;
 
-    IF FOUND THEN
-      IF v_ex.byte_size <> v_sz OR v_ex.md5_b64 <> v_md5 OR v_ex.crc32c_b64 <> v_crc THEN
-        RAISE EXCEPTION 'STORED_FILE_CONFLICT: stored file % metadata conflicts with existing record.', v_sha
-          USING ERRCODE = '23505';
-      END IF;
-    ELSE
-      v_out := v_out || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'store_kind', v_sk, 'sha256', v_sha, 'byte_size', v_sz,
-        'md5_b64', v_md5, 'crc32c_b64', v_crc, 'object_name', v_obj
-      ));
-    END IF;
-  END LOOP;
+  IF v_conflict_sha IS NOT NULL THEN
+    RAISE EXCEPTION 'STORED_FILE_CONFLICT: stored file % metadata conflicts with existing record.', v_conflict_sha
+      USING ERRCODE = '23505';
+  END IF;
+
+  WITH dedup AS (
+    SELECT DISTINCT ON (sk, sha)
+      ord, sk, sha, sz, md5, crc, obj
+    FROM (
+      SELECT
+        ord,
+        COALESCE(elem ->> 'store_kind', elem ->> 'storeKind') AS sk,
+        elem ->> 'sha256' AS sha,
+        COALESCE(elem ->> 'byte_size', elem ->> 'byteSize')::bigint AS sz,
+        COALESCE(elem ->> 'md5_b64', elem ->> 'md5B64') AS md5,
+        COALESCE(elem ->> 'crc32c_b64', elem ->> 'crc32cB64') AS crc,
+        COALESCE(elem ->> 'object_name', elem ->> 'objectName', 'objects/' || (elem ->> 'sha256')) AS obj
+      FROM pg_catalog.jsonb_array_elements(p_files) WITH ORDINALITY AS t(elem, ord)
+    ) s
+    ORDER BY sk, sha, ord
+  )
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(
+      pg_catalog.jsonb_build_object(
+        'store_kind', d.sk, 'sha256', d.sha, 'byte_size', d.sz,
+        'md5_b64', d.md5, 'crc32c_b64', d.crc, 'object_name', d.obj
+      ) ORDER BY d.ord
+    ),
+    '[]'::jsonb
+  ) INTO v_out
+  FROM dedup d
+  WHERE NOT EXISTS (
+    SELECT 1 FROM coherence.stored_files sf
+    WHERE sf.store_kind = d.sk AND sf.sha256 = d.sha
+  );
+
   RETURN v_out;
 END;
 $$;
@@ -3529,7 +2662,16 @@ BEGIN
     'batch_kind', COALESCE(v_sb ->> 'batch_kind', 'run_emission'),
     'statement_date', coherence.fmt_date(v_stmt_date),
     'source_file_name', v_sb ->> 'source_file_name',
-    'source_file_sha256', v_sb ->> 'source_file_sha256',
+    'source_file_sha256', COALESCE(
+      v_sb ->> 'source_file_sha256',
+      (
+        SELECT a.file_sha256
+        FROM coherence.artifacts a
+        WHERE a.attempt_event_id = p_attempt_event_id
+          AND a.rel_path = 'emits/statements_' || pg_catalog.to_char(v_stmt_date, 'YYYYMMDD') || '.csv'
+        LIMIT 1
+      )
+    ),
     'reason', COALESCE(v_sb ->> 'reason', 'Run emission'),
     'agency_line_count', COALESCE((v_sb ->> 'agency_line_count')::int, v_ag_cnt),
     'agency_lines_sha256', COALESCE(v_sb ->> 'agency_lines_sha256', v_ag_lines_hash),
@@ -3618,14 +2760,12 @@ DECLARE
   v_bp JSONB := coherence._cmd_jsonb_array(p_mat -> 'bob_policies');
   v_bpf JSONB := coherence._cmd_jsonb_array(p_mat -> 'bob_financials');
   v_clr JSONB := coherence._cmd_jsonb_array(p_mat -> 'ledger_rows');
-  v_tenant_tree UUID[];
 BEGIN
-  v_tenant_tree := coherence._cmd_tenant_tree_org_ids();
-  PERFORM coherence._cmd_assert_tenant_orgs(v_ag, 'statement_agency_lines', v_tenant_tree);
-  PERFORM coherence._cmd_assert_tenant_orgs(v_up, 'statement_upline_lines', v_tenant_tree);
-  PERFORM coherence._cmd_assert_tenant_orgs(v_bp, 'bob_policies', v_tenant_tree);
-  PERFORM coherence._cmd_assert_tenant_orgs(v_bpf, 'bob_policy_financials', v_tenant_tree);
-  PERFORM coherence._cmd_assert_tenant_orgs(v_clr, 'coherent_ledger_rows', v_tenant_tree);
+  PERFORM coherence._cmd_assert_tenant_orgs(v_ag, 'statement_agency_lines');
+  PERFORM coherence._cmd_assert_tenant_orgs(v_up, 'statement_upline_lines');
+  PERFORM coherence._cmd_assert_tenant_orgs(v_bp, 'bob_policies');
+  PERFORM coherence._cmd_assert_tenant_orgs(v_bpf, 'bob_policy_financials');
+  PERFORM coherence._cmd_assert_tenant_orgs(v_clr, 'coherent_ledger_rows');
 
   INSERT INTO coherence.statement_batches (
     id, batch_kind, statement_date, run_id, attempt_event_id,
@@ -3653,7 +2793,10 @@ BEGIN
     )
     SELECT
       v_batch_id, (e ->> 'line_no')::int, v_stmt_date, e ->> 'entry_kind', e ->> 'run_action', e ->> 'entity',
-      (e ->> 'organization_id')::uuid, e ->> 'writing_npn', (e ->> 'writing_person_id')::uuid, e ->> 'writing_agent',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'organization_id'), '')::uuid, coherence._resolve_entity_org_id(e ->> 'entity', 'statement_agency_lines')),
+      e ->> 'writing_npn',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'writing_person_id'), '')::uuid, coherence._resolve_writing_person_id(e ->> 'writing_npn', 'statement_agency_lines')),
+      e ->> 'writing_agent',
       e ->> 'record_id', e ->> 'reversal_of', e ->> 'corrects_record_id', e ->> 'source_file', e ->> 'sheet_name', (e ->> 'source_row_no')::int,
       e ->> 'src_type', e ->> 'carrier', e ->> 'mbi', e ->> 'member', e ->> 'external_policy_id', (e ->> 'policy_id')::int, (e ->> 'tx_id')::int,
       e ->> 'plan_type', e ->> 'simple_plan_type', e ->> 'state', (e ->> 'submission_date')::date, (e ->> 'origin_effective')::date,
@@ -3674,7 +2817,10 @@ BEGIN
     )
     SELECT
       v_batch_id, (e ->> 'line_no')::int, v_stmt_date, e ->> 'entry_kind', e ->> 'run_action', e ->> 'source_entity', COALESCE((e ->> 'marked_sent')::boolean, true),
-      (e ->> 'organization_id')::uuid, e ->> 'writing_npn', (e ->> 'writing_person_id')::uuid, e ->> 'writing_agent',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'organization_id'), '')::uuid, coherence._resolve_entity_org_id(e ->> 'source_entity', 'statement_upline_lines')),
+      e ->> 'writing_npn',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'writing_person_id'), '')::uuid, coherence._resolve_writing_person_id(e ->> 'writing_npn', 'statement_upline_lines')),
+      e ->> 'writing_agent',
       e ->> 'record_id', e ->> 'reversal_of', e ->> 'corrects_record_id', e ->> 'source_file', e ->> 'sheet_name', (e ->> 'source_row_no')::int,
       e ->> 'src_type', e ->> 'carrier', e ->> 'mbi', e ->> 'member', e ->> 'external_policy_id', (e ->> 'policy_id')::int, (e ->> 'tx_id')::int,
       e ->> 'plan_type', e ->> 'simple_plan_type', e ->> 'state', (e ->> 'submission_date')::date, (e ->> 'origin_effective')::date,
@@ -3709,7 +2855,9 @@ BEGIN
       e ->> 'carrier', e ->> 'plan_type', e ->> 'plan_name', e ->> 'simple_plan_type', e ->> 'mbi', e ->> 'member',
       e ->> 'dob', e ->> 'phone', e ->> 'email', e ->> 'address', e ->> 'county', e ->> 'state',
       (e ->> 'submission_date')::date, (e ->> 'origin_effective')::date, (e ->> 'effective_date')::date, (e ->> 'termination_date')::date,
-      e ->> 'writing_npn', e ->> 'writing_agent', e ->> 'entity', (e ->> 'organization_id')::uuid, (e ->> 'writing_person_id')::uuid,
+      e ->> 'writing_npn', e ->> 'writing_agent', e ->> 'entity',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'organization_id'), '')::uuid, coherence._resolve_entity_org_id(e ->> 'entity', 'bob_policies')),
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'writing_person_id'), '')::uuid, coherence._resolve_writing_person_id(e ->> 'writing_npn', 'bob_policies')),
       e ->> 'status', e ->> 'coherent_status', p_journal_seq
     FROM pg_catalog.jsonb_array_elements(v_bp) AS t(e);
   END IF;
@@ -3721,7 +2869,9 @@ BEGIN
       spine_source, confidence_level, coherent_trajectory, journal_seq
     )
     SELECT
-      p_attempt_event_id, (e ->> 'policy_id')::int, e ->> 'entity', e ->> 'writing_npn', (e ->> 'organization_id')::uuid, (e ->> 'writing_person_id')::uuid,
+      p_attempt_event_id, (e ->> 'policy_id')::int, e ->> 'entity', e ->> 'writing_npn',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'organization_id'), '')::uuid, coherence._resolve_entity_org_id(e ->> 'entity', 'bob_policy_financials')),
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'writing_person_id'), '')::uuid, coherence._resolve_writing_person_id(e ->> 'writing_npn', 'bob_policy_financials')),
       (e ->> 'amount')::numeric(14,2), (e ->> 'upline_amount')::numeric(14,2), e ->> 'enrollment_code',
       (e ->> 'min_date')::date, (e ->> 'anchor_date')::date, e ->> 'agency_id', e ->> 'conflicts',
       e ->> 'spine_source', (e ->> 'confidence_level')::smallint, e -> 'coherent_trajectory', p_journal_seq
@@ -3746,7 +2896,9 @@ BEGIN
       (e ->> 'gross_comm')::numeric(14,2), e ->> 'revenue_type', (e ->> 'override_amount')::numeric(14,2),
       (e ->> 'commission_amount')::numeric(14,2), (e ->> 'hra_amount')::numeric(14,2), (e ->> 'fee_amount')::numeric(14,2), (e ->> 'other_amount')::numeric(14,2),
       (e ->> 'downline_amount')::numeric(14,2), (e ->> 'upline_amount')::numeric(14,2),
-      e ->> 'writing_npn', e ->> 'writing_agent', e ->> 'entity', (e ->> 'organization_id')::uuid, (e ->> 'writing_person_id')::uuid,
+      e ->> 'writing_npn', e ->> 'writing_agent', e ->> 'entity',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'organization_id'), '')::uuid, coherence._resolve_entity_org_id(e ->> 'entity', 'coherent_ledger_rows')),
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'writing_person_id'), '')::uuid, coherence._resolve_writing_person_id(e ->> 'writing_npn', 'coherent_ledger_rows')),
       e ->> 'payee_npn', e ->> 'agency_id', e ->> 'status', e ->> 'policy_status',
       (e ->> 'cbob_c')::boolean, (e ->> 'cbob_s')::boolean, (e ->> 'sf')::boolean,
       e ->> 'notes', e ->> 'coherent_notes', e ->> 'sheet_name', (e ->> 'source_row_no')::int, p_journal_seq
@@ -3761,8 +2913,7 @@ ALTER FUNCTION coherence._cmd_check_expected_seq(BIGINT, UUID, BOOLEAN, BOOLEAN)
 ALTER FUNCTION coherence._cmd_write_journals(TEXT, UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, JSONB) OWNER TO platform_writer;
 ALTER FUNCTION coherence._cmd_jsonb_array(JSONB) OWNER TO platform_writer;
 ALTER FUNCTION coherence._cmd_jsonb_object(JSONB) OWNER TO platform_writer;
-ALTER FUNCTION coherence._cmd_tenant_tree_org_ids() OWNER TO platform_writer;
-ALTER FUNCTION coherence._cmd_assert_tenant_orgs(JSONB, TEXT, UUID[]) OWNER TO platform_writer;
+ALTER FUNCTION coherence._cmd_assert_tenant_orgs(JSONB, TEXT) OWNER TO platform_writer;
 ALTER FUNCTION coherence._cmd_filter_new_stored_files(JSONB) OWNER TO platform_writer;
 ALTER FUNCTION coherence._cmd_hash_stored_files_json(JSONB) OWNER TO platform_writer;
 ALTER FUNCTION coherence._cmd_insert_stored_files_json(JSONB, BIGINT) OWNER TO platform_writer;
@@ -3802,7 +2953,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.init_company', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('init_company', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'company_slug', p_slug);
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_hash := coherence.sha256_text(
@@ -3811,7 +2962,7 @@ BEGIN
     )) || E'\n'
   );
   v_body := pg_catalog.jsonb_build_object(
-    'result', pg_catalog.jsonb_build_object('companySlug', p_slug),
+    'result', pg_catalog.jsonb_build_object('companySlug', p_slug, 'displayName', p_display_name, 'defaultEmitMode', p_default_emit_mode),
     'commitments', pg_catalog.jsonb_build_object(
       'counts', pg_catalog.jsonb_build_object('company_meta', 1),
       'hashes', pg_catalog.jsonb_build_object('company_meta', v_hash)
@@ -3862,7 +3013,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.files.register', 'human_or_service');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('register_stored_files', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'registered', COALESCE((v_ex.existing_body->'result'->>'registered')::int, 0));
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_new := coherence._cmd_filter_new_stored_files(p_files);
@@ -3873,7 +3024,7 @@ BEGIN
   END IF;
   v_body := pg_catalog.jsonb_build_object(
     'registered', v_cnt,
-    'result', pg_catalog.jsonb_build_object('registered', v_cnt),
+    'result', pg_catalog.jsonb_build_object('insertedCount', v_cnt, 'registered', v_cnt),
     'commitments', pg_catalog.jsonb_build_object('counts', v_counts, 'hashes', v_hashes)
   );
 
@@ -3887,7 +3038,7 @@ BEGIN
 
   SET CONSTRAINTS ALL IMMEDIATE;
   SET CONSTRAINTS ALL DEFERRED;
-  RETURN pg_catalog.jsonb_build_object('idempotent', false, 'journal_seq', v_seq, 'registered', v_cnt);
+  RETURN pg_catalog.jsonb_build_object('idempotent', false, 'journal_seq', v_seq, 'registered', v_cnt, 'inserted_count', v_cnt);
 END;
 $$;
 
@@ -3934,7 +3085,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.register_engine', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('register_engine_version', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'engine_version_id', v_ex.existing_body->'result'->>'engineVersionId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_new_files := coherence._cmd_filter_new_stored_files(coherence._cmd_jsonb_array(p_payload -> 'stored_files'));
@@ -4020,7 +3171,23 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.approvals.register', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('register_approvals_file', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'file_sha256', v_sha);
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM coherence.approvals_files WHERE file_sha256 = v_sha) THEN
+    v_body := pg_catalog.jsonb_build_object(
+      'result', pg_catalog.jsonb_build_object('fileSha256', v_sha, 'alreadyRegistered', true),
+      'commitments', pg_catalog.jsonb_build_object('counts', '{}'::jsonb, 'hashes', '{}'::jsonb)
+    );
+    v_seq := coherence._cmd_write_journals(
+      v_ctx.environment, v_ctx.tenant_org_id, v_ctx.actor_person_id, v_ctx.recorded_as,
+      v_ctx.actor_label, v_ctx.acting_for_label,
+      'register_approvals_file', p_command_key, p_request_sha256, v_body,
+      pg_catalog.jsonb_build_object('file_sha256', v_sha, 'already_registered', true)
+    );
+    SET CONSTRAINTS ALL IMMEDIATE;
+    SET CONSTRAINTS ALL DEFERRED;
+    RETURN pg_catalog.jsonb_build_object('idempotent', false, 'already_registered', true, 'journal_seq', v_seq, 'file_sha256', v_sha);
   END IF;
 
   v_new_files := coherence._cmd_filter_new_stored_files(pg_catalog.jsonb_build_array(p_stored_file));
@@ -4056,7 +3223,7 @@ BEGIN
   END IF;
 
   v_body := pg_catalog.jsonb_build_object(
-    'result', pg_catalog.jsonb_build_object('fileSha256', v_sha, 'rowCount', p_row_count),
+    'result', pg_catalog.jsonb_build_object('fileSha256', v_sha, 'rowCount', p_row_count, 'alreadyRegistered', false),
     'commitments', pg_catalog.jsonb_build_object('counts', v_counts, 'hashes', v_hashes)
   );
   v_seq := coherence._cmd_write_journals(
@@ -4134,7 +3301,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.inputs.publish', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('publish_input_version', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'input_version_id', v_ex.existing_body->'result'->>'inputVersionId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, NULL, p_line_kind = 'standing', false);
 
@@ -4144,6 +3311,65 @@ BEGIN
     WHERE line_kind = 'standing'
     ORDER BY journal_seq DESC
     LIMIT 1;
+
+    -- Auto-compute standing diff (including byte-identical renames) when caller omitted p_changes.
+    IF v_parent_id IS NOT NULL AND (p_changes IS NULL OR pg_catalog.jsonb_typeof(p_changes) = 'null') THEN
+      WITH prev_e AS (
+        SELECT rel_path, file_sha256
+        FROM coherence.input_entries
+        WHERE input_version_id = v_parent_id
+      ),
+      next_e AS (
+        SELECT elem ->> 'rel_path' AS rel_path, elem ->> 'file_sha256' AS file_sha256
+        FROM pg_catalog.jsonb_array_elements(v_entries) AS t(elem)
+      ),
+      replaced AS (
+        SELECT 'replaced'::text AS change_kind, n.rel_path, NULL::text AS old_rel_path,
+               n.file_sha256, p.file_sha256 AS prev_file_sha256
+        FROM next_e n
+        JOIN prev_e p ON p.rel_path = n.rel_path AND p.file_sha256 <> n.file_sha256
+      ),
+      raw_rem AS (
+        SELECT p.rel_path, p.file_sha256,
+               pg_catalog.row_number() OVER (PARTITION BY p.file_sha256 ORDER BY p.rel_path COLLATE "C") AS rn
+        FROM prev_e p
+        WHERE NOT EXISTS (SELECT 1 FROM next_e n WHERE n.rel_path = p.rel_path)
+      ),
+      raw_add AS (
+        SELECT n.rel_path, n.file_sha256,
+               pg_catalog.row_number() OVER (PARTITION BY n.file_sha256 ORDER BY n.rel_path COLLATE "C") AS rn
+        FROM next_e n
+        WHERE NOT EXISTS (SELECT 1 FROM prev_e p WHERE p.rel_path = n.rel_path)
+      ),
+      renamed AS (
+        SELECT 'renamed'::text AS change_kind, a.rel_path, r.rel_path AS old_rel_path,
+               a.file_sha256, NULL::text AS prev_file_sha256
+        FROM raw_rem r
+        JOIN raw_add a ON a.file_sha256 = r.file_sha256 AND a.rn = r.rn
+      ),
+      removed AS (
+        SELECT 'removed'::text AS change_kind, r.rel_path, NULL::text AS old_rel_path,
+               NULL::text AS file_sha256, r.file_sha256 AS prev_file_sha256
+        FROM raw_rem r
+        WHERE NOT EXISTS (SELECT 1 FROM renamed rn WHERE rn.old_rel_path = r.rel_path)
+      ),
+      added AS (
+        SELECT 'added'::text AS change_kind, a.rel_path, NULL::text AS old_rel_path,
+               a.file_sha256, NULL::text AS prev_file_sha256
+        FROM raw_add a
+        WHERE NOT EXISTS (SELECT 1 FROM renamed rn WHERE rn.rel_path = a.rel_path)
+      ),
+      all_ch AS (
+        SELECT * FROM replaced UNION ALL SELECT * FROM renamed UNION ALL SELECT * FROM removed UNION ALL SELECT * FROM added
+      )
+      SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'change_kind', change_kind, 'rel_path', rel_path, 'old_rel_path', old_rel_path,
+        'file_sha256', file_sha256, 'prev_file_sha256', prev_file_sha256
+      )), '[]'::jsonb)
+      INTO v_changes
+      FROM all_ch;
+      v_change_cnt := pg_catalog.jsonb_array_length(v_changes);
+    END IF;
   END IF;
 
   v_new_files := coherence._cmd_filter_new_stored_files(p_stored_files);
@@ -4257,7 +3483,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.inputs.publish', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('publish_input_version', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'input_version_id', v_ex.existing_body->'result'->>'inputVersionId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, NULL, true, false);
 
@@ -4360,11 +3586,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.run.launch', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('launch_run', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object(
-      'idempotent', true, 'journal_seq', v_ex.existing_seq,
-      'run_id', v_ex.existing_body->'result'->>'runId',
-      'step_request_id', v_ex.existing_body->'result'->>'stepRequestId'
-    );
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, NULL, p_origin IN ('app', 'trial'), false);
 
@@ -4461,7 +3683,8 @@ BEGIN
   SET CONSTRAINTS ALL DEFERRED;
   RETURN pg_catalog.jsonb_build_object(
     'idempotent', false, 'journal_seq', v_seq,
-    'run_id', v_run_id, 'step_request_id', v_req_id, 'folder_number', v_folder_no
+    'run_id', v_run_id, 'step_request_id', v_req_id, 'folder_number', v_folder_no,
+    'prior_decision_commit_id', v_prior_dc
   );
 END;
 $$;
@@ -4494,7 +3717,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.run.cancel', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('request_cancel', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'cancel_request_id', v_ex.existing_body->'result'->>'cancelRequestId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, p_run_id, false, false);
 
@@ -4555,7 +3778,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.run.retry', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('request_retry', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'step_request_id', v_ex.existing_body->'result'->>'stepRequestId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, p_run_id, false, false);
 
@@ -4811,11 +4034,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.review.save', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('save_review_decisions', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object(
-      'idempotent', true, 'journal_seq', v_ex.existing_seq,
-      'decision_commit_id', v_ex.existing_body->'result'->>'decisionCommitId',
-      'review_save_id', v_ex.existing_body->'result'->>'reviewSaveId'
-    );
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   IF p_surface IS NULL OR p_surface NOT IN ('bible', 'adjust') THEN
     RAISE EXCEPTION 'INVALID_SURFACE: review surface must be bible or adjust.' USING ERRCODE = '22023';
@@ -4919,44 +4138,42 @@ BEGIN
     END IF;
   END IF;
 
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(v_in) LOOP
-    v_ord := v_ord + 1;
-    v_dec_id := COALESCE((v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid());
-    v_rec_id := v_elem ->> 'record_id';
-    v_prev := v_head_map -> v_rec_id;
-    v_prev_id := CASE WHEN v_prev IS NOT NULL THEN (v_prev ->> 'id')::uuid ELSE NULL END;
-
-    IF v_prior_same_found AND v_all_unchanged THEN
-      IF v_prev IS NULL
-         OR (v_prev ->> 'disposition') IS DISTINCT FROM (v_elem ->> 'disposition')
-         OR (v_prev ->> 'agent') IS DISTINCT FROM (v_elem ->> 'agent')
-         OR (v_prev ->> 'agency') IS DISTINCT FROM (v_elem ->> 'agency')
-         OR (v_prev ->> 'book') IS DISTINCT FROM (v_elem ->> 'book')
-         OR (v_prev ->> 'status') IS DISTINCT FROM (v_elem ->> 'status')
-         OR (v_prev ->> 'note') IS DISTINCT FROM (v_elem ->> 'note')
-         OR (v_prev ->> 'approved_amount') IS DISTINCT FROM (v_elem ->> 'approved_amount')
-         OR (v_prev ->> 'approved_agency') IS DISTINCT FROM (v_elem ->> 'approved_agency')
-         OR (v_prev ->> 'approved_agent') IS DISTINCT FROM (v_elem ->> 'approved_agent')
-         OR (v_prev ->> 'approved_agency_from') IS DISTINCT FROM (v_elem ->> 'approved_agency_from')
-         OR (v_prev ->> 'approved_agent_from') IS DISTINCT FROM (v_elem ->> 'approved_agent_from')
-      THEN
-        v_all_unchanged := false;
-      END IF;
-    END IF;
-
-    v_dec_rows := v_dec_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'id', v_dec_id, 'row_order', v_ord, 'record_id', v_rec_id,
-      'replaces_decision_id', v_prev_id, 'disposition', v_elem ->> 'disposition',
-      'agent', v_elem ->> 'agent', 'agency', v_elem ->> 'agency', 'book', v_elem ->> 'book',
-      'status', v_elem ->> 'status', 'note', v_elem ->> 'note',
-      'approved_amount', v_elem ->> 'approved_amount', 'approved_agency', v_elem ->> 'approved_agency',
-      'approved_agent', v_elem ->> 'approved_agent',
-      'approved_agency_from', v_elem ->> 'approved_agency_from',
-      'approved_agent_from', v_elem ->> 'approved_agent_from',
+  v_ord := v_in_cnt;
+  SELECT
+    COALESCE(pg_catalog.bool_and(
+      prev_obj IS NOT NULL
+      AND (prev_obj ->> 'disposition') IS NOT DISTINCT FROM (elem ->> 'disposition')
+      AND (prev_obj ->> 'agent') IS NOT DISTINCT FROM (elem ->> 'agent')
+      AND (prev_obj ->> 'agency') IS NOT DISTINCT FROM (elem ->> 'agency')
+      AND (prev_obj ->> 'book') IS NOT DISTINCT FROM (elem ->> 'book')
+      AND (prev_obj ->> 'status') IS NOT DISTINCT FROM (elem ->> 'status')
+      AND (prev_obj ->> 'note') IS NOT DISTINCT FROM (elem ->> 'note')
+      AND (prev_obj ->> 'approved_amount') IS NOT DISTINCT FROM (elem ->> 'approved_amount')
+      AND (prev_obj ->> 'approved_agency') IS NOT DISTINCT FROM (elem ->> 'approved_agency')
+      AND (prev_obj ->> 'approved_agent') IS NOT DISTINCT FROM (elem ->> 'approved_agent')
+      AND (prev_obj ->> 'approved_agency_from') IS NOT DISTINCT FROM (elem ->> 'approved_agency_from')
+      AND (prev_obj ->> 'approved_agent_from') IS NOT DISTINCT FROM (elem ->> 'approved_agent_from')
+    ), true),
+    COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', COALESCE((elem ->> 'id')::uuid, pg_catalog.gen_random_uuid()),
+      'row_order', ord::int,
+      'record_id', elem ->> 'record_id',
+      'replaces_decision_id', CASE WHEN prev_obj IS NOT NULL THEN (prev_obj ->> 'id')::uuid ELSE NULL END,
+      'disposition', elem ->> 'disposition',
+      'agent', elem ->> 'agent', 'agency', elem ->> 'agency', 'book', elem ->> 'book',
+      'status', elem ->> 'status', 'note', elem ->> 'note',
+      'approved_amount', elem ->> 'approved_amount', 'approved_agency', elem ->> 'approved_agency',
+      'approved_agent', elem ->> 'approved_agent',
+      'approved_agency_from', elem ->> 'approved_agency_from',
+      'approved_agent_from', elem ->> 'approved_agent_from',
       'decided_at', coherence.format_utc_us(v_now),
-      'committed_at_raw', COALESCE(v_elem ->> 'committed_at_raw', coherence.format_utc_us(v_now))
-    ));
-  END LOOP;
+      'committed_at_raw', COALESCE(elem ->> 'committed_at_raw', coherence.format_utc_us(v_now))
+    ) ORDER BY ord), '[]'::jsonb)
+  INTO v_all_unchanged, v_dec_rows
+  FROM (
+    SELECT ord, elem, v_head_map -> (elem ->> 'record_id') AS prev_obj
+    FROM pg_catalog.jsonb_array_elements(v_in) WITH ORDINALITY AS t(elem, ord)
+  ) s;
 
   IF v_prior_same_found AND v_in_cnt > 0 AND v_all_unchanged THEN
     RAISE EXCEPTION 'DUPLICATE_REVIEW_SAVE: submitted decisions are identical to the current saved review.'
@@ -5123,7 +4340,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.confirm_emit', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('confirm_emit', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'emit_confirmation_id', v_ex.existing_body->'result'->>'emitConfirmationId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, p_run_id, false, false);
 
@@ -5171,7 +4388,8 @@ CREATE OR REPLACE FUNCTION app_cmd.coherence_carry_sent(
   p_typed_phrase TEXT,
   p_reason TEXT DEFAULT NULL,
   p_carry_id UUID DEFAULT NULL,
-  p_input_version_id UUID DEFAULT NULL
+  p_input_version_id UUID DEFAULT NULL,
+  p_sent_provenance JSONB DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER
@@ -5205,7 +4423,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.carry_sent', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('carry_sent', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'carry_id', v_ex.existing_body->'result'->>'carryId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, p_run_id, true, false);
 
@@ -5278,7 +4496,7 @@ BEGIN
   v_body := pg_catalog.jsonb_build_object(
     'result', pg_catalog.jsonb_build_object('carryId', v_carry_id, 'publishedInputVersionId', v_iv_id, 'statementDate', coherence.fmt_date(v_stmt_date), 'fileSha256', v_file_sha),
     'commitments', pg_catalog.jsonb_build_object('counts', v_counts, 'hashes', v_hashes)
-  );
+  ) || CASE WHEN p_sent_provenance IS NOT NULL THEN pg_catalog.jsonb_build_object('sentProvenance', p_sent_provenance) ELSE '{}'::jsonb END;
   v_seq := coherence._cmd_write_journals(
     v_ctx.environment, v_ctx.tenant_org_id, v_ctx.actor_person_id, v_ctx.recorded_as,
     v_ctx.actor_label, v_ctx.acting_for_label,
@@ -5356,7 +4574,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.carry_approvals', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('carry_approvals', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'carry_id', v_ex.existing_body->'result'->>'carryId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, p_run_id, true, false);
 
@@ -5524,7 +4742,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.carry_decisions', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('carry_decisions', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'carry_id', v_ex.existing_body->'result'->>'carryId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, p_run_id, false, false);
 
@@ -5582,7 +4800,7 @@ BEGIN
 
   SET CONSTRAINTS ALL IMMEDIATE;
   SET CONSTRAINTS ALL DEFERRED;
-  RETURN pg_catalog.jsonb_build_object('idempotent', false, 'journal_seq', v_seq, 'carry_id', v_carry_id, 'carried_decision_commit_id', v_carried_dc);
+  RETURN pg_catalog.jsonb_build_object('idempotent', false, 'journal_seq', v_seq, 'carry_id', v_carry_id, 'carried_decision_commit_id', v_carried_dc, 'nothing_new', v_nothing_new);
 END;
 $$;
 
@@ -5611,7 +4829,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.abandon_run', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('abandon_run', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'abandonment_id', v_ex.existing_body->'result'->>'abandonmentId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   PERFORM coherence._cmd_check_expected_seq(p_expected_seq, p_run_id, false, false);
 
@@ -5680,7 +4898,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.record_baseline', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('record_decision_baseline', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'decision_commit_id', v_ex.existing_body->'result'->>'decisionCommitId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   IF v_parent_id IS NOT NULL THEN
@@ -5691,33 +4909,48 @@ BEGIN
     FROM coherence.decisions_current(v_parent_id);
   END IF;
 
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'decisions')) LOOP
-    v_ord := v_ord + 1;
-    v_dec_id := COALESCE((v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid());
-    v_rec_id := v_elem ->> 'record_id';
-    v_prev_id := (v_head_map ->> v_rec_id)::uuid;
-    v_head_map := v_head_map || pg_catalog.jsonb_build_object(v_rec_id, v_dec_id::text);
-    v_dec_at := COALESCE((v_elem ->> 'decided_at')::timestamptz, v_orig, v_now);
-    v_rows := v_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'id', v_dec_id, 'row_order', v_ord,
-      'run_id', v_elem ->> 'run_id', 'surface', v_elem ->> 'surface',
-      'record_id', v_rec_id, 'replaces_decision_id', v_prev_id,
-      'disposition', COALESCE(v_elem ->> 'disposition', 'CONFIRM'),
-      'agent', v_elem ->> 'agent', 'agency', v_elem ->> 'agency',
-      'policy', v_elem ->> 'policy', 'book', v_elem ->> 'book',
-      'month', v_elem ->> 'month', 'status', v_elem ->> 'status', 'note', v_elem ->> 'note',
-      'approved_amount', CASE WHEN v_hc = 'v1' THEN NULL ELSE v_elem ->> 'approved_amount' END,
-      'approved_agency', CASE WHEN v_hc = 'v1' THEN NULL ELSE v_elem ->> 'approved_agency' END,
-      'approved_agent', CASE WHEN v_hc = 'v1' THEN NULL ELSE v_elem ->> 'approved_agent' END,
-      'approved_agency_from', CASE WHEN v_hc = 'v1' THEN NULL ELSE v_elem ->> 'approved_agency_from' END,
-      'approved_agent_from', CASE WHEN v_hc = 'v1' THEN NULL ELSE v_elem ->> 'approved_agent_from' END,
-      'decided_by', COALESCE(v_elem ->> 'decided_by', v_ctx.actor_label),
-      'acting_for', COALESCE(v_elem ->> 'acting_for', v_ctx.acting_for_label),
-      'decided_at', coherence.format_utc_us(v_dec_at),
-      'committed_at_raw', v_elem ->> 'committed_at_raw',
+  WITH input_rows AS MATERIALIZED (
+    SELECT
+      ord::int AS row_order,
+      COALESCE((elem ->> 'id')::uuid, pg_catalog.gen_random_uuid()) AS dec_id,
+      elem ->> 'record_id' AS rec_id,
+      COALESCE((elem ->> 'decided_at')::timestamptz, v_orig, v_now) AS dec_at,
+      elem
+    FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'decisions'))
+         WITH ORDINALITY AS t(elem, ord)
+  ),
+  chained AS (
+    SELECT
+      ir.*,
+      COALESCE(
+        pg_catalog.lag(ir.dec_id) OVER (PARTITION BY ir.rec_id ORDER BY ir.row_order),
+        (v_head_map ->> ir.rec_id)::uuid
+      ) AS prev_id
+    FROM input_rows ir
+  )
+  SELECT
+    pg_catalog.count(*)::int,
+    COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', c.dec_id, 'row_order', c.row_order,
+      'run_id', c.elem ->> 'run_id', 'surface', c.elem ->> 'surface',
+      'record_id', c.rec_id, 'replaces_decision_id', c.prev_id,
+      'disposition', COALESCE(c.elem ->> 'disposition', 'CONFIRM'),
+      'agent', c.elem ->> 'agent', 'agency', c.elem ->> 'agency',
+      'policy', c.elem ->> 'policy', 'book', c.elem ->> 'book',
+      'month', c.elem ->> 'month', 'status', c.elem ->> 'status', 'note', c.elem ->> 'note',
+      'approved_amount', CASE WHEN v_hc = 'v1' THEN NULL ELSE c.elem ->> 'approved_amount' END,
+      'approved_agency', CASE WHEN v_hc = 'v1' THEN NULL ELSE c.elem ->> 'approved_agency' END,
+      'approved_agent', CASE WHEN v_hc = 'v1' THEN NULL ELSE c.elem ->> 'approved_agent' END,
+      'approved_agency_from', CASE WHEN v_hc = 'v1' THEN NULL ELSE c.elem ->> 'approved_agency_from' END,
+      'approved_agent_from', CASE WHEN v_hc = 'v1' THEN NULL ELSE c.elem ->> 'approved_agent_from' END,
+      'decided_by', COALESCE(c.elem ->> 'decided_by', v_ctx.actor_label),
+      'acting_for', COALESCE(c.elem ->> 'acting_for', v_ctx.acting_for_label),
+      'decided_at', coherence.format_utc_us(c.dec_at),
+      'committed_at_raw', c.elem ->> 'committed_at_raw',
       'imported', v_imp
-    ));
-  END LOOP;
+    ) ORDER BY c.row_order), '[]'::jsonb)
+  INTO v_ord, v_rows
+  FROM chained c;
 
   SELECT coherence.sha256_text(COALESCE(pg_catalog.string_agg(
     coherence.canonical_json(pg_catalog.jsonb_build_array(
@@ -5757,7 +4990,7 @@ BEGIN
   END IF;
 
   v_body := pg_catalog.jsonb_build_object(
-    'result', pg_catalog.jsonb_build_object('decisionCommitId', v_dc_id, 'addedDecisionCount', v_ord),
+    'result', pg_catalog.jsonb_build_object('decisionCommitId', v_dc_id, 'addedDecisionCount', v_ord, 'cumulativeDecisionCount', v_parent_cum + v_ord),
     'commitments', pg_catalog.jsonb_build_object('counts', v_counts, 'hashes', v_hashes)
   );
   v_seq := coherence._cmd_write_journals(
@@ -5795,7 +5028,10 @@ BEGIN
 
   SET CONSTRAINTS ALL IMMEDIATE;
   SET CONSTRAINTS ALL DEFERRED;
-  RETURN pg_catalog.jsonb_build_object('idempotent', false, 'journal_seq', v_seq, 'decision_commit_id', v_dc_id, 'added_count', v_ord);
+  RETURN pg_catalog.jsonb_build_object(
+    'idempotent', false, 'journal_seq', v_seq,
+    'decision_commit_id', v_dc_id, 'added_count', v_ord, 'cumulative_count', v_parent_cum + v_ord
+  );
 END;
 $$;
 
@@ -5821,11 +5057,8 @@ DECLARE
   v_reason TEXT := p_payload ->> 'reason';
   v_ag_in JSONB := coherence._cmd_jsonb_array(p_payload -> 'agency_lines');
   v_up_in JSONB := coherence._cmd_jsonb_array(p_payload -> 'upline_lines');
-  v_tenant_tree UUID[];
   v_ag_norm JSONB := '[]'::jsonb;
   v_up_norm JSONB := '[]'::jsonb;
-  v_elem JSONB;
-  v_idx INT := 0;
   v_ag_cnt INT;
   v_up_cnt INT;
   v_ag_net NUMERIC(14,2) := 0.00;
@@ -5845,22 +5078,20 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.record_statement_batch', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('record_statement_batch', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'batch_id', v_ex.existing_body->'result'->>'batchId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   IF v_kind NOT IN ('historical_sent', 'method_correction') THEN
     RAISE EXCEPTION 'INVALID_BATCH_KIND: standalone statement batch must be historical_sent or method_correction.' USING ERRCODE = '22023';
   END IF;
 
-  v_tenant_tree := coherence._cmd_tenant_tree_org_ids();
-  PERFORM coherence._cmd_assert_tenant_orgs(v_ag_in, 'statement_agency_lines', v_tenant_tree);
-  PERFORM coherence._cmd_assert_tenant_orgs(v_up_in, 'statement_upline_lines', v_tenant_tree);
+  PERFORM coherence._cmd_assert_tenant_orgs(v_ag_in, 'statement_agency_lines');
+  PERFORM coherence._cmd_assert_tenant_orgs(v_up_in, 'statement_upline_lines');
 
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(v_ag_in) LOOP
-    v_idx := v_idx + 1;
-    v_ag_net := v_ag_net + (v_elem ->> 'amount')::numeric(14,2);
-    v_ag_norm := v_ag_norm || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'line_no', COALESCE((v_elem ->> 'line_no')::int, v_idx),
+  SELECT
+    COALESCE(pg_catalog.sum((v_elem ->> 'amount')::numeric(14,2)), 0.00)::numeric(14,2),
+    COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'line_no', COALESCE((v_elem ->> 'line_no')::int, ord::int),
       'entry_kind', COALESCE(v_elem ->> 'entry_kind', CASE WHEN v_kind = 'method_correction' THEN 'method_correction' ELSE 'historical_sent' END),
       'run_action', COALESCE(v_elem ->> 'run_action', CASE WHEN v_kind = 'method_correction' THEN 'CORRECTION' ELSE 'SENT' END),
       'entity', v_elem ->> 'entity',
@@ -5873,7 +5104,7 @@ BEGIN
       'corrects_record_id', v_elem ->> 'corrects_record_id',
       'source_file', COALESCE(v_elem ->> 'source_file', v_src_name, v_kind || '_' || coherence.fmt_date(v_stmt_date)),
       'sheet_name', v_elem ->> 'sheet_name',
-      'source_row_no', COALESCE((v_elem ->> 'source_row_no')::int, v_idx),
+      'source_row_no', COALESCE((v_elem ->> 'source_row_no')::int, ord::int),
       'src_type', v_elem ->> 'src_type', 'carrier', v_elem ->> 'carrier',
       'mbi', v_elem ->> 'mbi', 'member', v_elem ->> 'member',
       'external_policy_id', v_elem ->> 'external_policy_id',
@@ -5886,15 +5117,14 @@ BEGIN
       'gross_comm', coherence.fmt_num2(COALESCE((v_elem ->> 'gross_comm')::numeric(14,2), (v_elem ->> 'amount')::numeric(14,2))),
       'amount', coherence.fmt_num2((v_elem ->> 'amount')::numeric(14,2)),
       'reason', v_elem ->> 'reason', 'notes', v_elem ->> 'notes'
-    ));
-  END LOOP;
+    ) ORDER BY ord), '[]'::jsonb)
+  INTO v_ag_net, v_ag_norm
+  FROM pg_catalog.jsonb_array_elements(v_ag_in) WITH ORDINALITY AS t(v_elem, ord);
 
-  v_idx := 0;
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(v_up_in) LOOP
-    v_idx := v_idx + 1;
-    v_up_net := v_up_net + (v_elem ->> 'amount')::numeric(14,2);
-    v_up_norm := v_up_norm || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'line_no', COALESCE((v_elem ->> 'line_no')::int, v_idx),
+  SELECT
+    COALESCE(pg_catalog.sum((v_elem ->> 'amount')::numeric(14,2)), 0.00)::numeric(14,2),
+    COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'line_no', COALESCE((v_elem ->> 'line_no')::int, ord::int),
       'entry_kind', COALESCE(v_elem ->> 'entry_kind', CASE WHEN v_kind = 'method_correction' THEN 'method_correction' ELSE 'historical_upline_derived' END),
       'run_action', COALESCE(v_elem ->> 'run_action', CASE WHEN v_kind = 'method_correction' THEN 'CORRECTION' ELSE 'SENT' END),
       'source_entity', COALESCE(v_elem ->> 'source_entity', v_elem ->> 'entity'),
@@ -5908,7 +5138,7 @@ BEGIN
       'corrects_record_id', v_elem ->> 'corrects_record_id',
       'source_file', COALESCE(v_elem ->> 'source_file', v_src_name, v_kind || '_' || coherence.fmt_date(v_stmt_date)),
       'sheet_name', v_elem ->> 'sheet_name',
-      'source_row_no', COALESCE((v_elem ->> 'source_row_no')::int, v_idx),
+      'source_row_no', COALESCE((v_elem ->> 'source_row_no')::int, ord::int),
       'src_type', v_elem ->> 'src_type', 'carrier', v_elem ->> 'carrier',
       'mbi', v_elem ->> 'mbi', 'member', v_elem ->> 'member',
       'external_policy_id', v_elem ->> 'external_policy_id',
@@ -5921,8 +5151,9 @@ BEGIN
       'gross_comm', coherence.fmt_num2(COALESCE((v_elem ->> 'gross_comm')::numeric(14,2), (v_elem ->> 'amount')::numeric(14,2))),
       'amount', coherence.fmt_num2((v_elem ->> 'amount')::numeric(14,2)),
       'reason', v_elem ->> 'reason', 'notes', v_elem ->> 'notes'
-    ));
-  END LOOP;
+    ) ORDER BY ord), '[]'::jsonb)
+  INTO v_up_net, v_up_norm
+  FROM pg_catalog.jsonb_array_elements(v_up_in) WITH ORDINALITY AS t(v_elem, ord);
 
   v_ag_cnt := pg_catalog.jsonb_array_length(v_ag_norm);
   v_up_cnt := pg_catalog.jsonb_array_length(v_up_norm);
@@ -6053,7 +5284,10 @@ BEGIN
     )
     SELECT
       v_batch_id, (e ->> 'line_no')::int, v_stmt_date, e ->> 'entry_kind', e ->> 'run_action', e ->> 'entity',
-      (e ->> 'organization_id')::uuid, e ->> 'writing_npn', (e ->> 'writing_person_id')::uuid, e ->> 'writing_agent',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'organization_id'), '')::uuid, coherence._resolve_entity_org_id(e ->> 'entity', 'statement_agency_lines')),
+      e ->> 'writing_npn',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'writing_person_id'), '')::uuid, coherence._resolve_writing_person_id(e ->> 'writing_npn', 'statement_agency_lines')),
+      e ->> 'writing_agent',
       e ->> 'record_id', e ->> 'reversal_of', e ->> 'corrects_record_id', e ->> 'source_file', e ->> 'sheet_name', (e ->> 'source_row_no')::int,
       e ->> 'src_type', e ->> 'carrier', e ->> 'mbi', e ->> 'member', e ->> 'external_policy_id', (e ->> 'policy_id')::int, (e ->> 'tx_id')::int,
       e ->> 'plan_type', e ->> 'simple_plan_type', e ->> 'state', (e ->> 'submission_date')::date, (e ->> 'origin_effective')::date,
@@ -6074,7 +5308,10 @@ BEGIN
     )
     SELECT
       v_batch_id, (e ->> 'line_no')::int, v_stmt_date, e ->> 'entry_kind', e ->> 'run_action', e ->> 'source_entity', (e ->> 'marked_sent')::boolean,
-      (e ->> 'organization_id')::uuid, e ->> 'writing_npn', (e ->> 'writing_person_id')::uuid, e ->> 'writing_agent',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'organization_id'), '')::uuid, coherence._resolve_entity_org_id(e ->> 'source_entity', 'statement_upline_lines')),
+      e ->> 'writing_npn',
+      COALESCE(NULLIF(pg_catalog.btrim(e ->> 'writing_person_id'), '')::uuid, coherence._resolve_writing_person_id(e ->> 'writing_npn', 'statement_upline_lines')),
+      e ->> 'writing_agent',
       e ->> 'record_id', e ->> 'reversal_of', e ->> 'corrects_record_id', e ->> 'source_file', e ->> 'sheet_name', (e ->> 'source_row_no')::int,
       e ->> 'src_type', e ->> 'carrier', e ->> 'mbi', e ->> 'member', e ->> 'external_policy_id', (e ->> 'policy_id')::int, (e ->> 'tx_id')::int,
       e ->> 'plan_type', e ->> 'simple_plan_type', e ->> 'state', (e ->> 'submission_date')::date, (e ->> 'origin_effective')::date,
@@ -6086,7 +5323,10 @@ BEGIN
 
   SET CONSTRAINTS ALL IMMEDIATE;
   SET CONSTRAINTS ALL DEFERRED;
-  RETURN pg_catalog.jsonb_build_object('idempotent', false, 'journal_seq', v_seq, 'batch_id', v_batch_id);
+  RETURN pg_catalog.jsonb_build_object(
+    'idempotent', false, 'journal_seq', v_seq, 'batch_id', v_batch_id,
+    'agency_line_count', v_ag_cnt, 'upline_line_count', v_up_cnt
+  );
 END;
 $$;
 
@@ -6117,29 +5357,30 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.import_history', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('import_standalone_files', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq);
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_new_files := coherence._cmd_filter_new_stored_files(coherence._cmd_jsonb_array(p_payload -> 'stored_files'));
   v_file_cnt := pg_catalog.jsonb_array_length(v_new_files);
 
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'files')) LOOP
-    IF NOT EXISTS (
-      SELECT 1 FROM coherence.imported_files f
-      WHERE f.area = (v_elem ->> 'area') AND f.rel_path = (v_elem ->> 'rel_path') AND f.file_sha256 = (v_elem ->> 'file_sha256')
-    ) THEN
-      v_imp_rows := v_imp_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'id', COALESCE((v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid()),
-        'area', v_elem ->> 'area',
-        'rel_path', v_elem ->> 'rel_path',
-        'artifact_kind', COALESCE(v_elem ->> 'artifact_kind', 'data'),
-        'store_kind', COALESCE(v_elem ->> 'store_kind', 'company_data'),
-        'file_sha256', v_elem ->> 'file_sha256',
-        'original_at', CASE WHEN v_elem ->> 'original_at' IS NULL THEN NULL ELSE coherence.format_utc_us((v_elem ->> 'original_at')::timestamptz) END,
-        'metadata', coherence._cmd_jsonb_object(v_elem -> 'metadata')
-      ));
-    END IF;
-  END LOOP;
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', COALESCE((elem ->> 'id')::uuid, pg_catalog.gen_random_uuid()),
+      'area', elem ->> 'area',
+      'rel_path', elem ->> 'rel_path',
+      'artifact_kind', COALESCE(elem ->> 'artifact_kind', 'data'),
+      'store_kind', COALESCE(elem ->> 'store_kind', 'company_data'),
+      'file_sha256', elem ->> 'file_sha256',
+      'original_at', CASE WHEN elem ->> 'original_at' IS NULL THEN NULL ELSE coherence.format_utc_us((elem ->> 'original_at')::timestamptz) END,
+      'metadata', coherence._cmd_jsonb_object(elem -> 'metadata')
+    ) ORDER BY ord),
+    '[]'::jsonb
+  ) INTO v_imp_rows
+  FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'files')) WITH ORDINALITY AS t(elem, ord)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM coherence.imported_files f
+    WHERE f.area = (elem ->> 'area') AND f.rel_path = (elem ->> 'rel_path') AND f.file_sha256 = (elem ->> 'file_sha256')
+  );
   v_imp_cnt := pg_catalog.jsonb_array_length(v_imp_rows);
 
   IF v_file_cnt > 0 THEN
@@ -6159,7 +5400,7 @@ BEGIN
   END IF;
 
   v_body := pg_catalog.jsonb_build_object(
-    'result', pg_catalog.jsonb_build_object('imported', v_imp_cnt),
+    'result', pg_catalog.jsonb_build_object('importedCount', v_imp_cnt, 'imported', v_imp_cnt),
     'commitments', pg_catalog.jsonb_build_object('counts', v_counts, 'hashes', v_hashes)
   );
   v_seq := coherence._cmd_write_journals(
@@ -6281,7 +5522,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.owner.import_history', 'human_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('import_historical_run', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'run_id', v_ex.existing_body->'result'->>'runId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   SELECT id INTO v_existing_run FROM coherence.runs WHERE origin = v_origin AND source_folder = v_src_folder;
@@ -6305,49 +5546,75 @@ BEGIN
   v_new_files := coherence._cmd_filter_new_stored_files(coherence._cmd_jsonb_array(p_payload -> 'stored_files'));
   v_file_cnt := pg_catalog.jsonb_array_length(v_new_files);
 
-  -- Approvals files + approval_rows
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'approvals_files')) LOOP
-    v_af_sha := v_elem ->> 'file_sha256';
-    IF v_af_sha = ANY(v_seen_af) THEN CONTINUE; END IF;
-    v_seen_af := pg_catalog.array_append(v_seen_af, v_af_sha);
-    IF EXISTS (SELECT 1 FROM coherence.approvals_files af WHERE af.file_sha256 = v_af_sha) THEN CONTINUE; END IF;
-    v_af_shared := COALESCE((v_elem ->> 'shared_row_count')::int, 0);
-    v_af_added := '[]'::jsonb;
-    v_ar_idx := 0;
-    FOR v_sub_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(v_elem -> 'added_rows')) LOOP
-      v_ar_idx := v_ar_idx + 1;
-      v_af_added := v_af_added || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'approvals_file_sha256', v_af_sha,
-        'row_no', COALESCE((v_sub_elem ->> 'row_no')::int, v_af_shared + v_ar_idx),
-        'record_id', v_sub_elem ->> 'record_id',
-        'disposition', v_sub_elem ->> 'disposition',
-        'agent', v_sub_elem ->> 'agent', 'agency', v_sub_elem ->> 'agency',
-        'policy', v_sub_elem ->> 'policy', 'book', v_sub_elem ->> 'book',
-        'month', v_sub_elem ->> 'month', 'status', v_sub_elem ->> 'status',
-        'note', v_sub_elem ->> 'note', 'committed_at', v_sub_elem ->> 'committed_at',
-        'approved_amount', v_sub_elem ->> 'approved_amount',
-        'approved_agency', v_sub_elem ->> 'approved_agency',
-        'approved_agent', v_sub_elem ->> 'approved_agent',
-        'approved_agency_from', v_sub_elem ->> 'approved_agency_from',
-        'approved_agent_from', v_sub_elem ->> 'approved_agent_from'
-      ));
-    END LOOP;
-    SELECT coherence.sha256_text(COALESCE(pg_catalog.string_agg(
+  -- Approvals files + approval_rows (set-based jsonb_agg)
+  WITH dedup_af AS MATERIALIZED (
+    SELECT DISTINCT ON (elem ->> 'file_sha256')
+      ord AS af_ord,
+      elem ->> 'file_sha256' AS af_sha,
+      elem ->> 'header_kind' AS header_kind,
+      (elem ->> 'row_count')::int AS row_count,
+      elem ->> 'extends_sha256' AS extends_sha256,
+      COALESCE((elem ->> 'shared_row_count')::int, 0) AS shared_row_count,
+      coherence._cmd_jsonb_array(elem -> 'added_rows') AS added_rows
+    FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'approvals_files')) WITH ORDINALITY AS t(elem, ord)
+    ORDER BY elem ->> 'file_sha256', ord
+  ),
+  new_af AS MATERIALIZED (
+    SELECT * FROM dedup_af d
+    WHERE NOT EXISTS (SELECT 1 FROM coherence.approvals_files af WHERE af.file_sha256 = d.af_sha)
+  ),
+  ar_expanded AS MATERIALIZED (
+    SELECT
+      n.af_ord,
+      ar_ord,
+      n.af_sha,
+      COALESCE((sub ->> 'row_no')::int, n.shared_row_count + ar_ord::int) AS row_no,
+      pg_catalog.jsonb_build_object(
+        'approvals_file_sha256', n.af_sha,
+        'row_no', COALESCE((sub ->> 'row_no')::int, n.shared_row_count + ar_ord::int),
+        'record_id', sub ->> 'record_id',
+        'disposition', sub ->> 'disposition',
+        'agent', sub ->> 'agent', 'agency', sub ->> 'agency',
+        'policy', sub ->> 'policy', 'book', sub ->> 'book',
+        'month', sub ->> 'month', 'status', sub ->> 'status',
+        'note', sub ->> 'note', 'committed_at', sub ->> 'committed_at',
+        'approved_amount', sub ->> 'approved_amount',
+        'approved_agency', sub ->> 'approved_agency',
+        'approved_agent', sub ->> 'approved_agent',
+        'approved_agency_from', sub ->> 'approved_agency_from',
+        'approved_agent_from', sub ->> 'approved_agent_from'
+      ) AS row_obj,
       coherence.canonical_json(pg_catalog.jsonb_build_array(
-        (e ->> 'row_no')::int, e ->> 'record_id', e ->> 'disposition', e ->> 'agent', e ->> 'agency',
-        e ->> 'policy', e ->> 'book', e ->> 'month', e ->> 'status', e ->> 'note', e ->> 'committed_at',
-        e ->> 'approved_amount', e ->> 'approved_agency', e ->> 'approved_agent',
-        e ->> 'approved_agency_from', e ->> 'approved_agent_from'
-      )) || E'\n',
-      '' ORDER BY (e ->> 'row_no')::int ASC
-    ), '')) INTO v_af_added_hash FROM pg_catalog.jsonb_array_elements(v_af_added) AS t(e);
-    v_af_rows := v_af_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'file_sha256', v_af_sha, 'header_kind', v_elem ->> 'header_kind',
-      'row_count', (v_elem ->> 'row_count')::int, 'extends_sha256', v_elem ->> 'extends_sha256',
-      'shared_row_count', v_af_shared, 'added_rows_sha256', v_af_added_hash
-    ));
-    v_ar_rows := v_ar_rows || v_af_added;
-  END LOOP;
+        COALESCE((sub ->> 'row_no')::int, n.shared_row_count + ar_ord::int),
+        sub ->> 'record_id', sub ->> 'disposition', sub ->> 'agent', sub ->> 'agency',
+        sub ->> 'policy', sub ->> 'book', sub ->> 'month', sub ->> 'status', sub ->> 'note', sub ->> 'committed_at',
+        sub ->> 'approved_amount', sub ->> 'approved_agency', sub ->> 'approved_agent',
+        sub ->> 'approved_agency_from', sub ->> 'approved_agent_from'
+      )) || E'\n' AS canon_line
+    FROM new_af n
+    CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(n.added_rows) WITH ORDINALITY AS s(sub, ar_ord)
+  ),
+  ar_hashes AS (
+    SELECT af_sha, coherence.sha256_text(COALESCE(pg_catalog.string_agg(canon_line, '' ORDER BY row_no ASC), '')) AS added_hash
+    FROM ar_expanded
+    GROUP BY af_sha
+  )
+  SELECT
+    COALESCE((
+      SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'file_sha256', n.af_sha, 'header_kind', n.header_kind,
+        'row_count', n.row_count, 'extends_sha256', n.extends_sha256,
+        'shared_row_count', n.shared_row_count,
+        'added_rows_sha256', COALESCE(h.added_hash, coherence.sha256_text(''))
+      ) ORDER BY n.af_ord)
+      FROM new_af n
+      LEFT JOIN ar_hashes h ON h.af_sha = n.af_sha
+    ), '[]'::jsonb),
+    COALESCE((
+      SELECT pg_catalog.jsonb_agg(e.row_obj ORDER BY e.af_ord, e.ar_ord)
+      FROM ar_expanded e
+    ), '[]'::jsonb)
+  INTO v_af_rows, v_ar_rows;
   v_af_cnt := pg_catalog.jsonb_array_length(v_af_rows);
   v_ar_cnt := pg_catalog.jsonb_array_length(v_ar_rows);
 
@@ -6375,125 +5642,171 @@ BEGIN
     NULL::text, NULL::text, v_rerun_reason, v_src_folder
   )) || E'\n');
 
-  -- Step attempts (started + finished) and their artifacts
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'step_attempts')) LOOP
-    v_st_id := COALESCE((v_elem ->> 'start_event_id')::uuid, pg_catalog.gen_random_uuid());
-    v_fn_id := COALESCE((v_elem ->> 'finish_event_id')::uuid, (v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid());
-    v_st_no := COALESCE((v_elem ->> 'attempt_no')::int, 1);
-    v_st_arts := '[]'::jsonb;
-    FOR v_sub_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(v_elem -> 'artifacts')) LOOP
-      v_st_arts := v_st_arts || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'attempt_event_id', v_fn_id::text,
-        'rel_path', v_sub_elem ->> 'rel_path',
-        'artifact_kind', v_sub_elem ->> 'artifact_kind',
-        'store_kind', v_sub_elem ->> 'store_kind',
-        'file_sha256', v_sub_elem ->> 'file_sha256'
-      ));
-    END LOOP;
-    SELECT coherence.sha256_text(COALESCE(pg_catalog.string_agg(
+  -- Step attempts (started + finished) and their artifacts (set-based jsonb_agg)
+  WITH steps AS MATERIALIZED (
+    SELECT
+      ord AS st_ord,
+      COALESCE((elem ->> 'start_event_id')::uuid, pg_catalog.gen_random_uuid()) AS st_id,
+      COALESCE((elem ->> 'finish_event_id')::uuid, (elem ->> 'id')::uuid, pg_catalog.gen_random_uuid()) AS fn_id,
+      elem ->> 'step' AS step,
+      COALESCE((elem ->> 'attempt_no')::int, 1) AS st_no,
+      elem ->> 'born' AS born,
+      elem ->> 'log_file_sha256' AS log_file_sha256,
+      coherence._cmd_jsonb_object(elem -> 'census') AS census,
+      COALESCE(elem ->> 'started_at', elem ->> 'finished_at') AS started_at,
+      elem ->> 'finished_at' AS finished_at,
+      coherence._cmd_jsonb_array(elem -> 'artifacts') AS artifacts
+    FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'step_attempts')) WITH ORDINALITY AS t(elem, ord)
+  ),
+  arts_expanded AS MATERIALIZED (
+    SELECT
+      s.st_ord,
+      a_ord,
+      s.fn_id,
+      pg_catalog.jsonb_build_object(
+        'attempt_event_id', s.fn_id::text,
+        'rel_path', sub ->> 'rel_path',
+        'artifact_kind', sub ->> 'artifact_kind',
+        'store_kind', sub ->> 'store_kind',
+        'file_sha256', sub ->> 'file_sha256'
+      ) AS art_obj,
+      sub ->> 'rel_path' AS rel_path,
       coherence.canonical_json(pg_catalog.jsonb_build_array(
-        e ->> 'rel_path', e ->> 'artifact_kind', e ->> 'store_kind', e ->> 'file_sha256'
-      )) || E'\n',
-      '' ORDER BY (e ->> 'rel_path') COLLATE "C"
-    ), '')) INTO v_st_arts_hash FROM pg_catalog.jsonb_array_elements(v_st_arts) AS t(e);
-
-    v_ev_rows := v_ev_rows || pg_catalog.jsonb_build_array(
-      pg_catalog.jsonb_build_object(
-        'id', v_st_id::text, 'step', v_elem ->> 'step', 'attempt_no', v_st_no, 'event_kind', 'started',
-        'born', NULL, 'log_file_sha256', NULL, 'artifact_count', NULL, 'artifacts_sha256', NULL,
-        'census', NULL, 'original_at', COALESCE(v_elem ->> 'started_at', v_elem ->> 'finished_at')
-      ),
-      pg_catalog.jsonb_build_object(
-        'id', v_fn_id::text, 'step', v_elem ->> 'step', 'attempt_no', v_st_no, 'event_kind', 'finished',
-        'born', v_elem ->> 'born', 'log_file_sha256', v_elem ->> 'log_file_sha256',
-        'artifact_count', pg_catalog.jsonb_array_length(v_st_arts), 'artifacts_sha256', v_st_arts_hash,
-        'census', coherence._cmd_jsonb_object(v_elem -> 'census'), 'original_at', v_elem ->> 'finished_at'
-      )
-    );
-    v_art_rows := v_art_rows || v_st_arts;
-    v_fin_by_step := v_fin_by_step || pg_catalog.jsonb_build_object(v_elem ->> 'step', v_fn_id::text);
-  END LOOP;
+        sub ->> 'rel_path', sub ->> 'artifact_kind', sub ->> 'store_kind', sub ->> 'file_sha256'
+      )) || E'\n' AS canon_line
+    FROM steps s
+    CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(s.artifacts) WITH ORDINALITY AS a(sub, a_ord)
+  ),
+  art_agg AS (
+    SELECT
+      fn_id,
+      pg_catalog.count(*)::int AS art_cnt,
+      coherence.sha256_text(COALESCE(pg_catalog.string_agg(canon_line, '' ORDER BY rel_path COLLATE "C"), '')) AS art_hash
+    FROM arts_expanded
+    GROUP BY fn_id
+  ),
+  ev_pairs AS (
+    SELECT s.st_ord, 1 AS kind_ord, pg_catalog.jsonb_build_object(
+      'id', s.st_id::text, 'step', s.step, 'attempt_no', s.st_no, 'event_kind', 'started',
+      'born', NULL, 'log_file_sha256', NULL, 'artifact_count', NULL, 'artifacts_sha256', NULL,
+      'census', NULL, 'original_at', s.started_at
+    ) AS ev_obj
+    FROM steps s
+    UNION ALL
+    SELECT s.st_ord, 2 AS kind_ord, pg_catalog.jsonb_build_object(
+      'id', s.fn_id::text, 'step', s.step, 'attempt_no', s.st_no, 'event_kind', 'finished',
+      'born', s.born, 'log_file_sha256', s.log_file_sha256,
+      'artifact_count', COALESCE(aa.art_cnt, 0), 'artifacts_sha256', COALESCE(aa.art_hash, coherence.sha256_text('')),
+      'census', s.census, 'original_at', s.finished_at
+    ) AS ev_obj
+    FROM steps s
+    LEFT JOIN art_agg aa ON aa.fn_id = s.fn_id
+  ),
+  latest_by_step AS (
+    SELECT DISTINCT ON (step) step, fn_id
+    FROM steps
+    ORDER BY step, st_ord DESC
+  )
+  SELECT
+    COALESCE((SELECT pg_catalog.jsonb_agg(ev_obj ORDER BY st_ord, kind_ord) FROM ev_pairs), '[]'::jsonb),
+    COALESCE((SELECT pg_catalog.jsonb_agg(art_obj ORDER BY st_ord, a_ord) FROM arts_expanded), '[]'::jsonb),
+    COALESCE((SELECT pg_catalog.jsonb_object_agg(step, fn_id::text) FROM latest_by_step), '{}'::jsonb)
+  INTO v_ev_rows, v_art_rows, v_fin_by_step;
   v_ev_cnt := pg_catalog.jsonb_array_length(v_ev_rows);
   v_art_cnt := pg_catalog.jsonb_array_length(v_art_rows);
 
-  -- Review saves
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'review_saves')) LOOP
-    v_rs_att := COALESCE((v_elem ->> 'attempt_event_id')::uuid, (v_fin_by_step ->> (v_elem ->> 'surface'))::uuid);
-    IF v_rs_att IS NULL THEN CONTINUE; END IF;
-    v_rs_id := COALESCE((v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid());
-    v_rs_ids := pg_catalog.array_append(v_rs_ids, v_rs_id);
-    v_rs_rows := v_rs_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'id', v_rs_id::text, 'surface', v_elem ->> 'surface', 'attempt_event_id', v_rs_att::text,
-      'approvals_file_sha256', v_elem ->> 'approvals_file_sha256',
-      'decision_commit_id', v_elem ->> 'decision_commit_id',
-      'original_at', CASE WHEN v_elem ->> 'original_at' IS NULL THEN NULL ELSE coherence.format_utc_us((v_elem ->> 'original_at')::timestamptz) END
-    ));
-  END LOOP;
+  -- Review saves (set-based jsonb_agg)
+  WITH rs_prep AS MATERIALIZED (
+    SELECT
+      ord,
+      COALESCE((elem ->> 'id')::uuid, pg_catalog.gen_random_uuid()) AS rs_id,
+      COALESCE((elem ->> 'attempt_event_id')::uuid, (v_fin_by_step ->> (elem ->> 'surface'))::uuid) AS rs_att,
+      elem
+    FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'review_saves')) WITH ORDINALITY AS t(elem, ord)
+  )
+  SELECT
+    COALESCE(pg_catalog.array_agg(rs_id ORDER BY ord), ARRAY[]::uuid[]),
+    COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', rs_id::text, 'surface', elem ->> 'surface', 'attempt_event_id', rs_att::text,
+      'approvals_file_sha256', elem ->> 'approvals_file_sha256',
+      'decision_commit_id', elem ->> 'decision_commit_id',
+      'original_at', CASE WHEN elem ->> 'original_at' IS NULL THEN NULL ELSE coherence.format_utc_us((elem ->> 'original_at')::timestamptz) END
+    ) ORDER BY ord), '[]'::jsonb)
+  INTO v_rs_ids, v_rs_rows
+  FROM rs_prep
+  WHERE rs_att IS NOT NULL;
   v_rs_cnt := pg_catalog.jsonb_array_length(v_rs_rows);
 
-  -- Review queue items
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'review_queue_items')) LOOP
-    v_rqi_idx := v_rqi_idx + 1;
-    v_rqi_att := COALESCE(
-      (v_elem ->> 'attempt_event_id')::uuid,
-      (v_fin_by_step ->> COALESCE(v_elem ->> 'attempt_step', v_elem ->> 'surface'))::uuid
-    );
-    IF v_rqi_att IS NULL THEN CONTINUE; END IF;
-    v_rqi_rows := v_rqi_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'attempt_event_id', v_rqi_att::text,
-      'item_order', COALESCE((v_elem ->> 'item_order')::int, v_rqi_idx),
-      'surface', v_elem ->> 'surface',
-      'record_id', v_elem ->> 'record_id',
-      'case_kind', v_elem ->> 'case_kind', 'subtype', v_elem ->> 'subtype',
-      'entity', v_elem ->> 'entity', 'npn', v_elem ->> 'npn', 'amount', v_elem ->> 'amount',
-      'entity_from', v_elem ->> 'entity_from', 'npn_from', v_elem ->> 'npn_from',
-      'needs_reconfirm', COALESCE((v_elem ->> 'needs_reconfirm')::boolean, false)
-    ));
-  END LOOP;
+  -- Review queue items (set-based jsonb_agg)
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'attempt_event_id', rqi_att::text,
+      'item_order', COALESCE((elem ->> 'item_order')::int, ord::int),
+      'surface', elem ->> 'surface',
+      'record_id', elem ->> 'record_id',
+      'case_kind', elem ->> 'case_kind', 'subtype', elem ->> 'subtype',
+      'entity', elem ->> 'entity', 'npn', elem ->> 'npn', 'amount', elem ->> 'amount',
+      'entity_from', elem ->> 'entity_from', 'npn_from', elem ->> 'npn_from',
+      'needs_reconfirm', COALESCE((elem ->> 'needs_reconfirm')::boolean, false)
+    ) ORDER BY ord),
+    '[]'::jsonb
+  ) INTO v_rqi_rows
+  FROM (
+    SELECT
+      ord,
+      COALESCE(
+        (elem ->> 'attempt_event_id')::uuid,
+        (v_fin_by_step ->> COALESCE(elem ->> 'attempt_step', elem ->> 'surface'))::uuid
+      ) AS rqi_att,
+      elem
+    FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'review_queue_items')) WITH ORDINALITY AS t(elem, ord)
+  ) s
+  WHERE rqi_att IS NOT NULL;
   v_rqi_cnt := pg_catalog.jsonb_array_length(v_rqi_rows);
 
-  -- Decisions (imported = true)
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'decisions')) LOOP
-    v_rs_id := CASE
-      WHEN (v_elem ->> 'review_save_id') IS NOT NULL AND ((v_elem ->> 'review_save_id')::uuid = ANY(v_rs_ids))
-        THEN (v_elem ->> 'review_save_id')::uuid
-      ELSE NULL
-    END;
-    v_dec_rows := v_dec_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'id', COALESCE((v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid())::text,
-      'decision_commit_id', v_elem ->> 'decision_commit_id',
-      'row_order', (v_elem ->> 'row_order')::int,
+  -- Decisions (imported = true, set-based jsonb_agg)
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', COALESCE((elem ->> 'id')::uuid, pg_catalog.gen_random_uuid())::text,
+      'decision_commit_id', elem ->> 'decision_commit_id',
+      'row_order', (elem ->> 'row_order')::int,
       'run_id', CASE
-        WHEN v_elem ->> 'run_id' = '__THIS_RUN__' THEN v_run_id::text
-        WHEN v_elem ? 'run_id' THEN v_elem ->> 'run_id'
+        WHEN elem ->> 'run_id' = '__THIS_RUN__' THEN v_run_id::text
+        WHEN elem ? 'run_id' THEN elem ->> 'run_id'
         ELSE v_run_id::text
       END,
-      'review_save_id', v_rs_id::text,
-      'surface', v_elem ->> 'surface',
-      'record_id', v_elem ->> 'record_id',
-      'replaces_decision_id', v_elem ->> 'replaces_decision_id',
-      'disposition', COALESCE(v_elem ->> 'disposition', 'CONFIRM'),
-      'agent', v_elem ->> 'agent', 'agency', v_elem ->> 'agency',
-      'policy', v_elem ->> 'policy', 'book', v_elem ->> 'book',
-      'month', v_elem ->> 'month', 'status', v_elem ->> 'status', 'note', v_elem ->> 'note',
-      'approved_amount', v_elem ->> 'approved_amount',
-      'approved_agency', v_elem ->> 'approved_agency',
-      'approved_agent', v_elem ->> 'approved_agent',
-      'approved_agency_from', v_elem ->> 'approved_agency_from',
-      'approved_agent_from', v_elem ->> 'approved_agent_from',
-      'decided_by', COALESCE(v_elem ->> 'decided_by', 'historical_import'),
-      'acting_for', v_elem ->> 'acting_for',
-      'decided_at', coherence.format_utc_us(COALESCE((v_elem ->> 'decided_at')::timestamptz, v_now)),
-      'committed_at_raw', v_elem ->> 'committed_at_raw'
-    ));
-  END LOOP;
+      'review_save_id', CASE
+        WHEN (elem ->> 'review_save_id') IS NOT NULL AND ((elem ->> 'review_save_id')::uuid = ANY(v_rs_ids))
+          THEN (elem ->> 'review_save_id')::uuid::text
+        ELSE NULL
+      END,
+      'surface', elem ->> 'surface',
+      'record_id', elem ->> 'record_id',
+      'replaces_decision_id', elem ->> 'replaces_decision_id',
+      'disposition', COALESCE(elem ->> 'disposition', 'CONFIRM'),
+      'agent', elem ->> 'agent', 'agency', elem ->> 'agency',
+      'policy', elem ->> 'policy', 'book', elem ->> 'book',
+      'month', elem ->> 'month', 'status', elem ->> 'status', 'note', elem ->> 'note',
+      'approved_amount', elem ->> 'approved_amount',
+      'approved_agency', elem ->> 'approved_agency',
+      'approved_agent', elem ->> 'approved_agent',
+      'approved_agency_from', elem ->> 'approved_agency_from',
+      'approved_agent_from', elem ->> 'approved_agent_from',
+      'decided_by', COALESCE(elem ->> 'decided_by', 'historical_import'),
+      'acting_for', elem ->> 'acting_for',
+      'decided_at', coherence.format_utc_us(COALESCE((elem ->> 'decided_at')::timestamptz, v_now)),
+      'committed_at_raw', elem ->> 'committed_at_raw'
+    ) ORDER BY ord),
+    '[]'::jsonb
+  ) INTO v_dec_rows
+  FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'decisions')) WITH ORDINALITY AS t(elem, ord);
   v_dec_cnt := pg_catalog.jsonb_array_length(v_dec_rows);
 
-  -- Decision commits (compute added_decision_count and added_decisions_sha256 from matching v_dec_rows)
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'decision_commits')) LOOP
-    v_dc_id := (v_elem ->> 'id')::uuid;
+  -- Decision commits (compute added_decision_count and added_decisions_sha256 from matching v_dec_rows, set-based)
+  WITH dec_by_dc AS (
     SELECT
-      pg_catalog.count(*)::int,
+      (d ->> 'decision_commit_id')::uuid AS dc_id,
+      pg_catalog.count(*)::int AS added_cnt,
       coherence.sha256_text(COALESCE(pg_catalog.string_agg(
         coherence.canonical_json(pg_catalog.jsonb_build_array(
           d ->> 'id', (d ->> 'row_order')::int, d ->> 'run_id', d ->> 'review_save_id', d ->> 'surface',
@@ -6504,59 +5817,65 @@ BEGIN
           d ->> 'decided_by', d ->> 'acting_for', d ->> 'decided_at', d ->> 'committed_at_raw', true
         )) || E'\n',
         '' ORDER BY (d ->> 'row_order')::int ASC
-      ), ''))
-    INTO v_dc_added_cnt, v_dc_added_hash
+      ), '')) AS added_hash
     FROM pg_catalog.jsonb_array_elements(v_dec_rows) AS t(d)
-    WHERE (d ->> 'decision_commit_id')::uuid = v_dc_id;
-
-    v_dc_rows := v_dc_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'id', v_dc_id::text,
-      'parent_commit_id', v_elem ->> 'parent_commit_id',
-      'commit_kind', COALESCE(v_elem ->> 'commit_kind', 'historical_overlay'),
-      'header_contract', COALESCE(v_elem ->> 'header_contract', 'v2'),
-      'added_decision_count', v_dc_added_cnt,
-      'cumulative_decision_count', (v_elem ->> 'cumulative_decision_count')::int,
-      'added_decisions_sha256', v_dc_added_hash,
-      'original_at', CASE WHEN v_elem ->> 'original_at' IS NULL THEN NULL ELSE coherence.format_utc_us((v_elem ->> 'original_at')::timestamptz) END
-    ));
-  END LOOP;
+    GROUP BY (d ->> 'decision_commit_id')::uuid
+  )
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', (elem ->> 'id')::uuid::text,
+      'parent_commit_id', elem ->> 'parent_commit_id',
+      'commit_kind', COALESCE(elem ->> 'commit_kind', 'historical_overlay'),
+      'header_contract', COALESCE(elem ->> 'header_contract', 'v2'),
+      'added_decision_count', COALESCE(agg.added_cnt, 0),
+      'cumulative_decision_count', (elem ->> 'cumulative_decision_count')::int,
+      'added_decisions_sha256', COALESCE(agg.added_hash, coherence.sha256_text('')),
+      'original_at', CASE WHEN elem ->> 'original_at' IS NULL THEN NULL ELSE coherence.format_utc_us((elem ->> 'original_at')::timestamptz) END
+    ) ORDER BY ord),
+    '[]'::jsonb
+  ) INTO v_dc_rows
+  FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'decision_commits')) WITH ORDINALITY AS t(elem, ord)
+  LEFT JOIN dec_by_dc agg ON agg.dc_id = (elem ->> 'id')::uuid;
   v_dc_cnt := pg_catalog.jsonb_array_length(v_dc_rows);
 
-  -- Generated overlays
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'generated_overlays')) LOOP
-    v_go_att := COALESCE(
-      (v_elem ->> 'attempt_event_id')::uuid,
-      CASE WHEN v_elem ->> 'attempt_step' IS NOT NULL THEN (v_fin_by_step ->> (v_elem ->> 'attempt_step'))::uuid ELSE NULL END
-    );
-    v_go_rows := v_go_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'id', COALESCE((v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid())::text,
-      'decision_commit_id', v_elem ->> 'decision_commit_id',
-      'purpose', v_elem ->> 'purpose',
-      'attempt_event_id', v_go_att::text,
-      'header_contract', COALESCE(v_elem ->> 'header_contract', 'v2'),
-      'row_count', (v_elem ->> 'row_count')::int,
-      'file_sha256', v_elem ->> 'file_sha256'
-    ));
-  END LOOP;
+  -- Generated overlays (set-based jsonb_agg)
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', COALESCE((elem ->> 'id')::uuid, pg_catalog.gen_random_uuid())::text,
+      'decision_commit_id', elem ->> 'decision_commit_id',
+      'purpose', elem ->> 'purpose',
+      'attempt_event_id', COALESCE(
+        (elem ->> 'attempt_event_id')::uuid,
+        CASE WHEN elem ->> 'attempt_step' IS NOT NULL THEN (v_fin_by_step ->> (elem ->> 'attempt_step'))::uuid ELSE NULL END
+      )::text,
+      'header_contract', COALESCE(elem ->> 'header_contract', 'v2'),
+      'row_count', (elem ->> 'row_count')::int,
+      'file_sha256', elem ->> 'file_sha256'
+    ) ORDER BY ord),
+    '[]'::jsonb
+  ) INTO v_go_rows
+  FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'generated_overlays')) WITH ORDINALITY AS t(elem, ord);
   v_go_cnt := pg_catalog.jsonb_array_length(v_go_rows);
 
-  -- Extra imported files
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'extra_imported_files')) LOOP
-    v_imp_meta := coherence._cmd_jsonb_object(v_elem -> 'metadata');
-    IF v_imp_meta ->> 'runId' = '__THIS_RUN__' THEN
-      v_imp_meta := v_imp_meta || pg_catalog.jsonb_build_object('runId', v_run_id::text);
-    END IF;
-    v_imp_rows := v_imp_rows || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'id', COALESCE((v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid())::text,
-      'area', COALESCE(v_elem ->> 'area', 'other'),
-      'rel_path', v_elem ->> 'rel_path',
-      'artifact_kind', COALESCE(v_elem ->> 'artifact_kind', 'data'),
-      'store_kind', COALESCE(v_elem ->> 'store_kind', 'company_data'),
-      'file_sha256', v_elem ->> 'file_sha256',
-      'original_at', CASE WHEN v_elem ->> 'original_at' IS NULL THEN NULL ELSE coherence.format_utc_us((v_elem ->> 'original_at')::timestamptz) END,
-      'metadata', v_imp_meta
-    ));
-  END LOOP;
+  -- Extra imported files (set-based jsonb_agg)
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', COALESCE((elem ->> 'id')::uuid, pg_catalog.gen_random_uuid())::text,
+      'area', COALESCE(elem ->> 'area', 'other'),
+      'rel_path', elem ->> 'rel_path',
+      'artifact_kind', COALESCE(elem ->> 'artifact_kind', 'data'),
+      'store_kind', COALESCE(elem ->> 'store_kind', 'company_data'),
+      'file_sha256', elem ->> 'file_sha256',
+      'original_at', CASE WHEN elem ->> 'original_at' IS NULL THEN NULL ELSE coherence.format_utc_us((elem ->> 'original_at')::timestamptz) END,
+      'metadata', CASE
+        WHEN coherence._cmd_jsonb_object(elem -> 'metadata') ->> 'runId' = '__THIS_RUN__'
+          THEN coherence._cmd_jsonb_object(elem -> 'metadata') || pg_catalog.jsonb_build_object('runId', v_run_id::text)
+        ELSE coherence._cmd_jsonb_object(elem -> 'metadata')
+      END
+    ) ORDER BY ord),
+    '[]'::jsonb
+  ) INTO v_imp_rows
+  FROM pg_catalog.jsonb_array_elements(coherence._cmd_jsonb_array(p_payload -> 'extra_imported_files')) WITH ORDINALITY AS t(elem, ord);
   v_imp_cnt := pg_catalog.jsonb_array_length(v_imp_rows);
 
   -- Build full commitment counts & hashes across all non-empty child tables
@@ -6890,7 +6209,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.checks.record', 'human_or_service');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('record_check', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'check_id', v_ex.existing_body->'result'->>'checkId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_hash := coherence.sha256_text(coherence.canonical_json(pg_catalog.jsonb_build_array(
@@ -6952,7 +6271,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.overlays.record', 'human_or_service');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('record_generated_overlay', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'overlay_id', v_ex.existing_body->'result'->>'overlayId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
   IF v_sk IS DISTINCT FROM 'company_data' THEN
     RAISE EXCEPTION 'INVALID_STORE: generated overlay must live in company_data.' USING ERRCODE = '42501';
@@ -7020,17 +6339,26 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.emit.materialize', 'human_or_service');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('materialize_emit', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object(
-      'idempotent', true, 'journal_seq', v_ex.existing_seq,
-      'run_id', v_ex.existing_body->'result'->>'runId',
-      'statement_batch_id', v_ex.existing_body->'result'->>'statementBatchId'
-    );
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM coherence.run_materializations WHERE attempt_event_id = v_att_id) THEN
+    RAISE EXCEPTION 'ALREADY_MATERIALIZED: Emit attempt has already been materialized.' USING ERRCODE = '23505';
   END IF;
 
   SELECT * INTO v_mat FROM coherence._cmd_prepare_materialization(p_payload, v_run_id, v_att_id);
 
   v_body := pg_catalog.jsonb_build_object(
-    'result', pg_catalog.jsonb_build_object('attemptEventId', v_att_id, 'runId', v_run_id, 'statementBatchId', v_mat.batch_id),
+    'result', pg_catalog.jsonb_build_object(
+      'attemptEventId', v_att_id, 'runId', v_run_id, 'statementBatchId', v_mat.batch_id,
+      'bobRowCount', (v_mat.rm_norm ->> 'bob_row_count')::int,
+      'ledgerRowCount', (v_mat.rm_norm ->> 'ledger_row_count')::int,
+      'agencyLineCount', (v_mat.sb_norm ->> 'agency_line_count')::int,
+      'uplineLineCount', (v_mat.sb_norm ->> 'upline_line_count')::int,
+      'ledgerGrossTotal', v_mat.rm_norm ->> 'ledger_gross_total',
+      'ledgerDownlineTotal', v_mat.rm_norm ->> 'ledger_downline_total',
+      'ledgerUplineTotal', v_mat.rm_norm ->> 'ledger_upline_total'
+    ),
     'commitments', pg_catalog.jsonb_build_object('counts', v_mat.counts, 'hashes', v_mat.hashes)
   );
   v_seq := coherence._cmd_write_journals(
@@ -7043,7 +6371,16 @@ BEGIN
 
   SET CONSTRAINTS ALL IMMEDIATE;
   SET CONSTRAINTS ALL DEFERRED;
-  RETURN pg_catalog.jsonb_build_object('idempotent', false, 'journal_seq', v_seq, 'run_id', v_run_id, 'statement_batch_id', v_mat.batch_id);
+  RETURN pg_catalog.jsonb_build_object(
+    'idempotent', false, 'journal_seq', v_seq, 'run_id', v_run_id, 'statement_batch_id', v_mat.batch_id,
+    'bob_row_count', (v_mat.rm_norm ->> 'bob_row_count')::int,
+    'ledger_row_count', (v_mat.rm_norm ->> 'ledger_row_count')::int,
+    'agency_line_count', (v_mat.sb_norm ->> 'agency_line_count')::int,
+    'upline_line_count', (v_mat.sb_norm ->> 'upline_line_count')::int,
+    'ledger_gross_total', v_mat.rm_norm ->> 'ledger_gross_total',
+    'ledger_downline_total', v_mat.rm_norm ->> 'ledger_downline_total',
+    'ledger_upline_total', v_mat.rm_norm ->> 'ledger_upline_total'
+  );
 END;
 $$;
 
@@ -7074,7 +6411,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.worker.attempt', 'service_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('start_attempt', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'attempt_event_id', v_ex.existing_body->'result'->>'attemptEventId', 'attempt_no', (v_ex.existing_body->'result'->>'attemptNo')::int);
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   SELECT COALESCE(pg_catalog.max(attempt_no), 0) + 1 INTO v_attempt_no
@@ -7164,12 +6501,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.worker.attempt', 'service_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('finish_attempt', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object(
-      'idempotent', true, 'journal_seq', v_ex.existing_seq,
-      'attempt_event_id', v_ex.existing_body->'result'->>'attemptEventId',
-      'next_request_id', v_ex.existing_body->'result'->>'nextRequestId',
-      'statement_batch_id', v_ex.existing_body->'result'->>'statementBatchId'
-    );
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_new_files := coherence._cmd_filter_new_stored_files(v_all_files);
@@ -7182,30 +6514,33 @@ BEGIN
     '' ORDER BY (e ->> 'rel_path') COLLATE "C"
   ), '')) INTO v_arts_hash FROM pg_catalog.jsonb_array_elements(v_arts) AS t(e);
 
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(v_rqi_in) LOOP
-    v_idx := v_idx + 1;
-    v_rqi_norm := v_rqi_norm || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'item_order', COALESCE((v_elem ->> 'item_order')::int, v_idx),
-      'surface', COALESCE(v_elem ->> 'surface', v_step),
-      'record_id', v_elem ->> 'record_id',
-      'case_kind', v_elem ->> 'case_kind', 'subtype', v_elem ->> 'subtype',
-      'entity', v_elem ->> 'entity', 'npn', v_elem ->> 'npn', 'amount', v_elem ->> 'amount',
-      'entity_from', v_elem ->> 'entity_from', 'npn_from', v_elem ->> 'npn_from',
-      'needs_reconfirm', COALESCE((v_elem ->> 'needs_reconfirm')::boolean, false)
-    ));
-  END LOOP;
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'item_order', COALESCE((elem ->> 'item_order')::int, ord::int),
+      'surface', COALESCE(elem ->> 'surface', v_step),
+      'record_id', elem ->> 'record_id',
+      'case_kind', elem ->> 'case_kind', 'subtype', elem ->> 'subtype',
+      'entity', elem ->> 'entity', 'npn', elem ->> 'npn', 'amount', elem ->> 'amount',
+      'entity_from', elem ->> 'entity_from', 'npn_from', elem ->> 'npn_from',
+      'needs_reconfirm', COALESCE((elem ->> 'needs_reconfirm')::boolean, false)
+    ) ORDER BY ord),
+    '[]'::jsonb
+  ) INTO v_rqi_norm
+  FROM pg_catalog.jsonb_array_elements(v_rqi_in) WITH ORDINALITY AS t(elem, ord);
   v_rqi_cnt := pg_catalog.jsonb_array_length(v_rqi_norm);
 
-  FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(v_go_in) LOOP
-    v_go_norm := v_go_norm || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'id', COALESCE((v_elem ->> 'id')::uuid, pg_catalog.gen_random_uuid())::text,
-      'decision_commit_id', v_elem ->> 'decision_commit_id',
-      'purpose', v_elem ->> 'purpose',
-      'header_contract', COALESCE(v_elem ->> 'header_contract', 'v2'),
-      'row_count', (v_elem ->> 'row_count')::int,
-      'file_sha256', v_elem ->> 'file_sha256'
-    ));
-  END LOOP;
+  SELECT COALESCE(
+    pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'id', COALESCE((elem ->> 'id')::uuid, pg_catalog.gen_random_uuid())::text,
+      'decision_commit_id', elem ->> 'decision_commit_id',
+      'purpose', elem ->> 'purpose',
+      'header_contract', COALESCE(elem ->> 'header_contract', 'v2'),
+      'row_count', (elem ->> 'row_count')::int,
+      'file_sha256', elem ->> 'file_sha256'
+    ) ORDER BY ord),
+    '[]'::jsonb
+  ) INTO v_go_norm
+  FROM pg_catalog.jsonb_array_elements(v_go_in) WITH ORDINALITY AS t(elem, ord);
   v_go_cnt := pg_catalog.jsonb_array_length(v_go_norm);
 
   v_ev_hash := coherence.sha256_text(coherence.canonical_json(pg_catalog.jsonb_build_array(
@@ -7265,6 +6600,7 @@ BEGIN
   v_body := pg_catalog.jsonb_build_object(
     'result', pg_catalog.jsonb_build_object(
       'attemptEventId', v_ev_id, 'nextRequestId', v_next_req_id,
+      'nextStep', CASE WHEN v_next_req_id IS NOT NULL THEN v_next_step ELSE NULL END,
       'materialized', v_has_mat,
       'statementBatchId', v_mat_batch_id
     ),
@@ -7325,6 +6661,7 @@ BEGIN
   RETURN pg_catalog.jsonb_build_object(
     'idempotent', false, 'journal_seq', v_seq,
     'attempt_event_id', v_ev_id, 'next_request_id', v_next_req_id,
+    'next_step', CASE WHEN v_next_req_id IS NOT NULL THEN v_next_step ELSE NULL END,
     'statement_batch_id', v_mat_batch_id
   );
 END;
@@ -7363,7 +6700,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.worker.attempt', 'service_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('fail_attempt', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'attempt_event_id', v_ex.existing_body->'result'->>'attemptEventId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_new_files := coherence._cmd_filter_new_stored_files(v_all_files);
@@ -7437,7 +6774,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.worker.attempt', 'service_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('cancel_attempt', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'attempt_event_id', v_ex.existing_body->'result'->>'attemptEventId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_new_files := coherence._cmd_filter_new_stored_files(v_all_files);
@@ -7503,7 +6840,7 @@ BEGIN
   SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.worker.attempt', 'service_only');
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('interrupt_attempt', p_command_key, v_ctx.actor_label, v_ctx.acting_for_label, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'attempt_event_id', v_ex.existing_body->'result'->>'attemptEventId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   v_ev_hash := coherence.sha256_text(coherence.canonical_json(pg_catalog.jsonb_build_array(
@@ -7577,7 +6914,7 @@ BEGIN
 
   SELECT * INTO v_ex FROM coherence._cmd_check_idempotency('save_review', p_command_key, v_sub.actor, v_sub.acting_for, p_request_sha256);
   IF FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'review_save_id', v_ex.existing_body->'result'->>'reviewSaveId');
+    RETURN pg_catalog.jsonb_build_object('idempotent', true, 'journal_seq', v_ex.existing_seq, 'result', v_ex.existing_body -> 'result');
   END IF;
 
   IF v_sub.status <> 'pending' THEN RAISE EXCEPTION 'SUBMISSION_ALREADY_RESOLVED: submission is %.', v_sub.status USING ERRCODE = '23514'; END IF;
@@ -7756,7 +7093,24 @@ BEGIN
 END;
 $$;
 
--- Assign ownership of all 31 app_cmd.coherence_* functions to platform_writer and configure exact EXECUTE grants.
+-- 7.32 expire_old_drafts (Worker only)
+CREATE OR REPLACE FUNCTION app_cmd.coherence_expire_old_drafts()
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_ctx RECORD;
+  v_deleted INT;
+BEGIN
+  SELECT * INTO v_ctx FROM coherence._cmd_resolve_context('act:coherence.worker.attempt', 'service_only');
+  DELETE FROM coherence.review_drafts WHERE expires_at <= pg_catalog.clock_timestamp();
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN pg_catalog.jsonb_build_object('deleted', v_deleted);
+END;
+$$;
+
+-- Assign ownership of all 32 app_cmd.coherence_* functions to platform_writer and configure exact EXECUTE grants.
 DO $$
 DECLARE
   v_sig TEXT;
@@ -7775,7 +7129,7 @@ BEGIN
     'app_cmd.coherence_save_review_draft(uuid, text, integer, text, jsonb, text)',
     'app_cmd.coherence_save_review_decisions(text, text, bigint, uuid, text, jsonb, uuid, uuid, uuid)',
     'app_cmd.coherence_confirm_emit(text, text, bigint, uuid, uuid, text, uuid, uuid)',
-    'app_cmd.coherence_carry_sent(text, text, bigint, uuid, text, text, uuid, uuid)',
+    'app_cmd.coherence_carry_sent(text, text, bigint, uuid, text, text, uuid, uuid, jsonb)',
     'app_cmd.coherence_carry_approvals(text, text, bigint, uuid, text, uuid, uuid)',
     'app_cmd.coherence_carry_decisions(text, text, bigint, uuid, text, text, uuid)',
     'app_cmd.coherence_abandon_run(text, text, bigint, uuid, text, text, uuid)',
@@ -7801,7 +7155,7 @@ BEGIN
     EXECUTE 'GRANT EXECUTE ON FUNCTION ' || v_sig || ' TO platform_app, platform_worker';
   END LOOP;
 
-  -- Worker-only commands (7 commands): EXECUTE strictly for platform_worker (NEVER platform_app or PUBLIC).
+  -- Worker-only commands (8 commands): EXECUTE strictly for platform_worker (NEVER platform_app or PUBLIC).
   FOREACH v_sig IN ARRAY ARRAY[
     'app_cmd.coherence_start_attempt(text, text, uuid, text, uuid, uuid)',
     'app_cmd.coherence_finish_attempt(text, text, jsonb)',
@@ -7809,7 +7163,8 @@ BEGIN
     'app_cmd.coherence_cancel_attempt(text, text, uuid, text, integer, uuid, jsonb, jsonb, uuid)',
     'app_cmd.coherence_interrupt_attempt(text, text, uuid, text, integer, text, uuid)',
     'app_cmd.coherence_accept_review_submission(text, text, jsonb)',
-    'app_cmd.coherence_reject_review_submission(uuid, text, text)'
+    'app_cmd.coherence_reject_review_submission(uuid, text, text)',
+    'app_cmd.coherence_expire_old_drafts()'
   ] LOOP
     EXECUTE 'ALTER FUNCTION ' || v_sig || ' OWNER TO platform_writer';
     EXECUTE 'REVOKE ALL ON FUNCTION ' || v_sig || ' FROM PUBLIC, platform_app';
@@ -7833,7 +7188,7 @@ BEGIN
   -- platform_versioner: minimum read/update rights for backfill_iam_foreign_keys()
   GRANT SELECT ON
     iam.database_context,
-    iam.organizations, iam.organization_versions, iam.organization_edges,
+    iam.organizations, iam.organization_versions, iam.organization_edges, iam.v_organization_closure,
     iam.people, iam.person_versions, iam.agent_affiliations
   TO platform_versioner;
   GRANT EXECUTE ON FUNCTION iam.business_today(TIMESTAMPTZ) TO platform_versioner;
@@ -7848,8 +7203,11 @@ BEGIN
     );
   END LOOP;
 
-  -- Explicit read-only/hash helper functions for platform_writer (owns _cmd_*; NEVER backfill or _resolve_*).
+  -- Explicit read-only/hash helper functions + single IAM FK resolvers for platform_writer (NEVER backfill).
   GRANT EXECUTE ON FUNCTION
+    coherence._resolve_tenant_tree_org_ids(),
+    coherence._resolve_entity_org_id(TEXT, TEXT, JSONB),
+    coherence._resolve_writing_person_id(TEXT, TEXT, JSONB),
     coherence.slot_class_id(),
     coherence.slot_obj_id(),
     coherence.this_connection_holds_slot(),
@@ -7891,7 +7249,7 @@ BEGIN
     coherence.run_effective_statement_batches(UUID)
   TO platform_writer;
 
-  -- platform_readonly: SELECT on Coherence tables + explicit read-only query/hash helpers (NEVER backfill_iam_foreign_keys).
+  -- platform_readonly: SELECT on Coherence tables + explicit read-only helpers.
   GRANT SELECT ON ALL TABLES IN SCHEMA coherence TO platform_readonly;
   GRANT EXECUTE ON FUNCTION
     coherence.slot_class_id(),
@@ -8004,14 +7362,18 @@ BEGIN
     coherence._cmd_write_journals(TEXT, UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, JSONB),
     coherence._cmd_jsonb_array(JSONB),
     coherence._cmd_jsonb_object(JSONB),
-    coherence._cmd_tenant_tree_org_ids(),
-    coherence._cmd_assert_tenant_orgs(JSONB, TEXT, UUID[]),
+    coherence._cmd_assert_tenant_orgs(JSONB, TEXT),
     coherence._cmd_filter_new_stored_files(JSONB),
     coherence._cmd_hash_stored_files_json(JSONB),
     coherence._cmd_insert_stored_files_json(JSONB, BIGINT),
     coherence._cmd_prepare_materialization(JSONB, UUID, UUID),
     coherence._cmd_insert_materialization(JSONB, JSONB, JSONB, UUID, UUID, BIGINT)
   FROM PUBLIC;
+  GRANT EXECUTE ON FUNCTION
+    coherence._resolve_tenant_tree_org_ids(),
+    coherence._resolve_entity_org_id(TEXT, TEXT, JSONB),
+    coherence._resolve_writing_person_id(TEXT, TEXT, JSONB)
+  TO platform_writer;
 
   -- Hard lockdown: revoke EVERY Coherence and coherence_views privilege from platform_app and PUBLIC.
   REVOKE ALL ON SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;

@@ -8,12 +8,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { assertLocalPgHost, assertSafeStoresDir, runHistoryPlan, runHistoryProof } from '../scripts/prove-history.mjs';
+import { assertLocalPgHost, assertSafeStoresDir, ensureProofIamSubjectsForBatches, runHistoryPlan, runHistoryProof } from '../scripts/prove-history.mjs';
 import { createCommandLayer } from '../src/commands/command-layer.mjs';
 import { compareDatabasesAsOf, exportJournalNdjson, rebuildFromJournalExport, verifyChain, verifyCommitments } from '../src/commands/journal-export.mjs';
 import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstruction.mjs';
 import { compareCsvExactText, compareDbRuns, compareRunFolders, mapEntitiesCsv } from '../src/compare/run-comparator.mjs';
-import { createPool } from '../src/db/pg-client.mjs';
+import { createPool, withRequestTx } from '../src/db/pg-client.mjs';
 import { formatOverlayCsvFromRows, generateOverlayCsv } from '../src/decisions/overlay-generator.mjs';
 import {
   buildImportManifest,
@@ -43,6 +43,7 @@ import {
   SYNTHETIC_LEDGER_COLUMNS,
   SYNTHETIC_RUN_COLUMNS,
 } from './helpers/fixtures.mjs';
+import { createRoleScopedTestPool, seedCoherenceIamFixture } from './helpers/iam-harness.mjs';
 import { checkPgAvailable, createEmptyMigratedTestDb, createTestEnv } from './helpers/test-db.mjs';
 
 const pgCheck = await checkPgAvailable();
@@ -198,7 +199,7 @@ test('Layer 4 [Import, Rebuild, Replay & Working-Table Verification]: read-only 
   assert.equal(manifest.incidentReportFiles.length, 2);
 
   const report1 = await executeHistoryImport({
-    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pool: env.pool, stores: env.stores, commands: env.commands, dbToken: env.ownerToken,
     manifest, parseOverlay, verifyRebuild: true, tempBaseDir: env.tempDir,
   });
   assert.equal(report1.passed, true, `Import failed: ${report1.problems.join('; ')}`);
@@ -232,7 +233,7 @@ test('Layer 4 [Import, Rebuild, Replay & Working-Table Verification]: read-only 
   assert.equal(badStoreCheck.rows[0].n, 0);
 
   const report2 = await executeHistoryImport({
-    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pool: env.pool, stores: env.stores, commands: env.commands, dbToken: env.ownerToken,
     manifest, parseOverlay, verifyRebuild: false, tempBaseDir: env.tempDir,
   });
   assert.equal(report2.importedRuns.length, 0);
@@ -240,34 +241,34 @@ test('Layer 4 [Import, Rebuild, Replay & Working-Table Verification]: read-only 
   assert.equal((await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.runs')).rows[0].n, 2);
 
   const replayLaunch = await env.commands.launchRun({
-    actor: env.ownerActor, commandKey: 'replay-1121', statementDate: '2026-11-21',
+    dbToken: env.ownerToken, commandKey: 'replay-1121', statementDate: '2026-11-21',
     origin: 'replay', replaysRunId: orig1121Id, engineVersionId, emitMode: 'coherence',
   });
   const replayRunId = replayLaunch.result.runId;
 
   const worker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer({ fixedCodeHash: '809c6ea' }), tempBaseDir: env.tempDir,
   }));
 
   for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
   let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [replayRunId])).rows[0].latest_journal_seq);
-  await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'rep-b', expectedJournalSeq: seq, runId: replayRunId, surface: 'bible', csvBytes: Buffer.from(bibleCsv, 'utf8') });
+  await env.commands.submitReview({ dbToken: env.ownerToken, commandKey: 'rep-b', expectedJournalSeq: seq, runId: replayRunId, surface: 'bible', csvBytes: Buffer.from(bibleCsv, 'utf8') });
   assert.equal((await worker.runOnce()).action, 'review_accepted');
   assert.equal((await worker.runOnce()).action, 'step_finished');
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [replayRunId])).rows[0].latest_journal_seq);
-  await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'rep-a', expectedJournalSeq: seq, runId: replayRunId, surface: 'adjust', csvBytes: Buffer.from(adjCsv, 'utf8') });
+  await env.commands.submitReview({ dbToken: env.ownerToken, commandKey: 'rep-a', expectedJournalSeq: seq, runId: replayRunId, surface: 'adjust', csvBytes: Buffer.from(adjCsv, 'utf8') });
   const repAdj = await worker.runOnce();
   assert.equal(repAdj.action, 'review_accepted');
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [replayRunId])).rows[0].latest_journal_seq);
-  await env.commands.confirmEmit({ actor: env.ownerActor, commandKey: 'rep-e', expectedJournalSeq: seq, runId: replayRunId, adjustReviewSaveId: repAdj.reviewSaveId, typedPhrase: 'create statements for 2026-11-21' });
+  await env.commands.confirmEmit({ dbToken: env.ownerToken, commandKey: 'rep-e', expectedJournalSeq: seq, runId: replayRunId, adjustReviewSaveId: repAdj.reviewSaveId, typedPhrase: 'create statements for 2026-11-21' });
   assert.equal((await worker.runOnce()).action, 'step_finished');
 
   const replayProof = await compareDbRuns({
     pool: env.pool, stores: env.stores, leftRunId: replayRunId, rightRunId: orig1121Id,
-    mode: 'replay', commands: env.commands, actor: env.ownerActor, tempBaseDir: env.tempDir,
+    mode: 'replay', commands: env.commands, dbToken: env.ownerToken, tempBaseDir: env.tempDir,
   });
   assert.equal(replayProof.inputs.passed, true);
   assert.equal(replayProof.passed, true, `Replay mismatch: ${JSON.stringify(replayProof.tree.unexpectedDiffs)}`);
@@ -369,10 +370,10 @@ test('Layer 4 [Worker Default Working Rebuild]: worker rebuilds omitted working 
 
   const worker = env.registerWorker(createEngineWorker({
     pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
-    stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
   }));
-  const launch = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'wk-reb-launch', statementDate: '2026-11-21', engineVersionId });
+  const launch = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'wk-reb-launch', statementDate: '2026-11-21', engineVersionId });
   const runId = launch.result.runId;
   for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
 
@@ -401,12 +402,12 @@ test('Layer 4 [Worker Default Working Rebuild]: worker rebuilds omitted working 
 
   const seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await env.commands.submitReview({
-    actor: env.ownerActor, commandKey: 'wk-reb-bible', expectedJournalSeq: seq, runId, surface: 'bible',
+    dbToken: env.ownerToken, commandKey: 'wk-reb-bible', expectedJournalSeq: seq, runId, surface: 'bible',
     csvBytes: Buffer.from(makeOverlayCsv([row0, sampleApprovalRow({ note: 'ok' })]), 'utf8'),
   });
   const rebuildWorker = env.registerWorker(createEngineWorker({
     pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
-    stores: omitStores, commands: env.commands, workerActor: env.workerActor,
+    stores: omitStores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
   }));
   assert.equal((await rebuildWorker.runOnce()).action, 'review_accepted');
@@ -494,7 +495,7 @@ test('Layer 4 [Importer Safety & Config]: Python-only overlay parsing, failed gi
   assert.equal(acmeManifest.currentInputDir, join(legacyRoot, 'input'));
 
   const repMissingCommit = await executeHistoryImport({
-    pool: env1.pool, stores: env1.stores, commands: env1.commands, actor: env1.ownerActor,
+    pool: env1.pool, stores: env1.stores, commands: env1.commands, dbToken: env1.ownerToken,
     manifest: acmeManifest, pythonPath: 'python3', coherenceRepo: dir, overlayCheckPath: fakeCheckerOk,
     gitBin: fakeGitFail, verifyRebuild: false, tempBaseDir: env1.tempDir,
   });
@@ -506,7 +507,7 @@ test('Layer 4 [Importer Safety & Config]: Python-only overlay parsing, failed gi
   t.after(() => env2.cleanup());
   await assert.rejects(
     () => executeHistoryImport({
-      pool: env2.pool, stores: env2.stores, commands: env2.commands, actor: env2.ownerActor,
+      pool: env2.pool, stores: env2.stores, commands: env2.commands, dbToken: env2.ownerToken,
       manifest: acmeManifest, pythonPath: 'python3', coherenceRepo: dir, overlayCheckPath: fakeCheckerFail,
       allowedMissingCommits: ['deadbeef'], verifyRebuild: false, tempBaseDir: env2.tempDir,
     }),
@@ -530,7 +531,7 @@ test('Layer 4 [Importer Safety & Config]: Python-only overlay parsing, failed gi
   const env3 = await createTestEnv({ companySlug: 'beacon', displayName: 'Beacon' });
   t.after(() => env3.cleanup());
   const beaconRep = await executeHistoryImport({
-    pool: env3.pool, stores: env3.stores, commands: env3.commands, actor: env3.ownerActor,
+    pool: env3.pool, stores: env3.stores, commands: env3.commands, dbToken: env3.ownerToken,
     manifest: beaconManifest, verifyRebuild: false, tempBaseDir: env3.tempDir,
   });
   assert.equal(beaconRep.passed, true);
@@ -693,7 +694,7 @@ test('Layer 4 [opt-in COHERENCE_LIVE_PROOF=1]: import configured historical run 
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest: scopedManifest,
     pythonPath: cfg.pythonPath,
     coherenceRepo: cfg.coherenceRepo,
@@ -826,7 +827,7 @@ test('Layer 4 [Historical Overlays, Branching, Layer 2 Reconstruction & G3 Prefi
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -867,7 +868,7 @@ test('Layer 4 [Historical Overlays, Branching, Layer 2 Reconstruction & G3 Prefi
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
     tempBaseDir: env.tempDir,
@@ -916,7 +917,7 @@ test('Layer 4 [Historical Overlays, Branching, Layer 2 Reconstruction & G3 Prefi
       pool: badEnv.pool,
       stores: badEnv.stores,
       commands: badEnv.commands,
-      actor: badEnv.ownerActor,
+      dbToken: badEnv.ownerToken,
       manifest: badManifest,
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -1081,7 +1082,7 @@ test('Layer 4 [G4 Config-Driven Manifest, All Sources, Company Sent Provenance &
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     verifyRebuild: true,
     tempBaseDir: env.tempDir,
@@ -1134,8 +1135,10 @@ test('Layer 4 [G4 Config-Driven Manifest, All Sources, Company Sent Provenance &
   assert.equal(sentCarries[0].prov.source, 'company-environment/audit.json');
   assert.equal(sentCarries[0].prov.recordId, 'evt-1111');
 
-  // Verify abandoned company run is excluded from findLatestPublishedRun!
-  const latestPub = await findLatestPublishedRun(env.pool);
+  // Verify abandoned company run is excluded from findLatestPublishedRun (strictly via platform_app + app_views)!
+  const iamG4 = env.iam;
+  const appPoolG4 = createRoleScopedTestPool(env.pool, 'platform_app');
+  const latestPub = await findLatestPublishedRun(appPoolG4, iamG4.tokens.owner);
   assert.equal(latestPub.statement_date, '2026-11-12');
 
   // Verify idempotency: re-importing the same manifest adds ZERO new rows across all business tables!
@@ -1151,7 +1154,7 @@ test('Layer 4 [G4 Config-Driven Manifest, All Sources, Company Sent Provenance &
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     verifyRebuild: false,
     recordCheck: false,
@@ -1213,7 +1216,7 @@ test('Layer 4 [Pre-Coherence 5 Sent Dates & 2 Method Corrections]: imports via p
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -1255,7 +1258,7 @@ test('Layer 4 [Pre-Coherence 5 Sent Dates & 2 Method Corrections]: imports via p
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -1464,7 +1467,7 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
       pool: env.pool,
       stores: env.stores,
       commands: env.commands,
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       manifest: offByOneManifest,
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -1688,7 +1691,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
       checksPassed: true,
     });
     await env.commands.recordStatementBatch({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'hist-allagency-20260731',
       batchKind: 'historical_sent',
       statementDate: '2026-07-31',
@@ -1707,7 +1710,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
       ? corrBatch.uplineLines.map((l) => ({ ...l, amount: flipAmt(l.amount) }))
       : corrBatch.uplineLines;
     await env.commands.recordStatementBatch({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'corr-allagency-20260801',
       batchKind: 'method_correction',
       statementDate: '2026-08-01',
@@ -1722,7 +1725,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
       [standingId],
     )).rows;
     await env.commands.publishInputVersion({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'include-allagency-input',
       lineKind: 'standing',
       sourceKind: 'include',
@@ -1734,7 +1737,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
     });
 
     const launch = await env.commands.launchRun({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'launch-20260831',
       statementDate: '2026-08-31',
       origin: 'app',
@@ -1747,14 +1750,14 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
       companySlug: env.companySlug,
       stores: env.stores,
       commands: env.commands,
-      workerActor: env.workerActor,
+      workerToken: env.workerToken,
       materializeEngine: createMockEngineMaterializer(),
       tempBaseDir: env.tempDir,
     }));
     for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
     let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
     await env.commands.saveReviewDecisions({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'bible-20260831',
       expectedJournalSeq: seq,
       runId,
@@ -1767,7 +1770,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
     assert.equal((await worker.runOnce()).action, 'step_finished');
     seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
     const adjSave = await env.commands.saveReviewDecisions({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'adjust-20260831',
       expectedJournalSeq: seq,
       runId,
@@ -1776,7 +1779,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
     });
     seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
     await env.commands.confirmEmit({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'confirm-20260831',
       expectedJournalSeq: seq,
       runId,
@@ -1864,13 +1867,20 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
       reversal_of: 'carriera~spark~1AB2CD3EF45~500.00~2026-07', reason: 'cancel reversed ALLAGENCY line',
     }]);
 
+    const emitAttemptId = (await env.pool.query(
+      "SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev",
+      [runId],
+    )).rows[0].ev;
+
     return {
       env,
       runId,
       materialize: () => env.commands.materializeEmit({
-        actor: env.ownerActor,
+        dbToken: env.workerToken,
         commandKey: 'mat-20260831',
         runId,
+        attemptEventId: emitAttemptId,
+        statementDate: '2026-08-31',
         canonicalBobCsv: bobCsv,
         coherentLedgerCsv: ledgerCsv,
         statementsCsv: stmtCsv,
@@ -1900,7 +1910,11 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
 });
 
 test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal values and rounds once per statement file (ROUND_HALF_UP), keeps each line amount as Coherence shows it, preserves 8/1 split and all other totals, and passes PostgreSQL conservation', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
-  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  const env = await createTestEnv({
+    companySlug: 'acme',
+    displayName: 'Acme',
+    extraAgencies: [{ slug: 'upline', displayName: 'Upline' }],
+  });
   t.after(() => env.cleanup());
 
   const mockRepo = join(env.tempDir, 'mock-coherence');
@@ -2151,7 +2165,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -2210,7 +2224,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -2224,7 +2238,11 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   // Full PostgreSQL Emit conservation check (trg_run_materializations_verify_deferred + v_entity_statement_reconciliation)
   // proving that sub-cent plxSpark historical upline + 8/31 take-back (including rounding lines) tie out at $0.00 variance
   // both in aggregate and record-by-record.
-  const envMat = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  const envMat = await createTestEnv({
+    companySlug: 'acme',
+    displayName: 'Acme',
+    extraAgencies: [{ slug: 'upline', displayName: 'Upline' }],
+  });
   t.after(() => envMat.cleanup());
   const { engineVersionId } = await seedEngineVersion(envMat);
   await seedStandingInput(envMat, { commandKey: 'subcent-standing' });
@@ -2259,7 +2277,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     checksPassed: true,
   });
   await envMat.commands.recordStatementBatch({
-    actor: envMat.ownerActor,
+    dbToken: envMat.ownerToken,
     commandKey: 'hist-plx-20260429',
     batchKind: 'historical_sent',
     statementDate: '2026-04-29',
@@ -2270,7 +2288,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     uplineLines: matParsed.historicalBatches[0].uplineLines,
   });
   await envMat.commands.recordStatementBatch({
-    actor: envMat.ownerActor,
+    dbToken: envMat.ownerToken,
     commandKey: 'corr-plx-takeback-20260831',
     batchKind: 'method_correction',
     statementDate: '2026-08-31',
@@ -2285,7 +2303,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     [standingId],
   )).rows;
   await envMat.commands.publishInputVersion({
-    actor: envMat.ownerActor,
+    dbToken: envMat.ownerToken,
     commandKey: 'include-plx-input',
     lineKind: 'standing',
     sourceKind: 'include',
@@ -2297,7 +2315,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   });
 
   const launch = await envMat.commands.launchRun({
-    actor: envMat.ownerActor,
+    dbToken: envMat.ownerToken,
     commandKey: 'launch-subcent-20260831',
     statementDate: '2026-08-31',
     origin: 'app',
@@ -2310,14 +2328,14 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     companySlug: envMat.companySlug,
     stores: envMat.stores,
     commands: envMat.commands,
-    workerActor: envMat.workerActor,
+    workerToken: envMat.workerToken,
     materializeEngine: createMockEngineMaterializer(),
     tempBaseDir: envMat.tempDir,
   }));
   for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
   let seq = Number((await envMat.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await envMat.commands.saveReviewDecisions({
-    actor: envMat.ownerActor,
+    dbToken: envMat.ownerToken,
     commandKey: 'bible-subcent-20260831',
     expectedJournalSeq: seq,
     runId,
@@ -2330,7 +2348,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   assert.equal((await worker.runOnce()).action, 'step_finished');
   seq = Number((await envMat.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   const adjSave = await envMat.commands.saveReviewDecisions({
-    actor: envMat.ownerActor,
+    dbToken: envMat.ownerToken,
     commandKey: 'adjust-subcent-20260831',
     expectedJournalSeq: seq,
     runId,
@@ -2339,7 +2357,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   });
   seq = Number((await envMat.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await envMat.commands.confirmEmit({
-    actor: envMat.ownerActor,
+    dbToken: envMat.ownerToken,
     commandKey: 'confirm-subcent-20260831',
     expectedJournalSeq: seq,
     runId,
@@ -2398,10 +2416,16 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     },
   ]);
 
+  const subcentEmitEv = (await envMat.pool.query(
+    "SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev",
+    [runId],
+  )).rows[0].ev;
   await envMat.commands.materializeEmit({
-    actor: envMat.ownerActor,
+    dbToken: envMat.workerToken,
     commandKey: 'mat-subcent-20260831',
     runId,
+    attemptEventId: subcentEmitEv,
+    statementDate: '2026-08-31',
     canonicalBobCsv: bobCsv,
     coherentLedgerCsv: ledgerCsv,
     statementsCsv: stmtCsv,
@@ -2511,7 +2535,7 @@ test('Layer 4 [Fix 3 - Consistent SQLite Snapshot & Sidecar Guard]: never reads 
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     verifyRebuild: false,
     tempBaseDir: env.tempDir,
@@ -2577,7 +2601,7 @@ test('Layer 4 [Fix 4 - Journal Rebuild Topological Ordering]: imported run with 
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -2647,7 +2671,7 @@ test('Layer 4 [Fix 5 - Long Path Command Keys <= 200 chars]: 300-character paths
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -2665,7 +2689,7 @@ test('Layer 4 [Fix 5 - Long Path Command Keys <= 200 chars]: 300-character paths
     mode: 'substance',
     requireConservation: true,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     tempBaseDir: env.tempDir,
   });
   assert.equal(cmpRep.passed, true, `Comparator failed: ${cmpRep.problems.join('; ')}`);
@@ -2744,7 +2768,7 @@ test('Layer 4 [Fix 6 - Chronological Same-Date Runs & Merged Checkpoints]: order
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -2795,7 +2819,7 @@ test('Layer 4 [Fix 7 & Note 3 - Standing Sent Idempotency & Missing Statements P
   });
 
   await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'seed-fix7-baseline',
     commitKind: 'historical_baseline',
     headerContract: 'v2',
@@ -2814,7 +2838,7 @@ test('Layer 4 [Fix 7 & Note 3 - Standing Sent Idempotency & Missing Statements P
   });
 
   const rep1 = await executeHistoryImport({
-    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pool: env.pool, stores: env.stores, commands: env.commands, dbToken: env.ownerToken,
     manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: true, tempBaseDir: env.tempDir,
   });
   assert.equal(rep1.passed, true, `First import failed: ${rep1.problems.join('; ')}`);
@@ -2831,13 +2855,117 @@ test('Layer 4 [Fix 7 & Note 3 - Standing Sent Idempotency & Missing Statements P
 
   // Second import with Sent/statements_20261111.csv present MUST add zero rows and pass rebuild!
   const rep2 = await executeHistoryImport({
-    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pool: env.pool, stores: env.stores, commands: env.commands, dbToken: env.ownerToken,
     manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: true, recordCheck: false, tempBaseDir: env.tempDir,
   });
   const after = await snapCounts();
   assert.equal(rep2.passed, true, `Second import failed: ${rep2.problems.join('; ')}`);
   assert.equal(rep2.standingInputRebuildCheck.passed, true);
   assert.deepEqual(after, before, 're-importing with Sent/statements_<date>.csv present must add zero rows');
+
+  // Item 6: historical company_import run without audit.json whose emits/statements_<date>.csv matches
+  // standing Sent/statements_<date>.csv byte-for-byte MUST still receive a sent carry in coherence.carries!
+  const envStandingSent = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => envStandingSent.cleanup());
+  const ssRoot = join(envStandingSent.tempDir, 'src-standing-sent');
+  await writeTree(join(ssRoot, 'company-ws', '2026-11-11', 'runs', '2026-11-11'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'run.json': JSON.stringify({ date: '2026-11-11', steps: { assign: { at: '2026-11-11T10:00:00' }, emit: { at: '2026-11-11T10:05:00' } } }),
+    'emits/statements_20261111.csv': stmt1111,
+  });
+  await writeTree(join(ssRoot, 'standing-input'), {
+    'Carrier/c.csv': 'k\n1\n',
+    'Overlay/overlay.csv': ovCsv,
+    'Sent/statements_20261111.csv': stmt1111,
+  });
+  await envStandingSent.commands.recordDecisionBaseline({
+    dbToken: envStandingSent.ownerToken,
+    commandKey: 'seed-standing-sent-baseline',
+    commitKind: 'historical_baseline',
+    headerContract: 'v2',
+    imported: true,
+    decisions: [row0],
+  });
+  const ssManifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      standingInputDir: join(ssRoot, 'standing-input'),
+      companyWorkspacesDir: join(ssRoot, 'company-ws'),
+    },
+    importConfig: { includeLegacyHostHistory: false, useCompanyIncomingInput: false, currentInputSourceKind: 'company_import' },
+  });
+  const ssRep = await executeHistoryImport({
+    pool: envStandingSent.pool, stores: envStandingSent.stores, commands: envStandingSent.commands, dbToken: envStandingSent.ownerToken,
+    manifest: ssManifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: true, tempBaseDir: envStandingSent.tempDir,
+  });
+  assert.equal(ssRep.passed, true, `Standing Sent import failed: ${ssRep.problems.join('; ')}`);
+  const ssCarries = (await envStandingSent.pool.query(
+    "SELECT carry_kind, pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS dt FROM coherence.carries WHERE carry_kind = 'sent'",
+  )).rows;
+  assert.deepEqual(ssCarries, [{ carry_kind: 'sent', dt: '2026-11-11' }], 'importer must record a sent carry for historical sent run matching standing Sent/statements_<date>.csv');
+
+  // Fix round 2 (C4): two non-abandoned company runs matching the same date's standing Sent file
+  // without explicit provenance must NEVER queue two sent carries and must report a problem!
+  const envDupSent = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => envDupSent.cleanup());
+  const dupRoot = join(envDupSent.tempDir, 'src-dup-standing-sent');
+  await writeTree(join(dupRoot, 'company-ws', '2026-11-11', 'runs', '2026-11-11'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'run.json': JSON.stringify({ date: '2026-11-11', steps: { assign: { at: '2026-11-11T09:00:00' }, emit: { at: '2026-11-11T09:05:00' } } }),
+    'emits/statements_20261111.csv': stmt1111,
+  });
+  await writeTree(join(dupRoot, 'company-ws', '2026-11-11-alt', 'runs', '2026-11-11'), {
+    'input/Overlay/overlay.csv': ovCsv,
+    'overlay.csv': ovCsv,
+    'emits/overlay.csv': ovCsv,
+    'run.json': JSON.stringify({ date: '2026-11-11', steps: { assign: { at: '2026-11-11T10:00:00' }, emit: { at: '2026-11-11T10:05:00' } } }),
+    'emits/statements_20261111.csv': stmt1111,
+  });
+  await writeTree(join(dupRoot, 'standing-input'), {
+    'Carrier/c.csv': 'k\n1\n',
+    'Overlay/overlay.csv': ovCsv,
+    'Sent/statements_20261111.csv': stmt1111,
+  });
+  await envDupSent.commands.recordDecisionBaseline({
+    dbToken: envDupSent.ownerToken,
+    commandKey: 'seed-dup-sent-baseline',
+    commitKind: 'historical_baseline',
+    headerContract: 'v2',
+    imported: true,
+    decisions: [row0],
+  });
+  const dupManifest = await buildImportManifest({
+    companySlug: 'acme',
+    sources: {
+      standingInputDir: join(dupRoot, 'standing-input'),
+      companyWorkspacesDir: join(dupRoot, 'company-ws'),
+    },
+    importConfig: { includeLegacyHostHistory: false, useCompanyIncomingInput: false, currentInputSourceKind: 'company_import' },
+  });
+  dupManifest.companyRuns.push({
+    origin: 'company_import',
+    statementDate: '2026-11-11',
+    sourceFolder: 'company-workspaces/acme/2026-11-11-alt/runs/2026-11-11',
+    absPath: join(dupRoot, 'company-ws', '2026-11-11-alt', 'runs', '2026-11-11'),
+    abandoned: false,
+  });
+  const dupRep = await executeHistoryImport({
+    pool: envDupSent.pool, stores: envDupSent.stores, commands: envDupSent.commands, dbToken: envDupSent.ownerToken,
+    manifest: dupManifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: envDupSent.tempDir,
+  });
+  assert.equal(dupRep.passed, false, 'two non-abandoned runs matching one Sent file without explicit provenance must report a problem');
+  assert.ok(
+    dupRep.problems.some((p) => /multiple non-abandoned runs/i.test(p) && /2026-11-11/.test(p)),
+    `expected ambiguity problem for 2026-11-11, got: ${JSON.stringify(dupRep.problems)}`,
+  );
+  const dupCarries = (await envDupSent.pool.query(
+    "SELECT id FROM coherence.carries WHERE carry_kind = 'sent' AND statement_date = '2026-11-11'::date",
+  )).rows;
+  assert.equal(dupCarries.length, 0, 'ambiguous sent runs must queue zero sent carries');
 
   // Note 3: declared sent record whose company run has no statements file must be listed in problems
   const envMissing = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
@@ -2854,7 +2982,7 @@ test('Layer 4 [Fix 7 & Note 3 - Standing Sent Idempotency & Missing Statements P
     }),
   });
   await envMissing.commands.recordDecisionBaseline({
-    actor: envMissing.ownerActor,
+    dbToken: envMissing.ownerToken,
     commandKey: 'seed-fix7-missing-baseline',
     commitKind: 'historical_baseline',
     headerContract: 'v2',
@@ -2870,7 +2998,7 @@ test('Layer 4 [Fix 7 & Note 3 - Standing Sent Idempotency & Missing Statements P
     importConfig: { includeLegacyHostHistory: false },
   });
   const missRep = await executeHistoryImport({
-    pool: envMissing.pool, stores: envMissing.stores, commands: envMissing.commands, actor: envMissing.ownerActor,
+    pool: envMissing.pool, stores: envMissing.stores, commands: envMissing.commands, dbToken: envMissing.ownerToken,
     manifest: missManifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: envMissing.tempDir,
   });
   assert.equal(missRep.passed, false);
@@ -2931,7 +3059,7 @@ test('Layer 4 [Fix 8 & Note 1 - Blank committed_at on Imported Rows & Zero-Check
     },
   });
   const rep = await executeHistoryImport({
-    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pool: env.pool, stores: env.stores, commands: env.commands, dbToken: env.ownerToken,
     manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: env.tempDir,
   });
   assert.equal(rep.passed, true, rep.problems.join('; '));
@@ -2940,7 +3068,7 @@ test('Layer 4 [Fix 8 & Note 1 - Blank committed_at on Imported Rows & Zero-Check
   assert.equal(gen.rows[0].committed_at, null, 'generated overlay for imported row must keep committed_at blank');
 
   const l2 = await verifyOverlayReconstruction({
-    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pool: env.pool, stores: env.stores, commands: env.commands, dbToken: env.ownerToken,
     pythonPath: 'python3', coherenceRepo: mockRepo, tempBaseDir: env.tempDir,
   });
   assert.equal(l2.passed, true, `Layer 2 failed on blank committed_at: ${l2.problems.join('; ')}`);
@@ -2959,7 +3087,7 @@ test('Layer 4 [Fix 8 & Note 1 - Blank committed_at on Imported Rows & Zero-Check
     importConfig: { includeLegacyHostHistory: true, useCompanyIncomingInput: false },
   });
   const noOvRep = await executeHistoryImport({
-    pool: envEmptyOv.pool, stores: envEmptyOv.stores, commands: envEmptyOv.commands, actor: envEmptyOv.ownerActor,
+    pool: envEmptyOv.pool, stores: envEmptyOv.stores, commands: envEmptyOv.commands, dbToken: envEmptyOv.ownerToken,
     manifest: noOvManifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: envEmptyOv.tempDir,
   });
   assert.equal(noOvRep.passed, true);
@@ -3027,7 +3155,7 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
   });
 
   await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'seed-fix9-baseline',
     commitKind: 'historical_baseline',
     headerContract: 'v2',
@@ -3045,7 +3173,7 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
   });
 
   const rep = await executeHistoryImport({
-    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pool: env.pool, stores: env.stores, commands: env.commands, dbToken: env.ownerToken,
     manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: true, tempBaseDir: env.tempDir,
   });
   assert.equal(rep.passed, true, `Import/rebuild failed: ${rep.problems.join('; ')}`);
@@ -3069,7 +3197,9 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
   }
 
   // Never published: findLatestPublishedRun skips 2026-11-15 and returns 2026-11-11; attempt_is_published_run is false!
-  const latestPub = await findLatestPublishedRun(env.pool);
+  const iamFix9 = env.iam;
+  const appPoolFix9 = createRoleScopedTestPool(env.pool, 'platform_app');
+  const latestPub = await findLatestPublishedRun(appPoolFix9, iamFix9.tokens.entityMgr);
   assert.equal(latestPub.id, live1111);
   const abEmitEv = (await env.pool.query(
     "SELECT id FROM coherence.step_attempt_events WHERE run_id = $1::uuid AND step = 'emit' AND event_kind = 'finished'",
@@ -3080,19 +3210,19 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
 
   // Never carried: carrySent on abandoned imported company run is refused by PostgreSQL
   await env.commands.publishInputVersion({
-    actor: env.ownerActor, commandKey: 'seed-standing-fix9', lineKind: 'standing', sourceKind: 'company_import',
+    dbToken: env.ownerToken, commandKey: 'seed-standing-fix9', lineKind: 'standing', sourceKind: 'company_import',
     reason: 'base', entries: [], storedFiles: [],
   });
   await assert.rejects(
     () => env.commands.carrySent({
-      actor: env.ownerActor, commandKey: 'carry-abandoned-1115', runId: ab1115, typedPhrase: 'sent 2026-11-15',
+      dbToken: env.ownerToken, commandKey: 'carry-abandoned-1115', runId: ab1115, typedPhrase: 'sent 2026-11-15',
     }),
     /abandoned/i,
   );
 
-  // Never visible through entity views: even if materialized, scoped roles see 0 rows for abandoned run
+  // Materialize abandoned run before NDJSON rebuild so rebuild comparison verifies identical pre-backfill rows
   await env.commands.materializeEmit({
-    actor: env.workerActor,
+    dbToken: env.workerToken,
     commandKey: 'mat-abandoned-1115',
     runId: ab1115,
     attemptEventId: abEmitEv,
@@ -3101,24 +3231,11 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
     coherentLedgerCsv: ledCsv,
     statementsCsv: stmtCsv,
   });
-  const c = await env.pool.connect();
-  try {
-    await c.query('BEGIN');
-    await c.query('SET LOCAL ROLE coherence_entity_manager_ro');
-    await c.query("SELECT pg_catalog.set_config('app.access_tier', 'entity_manager', true)");
-    const emBob = (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.v_canonical_bob WHERE run_id = $1::uuid', [ab1115])).rows[0].n;
-    const emLines = (await c.query('SELECT COUNT(*)::int AS n FROM coherence_views.v_entity_statement_lines')).rows[0].n;
-    assert.equal(emBob, 0, 'abandoned company run must be invisible in v_canonical_bob');
-    assert.equal(emLines, 0, 'abandoned company run must be invisible in v_entity_statement_lines');
-    await c.query('ROLLBACK');
-  } finally {
-    c.release();
-  }
 
   // Non-abandoned imported runs still cannot be abandoned after import
   await assert.rejects(
     () => env.commands.abandonRun({
-      actor: env.ownerActor, commandKey: 'abandon-live-import-1111', runId: live1111, typedPhrase: 'abandon 2026-11-11', reason: 'not allowed',
+      dbToken: env.ownerToken, commandKey: 'abandon-live-import-1111', runId: live1111, typedPhrase: 'abandon 2026-11-11', reason: 'not allowed',
     }),
     /imported historical runs cannot be abandoned/i,
   );
@@ -3131,6 +3248,15 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
   await rebuildFromJournalExport(emptyDb.pool, ndjson);
   const cmp = await compareDatabasesAsOf(env.pool, emptyDb.pool, tipSeq);
   assert.equal(cmp.passed, true, `Layer 4 rebuild failed for abandoned runs: ${cmp.problems.join('; ')}`);
+
+  // Never visible through app_views.*: even when materialized and FK-backfilled, platform_app Entity Manager sees 0 rows for abandoned run
+  await env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys()');
+  await withRequestTx(appPoolFix9, iamFix9.tokens.entityMgr, async (tx) => {
+    const emBob = (await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob WHERE run_id = $1::uuid', [ab1115])).rows[0].n;
+    const emLines = (await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_entity_statement_lines')).rows[0].n;
+    assert.equal(emBob, 0, 'abandoned company run must be invisible in app_views.coherence_bob');
+    assert.equal(emLines, 0, 'abandoned company run must be invisible in app_views.coherence_entity_statement_lines');
+  }, { readOnly: true });
 });
 
 test('Layer 4 [Substance Comparator PHI-Free & Parameterized Columns]: planted name, MBI, address, phone, and record_id in differing cells never appear in report', async (t) => {
@@ -3358,6 +3484,51 @@ test('Layer 4 [Proof Runner CLI scripts/prove-history.mjs]: migrates fresh test_
   assert.equal(summary.comparator.targets[0].gates.gate2.passed, true);
   assert.equal(summary.comparator.targets[0].gates.gate3.passed, true);
   assert.equal(summary.comparator.targets[0].gates.gate4.passed, true);
+
+  // Fix round 2 (C5): ensureProofIamSubjectsForBatches clamps generated slugs <= 48 chars
+  // (base cut to 40 before _N with trailing _ removed) and lowercases generated emails.
+  const envSubj = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => envSubj.cleanup());
+  const longEnt1 = 'Very Long Synthetic Brokerage Group Alpha One Hundred Twenty Three LLC';
+  const longEnt2 = 'Very Long Synthetic Brokerage Group Alpha Two Hundred Forty Six LLC';
+  const trailingUnderscoreEnt = `${'a'.repeat(39)} extra words beyond forty characters`;
+  await ensureProofIamSubjectsForBatches(envSubj.pool, {
+    companyOrgId: envSubj.iam.ids.companyOrg,
+    environment: envSubj.iam.environment,
+    bridgeResult: {
+      historicalBatches: [{
+        agencyLines: [
+          { entity: longEnt1, writingNpn: '88888888' },
+          { entity: longEnt2, writingNpn: '99999999' },
+          { entity: trailingUnderscoreEnt, writingNpn: '77777777' },
+        ],
+        uplineLines: [],
+      }],
+      methodCorrectionBatches: [],
+    },
+  });
+  const seededOrgs = (await envSubj.pool.query(
+    `SELECT slug, display_name FROM iam.organization_versions
+     WHERE superseded_by_id IS NULL AND display_name = ANY($1::text[])
+     ORDER BY display_name`,
+    [[longEnt1, longEnt2, trailingUnderscoreEnt]],
+  )).rows;
+  assert.equal(seededOrgs.length, 3);
+  for (const row of seededOrgs) {
+    assert.ok(row.slug.length <= 48, `slug too long (${row.slug.length}): ${row.slug}`);
+    assert.match(row.slug, /^[a-z0-9][a-z0-9_-]{0,47}$/);
+    assert.ok(!row.slug.endsWith('_'), `slug must not have trailing underscore: ${row.slug}`);
+  }
+  const seededPeople = (await envSubj.pool.query(
+    `SELECT npn, primary_email FROM iam.person_versions
+     WHERE superseded_by_id IS NULL AND npn = ANY($1::text[])
+     ORDER BY npn`,
+    [['88888888', '99999999', '77777777']],
+  )).rows;
+  assert.equal(seededPeople.length, 3);
+  for (const row of seededPeople) {
+    assert.equal(row.primary_email, row.primary_email.toLowerCase(), `generated email must be lowercased: ${row.primary_email}`);
+  }
 });
 
 test('Layer 4 [Fix 10 & Note 2 - Proof Runner Missing Right Run, Configured Folders, Local PGHOST & Temp Cleanup]: missing right run fails by name, missing configured folders fail loudly, non-local PGHOST is refused, and proof temp folder is always cleaned up', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
@@ -3495,7 +3666,7 @@ test('Layer 4 [Fix2-2 - Gate 4 Non-Vacuous Entity Parity]: fails naming missing 
     },
   });
   const imp = await executeHistoryImport({
-    pool: env.pool, stores: env.stores, commands: env.commands, actor: env.ownerActor,
+    pool: env.pool, stores: env.stores, commands: env.commands, dbToken: env.ownerToken,
     manifest, pythonPath: 'python3', coherenceRepo: mockRepo, verifyRebuild: false, tempBaseDir: env.tempDir,
   });
   assert.equal(imp.passed, true);
@@ -3531,7 +3702,7 @@ test('Layer 4 [Fix2-2 - Gate 4 Non-Vacuous Entity Parity]: fails naming missing 
     [leftRunId],
   )).rows[0].id;
   await env.commands.materializeEmit({
-    actor: env.workerActor,
+    dbToken: env.workerToken,
     commandKey: 'mat-gate4-test',
     runId: leftRunId,
     attemptEventId: emitEv,
@@ -3610,7 +3781,7 @@ test('Layer 4 [Fix2-3 - Zone-Less Timestamps on Non-UTC Session]: normalizes man
   // 1) Direct importStandaloneFiles with a zone-less originalAt MUST store normalized UTC matching commitment hash on America/New_York session
   const directFile = await env.dataStore.promoteBytes(Buffer.from('hello standalone\n', 'utf8'), { relPath: 'standalone/note.txt', checksPassed: true });
   await nyCommands.importStandaloneFiles({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'fix2-3-standalone-zoneless',
     files: [{
       area: 'other',
@@ -3660,7 +3831,7 @@ test('Layer 4 [Fix2-3 - Zone-Less Timestamps on Non-UTC Session]: normalizes man
     pool: nyPool,
     stores: env.stores,
     commands: nyCommands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -4583,7 +4754,7 @@ test('Layer 4 [Fix4-1 - Overlay Lineage Law & Pinned freshOverlayRoots]: four ki
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         manifest,
         pythonPath: 'python3',
         coherenceRepo: mockRepo,
@@ -4720,7 +4891,7 @@ test('Layer 4 [Fix4-2 - Empty Prior approvals_files, Same-Date Draft Sorting & i
     pool: env1.pool,
     stores: env1.stores,
     commands: env1.commands,
-    actor: env1.ownerActor,
+    dbToken: env1.ownerToken,
     manifest: manifest1,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -4761,7 +4932,7 @@ test('Layer 4 [Fix4-2 - Empty Prior approvals_files, Same-Date Draft Sorting & i
     pool: env2.pool,
     stores: env2.stores,
     commands: env2.commands,
-    actor: env2.ownerActor,
+    dbToken: env2.ownerToken,
     manifest: manifest2,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -4791,7 +4962,7 @@ test('Layer 4 [Fix4-2 - Empty Prior approvals_files, Same-Date Draft Sorting & i
     pool: env2b.pool,
     stores: env2b.stores,
     commands: env2b.commands,
-    actor: env2b.ownerActor,
+    dbToken: env2b.ownerToken,
     manifest: manifest2b,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -4818,7 +4989,7 @@ test('Layer 4 [Fix4-2 - Empty Prior approvals_files, Same-Date Draft Sorting & i
       pool: env2c.pool,
       stores: env2c.stores,
       commands: env2c.commands,
-      actor: env2c.ownerActor,
+      dbToken: env2c.ownerToken,
       manifest: manifest2c,
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -4835,7 +5006,7 @@ test('Layer 4 [Fix4-2 - Empty Prior approvals_files, Same-Date Draft Sorting & i
       pool: env1.pool,
       stores: env1.stores,
       commands: env1.commands,
-      actor: env1.ownerActor,
+      dbToken: env1.ownerToken,
       companySlug: 'acme',
       runItem: alreadyRunItem,
       importConfig: { allowDisjointOverlayRoots: true },
@@ -5126,7 +5297,7 @@ test('Layer 4 [Fix5-1 - Carried Priors & --plan Validation]: accepts a frozen pr
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         manifest,
         pythonPath: 'python3',
         coherenceRepo: mockRepo,
@@ -5319,7 +5490,7 @@ test('Layer 4 [Fix5-2 - Header-Only File in Pinned Root Folder Fails]: an empty 
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         manifest,
         pythonPath: 'python3',
         coherenceRepo: mockRepo,
@@ -5381,7 +5552,7 @@ test('Layer 4 [Fix5-3 - 0-Row Commits Never Satisfy exact_known_commit After Non
       pool: env1.pool,
       stores: env1.stores,
       commands: env1.commands,
-      actor: env1.ownerActor,
+      dbToken: env1.ownerToken,
       manifest: m1,
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -5423,7 +5594,7 @@ test('Layer 4 [Fix5-3 - 0-Row Commits Never Satisfy exact_known_commit After Non
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         manifest,
         pythonPath: 'python3',
         coherenceRepo: mockRepo,
@@ -5463,7 +5634,7 @@ test('Layer 4 [Fix5-3 - 0-Row Commits Never Satisfy exact_known_commit After Non
     pool: env3.pool,
     stores: env3.stores,
     commands: env3.commands,
-    actor: env3.ownerActor,
+    dbToken: env3.ownerToken,
     manifest: m3,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -5508,7 +5679,7 @@ test('Layer 4 [Fix5-3 - 0-Row Commits Never Satisfy exact_known_commit After Non
       pool: env3.pool,
       stores: env3.stores,
       commands: env3.commands,
-      actor: env3.ownerActor,
+      dbToken: env3.ownerToken,
       manifest: m3b,
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -5570,7 +5741,7 @@ test('Layer 4 [Fix5-4 - Fresh Roots Are historical_overlay & Standing Head Alway
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest: m1,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -5625,7 +5796,7 @@ test('Layer 4 [Fix5-4 - Fresh Roots Are historical_overlay & Standing Head Alway
     pool: env.pool,
     stores: env.stores,
     commands: env.commands,
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     manifest: m2,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -5649,7 +5820,7 @@ test('Layer 4 [Fix5-4 - Fresh Roots Are historical_overlay & Standing Head Alway
   // Verify that if standing_decision_head_as_of(NULL) drifts away (e.g. an explicit baseline moves it),
   // re-running executeHistoryImport with the already-imported standing overlay catches it instead of returning stale metadata.
   await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'fix5-explicit-drift-baseline',
     parentCommitId: null,
     commitKind: 'historical_baseline',
@@ -5662,7 +5833,7 @@ test('Layer 4 [Fix5-4 - Fresh Roots Are historical_overlay & Standing Head Alway
       pool: env.pool,
       stores: env.stores,
       commands: env.commands,
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       manifest: m2,
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -5739,7 +5910,7 @@ test('Layer 4 [Fix6-1 - Pinned Files Cannot Be Bypassed & Company Runs Require F
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         manifest,
         pythonPath: 'python3',
         coherenceRepo: mockRepo,
@@ -5931,7 +6102,7 @@ test('Layer 4 [Fix6-1 - Pinned Files Cannot Be Bypassed & Company Runs Require F
     pool: okCoEnv.pool,
     stores: okCoEnv.stores,
     commands: okCoEnv.commands,
-    actor: okCoEnv.ownerActor,
+    dbToken: okCoEnv.ownerToken,
     manifest: okCoManifest,
     pythonPath: 'python3',
     coherenceRepo: mockRepo,
@@ -5955,7 +6126,7 @@ test('Layer 4 [Fix6-1 - Pinned Files Cannot Be Bypassed & Company Runs Require F
   const cpEnv = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
   t.after(() => cpEnv.cleanup());
   const baseCommit = await cpEnv.commands.recordDecisionBaseline({
-    actor: cpEnv.ownerActor,
+    dbToken: cpEnv.ownerToken,
     commandKey: 'fix6-cp-base',
     commitKind: 'historical_overlay',
     headerContract: 'v2',
@@ -5985,7 +6156,7 @@ test('Layer 4 [Fix6-1 - Pinned Files Cannot Be Bypassed & Company Runs Require F
       pool: cpEnv.pool,
       stores: cpEnv.stores,
       commands: cpEnv.commands,
-      actor: cpEnv.ownerActor,
+      dbToken: cpEnv.ownerToken,
       manifest: cpManifest,
       pythonPath: 'python3',
       coherenceRepo: mockRepo,
@@ -6186,7 +6357,7 @@ test('Layer 4 [Fix7-1 - Pre-Write Pin Checks, Direct Single-Run Guards & Shared-
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         companySlug: manifest.companySlug,
         runItem,
         importConfig: manifest.importConfig,
@@ -6331,7 +6502,7 @@ test('Layer 4 [Fix7-1 - Pre-Write Pin Checks, Direct Single-Run Guards & Shared-
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         manifest,
         pythonPath: 'python3',
         coherenceRepo: mockRepo,
@@ -6387,7 +6558,7 @@ test('Layer 4 [Fix7-1 - Pre-Write Pin Checks, Direct Single-Run Guards & Shared-
           pool: env.pool,
           stores: env.stores,
           commands: env.commands,
-          actor: env.ownerActor,
+          dbToken: env.ownerToken,
           companySlug: 'acme',
           runItem: companyRunItem,
           importConfig,
@@ -6476,7 +6647,7 @@ test('Layer 4 [Fix7-1 - Pre-Write Pin Checks, Direct Single-Run Guards & Shared-
           pool: env.pool,
           stores: env.stores,
           commands: env.commands,
-          actor: env.ownerActor,
+          dbToken: env.ownerToken,
           manifest,
           pythonPath: 'python3',
           coherenceRepo: mockRepo,
@@ -6533,7 +6704,7 @@ test('Layer 4 [Fix7-1 - Pre-Write Pin Checks, Direct Single-Run Guards & Shared-
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         manifest,
         pythonPath: 'python3',
         coherenceRepo: mockRepo,
@@ -6589,7 +6760,7 @@ test('Layer 4 [Fix7-1 - Pre-Write Pin Checks, Direct Single-Run Guards & Shared-
         pool: env.pool,
         stores: env.stores,
         commands: env.commands,
-        actor: env.ownerActor,
+        dbToken: env.ownerToken,
         manifest,
         pythonPath: 'python3',
         coherenceRepo: mockRepo,
@@ -6948,7 +7119,7 @@ test('Layer 4 [Fix8 - Import Agrees With Plan on Legacy Run Plus Extending Check
           pool: env.pool,
           stores: env.stores,
           commands: env.commands,
-          actor: env.ownerActor,
+          dbToken: env.ownerToken,
           manifest,
           pythonPath: 'python3',
           coherenceRepo: mockRepo,

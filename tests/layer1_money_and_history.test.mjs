@@ -232,7 +232,7 @@ test('Layer 1 [Commitments & Batching]: batched multi-array unnest writes succee
   const stored = await env.dataStore.promoteBytes(Buffer.from(csv, 'utf8'), { relPath: 'overlay.csv', checksPassed: true });
 
   const reg = await env.commands.registerApprovalsFile({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'reg-af-batched',
     storedFile: stored,
     headerKind: 'v2',
@@ -317,7 +317,7 @@ test('Layer 1 [Input Path & Folder Guards]: case twins, NFC/NFD twins, file-fold
   const seed = await seedStandingInput(env);
   const f1 = await env.dataStore.promoteBytes(Buffer.from('a,b\n1,2\n'), { relPath: 'All BOB/test.csv', checksPassed: true });
   const f2 = await env.dataStore.promoteBytes(Buffer.from('a,b\n3,4\n'), { relPath: 'All BOB/test2.csv', checksPassed: true });
-  await env.commands.registerStoredFiles({ actor: env.ownerActor, commandKey: 'reg-f1-f2', files: [f1, f2] });
+  await env.commands.registerStoredFiles({ dbToken: env.ownerToken, commandKey: 'reg-f1-f2', files: [f1, f2] });
 
   const trailingRes = await env.pool.query(
     "SELECT rel_path FROM coherence.input_entries WHERE input_version_id = $1::uuid AND rel_path = 'All BOB/TrailingCarrier /book.csv'",
@@ -331,7 +331,7 @@ test('Layer 1 [Input Path & Folder Guards]: case twins, NFC/NFD twins, file-fold
       : e
   ));
   const renPub = await env.commands.publishInputVersion({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'rename-misdated',
     lineKind: 'standing',
     sourceKind: 'rename',
@@ -438,14 +438,14 @@ test('Layer 1 [Negative Invariant]: no second sent statement, out-of-order appro
     companySlug: env.companySlug,
     stores: env.stores,
     commands: env.commands,
-    workerActor: env.workerActor,
+    workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(),
     tempBaseDir: env.tempDir,
   }));
 
   const completeRun = async ({ date, origin, extraRows, rerunReason = null }) => {
     const launch = await env.commands.launchRun({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `launch-${origin}-${date}-${Date.now()}-${Math.random()}`,
       statementDate: date,
       origin,
@@ -457,18 +457,18 @@ test('Layer 1 [Negative Invariant]: no second sent statement, out-of-order appro
 
     const bibleRows = [row0, ...extraRows.bible];
     let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
-    await env.commands.submitReview({ actor: env.ownerActor, commandKey: `b-${runId}`, expectedJournalSeq: seq, runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv(bibleRows), 'utf8') });
+    await env.commands.submitReview({ dbToken: env.ownerToken, commandKey: `b-${runId}`, expectedJournalSeq: seq, runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv(bibleRows), 'utf8') });
     assert.equal((await worker.runOnce()).action, 'review_accepted');
     assert.equal((await worker.runOnce()).action, 'step_finished');
 
     const adjRows = [...bibleRows, ...extraRows.adjust];
     seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
-    await env.commands.submitReview({ actor: env.ownerActor, commandKey: `a-${runId}`, expectedJournalSeq: seq, runId, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv(adjRows), 'utf8') });
+    await env.commands.submitReview({ dbToken: env.ownerToken, commandKey: `a-${runId}`, expectedJournalSeq: seq, runId, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv(adjRows), 'utf8') });
     const adjAcc = await worker.runOnce();
     assert.equal(adjAcc.action, 'review_accepted');
 
     seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
-    await env.commands.confirmEmit({ actor: env.ownerActor, commandKey: `e-${runId}`, expectedJournalSeq: seq, runId, adjustReviewSaveId: adjAcc.reviewSaveId, typedPhrase: `create statements for ${date}` });
+    await env.commands.confirmEmit({ dbToken: env.ownerToken, commandKey: `e-${runId}`, expectedJournalSeq: seq, runId, adjustReviewSaveId: adjAcc.reviewSaveId, typedPhrase: `create statements for ${date}` });
     assert.equal((await worker.runOnce()).action, 'step_finished');
     return runId;
   };
@@ -479,11 +479,11 @@ test('Layer 1 [Negative Invariant]: no second sent statement, out-of-order appro
     extraRows: { bible: [sampleApprovalRow({ note: 'trial-b' })], adjust: [sampleApprovalRow({ note: 'trial-a' })] },
   });
   await assert.rejects(
-    () => env.commands.carrySent({ actor: env.ownerActor, commandKey: 'carry-trial-sent', runId: trialId, typedPhrase: 'sent 2026-11-20' }),
+    () => env.commands.carrySent({ dbToken: env.ownerToken, commandKey: 'carry-trial-sent', runId: trialId, typedPhrase: 'sent 2026-11-20' }),
     /only app and company_import/i,
   );
   await assert.rejects(
-    () => env.commands.carryApprovals({ actor: env.ownerActor, commandKey: 'carry-trial-ov', runId: trialId, typedPhrase: 'carry 2026-11-20' }),
+    () => env.commands.carryApprovals({ dbToken: env.ownerToken, commandKey: 'carry-trial-ov', runId: trialId, typedPhrase: 'carry 2026-11-20' }),
     /only app and company_import/i,
   );
 
@@ -500,29 +500,29 @@ test('Layer 1 [Negative Invariant]: no second sent statement, out-of-order appro
   });
 
   await assert.rejects(
-    () => env.commands.launchRun({ actor: env.ownerActor, commandKey: 'dup-1120', statementDate: '2026-11-20', engineVersionId, rerunReason: 'retry' }),
+    () => env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'dup-1120', statementDate: '2026-11-20', engineVersionId, rerunReason: 'retry' }),
     /non-abandoned run/i,
   );
 
-  const carryB = await env.commands.carryApprovals({ actor: env.ownerActor, commandKey: 'carry-ov-B', runId: runB, typedPhrase: 'carry 2026-11-21' });
+  const carryB = await env.commands.carryApprovals({ dbToken: env.ownerToken, commandKey: 'carry-ov-B', runId: runB, typedPhrase: 'carry 2026-11-21' });
   assert.equal(carryB.result.nothingNew, false);
 
-  const carryB2 = await env.commands.carryApprovals({ actor: env.ownerActor, commandKey: 'carry-ov-B-again', runId: runB, typedPhrase: 'carry 2026-11-21' });
+  const carryB2 = await env.commands.carryApprovals({ dbToken: env.ownerToken, commandKey: 'carry-ov-B-again', runId: runB, typedPhrase: 'carry 2026-11-21' });
   assert.equal(carryB2.result.nothingNew, true);
   assert.equal(carryB2.result.publishedInputVersionId, null);
 
   await assert.rejects(
-    () => env.commands.carryApprovals({ actor: env.ownerActor, commandKey: 'carry-ov-A-ooo', runId: runA, typedPhrase: 'carry 2026-11-20' }),
+    () => env.commands.carryApprovals({ dbToken: env.ownerToken, commandKey: 'carry-ov-A-ooo', runId: runA, typedPhrase: 'carry 2026-11-20' }),
     /does not extend the standing approvals/i,
   );
 
-  await env.commands.carrySent({ actor: env.ownerActor, commandKey: 'carry-sent-B', runId: runB, typedPhrase: 'sent 2026-11-21' });
+  await env.commands.carrySent({ dbToken: env.ownerToken, commandKey: 'carry-sent-B', runId: runB, typedPhrase: 'sent 2026-11-21' });
   await assert.rejects(
-    () => env.commands.carrySent({ actor: env.ownerActor, commandKey: 'carry-sent-B-dup', runId: runB, typedPhrase: 'sent 2026-11-21' }),
+    () => env.commands.carrySent({ dbToken: env.ownerToken, commandKey: 'carry-sent-B-dup', runId: runB, typedPhrase: 'sent 2026-11-21' }),
     /unique|already/i,
   );
   await assert.rejects(
-    () => env.commands.launchRun({ actor: env.ownerActor, commandKey: 'launch-after-sent', statementDate: '2026-11-21', engineVersionId, rerunReason: 'correction' }),
+    () => env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'launch-after-sent', statementDate: '2026-11-21', engineVersionId, rerunReason: 'correction' }),
     /sent statement already exists/i,
   );
   const sentCarryRow = (await env.pool.query("SELECT file_sha256, published_input_version_id FROM coherence.carries WHERE run_id = $1::uuid AND carry_kind = 'sent'", [runB])).rows[0];
@@ -548,13 +548,13 @@ test('Layer 1 [Negative Invariant]: no second sent statement, out-of-order appro
   }, /unique|carries_one_sent_per_date|same journal entry/i);
 
   await assert.rejects(
-    () => env.commands.abandonRun({ actor: env.ownerActor, commandKey: 'abandon-carried', runId: runB, typedPhrase: 'abandon 2026-11-21', reason: 'nope' }),
+    () => env.commands.abandonRun({ dbToken: env.ownerToken, commandKey: 'abandon-carried', runId: runB, typedPhrase: 'abandon 2026-11-21', reason: 'nope' }),
     /carried outputs/i,
   );
 
-  await env.commands.abandonRun({ actor: env.ownerActor, commandKey: 'abandon-A', runId: runA, typedPhrase: 'abandon 2026-11-20', reason: 'superseded by 11-21' });
+  await env.commands.abandonRun({ dbToken: env.ownerToken, commandKey: 'abandon-A', runId: runA, typedPhrase: 'abandon 2026-11-20', reason: 'superseded by 11-21' });
   const launchA2 = await env.commands.launchRun({
-    actor: env.ownerActor, commandKey: 'launch-A2', statementDate: '2026-11-20', engineVersionId, rerunReason: 'clean rerun after carry',
+    dbToken: env.ownerToken, commandKey: 'launch-A2', statementDate: '2026-11-20', engineVersionId, rerunReason: 'clean rerun after carry',
   });
   assert.equal(launchA2.result.folderNumber, 2);
 
@@ -643,7 +643,7 @@ test('Layer 1 [Decisions & Overlay Round-Trip]: replaces_decision_id lineage enf
   const expectedCsv = makeOverlayCsv(baseRows, { version: 'v2' });
 
   const baseCommit = await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'baseline-v2-roundtrip',
     commitKind: 'historical_baseline',
     headerContract: 'v2',
@@ -689,7 +689,7 @@ test('Layer 1 [Decisions & Overlay Round-Trip]: replaces_decision_id lineage enf
     },
   ];
   const v1Commit = await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'baseline-v1',
     commitKind: 'historical_overlay',
     headerContract: 'v1',
@@ -711,7 +711,7 @@ test('Layer 1 [Decisions & Overlay Round-Trip]: replaces_decision_id lineage enf
     approved_agent: '22222222',
   }];
   const childCommit = await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'child-overlay-commit',
     parentCommitId: baseCommitId,
     commitKind: 'historical_overlay',
@@ -862,7 +862,7 @@ test('Layer 1 [Decisions & Overlay Round-Trip]: replaces_decision_id lineage enf
   }
   const bulkStart = Date.now();
   const bulkRes = await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'bulk-2200-decisions',
     parentCommitId: childCommitId,
     commitKind: 'historical_overlay',
@@ -901,7 +901,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   // Helper to create a finished app run (without auto-materializing) so we can test materializeEmit directly
   const createFinishedRun = async (date, stmtCsv) => {
     const launch = await env.commands.launchRun({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `mat-launch-${date}`,
       statementDate: date,
       origin: 'app',
@@ -910,13 +910,13 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
     const runId = launch.result.runId;
     const worker = env.registerWorker(createEngineWorker({
       pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
-      stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+      stores: env.stores, commands: env.commands, workerToken: env.workerToken,
       materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
     }));
     for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
     let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
     await env.commands.saveReviewDecisions({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `mat-bible-${date}`,
       expectedJournalSeq: seq,
       runId,
@@ -929,7 +929,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
     assert.equal((await worker.runOnce()).action, 'step_finished');
     seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
     const adjSave = await env.commands.saveReviewDecisions({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `mat-adjust-${date}`,
       expectedJournalSeq: seq,
       runId,
@@ -938,7 +938,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
     });
     seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
     await env.commands.confirmEmit({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `mat-confirm-${date}`,
       expectedJournalSeq: seq,
       runId,
@@ -946,25 +946,31 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
       typedPhrase: `create statements for ${date}`,
     });
     assert.equal((await worker.runOnce()).action, 'step_finished');
+    const emitAttemptId = (await env.pool.query(
+      "SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev",
+      [runId],
+    )).rows[0].ev;
     if (stmtCsv) {
       const stmtArt = await env.dataStore.promoteBytes(Buffer.from(stmtCsv, 'utf8'), { relPath: `emits/statements_${date.replaceAll('-', '')}.csv`, checksPassed: true });
-      await env.commands.registerStoredFiles({ actor: env.ownerActor, commandKey: `reg-stmt-${date}`, files: [stmtArt] });
-      return { runId, stmtFileSha: stmtArt.sha256 };
+      await env.commands.registerStoredFiles({ dbToken: env.ownerToken, commandKey: `reg-stmt-${date}`, files: [stmtArt] });
+      return { runId, emitAttemptId, stmtFileSha: stmtArt.sha256 };
     }
-    return { runId, stmtFileSha: null };
+    return { runId, emitAttemptId, stmtFileSha: null };
   };
 
   // 1. Run 1 (2026-10-31): materialize Acme, Beacon, Harbor + house override
   const ds1 = buildSyntheticEmitDataset({ statementDate: '2026-10-31' });
-  const { runId: run1Id, stmtFileSha: stmt1Sha } = await createFinishedRun('2026-10-31', ds1.statementsCsv);
+  const { runId: run1Id, emitAttemptId: run1EmitEv, stmtFileSha: stmt1Sha } = await createFinishedRun('2026-10-31', ds1.statementsCsv);
 
   // Negative conservation check BEFORE valid load: $0.01 BoB drift must fail and write zero rows
   const badBobCsv = ds1.canonicalBobCsv.replace(',80.00,20.00,', ',80.01,20.00,');
   await assert.rejects(
     () => env.commands.materializeEmit({
-      actor: env.ownerActor,
+      dbToken: env.workerToken,
       commandKey: 'mat-bad-bob',
       runId: run1Id,
+      attemptEventId: run1EmitEv,
+      statementDate: '2026-10-31',
       canonicalBobCsv: badBobCsv,
       coherentLedgerCsv: ds1.coherentLedgerCsv,
       statementsCsv: ds1.statementsCsv,
@@ -979,9 +985,11 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   const badLedgerCsv = ds1.coherentLedgerCsv.replace(',80.00,20.00,', ',79.99,20.00,');
   await assert.rejects(
     () => env.commands.materializeEmit({
-      actor: env.ownerActor,
+      dbToken: env.workerToken,
       commandKey: 'mat-bad-ledger-split',
       runId: run1Id,
+      attemptEventId: run1EmitEv,
+      statementDate: '2026-10-31',
       canonicalBobCsv: ds1.canonicalBobCsv,
       coherentLedgerCsv: badLedgerCsv,
       statementsCsv: ds1.statementsCsv,
@@ -993,9 +1001,11 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   const badStmtCsv = ds1.statementsCsv.replace('100.00,commission,,100.00,,,,80.00,20.00', '100.01,commission,,100.01,,,,80.01,20.00');
   await assert.rejects(
     () => env.commands.materializeEmit({
-      actor: env.ownerActor,
+      dbToken: env.workerToken,
       commandKey: 'mat-bad-stmt-tie',
       runId: run1Id,
+      attemptEventId: run1EmitEv,
+      statementDate: '2026-10-31',
       canonicalBobCsv: ds1.canonicalBobCsv,
       coherentLedgerCsv: ds1.coherentLedgerCsv,
       statementsCsv: badStmtCsv,
@@ -1007,9 +1017,11 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
 
   // Valid single-transaction load of Run 1
   const mat1 = await env.commands.materializeEmit({
-    actor: env.ownerActor,
+    dbToken: env.workerToken,
     commandKey: 'mat-run-1',
     runId: run1Id,
+    attemptEventId: run1EmitEv,
+    statementDate: '2026-10-31',
     canonicalBobCsv: ds1.canonicalBobCsv,
     coherentLedgerCsv: ds1.coherentLedgerCsv,
     statementsCsv: ds1.statementsCsv,
@@ -1048,9 +1060,11 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   // Refuse a SECOND load of the same run!
   await assert.rejects(
     () => env.commands.materializeEmit({
-      actor: env.ownerActor,
+      dbToken: env.workerToken,
       commandKey: 'mat-run-1-second-load',
       runId: run1Id,
+      attemptEventId: run1EmitEv,
+      statementDate: '2026-10-31',
       canonicalBobCsv: ds1.canonicalBobCsv,
       coherentLedgerCsv: ds1.coherentLedgerCsv,
       statementsCsv: ds1.statementsCsv,
@@ -1064,7 +1078,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   const preRecId = 'carrier_a~direct~OLD MEMBER~100.00~2026-07';
 
   await env.commands.recordStatementBatch({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'hist-sent-20260731',
     batchKind: 'historical_sent',
     statementDate: '2026-07-31',
@@ -1088,7 +1102,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
 
   // 2026-08-01 method correction moving 20% from Beacon to Acme Upline (marked_sent = false)
   await env.commands.recordStatementBatch({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'method-corr-20260801',
     batchKind: 'method_correction',
     statementDate: '2026-08-01',
@@ -1126,7 +1140,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   const standingId = (await env.pool.query('SELECT coherence.standing_input_version_as_of(NULL) AS id')).rows[0].id;
   const curEntries = (await env.pool.query('SELECT rel_path, file_sha256 FROM coherence.input_entries WHERE input_version_id = $1::uuid', [standingId])).rows;
   await env.commands.publishInputVersion({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'add-pre-coherence-file',
     lineKind: 'standing',
     sourceKind: 'include',
@@ -1152,12 +1166,14 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
     status: '', policy_status: '', cbob_c: 'false', cbob_s: 'false', sf: 'false', notes: '', coherent_notes: 'CANCEL',
     run_action: 'CANCEL', run_statement_date: '2026-08-31', reversal_of: preRecId, reason: 'cancel pre-coherence',
   }]);
-  const { runId: run2Id } = await createFinishedRun('2026-08-31');
+  const { runId: run2Id, emitAttemptId: run2EmitEv } = await createFinishedRun('2026-08-31');
 
   const mat2 = await env.commands.materializeEmit({
-    actor: env.ownerActor,
+    dbToken: env.workerToken,
     commandKey: 'mat-run-2-null-split',
     runId: run2Id,
+    attemptEventId: run2EmitEv,
+    statementDate: '2026-08-31',
     canonicalBobCsv: run2BobCsv,
     coherentLedgerCsv: run2LedgerCsv,
     statementsCsv: run2StmtCsv,
@@ -1175,7 +1191,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   // 3. Multi-run cumulative reconciliation across Sent Run 1 (2026-10-31) -> Run 3 (2026-11-30) with REVERSAL + RESTATED + NEW
   // First publish Run 1's actual statement file as sent via a run whose emits/statements_20261031.csv matches Run 1's materialized batch
   const run3InputVer = await env.commands.publishInputVersion({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'add-sent-run1-for-run3',
     lineKind: 'standing',
     sourceKind: 'mac_import',
@@ -1189,27 +1205,27 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   // Record Run 1 as sent by matching its actual emitted artifact (or verify via carrySent on a data-only engine run)
   const dataOnlyWorker = env.registerWorker(createEngineWorker({
     pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
-    stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: null }),
     tempBaseDir: env.tempDir,
   }));
   // Run a fresh env for clean multi-date Sent Run 1 -> Run 2 REVERSAL/RESTATED cumulative tie-out using engine-style CSV headers
-  const envMulti = await createTestEnv({ companySlug: 'beacon', displayName: 'Beacon' });
+  const envMulti = await createTestEnv({ companySlug: 'acme_multi', displayName: 'Acme' });
   t.after(() => envMulti.cleanup());
   const { engineVersionId: engMultiId } = await seedEngineCopyVersion(envMulti, { label: 'beacon-copy-2026.11' });
   await seedStandingInput(envMulti, { commandKey: 'multi-standing-1' });
   const wMulti = envMulti.registerWorker(createEngineWorker({
     pool: envMulti.pool, pgConfig: envMulti.pgConfig, companySlug: envMulti.companySlug,
-    stores: envMulti.stores, commands: envMulti.commands, workerActor: envMulti.workerActor,
+    stores: envMulti.stores, commands: envMulti.commands, workerToken: envMulti.workerToken,
     materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: null }),
     tempBaseDir: envMulti.tempDir,
   }));
-  const lm1 = await envMulti.commands.launchRun({ actor: envMulti.ownerActor, commandKey: 'm-l1', statementDate: '2026-10-31', engineVersionId: engMultiId });
+  const lm1 = await envMulti.commands.launchRun({ dbToken: envMulti.ownerToken, commandKey: 'm-l1', statementDate: '2026-10-31', engineVersionId: engMultiId });
   const mRun1 = lm1.result.runId;
   for (let i = 0; i < 3; i++) assert.equal((await wMulti.runOnce()).action, 'step_finished');
   let mSeq = Number((await envMulti.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [mRun1])).rows[0].latest_journal_seq);
   await envMulti.commands.saveReviewDecisions({
-    actor: envMulti.ownerActor, commandKey: 'm-b1', expectedJournalSeq: mSeq, runId: mRun1, surface: 'bible',
+    dbToken: envMulti.ownerToken, commandKey: 'm-b1', expectedJournalSeq: mSeq, runId: mRun1, surface: 'bible',
     decisions: [
       { recordId: 'policy:carrier_a:C-101#effective:2026-10-01', disposition: 'CONFIRM' },
       { recordId: 'policy:carrier_b:C-201#effective:2026-10-01', disposition: 'CONFIRM' },
@@ -1218,17 +1234,17 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   assert.equal((await wMulti.runOnce()).action, 'step_finished');
   mSeq = Number((await envMulti.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [mRun1])).rows[0].latest_journal_seq);
   const mAdj1 = await envMulti.commands.saveReviewDecisions({
-    actor: envMulti.ownerActor, commandKey: 'm-a1', expectedJournalSeq: mSeq, runId: mRun1, surface: 'adjust',
+    dbToken: envMulti.ownerToken, commandKey: 'm-a1', expectedJournalSeq: mSeq, runId: mRun1, surface: 'adjust',
     decisions: [
       { recordId: 'carrier_a~direct~PAT SAMPLE~100.00~2026-10', disposition: 'CONFIRM' },
       { recordId: 'carrier_b~direct~CASEY MOCK~250.00~2026-10', disposition: 'CONFIRM' },
     ],
   });
   mSeq = Number((await envMulti.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [mRun1])).rows[0].latest_journal_seq);
-  await envMulti.commands.confirmEmit({ actor: envMulti.ownerActor, commandKey: 'm-e1', expectedJournalSeq: mSeq, runId: mRun1, adjustReviewSaveId: mAdj1.result.reviewSaveId, typedPhrase: 'create statements for 2026-10-31' });
+  await envMulti.commands.confirmEmit({ dbToken: envMulti.ownerToken, commandKey: 'm-e1', expectedJournalSeq: mSeq, runId: mRun1, adjustReviewSaveId: mAdj1.result.reviewSaveId, typedPhrase: 'create statements for 2026-10-31' });
   assert.equal((await wMulti.runOnce()).action, 'step_finished');
-  await envMulti.commands.carrySent({ actor: envMulti.ownerActor, commandKey: 'm-sent-1', runId: mRun1, typedPhrase: 'sent 2026-10-31' });
-  await envMulti.commands.carryDecisions({ actor: envMulti.ownerActor, commandKey: 'm-dec-1', runId: mRun1, typedPhrase: 'carry 2026-10-31' });
+  await envMulti.commands.carrySent({ dbToken: envMulti.ownerToken, commandKey: 'm-sent-1', runId: mRun1, typedPhrase: 'sent 2026-10-31' });
+  await envMulti.commands.carryDecisions({ dbToken: envMulti.ownerToken, commandKey: 'm-dec-1', runId: mRun1, typedPhrase: 'carry 2026-10-31' });
 
   // Run 2 (2026-11-30): moves Policy 1 ($100 gross: $80 downline / $20 upline) from Beacon to Harbor (REVERSAL + RESTATED)
   const movedDataset = () => {
@@ -1263,21 +1279,21 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   };
   const wMulti2 = envMulti.registerWorker(createEngineWorker({
     pool: envMulti.pool, pgConfig: envMulti.pgConfig, companySlug: envMulti.companySlug,
-    stores: envMulti.stores, commands: envMulti.commands, workerActor: envMulti.workerActor,
+    stores: envMulti.stores, commands: envMulti.commands, workerToken: envMulti.workerToken,
     materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: null, datasetBuilder: movedDataset }),
     tempBaseDir: envMulti.tempDir,
   }));
-  const lm2 = await envMulti.commands.launchRun({ actor: envMulti.ownerActor, commandKey: 'm-l2', statementDate: '2026-11-30', engineVersionId: engMultiId });
+  const lm2 = await envMulti.commands.launchRun({ dbToken: envMulti.ownerToken, commandKey: 'm-l2', statementDate: '2026-11-30', engineVersionId: engMultiId });
   const mRun2 = lm2.result.runId;
   for (let i = 0; i < 3; i++) assert.equal((await wMulti2.runOnce()).action, 'step_finished');
   mSeq = Number((await envMulti.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [mRun2])).rows[0].latest_journal_seq);
   // All Bible queue items are already covered by carried standing decisions -> empty decisions: [] preserves human pause!
-  await envMulti.commands.saveReviewDecisions({ actor: envMulti.ownerActor, commandKey: 'm-b2', expectedJournalSeq: mSeq, runId: mRun2, surface: 'bible', decisions: [] });
+  await envMulti.commands.saveReviewDecisions({ dbToken: envMulti.ownerToken, commandKey: 'm-b2', expectedJournalSeq: mSeq, runId: mRun2, surface: 'bible', decisions: [] });
   assert.equal((await wMulti2.runOnce()).action, 'step_finished');
   mSeq = Number((await envMulti.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [mRun2])).rows[0].latest_journal_seq);
-  const mAdj2 = await envMulti.commands.saveReviewDecisions({ actor: envMulti.ownerActor, commandKey: 'm-a2', expectedJournalSeq: mSeq, runId: mRun2, surface: 'adjust', decisions: [] });
+  const mAdj2 = await envMulti.commands.saveReviewDecisions({ dbToken: envMulti.ownerToken, commandKey: 'm-a2', expectedJournalSeq: mSeq, runId: mRun2, surface: 'adjust', decisions: [] });
   mSeq = Number((await envMulti.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [mRun2])).rows[0].latest_journal_seq);
-  await envMulti.commands.confirmEmit({ actor: envMulti.ownerActor, commandKey: 'm-e2', expectedJournalSeq: mSeq, runId: mRun2, adjustReviewSaveId: mAdj2.result.reviewSaveId, typedPhrase: 'create statements for 2026-11-30' });
+  await envMulti.commands.confirmEmit({ dbToken: envMulti.ownerToken, commandKey: 'm-e2', expectedJournalSeq: mSeq, runId: mRun2, adjustReviewSaveId: mAdj2.result.reviewSaveId, typedPhrase: 'create statements for 2026-11-30' });
   assert.equal((await wMulti2.runOnce()).action, 'step_finished');
 
   // Verify cumulative entity statements across BOTH dates (2026-10-31 + 2026-11-30) tie to Run 2's ledger!
@@ -1286,7 +1302,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   const byEntMulti = Object.fromEntries(reconMulti.map((r) => [r.statement_entity, r.statement_total]));
   assert.equal(byEntMulti.Beacon, '120.00', 'Beacon must reflect $200.00 - $80.00 reversal = $120.00');
   assert.equal(byEntMulti.Harbor, '280.00', 'Harbor must reflect $200.00 + $80.00 restatement = $280.00');
-  assert.equal(byEntMulti['Beacon Upline'], '125.00', 'Upline must remain $125.00 net across reversal and restatement');
+  assert.equal(byEntMulti['Acme Upline'], '125.00', 'Upline must remain $125.00 net across reversal and restatement');
   const perDate = (await envMulti.pool.query("SELECT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS d, statement_entity, net_amount FROM coherence_views.v_entity_statement_date_totals ORDER BY statement_date, statement_entity")).rows;
   assert.ok(perDate.some((r) => r.d === '2026-10-31' && r.statement_entity === 'Beacon' && r.net_amount === '200.00'));
   assert.ok(perDate.some((r) => r.d === '2026-11-30' && r.statement_entity === 'Beacon' && r.net_amount === '-80.00'));

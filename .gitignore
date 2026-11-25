@@ -2,6 +2,7 @@ node_modules/
 .devin/
 .neon-*
 .pass2-*
+.pass2.pid
 .env
 .env.*
 .DS_Store

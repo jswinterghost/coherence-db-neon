@@ -25,7 +25,7 @@ import {
   SYNTHETIC_LEDGER_COLUMNS,
   SYNTHETIC_RUN_COLUMNS,
 } from './helpers/fixtures.mjs';
-import { checkPgAvailable, getAdminPgConfig } from './helpers/test-db.mjs';
+import { checkPgAvailable, getAdminPgConfig, withClusterCatalogLock } from './helpers/test-db.mjs';
 
 const pgCheck = await checkPgAvailable();
 const TEST_DB_RE = /^test_[a-z0-9_]+$/;
@@ -51,6 +51,8 @@ function mintSignedToken({
   return `${payload}|${sig}`;
 }
 
+const ENV_BY_POOL = new WeakMap();
+
 async function createCoherenceIamTestEnv({ companySlug = 'acme', displayName = 'Acme', initCompany = true } = {}) {
   const suffix = randomBytes(5).toString('hex');
   const dbName = `test_r1_009_${suffix}`;
@@ -72,28 +74,6 @@ async function createCoherenceIamTestEnv({ companySlug = 'acme', displayName = '
   const dataStore = createDataStore({ backend: createMemoryObjectStore({ label: `r1-009-data-${suffix}` }) });
   const stores = createStorePair({ codeStore, dataStore });
   const commands = createCommandLayer({ pool, companySlug, stores });
-  const ownerActor = { id: 'test-owner', kind: 'owner', actingFor: null };
-  const workerActor = { id: `coherence-worker:${companySlug}`, kind: 'worker' };
-
-  if (initCompany) {
-    await commands.initCompany({
-      actor: ownerActor,
-      commandKey: `init-009-${suffix}`,
-      slug: companySlug,
-      displayName,
-      defaultEmitMode: 'coherence',
-    });
-    const baseFile = await dataStore.promoteBytes(Buffer.from('k,v\n1,2\n', 'utf8'), { relPath: 'Carrier/seed.csv', checksPassed: true });
-    await commands.publishInputVersion({
-      actor: ownerActor,
-      commandKey: `standing-seed-009-${suffix}`,
-      lineKind: 'standing',
-      sourceKind: 'upload',
-      reason: 'synthetic standing input root',
-      entries: [{ relPath: 'Carrier/seed.csv', fileSha256: baseFile.sha256 }],
-      storedFiles: [baseFile],
-    });
-  }
 
   async function cleanup() {
     await pool.end().catch(() => {});
@@ -112,7 +92,22 @@ async function createCoherenceIamTestEnv({ companySlug = 'acme', displayName = '
     }
   }
 
-  return { dbName, companySlug, displayName, pgConfig, pool, codeStore, dataStore, stores, commands, ownerActor, workerActor, cleanup };
+  const env = {
+    dbName,
+    companySlug,
+    displayName,
+    pgConfig,
+    pool,
+    codeStore,
+    dataStore,
+    stores,
+    commands,
+    ownerToken: null,
+    workerToken: null,
+    cleanup,
+  };
+  ENV_BY_POOL.set(pool, { env, initCompany, suffix });
+  return env;
 }
 
 async function inSerializableTx(pool, fn) {
@@ -509,18 +504,6 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
       );
     }
 
-    // Supervision chain at Beacon: leadManager -> teamManager -> agentA (sibling agentB unmanaged)
-    for (const [mgr, sub] of [
-      [ids.leadManager, ids.teamManager],
-      [ids.teamManager, ids.agentA],
-    ]) {
-      await c.query(
-        `INSERT INTO iam.supervision_links (id, organization_id, manager_person_id, subordinate_person_id, valid_range, status, journal_seq)
-         VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)`,
-        [randomUUID(), ids.beaconOrg, mgr, sub, seq],
-      );
-    }
-
     // Role grants
     const grants = [
       [ids.nusearOwner, ids.roleNusearOwner, ids.rootOrg, true, 'org_subtree'],
@@ -532,8 +515,6 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
       [ids.acmeCompanyAdmin, ids.roleCompanyAdmin, ids.acmeOrg, true, 'org_subtree'],
       [ids.acmeInvestor, ids.roleInvestor, ids.acmeOrg, true, 'org_subtree'],
       [ids.beaconManager, ids.roleAgencyManager, ids.beaconOrg, true, 'org_subtree'],
-      [ids.leadManager, ids.roleTeamManager, ids.beaconOrg, true, 'self_and_managed'],
-      [ids.teamManager, ids.roleTeamManager, ids.beaconOrg, true, 'self_and_managed'],
       [ids.multiAgencyPerson, ids.roleAgencyManager, ids.beaconOrg, true, 'org_subtree'],
       [ids.multiAgencyPerson, ids.roleRetentionAgent, ids.harborOrg, true, 'org_subtree'],
       [ids.harborRetention, ids.roleRetentionAgent, ids.harborOrg, true, 'org_subtree'],
@@ -547,14 +528,41 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
       await c.query(
         `INSERT INTO iam.role_grants (
            id, person_id, role_id, organization_id, include_descendants,
-           person_scope_mode, connection_scope_mode, valid_range, status, journal_seq
-         ) VALUES ($1,$2,$3,$4,$5,$6,'all_in_org','[2020-01-01,)'::daterange,'active',$7)`,
+           person_scope_mode, valid_range, status, journal_seq
+         ) VALUES ($1,$2,$3,$4,$5,$6,'[2020-01-01,)'::daterange,'active',$7)`,
         [randomUUID(), personId, roleId, orgId, incDesc, pMode, seq],
       );
     }
   });
 
-  return { ids, keyId, secretBytes, environment };
+  const ownerToken = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.nusearOwner });
+  const workerToken = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.workerService });
+  const meta = ENV_BY_POOL.get(pool);
+  if (meta) {
+    meta.env.ownerToken = ownerToken;
+    meta.env.workerToken = workerToken;
+    if (meta.initCompany) {
+      await meta.env.commands.initCompany({
+        dbToken: ownerToken,
+        commandKey: `init-009-${meta.suffix}`,
+        slug: meta.env.companySlug,
+        displayName: meta.env.displayName,
+        defaultEmitMode: 'coherence',
+      });
+      const baseFile = await meta.env.dataStore.promoteBytes(Buffer.from('k,v\n1,2\n', 'utf8'), { relPath: 'Carrier/seed.csv', checksPassed: true });
+      await meta.env.commands.publishInputVersion({
+        dbToken: ownerToken,
+        commandKey: `standing-seed-009-${meta.suffix}`,
+        lineKind: 'standing',
+        sourceKind: 'upload',
+        reason: 'synthetic standing input root',
+        entries: [{ relPath: 'Carrier/seed.csv', fileSha256: baseFile.sha256 }],
+        storedFiles: [baseFile],
+      });
+    }
+  }
+
+  return { ids, keyId, secretBytes, environment, ownerToken, workerToken };
 }
 
 function buildMultiSubtreeEmitDataset(statementDate, { suffixTag = 'R1', entityAliasForEast = 'East Team' } = {}) {
@@ -711,7 +719,7 @@ async function seedPublishedRun(env, { statementDate, keyPrefix, markSent = true
   const emitEvId = randomUUID();
   const runId = randomUUID();
   const imp = await env.commands.importHistoricalRun({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: `${keyPrefix}-imp`,
     run: {
       id: runId,
@@ -751,7 +759,7 @@ async function seedPublishedRun(env, { statementDate, keyPrefix, markSent = true
   const actualEmitEvId = emitEvRes.rows[0].id;
 
   await env.commands.materializeEmit({
-    actor: env.workerActor,
+    dbToken: env.workerToken,
     commandKey: `${keyPrefix}-mat`,
     runId: imp.result.runId,
     attemptEventId: actualEmitEvId,
@@ -766,7 +774,7 @@ async function seedPublishedRun(env, { statementDate, keyPrefix, markSent = true
 
   if (markSent && !abandon) {
     await env.commands.carrySent({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `${keyPrefix}-sent`,
       runId: imp.result.runId,
       typedPhrase: `sent ${statementDate}`,
@@ -848,7 +856,7 @@ test('Layer 7B [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE
   }
 
   // 4. Updated live IAM + Coherence catalog audit passes
-  const audit = await policyChecks.verifyIamConfigInvariants(env.pool);
+  const audit = await withClusterCatalogLock(() => policyChecks.verifyIamConfigInvariants(env.pool));
   assert.equal(audit.passed, true, `verifyIamConfigInvariants failed:\n${audit.problems.join('\n')}`);
   assert.ok(audit.checkedAppViews >= 15, `expected >= 15 app_views views, got ${audit.checkedAppViews}`);
   assert.ok(audit.checkedAppCmdFunctions >= 31, `expected >= 31 app_cmd functions, got ${audit.checkedAppCmdFunctions}`);
@@ -946,9 +954,161 @@ test('Layer 7B [Foreign Keys & Strict Refusal Backfill]: backfill maps entity an
 
   const { ids } = await seedCoherenceIamWorld(env.pool);
 
-  // Seed a run containing a legacy entity alias ("Legacy East Unit") that does NOT match iam.organization_versions
+  // First confirm live token-based materializeEmit refuses an unmapped entity ("Legacy East Unit") immediately at write time (Item 5).
   const dsAlias = buildMultiSubtreeEmitDataset('2026-10-31', { suffixTag: 'BF', entityAliasForEast: 'Legacy East Unit' });
-  await seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'bf-r1', markSent: true, dataset: dsAlias });
+  await assert.rejects(
+    () => seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'bf-live-refuse', markSent: false, dataset: dsAlias }),
+    /UNMAPPED_ENTITY/i,
+    'live materializeEmit must refuse unmapped entity immediately inside PostgreSQL',
+  );
+
+  // Simulate a pre-009 database whose legacy financial rows have NULL organization_id / writing_person_id
+  // (using superuser direct SQL insert of a single legacy batch & materialization) so we can thoroughly
+  // test coherence.backfill_iam_foreign_keys() across all 5 tables.
+  const insertLegacyNullBatch = async ({ commandKey, statementDate, agencyLines = [], uplineLines = [], runMat = null }) => {
+    await inSerializableTx(env.pool, async (c) => {
+      const batchId = randomUUID();
+      await c.query('ALTER TABLE coherence.journal_entries DISABLE TRIGGER trg_journal_verify_commitments');
+      await c.query('ALTER TABLE coherence.statement_batches DISABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.statement_agency_lines DISABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.statement_upline_lines DISABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.run_materializations DISABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.bob_policies DISABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.bob_policy_financials DISABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.coherent_ledger_rows DISABLE TRIGGER USER');
+      const seq = (await c.query(
+        `INSERT INTO coherence.journal_entries (actor, acting_for, command_kind, command_key, request_sha256, body)
+         VALUES ('pre-009-legacy', NULL, 'record_statement_batch', $1, $2, '{"commitments":{"counts":{},"hashes":{}}}'::jsonb)
+         RETURNING seq`,
+        [commandKey, sha256Hex(commandKey)],
+      )).rows[0].seq;
+      const agNet = agencyLines.reduce((acc, r) => acc + Number(r.amount), 0).toFixed(2);
+      const upNet = uplineLines.reduce((acc, r) => acc + Number(r.amount), 0).toFixed(2);
+      await c.query(
+        `INSERT INTO coherence.statement_batches (
+           id, batch_kind, statement_date, run_id, attempt_event_id, reason,
+           agency_line_count, agency_lines_sha256, agency_net_total,
+           upline_line_count, upline_lines_sha256, upline_net_total, journal_seq
+         ) VALUES ($1,$2,$3::date,$4,$5,'pre-009 legacy',$6,$7,$8::numeric,$9,$10,$11::numeric,$12)`,
+        [batchId, runMat ? 'run_emission' : 'historical_sent', statementDate, runMat?.runId ?? null, runMat?.emitEvId ?? null,
+          agencyLines.length, sha256Hex('ag'), agNet, uplineLines.length, sha256Hex('up'), upNet, seq],
+      );
+      for (let i = 0; i < agencyLines.length; i++) {
+        const r = agencyLines[i];
+        await c.query(
+          `INSERT INTO coherence.statement_agency_lines (
+             batch_id, line_no, statement_date, entry_kind, run_action, entity,
+             organization_id, writing_npn, writing_person_id, writing_agent,
+             record_id, source_file, source_row_no, gross_comm, amount, journal_seq
+           ) VALUES ($1,$2,$3::date,$4,'NEW',$5,NULL,$6,NULL,$7,$8,$9,$10,$11::numeric,$12::numeric,$13)`,
+          [batchId, i + 1, statementDate, runMat ? 'run_emission' : 'historical_sent', r.entity, r.writingNpn ?? null, r.writingAgent ?? null,
+            r.recordId, r.sourceFile || 'legacy.csv', r.sourceRowNo || (i + 1), r.grossComm, r.amount, seq],
+        );
+      }
+      for (let i = 0; i < uplineLines.length; i++) {
+        const r = uplineLines[i];
+        await c.query(
+          `INSERT INTO coherence.statement_upline_lines (
+             batch_id, line_no, statement_date, entry_kind, run_action, source_entity, marked_sent,
+             organization_id, writing_npn, writing_person_id, writing_agent,
+             record_id, source_file, source_row_no, gross_comm, amount, journal_seq
+           ) VALUES ($1,$2,$3::date,$4,'NEW',$5,true,NULL,$6,NULL,$7,$8,$9,$10,$11::numeric,$12::numeric,$13)`,
+          [batchId, i + 1, statementDate, runMat ? 'run_emission' : 'historical_sent', r.sourceEntity, r.writingNpn ?? null, r.writingAgent ?? null,
+            r.recordId, r.sourceFile || 'legacy.csv', r.sourceRowNo || (i + 1), r.grossComm, r.amount, seq],
+        );
+      }
+      if (runMat) {
+        await c.query(
+          `INSERT INTO coherence.run_materializations (
+             attempt_event_id, run_id, statement_date, reconciliation_mode,
+             bob_row_count, bob_rows_sha256, bob_downline_total, bob_upline_total,
+             ledger_row_count, ledger_rows_sha256, ledger_gross_total, ledger_downline_total, ledger_upline_total,
+             statement_batch_id, journal_seq
+           ) VALUES ($1,$2,$3::date,'strict_entity_ledger',$4,$5,490.00,140.00,$6,$7,630.00,490.00,140.00,$8,$9)`,
+          [runMat.emitEvId, runMat.runId, statementDate, runMat.bobRows.length, sha256Hex('bob'), runMat.ledgerRows.length, sha256Hex('led'), batchId, seq],
+        );
+        for (const b of runMat.bobRows) {
+          await c.query(
+            `INSERT INTO coherence.bob_policies (
+               attempt_event_id, policy_id, run_id, writing_npn, writing_agent, entity,
+               organization_id, writing_person_id, status, journal_seq
+             ) VALUES ($1,$2,$3,$4,$5,$6,NULL,NULL,'ACTIVE_PAYING',$7)`,
+            [runMat.emitEvId, b.policyId, runMat.runId, b.writingNpn, b.writingAgent, b.entity, seq],
+          );
+          await c.query(
+            `INSERT INTO coherence.bob_policy_financials (
+               attempt_event_id, policy_id, entity, writing_npn, organization_id, writing_person_id,
+               amount, upline_amount, journal_seq
+             ) VALUES ($1,$2,$3,$4,NULL,NULL,$5::numeric,$6::numeric,$7)`,
+            [runMat.emitEvId, b.policyId, b.entity, b.writingNpn, b.amount, b.uplineAmount, seq],
+          );
+        }
+        for (const l of runMat.ledgerRows) {
+          await c.query(
+            `INSERT INTO coherence.coherent_ledger_rows (
+               attempt_event_id, tx_id, run_id, record_id, policy_id, src_type,
+               gross_comm, commission_amount, downline_amount, upline_amount, writing_npn, writing_agent, entity,
+               cbob_c, cbob_s, sf, organization_id, writing_person_id, journal_seq
+             ) VALUES ($1,$2,$3,$4,$5,'direct',$6::numeric,$6::numeric,$7::numeric,$8::numeric,$9,$10,$11,true,false,true,NULL,NULL,$12)`,
+            [runMat.emitEvId, l.txId, runMat.runId, l.recordId, l.policyId, l.grossComm, l.downlineAmount, l.uplineAmount, l.writingNpn, l.writingAgent, l.entity, seq],
+          );
+        }
+      }
+      await c.query('ALTER TABLE coherence.journal_entries ENABLE TRIGGER trg_journal_verify_commitments');
+      await c.query('ALTER TABLE coherence.statement_batches ENABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.statement_agency_lines ENABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.statement_upline_lines ENABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.run_materializations ENABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.bob_policies ENABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.bob_policy_financials ENABLE TRIGGER USER');
+      await c.query('ALTER TABLE coherence.coherent_ledger_rows ENABLE TRIGGER USER');
+    });
+  };
+
+  // Import a bare Emit run shell (without materialization), then seed pre-009 NULL-FK materialized rows for it.
+  const bfRunImp = await env.commands.importHistoricalRun({
+    dbToken: env.ownerToken,
+    commandKey: 'bf-r1-shell',
+    run: { statementDate: '2026-10-31', folderNumber: 1, origin: 'company_import', emitMode: 'coherence', sourceFolder: 'company-runs/2026-10-31-bf-shell' },
+    inputVersion: { reason: 'pre-009 backfill shell' },
+    inputEntries: [],
+    stepAttempts: [{ step: 'emit', attemptNo: 1, eventKind: 'finished', artifacts: [] }],
+    storedFiles: [],
+  });
+  const bfRunId = bfRunImp.result.runId;
+  const bfEmitEvId = (await env.pool.query("SELECT id FROM coherence.step_attempt_events WHERE run_id = $1::uuid AND step = 'emit' AND event_kind = 'finished' LIMIT 1", [bfRunId])).rows[0].id;
+  await insertLegacyNullBatch({
+    commandKey: 'bf-pre009-mat',
+    statementDate: '2026-10-31',
+    agencyLines: [
+      { entity: 'Beacon', writingNpn: '11111111', writingAgent: 'Sam Seller', recordId: 'bf-r1', grossComm: '100.00', amount: '80.00' },
+      { entity: 'Beacon', writingNpn: '22222222', writingAgent: 'Sam Seller', recordId: 'bf-r2', grossComm: '150.00', amount: '120.00' },
+      { entity: 'Legacy East Unit', writingNpn: '44444444', writingAgent: 'Jamie East', recordId: 'bf-r3', grossComm: '100.00', amount: '90.00' },
+      { entity: 'Harbor', writingNpn: '33333333', writingAgent: 'Robin Harbor', recordId: 'bf-r4', grossComm: '250.00', amount: '200.00' },
+    ],
+    uplineLines: [
+      { sourceEntity: 'Beacon', writingNpn: '11111111', writingAgent: 'Sam Seller', recordId: 'bf-r1', grossComm: '100.00', amount: '20.00' },
+      { sourceEntity: 'Legacy East Unit', writingNpn: '44444444', writingAgent: 'Jamie East', recordId: 'bf-r3', grossComm: '100.00', amount: '10.00' },
+      { sourceEntity: 'Acme', writingNpn: null, writingAgent: null, recordId: 'bf-house', grossComm: '30.00', amount: '30.00' },
+    ],
+    runMat: {
+      runId: bfRunId,
+      emitEvId: bfEmitEvId,
+      bobRows: [
+        { policyId: 1, entity: 'Beacon', writingNpn: '11111111', writingAgent: 'Sam Seller', amount: '80.00', uplineAmount: '20.00' },
+        { policyId: 2, entity: 'Beacon', writingNpn: '22222222', writingAgent: 'Sam Seller', amount: '120.00', uplineAmount: '30.00' },
+        { policyId: 3, entity: 'Legacy East Unit', writingNpn: '44444444', writingAgent: 'Jamie East', amount: '90.00', uplineAmount: '10.00' },
+        { policyId: 4, entity: 'Harbor', writingNpn: '33333333', writingAgent: 'Robin Harbor', amount: '200.00', uplineAmount: '50.00' },
+      ],
+      ledgerRows: [
+        { txId: 1, recordId: 'bf-r1', policyId: 1, entity: 'Beacon', writingNpn: '11111111', writingAgent: 'Sam Seller', grossComm: '100.00', downlineAmount: '80.00', uplineAmount: '20.00' },
+        { txId: 2, recordId: 'bf-r2', policyId: 2, entity: 'Beacon', writingNpn: '22222222', writingAgent: 'Sam Seller', grossComm: '150.00', downlineAmount: '120.00', uplineAmount: '30.00' },
+        { txId: 3, recordId: 'bf-r3', policyId: 3, entity: 'Legacy East Unit', writingNpn: '44444444', writingAgent: 'Jamie East', grossComm: '100.00', downlineAmount: '90.00', uplineAmount: '10.00' },
+        { txId: 4, recordId: 'bf-r4', policyId: 4, entity: 'Harbor', writingNpn: '33333333', writingAgent: 'Robin Harbor', grossComm: '250.00', downlineAmount: '200.00', uplineAmount: '50.00' },
+        { txId: 5, recordId: 'bf-house', policyId: 1, entity: 'Acme', writingNpn: null, writingAgent: null, grossComm: '30.00', downlineAmount: '0.00', uplineAmount: '30.00' },
+      ],
+    },
+  });
 
   // Before backfill: all 5 tables have NULL organization_id and writing_person_id
   for (const tbl of ['bob_policies', 'bob_policy_financials', 'statement_agency_lines', 'statement_upline_lines', 'coherent_ledger_rows']) {
@@ -1017,19 +1177,15 @@ test('Layer 7B [Foreign Keys & Strict Refusal Backfill]: backfill maps entity an
     assert.ok(row.rows_already_mapped > 0);
   }
 
-  // 5. Unmapped writing_npn on a new batch MUST be refused atomically
-  await env.commands.recordStatementBatch({
-    actor: env.ownerActor,
+  // 5. Unmapped writing_npn on a pre-009 legacy batch MUST be refused atomically by backfill
+  await insertLegacyNullBatch({
     commandKey: 'unmapped-npn-batch',
-    batchKind: 'historical_sent',
     statementDate: '2026-09-30',
-    reason: 'unmapped npn test',
     agencyLines: [{
       entity: 'Beacon', writingNpn: '99999999', writingAgent: 'Ghost Agent',
       recordId: 'carrier_a~direct~GHOST~10.00~2026-09', sourceFile: 'hist.csv', sourceRowNo: 1,
       grossComm: '10.00', amount: '10.00',
     }],
-    uplineLines: [],
   });
   await assert.rejects(
     () => env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys($1::jsonb)', [JSON.stringify(entityMap)]),
@@ -1052,7 +1208,7 @@ test('Layer 7B [Foreign Keys & Strict Refusal Backfill]: backfill maps entity an
   ));
   assert.equal(bfNpnMap.rows[0].rows_updated, 1);
 
-  // Ambiguous entity (two distinct orgs matching 'dup_org' / 'Dup_Org' inside Acme's tree) MUST refuse without guessing
+  // Ambiguous entity (two distinct orgs matching 'dup_entity' inside Acme's tree) MUST refuse without guessing
   const dupOrgA = randomUUID();
   const dupOrgB = randomUUID();
   await inSerializableTx(env.pool, async (c) => {
@@ -1064,18 +1220,14 @@ test('Layer 7B [Foreign Keys & Strict Refusal Backfill]: backfill maps entity an
       [randomUUID(), dupOrgA, ids.acmeOrg, j.seq, randomUUID(), dupOrgB],
     );
   });
-  await env.commands.recordStatementBatch({
-    actor: env.ownerActor,
+  await insertLegacyNullBatch({
     commandKey: 'ambig-entity-batch',
-    batchKind: 'historical_sent',
     statementDate: '2026-09-29',
-    reason: 'ambiguous entity test',
     agencyLines: [{
       entity: 'dup_entity', writingNpn: null, writingAgent: null,
       recordId: 'carrier_a~direct~DUP~5.00~2026-09', sourceFile: 'hist2.csv', sourceRowNo: 1,
       grossComm: '5.00', amount: '5.00',
     }],
-    uplineLines: [],
   });
   await assert.rejects(
     () => env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys($1::jsonb)', [JSON.stringify(entityMap)]),
@@ -1084,18 +1236,14 @@ test('Layer 7B [Foreign Keys & Strict Refusal Backfill]: backfill maps entity an
   );
 
   // Blank non-NULL writing_npn ('   ') MUST refuse without guessing
-  await env.commands.recordStatementBatch({
-    actor: env.ownerActor,
+  await insertLegacyNullBatch({
     commandKey: 'blank-npn-batch',
-    batchKind: 'historical_sent',
     statementDate: '2026-09-28',
-    reason: 'blank npn test',
     agencyLines: [{
       entity: 'Beacon', writingNpn: '   ', writingAgent: 'Blank',
       recordId: 'carrier_a~direct~BLANK~5.00~2026-09', sourceFile: 'hist3.csv', sourceRowNo: 1,
       grossComm: '5.00', amount: '5.00',
     }],
-    uplineLines: [],
   });
   await assert.rejects(
     () => env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys($1::jsonb)', [JSON.stringify({ ...entityMap, dup_entity: dupOrgA })]),
@@ -1240,15 +1388,7 @@ test('Layer 7B [Audience Row & Column Isolation]: Agent (own NPN + zero dollars 
     assert.equal(lines[0].record_id, null);
   });
 
-  // 3. Lead Manager (depth-2 recursive supervision: leadManager -> teamManager -> agentA; sibling agentB excluded)
-  await runAsPlatformApp(env.pool, { token: tok(ids.leadManager), readOnly: true }, async (c) => {
-    const bob = (await c.query('SELECT writing_npn, amount FROM app_views.coherence_bob')).rows;
-    assert.equal(bob.length, 1);
-    assert.equal(bob[0].writing_npn, '11111111');
-    assert.equal(bob[0].amount, null);
-  });
-
-  // 4. Beacon Agency Manager: sees Beacon + East Team (descendant org subtree!) + agency amount, NO Harbor, NO upline, NO gross_comm, NO ledger
+  // 3. Beacon Agency Manager: sees Beacon + East Team (descendant org subtree!) + agency amount, NO Harbor, NO upline, NO gross_comm, NO ledger
   await runAsPlatformApp(env.pool, { token: tok(ids.beaconManager), readOnly: true }, async (c) => {
     const bob = (await c.query('SELECT entity, writing_npn, amount, upline_amount, conflicts FROM app_views.coherence_bob ORDER BY policy_id')).rows;
     assert.equal(bob.length, 3, 'Beacon Agency Manager must see Beacon (2) + child East Team (1) = 3 policies');
@@ -1410,7 +1550,7 @@ test('Layer 7B [app_cmd.coherence_* Commands, View-As Refusal & Worker Boundary]
   assert.equal(initRes.rows[0].res.idempotent, false);
   assert.equal(initRes.rows[0].res.journal_seq, 1);
 
-  // Idempotent replay succeeds with same seq; conflicting payload fails 23505
+  // Idempotent replay succeeds with same seq AND full stored result object (Item 8); conflicting payload fails 23505
   const initReplay = await runAsPlatformApp(env.pool, { token: ownerTok, readOnly: false, serializable: true }, (c) => (
     c.query(
       `SELECT app_cmd.coherence_init_company($1, $2, 'acme', 'Acme', 'coherence') AS res`,
@@ -1419,6 +1559,7 @@ test('Layer 7B [app_cmd.coherence_* Commands, View-As Refusal & Worker Boundary]
   ));
   assert.equal(initReplay.rows[0].res.idempotent, true);
   assert.equal(initReplay.rows[0].res.journal_seq, 1);
+  assert.deepEqual(initReplay.rows[0].res.result, { companySlug: 'acme', displayName: 'Acme', defaultEmitMode: 'coherence' });
 
   await assert.rejects(
     () => runAsPlatformApp(env.pool, { token: ownerTok, readOnly: false, serializable: true }, (c) => (
@@ -1807,10 +1948,10 @@ test('Layer 7B [Fix1-1, Fix1-2, Fix1-12 - Backfill Role Isolation, platform_work
       );
     }
     const bfMig = await runAsRole(env.pool, 'platform_migrator', { readOnly: false }, (c) => (
-      c.query('SELECT table_name, rows_updated::int FROM coherence.backfill_iam_foreign_keys() ORDER BY table_name')
+      c.query('SELECT table_name, rows_updated::int, rows_already_mapped::int FROM coherence.backfill_iam_foreign_keys() ORDER BY table_name')
     ));
     assert.equal(bfMig.rows.length, 5);
-    assert.ok(bfMig.rows.every((r) => r.rows_updated > 0));
+    assert.ok(bfMig.rows.every((r) => r.rows_already_mapped > 0));
   });
 
   await t.test('Fix1-2: platform_worker gets 42501 on INSERT/UPDATE/DELETE on every Coherence base table & schema_migrations, and holds only FOR SELECT policies', async () => {
@@ -1881,7 +2022,7 @@ test('Layer 7B [Fix1-1, Fix1-2, Fix1-12 - Backfill Role Isolation, platform_work
   });
 
   await t.test('Fix1-12 [Audit baseline]: catalog audit passes on clean migration 009', async () => {
-    const okAudit = await policyChecks.verifyIamConfigInvariants(env.pool);
+    const okAudit = await withClusterCatalogLock(() => policyChecks.verifyIamConfigInvariants(env.pool));
     assert.equal(okAudit.passed, true, `audit failed:\n${okAudit.problems.join('\n')}`);
   });
 
@@ -2059,8 +2200,8 @@ test('Layer 7B [Fix1-3, Fix1-4, Fix1-5, Fix1-8 - Decisions Gate, Tenant-Scoped R
       [ledgerNoUplinePerson, roleLedgerNoUpline, ids.acmeOrg],
     ]) {
       await c.query(
-        `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-         VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)`,
+        `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
+         VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)`,
         [randomUUID(), pid, rid, oid, seq],
       );
     }
@@ -2208,7 +2349,7 @@ test('Layer 7B [Fix1-9 & Fix1-12 Note - Active-Only Affiliations, Tenant-Tree Or
       [randomUUID(), acmeNoDescPerson, ids.acmeOrg, seq],
     );
     await c.query(
-      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)",
+      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
       [randomUUID(), acmeNoDescPerson, ids.roleEntityManager, ids.acmeOrg, seq],
     );
   });
@@ -2247,23 +2388,20 @@ test('Layer 7B [Fix1-9 & Fix1-12 Note - Active-Only Affiliations, Tenant-Tree Or
   });
 
   await t.test('Fix1-9B: _resolve_writing_person_id uses only status = active agent_affiliations', async () => {
-    await env.commands.recordStatementBatch({
-      actor: env.ownerActor,
-      commandKey: 'f1-9b-revoked-npn',
-      batchKind: 'historical_sent',
-      statementDate: '2026-07-15',
-      reason: 'revoked affil test',
-      agencyLines: [{
-        entity: 'Beacon', writingNpn: '88888888', writingAgent: 'Affil Test',
-        recordId: 'carrier_a~direct~AFF88~10.00~2026-07', sourceFile: 'aff.csv', sourceRowNo: 1,
-        grossComm: '10.00', amount: '10.00',
-      }],
-      uplineLines: [],
-    });
     await assert.rejects(
-      () => runAsRole(env.pool, 'platform_migrator', { readOnly: false }, (c) => (
-        c.query('SELECT * FROM coherence.backfill_iam_foreign_keys()')
-      )),
+      () => env.commands.recordStatementBatch({
+        dbToken: env.ownerToken,
+        commandKey: 'f1-9b-revoked-npn',
+        batchKind: 'historical_sent',
+        statementDate: '2026-07-15',
+        reason: 'revoked affil test',
+        agencyLines: [{
+          entity: 'Beacon', writingNpn: '88888888', writingAgent: 'Affil Test',
+          recordId: 'carrier_a~direct~AFF88~10.00~2026-07', sourceFile: 'aff.csv', sourceRowNo: 1,
+          grossComm: '10.00', amount: '10.00',
+        }],
+        uplineLines: [],
+      }),
       /UNMAPPED_WRITING_NPN/i,
       'revoked agent_affiliation must not resolve writing_npn',
     );
@@ -2274,9 +2412,19 @@ test('Layer 7B [Fix1-9 & Fix1-12 Note - Active-Only Affiliations, Tenant-Tree Or
         [randomUUID(), activeAgent88, ids.beaconOrg, j.seq],
       );
     });
-    await runAsRole(env.pool, 'platform_migrator', { readOnly: false }, (c) => (
-      c.query('SELECT * FROM coherence.backfill_iam_foreign_keys()')
-    ));
+    await env.commands.recordStatementBatch({
+      dbToken: env.ownerToken,
+      commandKey: 'f1-9b-active-npn',
+      batchKind: 'historical_sent',
+      statementDate: '2026-07-15',
+      reason: 'active affil test',
+      agencyLines: [{
+        entity: 'Beacon', writingNpn: '88888888', writingAgent: 'Affil Test',
+        recordId: 'carrier_a~direct~AFF88~10.00~2026-07', sourceFile: 'aff.csv', sourceRowNo: 1,
+        grossComm: '10.00', amount: '10.00',
+      }],
+      uplineLines: [],
+    });
     const resolved88 = (await env.pool.query(
       "SELECT writing_person_id FROM coherence.statement_agency_lines WHERE writing_npn = '88888888'",
     )).rows[0];
@@ -2299,23 +2447,20 @@ test('Layer 7B [Fix1-9 & Fix1-12 Note - Active-Only Affiliations, Tenant-Tree Or
         `p_entity_map must reject ${badLabel}`,
       );
     }
-    await env.commands.recordStatementBatch({
-      actor: env.ownerActor,
-      commandKey: 'f1-9a-bad-auto',
-      batchKind: 'historical_sent',
-      statementDate: '2026-07-10',
-      reason: 'bad auto entity test',
-      agencyLines: [{
-        entity: 'LeadCo', writingNpn: null, writingAgent: null,
-        recordId: 'carrier_a~direct~LEADCO~10.00~2026-07', sourceFile: 'lead.csv', sourceRowNo: 1,
-        grossComm: '10.00', amount: '10.00',
-      }],
-      uplineLines: [],
-    });
     await assert.rejects(
-      () => runAsRole(env.pool, 'platform_migrator', { readOnly: false }, (c) => (
-        c.query('SELECT * FROM coherence.backfill_iam_foreign_keys()')
-      )),
+      () => env.commands.recordStatementBatch({
+        dbToken: env.ownerToken,
+        commandKey: 'f1-9a-bad-auto',
+        batchKind: 'historical_sent',
+        statementDate: '2026-07-10',
+        reason: 'bad auto entity test',
+        agencyLines: [{
+          entity: 'LeadCo', writingNpn: null, writingAgent: null,
+          recordId: 'carrier_a~direct~LEADCO~10.00~2026-07', sourceFile: 'lead.csv', sourceRowNo: 1,
+          grossComm: '10.00', amount: '10.00',
+        }],
+        uplineLines: [],
+      }),
       /UNMAPPED_ENTITY/i,
       'auto-resolve must not match lead_vendor org',
     );
@@ -2864,7 +3009,7 @@ test('Layer 7B [Fix2-Blocker1 - Archived Child Latest Non-Future Edge & Team Mov
       [randomUUID(), harborManager, ids.harborOrg, seq],
     );
     await c.query(
-      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)",
+      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
       [randomUUID(), harborManager, ids.roleAgencyManager, ids.harborOrg, seq],
     );
 
@@ -2938,20 +3083,22 @@ test('Layer 7B [Fix2-Blocker1 - Archived Child Latest Non-Future Edge & Team Mov
     }
   });
 
-  await t.test('Fix2-B1b: backfill_iam_foreign_keys and _resolve_entity_org_id reject a team moved out to another company and archived', async () => {
-    await assert.rejects(
-      () => runAsRole(env.pool, 'platform_migrator', { readOnly: false }, (c) => (
-        c.query('SELECT * FROM coherence.backfill_iam_foreign_keys($1::jsonb)', [JSON.stringify({ 'Moved Out': movedOutTeam })])
-      )),
-      /INVALID_ENTITY_MAP/i,
-      'p_entity_map must refuse a team whose latest non-future active edge belongs to another company',
-    );
+  await t.test('Fix2-B1b: org formerly under Acme and later moved to Northstar & archived stays in Acme tree (Item 4), while pure Northstar org is rejected', async () => {
+    const pureNorthstarTeam = randomUUID();
+    await inSerializableTx(env.pool, async (c) => {
+      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.seed_pure_ns_team', commandKey: 'f2-b1b-pure-ns' });
+      await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'team',$2)", [pureNorthstarTeam, j.seq]);
+      await c.query("INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'pure_ns','Pure Northstar','archived',$3)", [randomUUID(), pureNorthstarTeam, j.seq]);
+      await c.query("INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2026-01-01)'::daterange,'active',$4)", [randomUUID(), pureNorthstarTeam, ids.northstarOrg, j.seq]);
+    });
+
+    // Former Acme org moved to Northstar and archived stays resolvable in Acme's working DB!
     await env.commands.recordStatementBatch({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'f2-b1b-moved-out',
       batchKind: 'historical_sent',
       statementDate: '2026-07-05',
-      reason: 'moved-out team backfill test',
+      reason: 'moved-out team retained in Acme working DB',
       agencyLines: [{
         entity: 'Moved Out', writingNpn: null, writingAgent: null,
         recordId: 'carrier_a~direct~MOVEDOUT~10.00~2026-07', sourceFile: 'moved.csv', sourceRowNo: 1,
@@ -2959,12 +3106,35 @@ test('Layer 7B [Fix2-Blocker1 - Archived Child Latest Non-Future Edge & Team Mov
       }],
       uplineLines: [],
     });
+    const moRow = (await env.pool.query(
+      "SELECT organization_id FROM coherence.statement_agency_lines WHERE entity = 'Moved Out'",
+    )).rows[0];
+    assert.equal(moRow.organization_id, movedOutTeam, 'movedOutTeam must resolve to its organization_id in Acme DB');
+
+    // Pure Northstar org (never under Acme) is rejected by both backfill_iam_foreign_keys and live writes!
     await assert.rejects(
       () => runAsRole(env.pool, 'platform_migrator', { readOnly: false }, (c) => (
-        c.query('SELECT * FROM coherence.backfill_iam_foreign_keys()')
+        c.query('SELECT * FROM coherence.backfill_iam_foreign_keys($1::jsonb)', [JSON.stringify({ 'Pure Northstar': pureNorthstarTeam })])
       )),
+      /INVALID_ENTITY_MAP/i,
+      'p_entity_map must refuse an org that never had an active edge under Acme',
+    );
+    await assert.rejects(
+      () => env.commands.recordStatementBatch({
+        dbToken: env.ownerToken,
+        commandKey: 'f2-b1b-pure-ns-write',
+        batchKind: 'historical_sent',
+        statementDate: '2026-07-06',
+        reason: 'pure Northstar org must fail',
+        agencyLines: [{
+          entity: 'Pure Northstar', writingNpn: null, writingAgent: null,
+          recordId: 'carrier_a~direct~PURENS~10.00~2026-07', sourceFile: 'ns.csv', sourceRowNo: 1,
+          grossComm: '10.00', amount: '10.00',
+        }],
+        uplineLines: [],
+      }),
       /UNMAPPED_ENTITY/i,
-      'auto-resolve must refuse a team whose latest non-future active edge moved to another company',
+      'auto-resolve must refuse an org that never belonged to Acme',
     );
   });
 });
@@ -3090,12 +3260,12 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
       );
       // Live Nusear grant on Acme with include_descendants = FALSE
       await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)",
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
         [randomUUID(), dualPerson, ids.roleNusearAdmin, ids.acmeOrg, seq],
       );
       // Dead customer grant on Acme with include_descendants = TRUE (dead because Acme switch is OFF)
       await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)",
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
         [randomUUID(), dualPerson, ids.roleEntityManager, ids.acmeOrg, seq],
       );
     });
@@ -3152,8 +3322,8 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
         await c.query("INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'Dual NO','Dual NO','dual.no@nusear.example','active',$3)", [randomUUID(), dualNoDesc, j.seq]);
         await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), dualNoDesc, w.ids.rootOrg, j.seq]);
         await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), dualNoDesc, w.ids.acmeOrg, j.seq]);
-        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), dualNoDesc, w.ids.roleNusearAdmin, w.ids.acmeOrg, j.seq]);
-        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), dualNoDesc, w.ids.roleEntityManager, w.ids.acmeOrg, j.seq]);
+        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), dualNoDesc, w.ids.roleNusearAdmin, w.ids.acmeOrg, j.seq]);
+        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), dualNoDesc, w.ids.roleEntityManager, w.ids.acmeOrg, j.seq]);
       });
       const noTok = (pid) => mintSignedToken({ keyId: w.keyId, secretBytes: w.secretBytes, environment: w.environment, actorPersonId: pid });
       const custCnt = await runAsPlatformApp(envNusearOnly.pool, { token: noTok(w.ids.acmeEntityMgr), readOnly: true }, async (c) => (
@@ -3394,7 +3564,7 @@ test('Layer 7B [Fix2-ShouldFix - Current Views No Stale Fallback, Reconciliation
       [splitUnpubReconPerson, roleUnpubOnly, ids.acmeOrg, false],
     ]) {
       await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$6)",
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,'org_subtree','[2020-01-01,)'::daterange,'active',$6)",
         [randomUUID(), pid, rid, oid, incDesc, seq],
       );
     }
@@ -3562,14 +3732,13 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
     }
   };
 
-  await t.test('Fix2-SF2: coherence_record_statement_batch and _cmd_insert_materialization refuse non-tenant, non-company/agency/team, and NULL organization_ids', async () => {
+  await t.test('Fix2-SF2 & Item 5: coherence_record_statement_batch and _cmd_insert_materialization refuse non-tenant/non-CAT organization_ids and strictly resolve omitted FKs inside PostgreSQL (refusing unmapped/ambiguous entities and unmapped/blank NPNs)', async () => {
     for (const [label, badOrg] of [
       ['other_company', ids.northstarOrg],
       ['lead_vendor', leadVendorOrg],
       ['referral_firm', refFirmOrg],
       ['platform_root', ids.rootOrg],
       ['orphan_agency', orphanAgencyOrg],
-      ['null_org', null],
     ]) {
       await assert.rejects(
         () => runAsPlatformApp(env.pool, { token: ownerTok, readOnly: false, serializable: true }, (c) => (
@@ -3607,7 +3776,48 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
       );
     }
 
-    // Launch a run to emit and test _cmd_insert_materialization refusing bad organization_id
+    // Item 5 strict PG resolution: NULL organization_id with unmapped entity or non-empty unmapped/blank NPN refuses (never silent NULL)
+    await assert.rejects(
+      () => runAsPlatformApp(env.pool, { token: ownerTok, readOnly: false, serializable: true }, (c) => (
+        c.query('SELECT app_cmd.coherence_record_statement_batch($1, $2, $3::jsonb)', [
+          'f2-bad-sb-unmapped-entity', reqSha('bad-sb-unmapped-entity'), JSON.stringify({
+            batch_kind: 'historical_sent', statement_date: '2026-07-01', reason: 'unmapped entity',
+            agency_lines: [{ entity: 'Unknown Agency', organization_id: null, record_id: 'r-unmap-ent', source_file: 'bad.csv', source_row_no: 1, gross_comm: '10.00', amount: '10.00' }],
+            upline_lines: [],
+          }),
+        ])
+      )),
+      (err) => err?.code === '22023' && /UNMAPPED_ENTITY/i.test(err.message),
+      'null organization_id with unmapped entity must refuse with UNMAPPED_ENTITY',
+    );
+    await assert.rejects(
+      () => runAsPlatformApp(env.pool, { token: ownerTok, readOnly: false, serializable: true }, (c) => (
+        c.query('SELECT app_cmd.coherence_record_statement_batch($1, $2, $3::jsonb)', [
+          'f2-bad-sb-unmapped-npn', reqSha('bad-sb-unmapped-npn'), JSON.stringify({
+            batch_kind: 'historical_sent', statement_date: '2026-07-01', reason: 'unmapped npn',
+            agency_lines: [{ entity: 'Beacon', organization_id: null, writing_npn: '99999999', writing_person_id: null, record_id: 'r-unmap-npn', source_file: 'bad.csv', source_row_no: 1, gross_comm: '10.00', amount: '10.00' }],
+            upline_lines: [],
+          }),
+        ])
+      )),
+      (err) => err?.code === '22023' && /UNMAPPED_WRITING_NPN/i.test(err.message),
+      'non-empty unmapped writing_npn must refuse with UNMAPPED_WRITING_NPN (never silent NULL)',
+    );
+    await assert.rejects(
+      () => runAsPlatformApp(env.pool, { token: ownerTok, readOnly: false, serializable: true }, (c) => (
+        c.query('SELECT app_cmd.coherence_record_statement_batch($1, $2, $3::jsonb)', [
+          'f2-bad-sb-blank-npn', reqSha('bad-sb-blank-npn'), JSON.stringify({
+            batch_kind: 'historical_sent', statement_date: '2026-07-01', reason: 'blank npn',
+            agency_lines: [{ entity: 'Beacon', organization_id: null, writing_npn: '   ', writing_person_id: null, record_id: 'r-blank-npn', source_file: 'bad.csv', source_row_no: 1, gross_comm: '10.00', amount: '10.00' }],
+            upline_lines: [],
+          }),
+        ])
+      )),
+      (err) => err?.code === '22023' && /MALFORMED_WRITING_NPN/i.test(err.message),
+      'blank writing_npn must refuse with MALFORMED_WRITING_NPN',
+    );
+
+    // Launch a run to emit and test _cmd_insert_materialization refusing bad organization_id and strictly resolving omitted FKs
     const l1 = (await runAsPlatformApp(env.pool, { token: operatorTok, readOnly: false, serializable: true }, (c) => (
       c.query("SELECT app_cmd.coherence_launch_run($1, $2, NULL, DATE '2026-11-01', $3::uuid) AS res", ['f2-l1', reqSha('l1'), engId])
     ))).rows[0].res;
@@ -3649,7 +3859,6 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
       for (const [label, badOrg] of [
         ['northstar', ids.northstarOrg],
         ['lead_vendor', leadVendorOrg],
-        ['null_org', null],
       ]) {
         await assert.rejects(
           () => execTx((c) => c.query('SELECT app_cmd.coherence_finish_attempt($1, $2, $3::jsonb)', [
@@ -3672,6 +3881,47 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
           `_cmd_insert_materialization must reject ${label}`,
         );
       }
+      // Unmapped entity and unmapped writing_npn inside _cmd_insert_materialization must strictly refuse (Item 5)
+      await assert.rejects(
+        () => execTx((c) => c.query('SELECT app_cmd.coherence_finish_attempt($1, $2, $3::jsonb)', [
+          'f2-bad-mat-unmapped-ent', reqSha('bad-mat-unmapped-ent'), JSON.stringify({
+            run_id: runId, step: 'emit', attempt_no: 1, born: '2026-11-01T12:10:00Z',
+            artifacts: [{ rel_path: 'emits/statements_20261101.csv', artifact_kind: 'data', store_kind: 'company_data', file_sha256: artFile.sha256 }],
+            continue_to_next_step: false,
+            emit_materialization: {
+              statement_batch: { batch_kind: 'run_emission', statement_date: '2026-11-01', reason: 'unmapped ent' },
+              run_materialization: { statement_date: '2026-11-01', reconciliation_mode: 'strict_entity_ledger' },
+              agency_lines: [{ line_no: 1, entry_kind: 'run_emission', run_action: 'NEW', entity: 'NoSuchAgency', organization_id: null, record_id: 'r1', source_file: 'c.csv', source_row_no: 1, gross_comm: '100.00', amount: '80.00' }],
+              upline_lines: [{ line_no: 1, entry_kind: 'run_emission', run_action: 'NEW', source_entity: 'Beacon', marked_sent: true, organization_id: null, record_id: 'r1', source_file: 'c.csv', source_row_no: 1, gross_comm: '100.00', amount: '20.00' }],
+              bob_policies: [{ policy_id: 1, entity: 'Beacon', organization_id: null }],
+              bob_financials: [{ policy_id: 1, entity: 'Beacon', organization_id: null, amount: '80.00', upline_amount: '20.00' }],
+              ledger_rows: [{ tx_id: 1, record_id: 'r1', policy_id: 1, src_type: 'direct', gross_comm: '100.00', downline_amount: '80.00', upline_amount: '20.00', entity: 'Beacon', organization_id: null }],
+            },
+          }),
+        ])),
+        (err) => err?.code === '22023' && /UNMAPPED_ENTITY/i.test(err.message),
+        '_cmd_insert_materialization must reject unmapped entity when organization_id is NULL',
+      );
+      await assert.rejects(
+        () => execTx((c) => c.query('SELECT app_cmd.coherence_finish_attempt($1, $2, $3::jsonb)', [
+          'f2-bad-mat-unmapped-npn', reqSha('bad-mat-unmapped-npn'), JSON.stringify({
+            run_id: runId, step: 'emit', attempt_no: 1, born: '2026-11-01T12:10:00Z',
+            artifacts: [{ rel_path: 'emits/statements_20261101.csv', artifact_kind: 'data', store_kind: 'company_data', file_sha256: artFile.sha256 }],
+            continue_to_next_step: false,
+            emit_materialization: {
+              statement_batch: { batch_kind: 'run_emission', statement_date: '2026-11-01', reason: 'unmapped npn' },
+              run_materialization: { statement_date: '2026-11-01', reconciliation_mode: 'strict_entity_ledger' },
+              agency_lines: [{ line_no: 1, entry_kind: 'run_emission', run_action: 'NEW', entity: 'Beacon', organization_id: null, writing_npn: '99999999', writing_person_id: null, record_id: 'r1', source_file: 'c.csv', source_row_no: 1, gross_comm: '100.00', amount: '80.00' }],
+              upline_lines: [{ line_no: 1, entry_kind: 'run_emission', run_action: 'NEW', source_entity: 'Beacon', marked_sent: true, organization_id: null, record_id: 'r1', source_file: 'c.csv', source_row_no: 1, gross_comm: '100.00', amount: '20.00' }],
+              bob_policies: [{ policy_id: 1, entity: 'Beacon', organization_id: null }],
+              bob_financials: [{ policy_id: 1, entity: 'Beacon', organization_id: null, amount: '80.00', upline_amount: '20.00' }],
+              ledger_rows: [{ tx_id: 1, record_id: 'r1', policy_id: 1, src_type: 'direct', gross_comm: '100.00', downline_amount: '80.00', upline_amount: '20.00', entity: 'Beacon', organization_id: null }],
+            },
+          }),
+        ])),
+        (err) => err?.code === '22023' && /UNMAPPED_WRITING_NPN/i.test(err.message),
+        '_cmd_insert_materialization must reject unmapped writing_npn (never silent NULL)',
+      );
       // Also test bad org on bob_policies / ledger_rows specifically
       await assert.rejects(
         () => execTx((c) => c.query('SELECT app_cmd.coherence_finish_attempt($1, $2, $3::jsonb)', [
@@ -3693,7 +3943,7 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
         (err) => err?.code === '23503' && /INVALID_ORGANIZATION_ID/i.test(err.message),
         '_cmd_insert_materialization must reject referral_firm on ledger_rows',
       );
-      // Finish emit attempt 1 with valid tenant org (ids.beaconOrg) to prove happy path and close attempt
+      // Finish emit attempt 1 with omitted organization_id / writing_person_id and valid entity/NPN to prove PG resolves them strictly!
       const okMat = (await execTx((c) => c.query('SELECT app_cmd.coherence_finish_attempt($1, $2, $3::jsonb) AS res', [
         'f2-ok-mat', reqSha('ok-mat'), JSON.stringify({
           run_id: runId, step: 'emit', attempt_no: 1, born: '2026-11-01T12:10:00Z',
@@ -3702,15 +3952,29 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
           emit_materialization: {
             statement_batch: { batch_kind: 'run_emission', statement_date: '2026-11-01', reason: 'valid org mat' },
             run_materialization: { statement_date: '2026-11-01', reconciliation_mode: 'strict_entity_ledger' },
-            agency_lines: [{ line_no: 1, entry_kind: 'run_emission', run_action: 'NEW', entity: 'Beacon', organization_id: ids.beaconOrg, record_id: 'r1', source_file: 'c.csv', source_row_no: 1, gross_comm: '100.00', amount: '80.00' }],
-            upline_lines: [{ line_no: 1, entry_kind: 'run_emission', run_action: 'NEW', source_entity: 'Beacon', marked_sent: true, organization_id: ids.beaconOrg, record_id: 'r1', source_file: 'c.csv', source_row_no: 1, gross_comm: '100.00', amount: '20.00' }],
-            bob_policies: [{ policy_id: 1, entity: 'Beacon', organization_id: ids.beaconOrg }],
-            bob_financials: [{ policy_id: 1, entity: 'Beacon', organization_id: ids.beaconOrg, amount: '80.00', upline_amount: '20.00' }],
-            ledger_rows: [{ tx_id: 1, record_id: 'r1', policy_id: 1, src_type: 'direct', gross_comm: '100.00', commission_amount: '100.00', downline_amount: '80.00', upline_amount: '20.00', entity: 'Beacon', organization_id: ids.beaconOrg, cbob_c: true, cbob_s: false, sf: true }],
+            agency_lines: [{ line_no: 1, entry_kind: 'run_emission', run_action: 'NEW', entity: 'Beacon', writing_npn: '11111111', record_id: 'r1', source_file: 'c.csv', source_row_no: 1, gross_comm: '100.00', amount: '80.00' }],
+            upline_lines: [{ line_no: 1, entry_kind: 'run_emission', run_action: 'NEW', source_entity: 'Beacon', marked_sent: true, writing_npn: '11111111', record_id: 'r1', source_file: 'c.csv', source_row_no: 1, gross_comm: '100.00', amount: '20.00' }],
+            bob_policies: [{ policy_id: 1, entity: 'Beacon', writing_npn: '11111111' }],
+            bob_financials: [{ policy_id: 1, entity: 'Beacon', writing_npn: '11111111', amount: '80.00', upline_amount: '20.00' }],
+            ledger_rows: [{ tx_id: 1, record_id: 'r1', policy_id: 1, src_type: 'direct', gross_comm: '100.00', commission_amount: '100.00', downline_amount: '80.00', upline_amount: '20.00', entity: 'Beacon', writing_npn: '11111111', cbob_c: true, cbob_s: false, sf: true }],
           },
         }),
       ]))).rows[0].res;
       assert.ok(okMat.statement_batch_id, 'valid tenant org materialization must succeed');
+      const resolvedRow = (await env.pool.query(
+        'SELECT organization_id, writing_person_id FROM coherence.bob_policies WHERE run_id = $1::uuid',
+        [runId],
+      )).rows[0];
+      assert.equal(resolvedRow.organization_id, ids.beaconOrg, 'PostgreSQL _cmd_insert_materialization must resolve organization_id');
+      assert.equal(resolvedRow.writing_person_id, ids.agentA, 'PostgreSQL _cmd_insert_materialization must resolve writing_person_id');
+      // Replay of finish_attempt returns the stored result object whole (Item 8)
+      const okReplay = (await execTx((c) => c.query('SELECT app_cmd.coherence_finish_attempt($1, $2, $3::jsonb) AS res', [
+        'f2-ok-mat', reqSha('ok-mat'), JSON.stringify({}),
+      ]))).rows[0].res;
+      assert.equal(okReplay.idempotent, true);
+      assert.equal(okReplay.result.attemptEventId, okMat.attempt_event_id);
+      assert.equal(okReplay.result.statementBatchId, okMat.statement_batch_id);
+      assert.equal(okReplay.result.materialized, true);
     });
   });
 
@@ -3827,7 +4091,7 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
   });
 
   await t.test('Fix2-SF6 & SF8: audit checks every platform_view_owner policy in coherence, backfill pinned search_path, escaped LIKE underscores, _view_* helper, and zero stale comments', async () => {
-    const cleanAudit = await policyChecks.verifyIamConfigInvariants(env.pool);
+    const cleanAudit = await withClusterCatalogLock(() => policyChecks.verifyIamConfigInvariants(env.pool));
     assert.equal(cleanAudit.passed, true, `clean audit failed:\n${cleanAudit.problems.join('\n')}`);
 
     // 1. Unscoped platform_view_owner policy on non-FK coherence table (decisions) must fail audit
@@ -3999,26 +4263,20 @@ test('Layer 7B [Fix3-1A - Dual-Agency Tenant-Tree Bounds: Active Child Under Arc
       [acmeNoDollarPlusEastNarrowCash, roleNoDollarBob, ids.acmeOrg, true, 'org_subtree'],
     ]) {
       await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6,'all_in_org','[2020-01-01,)'::daterange,'active',$7)",
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6,'[2020-01-01,)'::daterange,'active',$7)",
         [randomUUID(), pid, roleId, orgId, incDesc, pMode, seq],
       );
     }
 
-    // Explicit-people narrow grants on East Team targeting agentEast
-    for (const [pid, roleId] of [
-      [dualAgencyNarrow, roleNarrowCash],
-      [acmeNoDollarPlusEastNarrowCash, roleNarrowCashOnly],
-    ]) {
-      const narrowGrantId = randomUUID();
-      await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'explicit_people','all_in_org','[2020-01-01,)'::daterange,'active',$5)",
-        [narrowGrantId, pid, roleId, ids.eastTeamOrg, seq],
-      );
-      await c.query(
-        'INSERT INTO iam.role_grant_people (grant_id, target_person_id, journal_seq) VALUES ($1,$2,$3)',
-        [narrowGrantId, ids.agentEast, seq],
-      );
-    }
+    // Self-scoped narrow grants on East Team for agentEast and dualAgencyNarrow (replaces parked explicit_people)
+    await c.query(
+      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'self','[2020-01-01,)'::daterange,'active',$5)",
+      [randomUUID(), ids.agentEast, roleNarrowCashOnly, ids.eastTeamOrg, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'self','[2020-01-01,)'::daterange,'active',$5)",
+      [randomUUID(), dualAgencyNarrow, roleNarrowCash, ids.eastTeamOrg, seq],
+    );
 
     // Turn East Team's own coherence switch ON, archive Beacon, and set Beacon's coherence switch HELD
     await c.query(
@@ -4132,10 +4390,21 @@ test('Layer 7B [Fix3-1A - Dual-Agency Tenant-Tree Bounds: Active Child Under Arc
     await assertZeroEastEverywhere('dualAgencyNarrow (Beacon archived on)', tok(dualAgencyNarrow), { expectHarbor: true });
     await assertZeroEastEverywhere('agentEastDual (Beacon archived on)', tok(ids.agentEast));
 
-    // col_scopes check (wide and narrow): Acme no-dollar bob/statements grant + direct East Team cash grant sees East Team row with ALL dollar/cash columns NULL
+    // col_scopes check (wide and narrow self): Acme no-dollar bob/statements grant + direct East Team cash grant sees East Team row with ALL dollar/cash columns NULL
+    await inSerializableTx(env.pool, async (c) => {
+      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f3_agent_east_acme_nodollar', commandKey: 'f3-agent-east-acme-nodollar' });
+      await c.query(
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        [randomUUID(), ids.agentEast, ids.acmeOrg, j.seq],
+      );
+      await c.query(
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+        [randomUUID(), ids.agentEast, roleNoDollarBob, ids.acmeOrg, j.seq],
+      );
+    });
     for (const [label, pid] of [
       ['wide cash grant', acmeNoDollarPlusEastCash],
-      ['narrow cash grant', acmeNoDollarPlusEastNarrowCash],
+      ['narrow self cash grant', ids.agentEast],
     ]) {
       await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
         const bobEast = (await c.query("SELECT amount, upline_amount, enrollment_code, conflicts FROM app_views.coherence_bob WHERE entity = 'East Team'")).rows;
@@ -4183,16 +4452,13 @@ test('Layer 7B [Fix3-1A - Dual-Agency Tenant-Tree Bounds: Active Child Under Arc
   });
 });
 
-test('Layer 7B [Fix3-1B - Dual-Company Caller (Harbor + Northstar) for a Team Moved Acme to Northstar, Active and Archived]', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7B [Item 4 - Moved Organizations in Working DB]: live Emit for moved agency in Acme DB, its own manager read, Acme staff & Nusear read with $0.00 reconciliation, and new upline zero rows (both active and archived)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createCoherenceIamTestEnv();
   t.after(() => env.cleanup());
 
   const { ids, keyId, secretBytes, environment } = await seedCoherenceIamWorld(env.pool);
-  const r1 = await seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'f3-dc-r1', markSent: true });
-  const r2 = await seedPublishedRun(env, { statementDate: '2026-11-15', keyPrefix: 'f3-dc-r2', markSent: false });
-  await runAsRole(env.pool, 'platform_migrator', { readOnly: false }, (c) => (
-    c.query('SELECT * FROM coherence.backfill_iam_foreign_keys()')
-  ));
+  const r1 = await seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'morg-r1', markSent: true });
+  const r2 = await seedPublishedRun(env, { statementDate: '2026-11-15', keyPrefix: 'morg-r2', markSent: false });
 
   const tok = (personId, viewAsPersonId = null) => mintSignedToken({ keyId, secretBytes, environment, actorPersonId: personId, viewAsPersonId });
 
@@ -4200,19 +4466,21 @@ test('Layer 7B [Fix3-1B - Dual-Company Caller (Harbor + Northstar) for a Team Mo
   const roleNarrowCash = randomUUID();
   const dualCoWide = randomUUID();
   const dualCoNarrow = randomUUID();
+  const northstarOnlyMgr = randomUUID();
   const acmeAndNorthstarEM = randomUUID();
+  const movedAgencyOwnMgr = randomUUID();
 
   await inSerializableTx(env.pool, async (c) => {
-    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f3_dc_setup', commandKey: 'f3-dc-setup' });
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.moved_org_setup', commandKey: 'morg-setup' });
     const seq = j.seq;
 
     for (const [roleId, slug, name, wide, rightList] of [
-      [roleFullScoped, 'f3_dc_full', 'F3 DC Full', true, [
+      [roleFullScoped, 'morg_dc_full', 'Morg DC Full', true, [
         'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
         'act:coherence.ledger.read', 'act:coherence.unpublished.read',
         'col:coherence.statement_cash', 'col:coherence.upline_cash',
       ]],
-      [roleNarrowCash, 'f3_dc_narrow', 'F3 DC Narrow', false, [
+      [roleNarrowCash, 'morg_dc_narrow', 'Morg DC Narrow', false, [
         'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.unpublished.read',
         'col:coherence.statement_cash',
       ]],
@@ -4233,7 +4501,9 @@ test('Layer 7B [Fix3-1B - Dual-Company Caller (Harbor + Northstar) for a Team Mo
     for (const [pid, name, email] of [
       [dualCoWide, 'Dual Company Wide', 'dc.wide@example.test'],
       [dualCoNarrow, 'Dual Company Narrow', 'dc.narrow@example.test'],
+      [northstarOnlyMgr, 'Northstar Upline Mgr', 'ns.mgr@example.test'],
       [acmeAndNorthstarEM, 'Acme Northstar EM', 'dc.em@example.test'],
+      [movedAgencyOwnMgr, 'Moved Agency Manager', 'moved.mgr@example.test'],
     ]) {
       await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
       await c.query(
@@ -4247,8 +4517,10 @@ test('Layer 7B [Fix3-1B - Dual-Company Caller (Harbor + Northstar) for a Team Mo
       [dualCoWide, ids.northstarOrg, 'employee'],
       [dualCoNarrow, ids.harborOrg, 'employee'],
       [dualCoNarrow, ids.northstarOrg, 'employee'],
+      [northstarOnlyMgr, ids.northstarOrg, 'owner'],
       [acmeAndNorthstarEM, ids.acmeOrg, 'owner'],
       [acmeAndNorthstarEM, ids.northstarOrg, 'owner'],
+      [movedAgencyOwnMgr, ids.eastTeamOrg, 'employee'],
     ]) {
       await c.query(
         "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
@@ -4260,26 +4532,22 @@ test('Layer 7B [Fix3-1B - Dual-Company Caller (Harbor + Northstar) for a Team Mo
       [dualCoWide, roleFullScoped, ids.harborOrg, true, 'org_subtree'],
       [dualCoWide, roleFullScoped, ids.northstarOrg, true, 'org_subtree'],
       [dualCoNarrow, ids.roleAgencyManager, ids.harborOrg, true, 'org_subtree'],
+      [northstarOnlyMgr, ids.roleEntityManager, ids.northstarOrg, true, 'org_subtree'],
       [acmeAndNorthstarEM, ids.roleEntityManager, ids.acmeOrg, true, 'org_subtree'],
       [acmeAndNorthstarEM, ids.roleEntityManager, ids.northstarOrg, true, 'org_subtree'],
+      [movedAgencyOwnMgr, ids.roleAgencyManager, ids.eastTeamOrg, true, 'org_subtree'],
     ]) {
       await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6,'all_in_org','[2020-01-01,)'::daterange,'active',$7)",
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6,'[2020-01-01,)'::daterange,'active',$7)",
         [randomUUID(), pid, roleId, orgId, incDesc, pMode, seq],
       );
     }
-
-    const dcNarrowGrantId = randomUUID();
     await c.query(
-      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'explicit_people','all_in_org','[2020-01-01,)'::daterange,'active',$5)",
-      [dcNarrowGrantId, dualCoNarrow, roleNarrowCash, ids.northstarOrg, seq],
-    );
-    await c.query(
-      'INSERT INTO iam.role_grant_people (grant_id, target_person_id, journal_seq) VALUES ($1,$2,$3)',
-      [dcNarrowGrantId, ids.agentEast, seq],
+      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'self','[2020-01-01,)'::daterange,'active',$5)",
+      [randomUUID(), dualCoNarrow, roleNarrowCash, ids.northstarOrg, seq],
     );
 
-    // Move East Team from Beacon (Acme) -> Northstar while ACTIVE
+    // Move East Team from Beacon (Acme) -> Northstar while ACTIVE (first real moved-agency case)
     const prevEastEdge = (await c.query(
       'SELECT id FROM iam.organization_edges WHERE child_org_id = $1 AND superseded_by_id IS NULL',
       [ids.eastTeamOrg],
@@ -4317,31 +4585,65 @@ test('Layer 7B [Fix3-1B - Dual-Company Caller (Harbor + Northstar) for a Team Mo
     });
   };
 
-  await t.test('Fix3-2a: dual-company callers (Harbor + Northstar, Acme + Northstar, Nusear) see 0 rows for active team moved Acme -> Northstar', async () => {
-    await assertZeroMovedEast('dualCoWide (active under Northstar)', tok(dualCoWide));
-    await assertZeroMovedEast('View-as dualCoWide (active under Northstar)', tok(ids.nusearOwner, dualCoWide));
-    await assertZeroMovedEast('dualCoNarrow (active under Northstar)', tok(dualCoNarrow));
-    await assertZeroMovedEast('acmeAndNorthstarEM (active under Northstar)', tok(acmeAndNorthstarEM));
-    await assertZeroMovedEast('View-as acmeAndNorthstarEM (active under Northstar)', tok(ids.nusearOwner, acmeAndNorthstarEM));
-    await assertZeroMovedEast('nusearOwner (active under Northstar)', tok(ids.nusearOwner));
+  // 1. Live Emit for the moved agency in Acme's working DB succeeds AFTER the move, resolving East Team -> ids.eastTeamOrg!
+  let r3PostMove;
+  await t.test('Item 4a: live Emit for moved agency in Acme working DB succeeds and populates non-NULL organization_id', async () => {
+    r3PostMove = await seedPublishedRun(env, { statementDate: '2026-11-30', keyPrefix: 'morg-r3-post-move', markSent: true });
+    const postMoveEast = (await env.pool.query(
+      "SELECT organization_id, writing_person_id FROM coherence.bob_policies WHERE run_id = $1::uuid AND entity = 'East Team'",
+      [r3PostMove.runId],
+    )).rows;
+    assert.equal(postMoveEast.length, 1);
+    assert.equal(postMoveEast[0].organization_id, ids.eastTeamOrg);
+    assert.equal(postMoveEast[0].writing_person_id, ids.agentEast);
+  });
 
-    // Reconciliation for acmeAndNorthstarEM remains $0.00 across sent r1 and unsent r2 without moved East Team
-    await runAsPlatformApp(env.pool, { token: tok(acmeAndNorthstarEM), readOnly: true }, async (c) => {
-      for (const runId of [r1.runId, r2.runId]) {
-        const recon = (await c.query(
-          'SELECT statement_entity, variance, reconciled FROM app_views.coherence_entity_statement_reconciliation WHERE run_id = $1::uuid',
-          [runId],
-        )).rows;
-        assert.ok(recon.length > 0);
-        assert.ok(!recon.some((r) => r.statement_entity === 'East Team'));
-        assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'));
-      }
+  // 2. Moved agency's own manager reads East Team's rows (and 0 rows for Beacon/Harbor/Acme) in Acme's DB!
+  await t.test('Item 4b: grant anchored at moved org itself reads that org rows in Acme working DB', async () => {
+    await runAsPlatformApp(env.pool, { token: tok(movedAgencyOwnMgr), readOnly: true }, async (c) => {
+      const bob = (await c.query('SELECT DISTINCT entity FROM app_views.coherence_bob ORDER BY entity')).rows.map((r) => r.entity);
+      assert.deepEqual(bob, ['East Team'], 'moved agency own manager must see East Team rows only');
+      const cur = (await c.query('SELECT entity, amount FROM app_views.v_current_policy_periods')).rows;
+      assert.equal(cur.length, 1);
+      assert.equal(cur[0].entity, 'East Team');
+      assert.equal(cur[0].amount, '90.00');
+      const stmts = (await c.query("SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines WHERE entity = 'East Team'")).rows[0].n;
+      assert.ok(stmts >= 2, 'moved agency own manager must see East Team statement lines across historical & post-move runs');
     });
   });
 
-  await t.test('Fix3-2b: dual-company callers (Harbor + Northstar, Acme + Northstar, Nusear) see 0 rows after moved team is ARCHIVED under Northstar', async () => {
+  // 3. Grants anchored at or above Acme read moved East Team with $0.00 reconciliation; new upline grants see 0 rows!
+  await t.test('Item 4c: Acme staff & Nusear read moved agency with $0.00 reconciliation while new upline grants see 0 rows (active under Northstar)', async () => {
+    for (const [label, pid] of [
+      ['acmeEntityMgr', ids.acmeEntityMgr],
+      ['acmeAndNorthstarEM', acmeAndNorthstarEM],
+      ['nusearOwner', ids.nusearOwner],
+    ]) {
+      await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+        for (const runId of [r1.runId, r2.runId, r3PostMove.runId]) {
+          const recon = (await c.query(
+            'SELECT statement_entity, variance, reconciled FROM app_views.coherence_entity_statement_reconciliation WHERE run_id = $1::uuid',
+            [runId],
+          )).rows;
+          assert.ok(recon.length > 0, `${label} must see reconciliation rows for run ${runId}`);
+          assert.ok(recon.some((r) => r.statement_entity === 'East Team'), `${label} must see moved East Team in reconciliation for run ${runId}`);
+          assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'), `${label} reconciliation must tie to $0.00 variance`);
+        }
+      });
+    }
+
+    // New upline grants NEVER reach Acme's working DB!
+    await assertZeroMovedEast('northstarOnlyMgr (active under Northstar)', tok(northstarOnlyMgr), { expectHarbor: false });
+    await assertZeroMovedEast('dualCoWide (active under Northstar)', tok(dualCoWide));
+    await assertZeroMovedEast('View-as dualCoWide (active under Northstar)', tok(ids.nusearOwner, dualCoWide));
+    await assertZeroMovedEast('dualCoNarrow (active under Northstar)', tok(dualCoNarrow));
+  });
+
+  // 4. After moved org is archived under Northstar, Acme staff & Nusear STILL read it with $0.00 reconciliation,
+  //    while new upline grants STILL see 0 rows!
+  await t.test('Item 4d: after moved agency is archived under Northstar, Acme staff & Nusear still read with $0.00 reconciliation and new upline sees 0 rows', async () => {
     await inSerializableTx(env.pool, async (c) => {
-      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f3_dc_arch', commandKey: 'f3-dc-arch' });
+      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.morg_arch', commandKey: 'morg-arch' });
       const seq = j.seq;
       const curNsEdge = (await c.query(
         'SELECT id FROM iam.organization_edges WHERE child_org_id = $1 AND parent_org_id = $2 AND superseded_by_id IS NULL',
@@ -4361,12 +4663,27 @@ test('Layer 7B [Fix3-1B - Dual-Company Caller (Harbor + Northstar) for a Team Mo
       );
     });
 
+    for (const [label, pid] of [
+      ['acmeEntityMgr', ids.acmeEntityMgr],
+      ['acmeAndNorthstarEM', acmeAndNorthstarEM],
+      ['nusearOwner', ids.nusearOwner],
+    ]) {
+      await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+        for (const runId of [r1.runId, r2.runId, r3PostMove.runId]) {
+          const recon = (await c.query(
+            'SELECT statement_entity, variance, reconciled FROM app_views.coherence_entity_statement_reconciliation WHERE run_id = $1::uuid',
+            [runId],
+          )).rows;
+          assert.ok(recon.some((r) => r.statement_entity === 'East Team'), `${label} must still see archived moved East Team in reconciliation`);
+          assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'), `${label} archived moved reconciliation must tie to $0.00`);
+        }
+      });
+    }
+
+    await assertZeroMovedEast('northstarOnlyMgr (archived under Northstar)', tok(northstarOnlyMgr), { expectHarbor: false });
     await assertZeroMovedEast('dualCoWide (archived under Northstar)', tok(dualCoWide));
     await assertZeroMovedEast('View-as dualCoWide (archived under Northstar)', tok(ids.nusearOwner, dualCoWide));
     await assertZeroMovedEast('dualCoNarrow (archived under Northstar)', tok(dualCoNarrow));
-    await assertZeroMovedEast('acmeAndNorthstarEM (archived under Northstar)', tok(acmeAndNorthstarEM));
-    await assertZeroMovedEast('View-as acmeAndNorthstarEM (archived under Northstar)', tok(ids.nusearOwner, acmeAndNorthstarEM));
-    await assertZeroMovedEast('nusearOwner (archived under Northstar)', tok(ids.nusearOwner));
   });
 });
 
@@ -4374,7 +4691,7 @@ test('Layer 7B [Fix3-2 - Catalog Audit Non-Vacuous _resolve_* and _cmd_* Loop & 
   const env = await createCoherenceIamTestEnv();
   t.after(() => env.cleanup());
 
-  const cleanAudit = await policyChecks.verifyIamConfigInvariants(env.pool);
+  const cleanAudit = await withClusterCatalogLock(() => policyChecks.verifyIamConfigInvariants(env.pool));
   assert.equal(cleanAudit.passed, true, `clean audit failed:\n${cleanAudit.problems.join('\n')}`);
 
   await t.test('Positive mutation: granting EXECUTE on coherence._resolve_entity_org_id to platform_readonly fails audit', async () => {
@@ -4445,16 +4762,43 @@ test('Layer 7B [Fix3-2 - Catalog Audit Non-Vacuous _resolve_* and _cmd_* Loop & 
     }
   });
 
-  await t.test('Positive mutation: adding an effective_wide_org_ids policy without tenant-tree bound on bob_policies fails audit', async () => {
+  await t.test('Positive mutation: unscoped policy, worker audit_journal INSERT, worker compute_journal_hash EXECUTE, or legacy coherence_app policy fails audit', async () => {
     await env.pool.query(
-      "CREATE POLICY bob_policies_unbounded_probe ON coherence.bob_policies FOR SELECT TO platform_view_owner USING (organization_id = ANY(iam.effective_wide_org_ids('act:coherence.bob.read')))",
+      'CREATE POLICY bob_policies_unbounded_probe ON coherence.bob_policies FOR SELECT TO platform_view_owner USING (true)',
     );
     try {
       const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
-      assert.equal(bad.passed, false, 'unbounded effective_wide_org_ids policy on coherence.bob_policies must fail audit');
-      assert.ok(bad.problems.some((p) => /bob_policies/i.test(p) && /database_context|closure_live|unscoped/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+      assert.equal(bad.passed, false, 'USING (true) policy on coherence.bob_policies must fail audit');
+      assert.ok(bad.problems.some((p) => /bob_policies/i.test(p) && /unscoped|USING \(true\)/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
     } finally {
       await env.pool.query('DROP POLICY IF EXISTS bob_policies_unbounded_probe ON coherence.bob_policies');
+    }
+
+    await env.pool.query('GRANT INSERT ON platform.audit_journal TO platform_worker');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'granting INSERT on platform.audit_journal to platform_worker must fail audit');
+      assert.ok(bad.problems.some((p) => /platform_worker/i.test(p) && /audit_journal/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+    } finally {
+      await env.pool.query('REVOKE INSERT ON platform.audit_journal FROM platform_worker');
+    }
+
+    await env.pool.query('GRANT EXECUTE ON FUNCTION platform.compute_journal_hash(BIGINT, TIMESTAMPTZ, TEXT, UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB) TO platform_worker');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'granting EXECUTE on platform.compute_journal_hash to platform_worker must fail audit');
+      assert.ok(bad.problems.some((p) => /platform_worker/i.test(p) && /compute_journal_hash/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+    } finally {
+      await env.pool.query('REVOKE EXECUTE ON FUNCTION platform.compute_journal_hash(BIGINT, TIMESTAMPTZ, TEXT, UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB) FROM platform_worker');
+    }
+
+    await env.pool.query('CREATE POLICY bob_policies_legacy_probe ON coherence.bob_policies FOR ALL TO coherence_app USING (true) WITH CHECK (true)');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'legacy coherence_app USING (true) policy must fail audit');
+      assert.ok(bad.problems.some((p) => /coherence_app/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+    } finally {
+      await env.pool.query('DROP POLICY IF EXISTS bob_policies_legacy_probe ON coherence.bob_policies');
     }
   });
 });
@@ -4529,42 +4873,25 @@ test('Layer 7B [Fix4 - Narrow unpublished.read Stays Narrow Across Keyed Tables 
     }
 
     // 1. agentA: wide sent-only Agency Manager on Beacon + narrow self unpublished.read on Beacon
+    await c.query(
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+      [randomUUID(), ids.agentA, ids.acmeOrg, seq],
+    );
     for (const [pid, roleId, orgId, incDesc, pMode] of [
       [ids.agentA, ids.roleAgencyManager, ids.beaconOrg, true, 'org_subtree'],
       [ids.agentA, roleUnpubNarrow, ids.beaconOrg, false, 'self'],
-      // 2. sentAgencyPlusExplicitUnpub: wide sent-only Agency Manager on Beacon + explicit_people unpublished.read (agentA) on Beacon
-      [sentAgencyPlusExplicitUnpub, ids.roleAgencyManager, ids.beaconOrg, true, 'org_subtree'],
-      // 3. sentEmPlusExplicitUnpub: wide sent-only Entity Manager on Acme + explicit_people unpublished.read (agentA) on Beacon
-      [sentEmPlusExplicitUnpub, roleSentEntityMgr, ids.acmeOrg, true, 'org_subtree'],
-      // 4. sentEmAcmeWideBeaconNarrowUnpub: wide sent-only Entity Manager on Acme + wide unpublished.read ONLY on Acme (no descendants) + explicit_people unpublished.read (agentA) on Beacon
-      [sentEmAcmeWideBeaconNarrowUnpub, roleSentEntityMgr, ids.acmeOrg, true, 'org_subtree'],
-      [sentEmAcmeWideBeaconNarrowUnpub, roleUnpubWide, ids.acmeOrg, false, 'org_subtree'],
     ]) {
       await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6,'all_in_org','[2020-01-01,)'::daterange,'active',$7)",
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6,'[2020-01-01,)'::daterange,'active',$7)",
         [randomUUID(), pid, roleId, orgId, incDesc, pMode, seq],
-      );
-    }
-
-    for (const pid of [sentAgencyPlusExplicitUnpub, sentEmPlusExplicitUnpub, sentEmAcmeWideBeaconNarrowUnpub]) {
-      const gid = randomUUID();
-      await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'explicit_people','all_in_org','[2020-01-01,)'::daterange,'active',$5)",
-        [gid, pid, roleUnpubNarrow, ids.beaconOrg, seq],
-      );
-      await c.query(
-        'INSERT INTO iam.role_grant_people (grant_id, target_person_id, journal_seq) VALUES ($1,$2,$3)',
-        [gid, ids.agentA, seq],
       );
     }
   });
 
-  await t.test('Fix4-1: wide sent-only agency role + narrow self/explicit_people unpublished.read on Beacon sees ONLY agentA unsent rows in bob, financials, and agency statements (direct and View-as)', async () => {
+  await t.test('Fix4-1: wide sent-only agency role + narrow self unpublished.read on Beacon sees ONLY agentA unsent rows in bob, financials, and agency statements (direct and View-as)', async () => {
     for (const [label, token] of [
       ['self (agentA)', tok(ids.agentA)],
       ['View-as self (agentA)', tok(ids.nusearOwner, ids.agentA)],
-      ['explicit_people (agentA)', tok(sentAgencyPlusExplicitUnpub)],
-      ['View-as explicit_people (agentA)', tok(ids.nusearOwner, sentAgencyPlusExplicitUnpub)],
     ]) {
       await runAsPlatformApp(env.pool, { token, readOnly: true }, async (c) => {
         const sentBob = (await c.query(
@@ -4619,10 +4946,17 @@ test('Layer 7B [Fix4 - Narrow unpublished.read Stays Narrow Across Keyed Tables 
     }
   });
 
-  await t.test('Fix4-2: wide sent-only Entity Manager + narrow unpublished.read on Beacon sees ONLY agentA unsent bob/agency rows and 0 unsent upline, ledger, and reconciliation rows', async () => {
+  await t.test('Fix4-2: wide sent-only Entity Manager + narrow self unpublished.read on Beacon sees ONLY agentA unsent bob/agency rows and 0 unsent upline, ledger, and reconciliation rows', async () => {
+    await inSerializableTx(env.pool, async (c) => {
+      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f4_em_self', commandKey: 'f4-em-self' });
+      await c.query(
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+        [randomUUID(), ids.agentA, roleSentEntityMgr, ids.acmeOrg, j.seq],
+      );
+    });
     for (const [label, token] of [
-      ['sentEmPlusExplicitUnpub', tok(sentEmPlusExplicitUnpub)],
-      ['View-as sentEmPlusExplicitUnpub', tok(ids.nusearOwner, sentEmPlusExplicitUnpub)],
+      ['agentA (sentEM + self unpub)', tok(ids.agentA)],
+      ['View-as agentA (sentEM + self unpub)', tok(ids.nusearOwner, ids.agentA)],
     ]) {
       await runAsPlatformApp(env.pool, { token, readOnly: true }, async (c) => {
         const unsentBob = (await c.query(
@@ -4693,8 +5027,15 @@ test('Layer 7B [Fix4 - Narrow unpublished.read Stays Narrow Across Keyed Tables 
     }
   });
 
-  await t.test('Fix4-3: wide unpublished.read on Acme (no descendants) + narrow unpublished.read on Beacon keeps r2 reconciliation clean (Acme $0.00, Beacon absent) and upline/ledger wide-only', async () => {
-    await runAsPlatformApp(env.pool, { token: tok(sentEmAcmeWideBeaconNarrowUnpub), readOnly: true }, async (c) => {
+  await t.test('Fix4-3: wide unpublished.read on Acme (no descendants) + narrow self unpublished.read on Beacon keeps r2 reconciliation clean (Acme $0.00, Beacon absent) and upline/ledger wide-only', async () => {
+    await inSerializableTx(env.pool, async (c) => {
+      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f4_acme_wide_unpub', commandKey: 'f4-acme-wide-unpub' });
+      await c.query(
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+        [randomUUID(), ids.agentA, roleUnpubWide, ids.acmeOrg, j.seq],
+      );
+    });
+    await runAsPlatformApp(env.pool, { token: tok(ids.agentA), readOnly: true }, async (c) => {
       const unsentBob = (await c.query(
         'SELECT policy_id, writing_person_id, entity FROM app_views.coherence_bob WHERE run_id = $1::uuid ORDER BY policy_id',
         [r2.runId],
@@ -4745,7 +5086,7 @@ test('Layer 7B [Fix4 - Narrow unpublished.read Stays Narrow Across Keyed Tables 
   });
 
   await t.test('Fix4-4: catalog audit requires tenant bound (database_context + v_organization_closure_live) on platform.audit_journal RLS policy, and none of the five keyed tables or reconciliation view use effective_any_org_ids', async () => {
-    const cleanAudit = await policyChecks.verifyIamConfigInvariants(env.pool);
+    const cleanAudit = await withClusterCatalogLock(() => policyChecks.verifyIamConfigInvariants(env.pool));
     assert.equal(cleanAudit.passed, true, `clean audit failed:\n${cleanAudit.problems.join('\n')}`);
 
     const keyedPols = (await env.pool.query(
@@ -4816,25 +5157,14 @@ test('Layer 7B [Fix4 - Narrow unpublished.read Stays Narrow Across Keyed Tables 
     }
 
     await env.pool.query(
-      "CREATE POLICY audit_journal_unbounded_probe ON platform.audit_journal FOR SELECT TO platform_view_owner USING (target_org_id = ANY(iam.effective_wide_org_ids('act:platform.audit_journal.read')))",
+      "CREATE POLICY audit_journal_has_right_probe ON platform.audit_journal FOR SELECT TO platform_view_owner USING (iam.has_right('act:platform.audit_journal.read'))",
     );
     try {
       const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
-      assert.equal(bad.passed, false, 'unbounded effective_wide_org_ids policy on platform.audit_journal must fail audit');
-      assert.ok(bad.problems.some((p) => /audit_journal/i.test(p) && /database_context|closure_live|unscoped/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+      assert.equal(bad.passed, false, 'unscoped iam.has_right policy on platform.audit_journal must fail audit');
+      assert.ok(bad.problems.some((p) => /audit_journal/i.test(p) && /unscoped|effective_wide_org_ids/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
     } finally {
-      await env.pool.query('DROP POLICY IF EXISTS audit_journal_unbounded_probe ON platform.audit_journal');
-    }
-
-    await env.pool.query(
-      "CREATE POLICY audit_journal_no_closure_probe ON platform.audit_journal FOR SELECT TO platform_view_owner USING (target_org_id = ANY(iam.effective_wide_org_ids('act:platform.audit_journal.read')) AND EXISTS (SELECT 1 FROM iam.database_context dc WHERE dc.singleton = true))",
-    );
-    try {
-      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
-      assert.equal(bad.passed, false, 'platform.audit_journal policy missing v_organization_closure_live must fail audit');
-      assert.ok(bad.problems.some((p) => /audit_journal/i.test(p) && /database_context|closure_live|unscoped/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
-    } finally {
-      await env.pool.query('DROP POLICY IF EXISTS audit_journal_no_closure_probe ON platform.audit_journal');
+      await env.pool.query('DROP POLICY IF EXISTS audit_journal_has_right_probe ON platform.audit_journal');
     }
   });
 });

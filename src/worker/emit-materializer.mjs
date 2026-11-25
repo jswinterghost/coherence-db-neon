@@ -170,6 +170,9 @@ export async function prepareEmitMaterialization({
   if (!isValidIsoDate(statementDate)) {
     throw new AppError('statementDate must be a valid ISO date.', 400, 'INVALID_DATE');
   }
+  if (!attemptEventId) {
+    throw new AppError('attemptEventId is required to prepare Emit materialization.', 400, 'MISSING_ATTEMPT_EVENT_ID');
+  }
   const stamp = statementDate.replaceAll('-', '');
   const resolvedFileName = statementsFileName || `statements_${stamp}.csv`;
 

@@ -7,6 +7,7 @@ import { createClient, createPool, resolveLocalUser } from '../../src/db/pg-clie
 import { runMigrations } from '../../src/db/migrate.mjs';
 import { createMemoryObjectStore } from '../../src/storage/object-store.mjs';
 import { createCodeStore, createDataStore, createStorePair } from '../../src/storage/stores.mjs';
+import { seedCoherenceIamFixture } from './iam-harness.mjs';
 import { createCommandLayer } from '../../src/commands/command-layer.mjs';
 
 export const TEST_DB_PREFIX = 'coherence_test_';
@@ -62,6 +63,20 @@ export async function createEmptyMigratedTestDb() {
   return { dbName, pgConfig, pool, cleanup };
 }
 
+export async function withClusterCatalogLock(fn) {
+  const admin = await createClient(getAdminPgConfig());
+  try {
+    await admin.query('SELECT pg_catalog.pg_advisory_lock(88421, 1)');
+    try {
+      return await fn();
+    } finally {
+      await admin.query('SELECT pg_catalog.pg_advisory_unlock(88421, 1)').catch(() => {});
+    }
+  } finally {
+    await admin.end().catch(() => {});
+  }
+}
+
 export async function checkPgAvailable() {
   let client;
   try {
@@ -84,7 +99,13 @@ export async function checkPgAvailable() {
  * and temp directory. Cleanup stops all registered workers before closing pools, dropping the test
  * database, and removing temp files.
  */
-export async function createTestEnv({ companySlug = 'acme', displayName = 'Acme', defaultEmitMode = 'builtin' } = {}) {
+export async function createTestEnv({
+  companySlug = 'acme',
+  displayName = 'Acme',
+  defaultEmitMode = 'builtin',
+  extraAgencies = [],
+  extraAgents = [],
+} = {}) {
   const suffix = randomBytes(6).toString('hex');
   const dbName = `${TEST_DB_PREFIX}${suffix}`;
   assertTestDbName(dbName);
@@ -109,11 +130,18 @@ export async function createTestEnv({ companySlug = 'acme', displayName = 'Acme'
   const commands = createCommandLayer({ pool, companySlug, stores });
   const tempDir = await mkdtemp(join(tmpdir(), `coherence-test-${suffix}-`));
 
-  const ownerActor = { id: 'test-owner', kind: 'owner', actingFor: null };
-  const workerActor = { id: `coherence-worker:${companySlug}`, kind: 'worker' };
+  const iam = await seedCoherenceIamFixture(pool, {
+    companySlug,
+    displayName,
+    extraAgencies,
+    extraAgents,
+  });
+  const ownerToken = iam.tokens.owner;
+  const operatorToken = iam.tokens.operator;
+  const workerToken = iam.tokens.worker;
 
   await commands.initCompany({
-    actor: ownerActor,
+    dbToken: ownerToken,
     commandKey: `init-company-${suffix}`,
     slug: companySlug,
     displayName,
@@ -169,8 +197,10 @@ export async function createTestEnv({ companySlug = 'acme', displayName = 'Acme'
     stores,
     commands,
     tempDir,
-    ownerActor,
-    workerActor,
+    iam,
+    ownerToken,
+    operatorToken,
+    workerToken,
     registerWorker,
     registerClient,
     cleanup,

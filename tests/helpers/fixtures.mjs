@@ -158,7 +158,7 @@ export async function seedEngineVersion(env, { label = 'v2.2.5-test', coherenceC
   const wrapperBundle = await promo('engine/wrappers.json', wrapperPkg);
 
   const res = await env.commands.registerEngineVersion({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: `register-engine-${label}`,
     label,
     coherenceCommit,
@@ -206,7 +206,7 @@ export async function seedStandingInput(env, { extraFiles = {}, withPriorOverlay
     storedFiles.push(ovPromoted);
     priorOverlaySha = ovPromoted.sha256;
     await env.commands.registerApprovalsFile({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `${commandKey}-prior-overlay`,
       storedFile: ovPromoted,
       headerKind: withPriorOverlay.version || 'v2',
@@ -219,7 +219,7 @@ export async function seedStandingInput(env, { extraFiles = {}, withPriorOverlay
   }
 
   const res = await env.commands.publishInputVersion({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey,
     lineKind: 'standing',
     sourceKind: withPriorOverlay ? 'mac_import' : 'upload',
@@ -714,7 +714,7 @@ export async function seedEngineCopyVersion(env, { label = 'acme-copy-2026.11', 
   };
 
   const res = await env.commands.registerEngineVersion({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: `register-engine-copy-${label}`,
     label,
     coherenceCommit,

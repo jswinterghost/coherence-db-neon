@@ -2,7 +2,7 @@
 // Read-only history proof runner: migrates a fresh local throwaway test_* PostgreSQL 17 database,
 // imports a company-agnostic JSON manifest read-only (no network), runs Layers 0, 1, 2, 4 and the
 // substance comparator (Gates 1-4) where inputs exist, and prints only a strictly PHI-free summary.
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
@@ -20,7 +20,12 @@ import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstructi
 import { compareDbRuns, compareRunFolders } from '../src/compare/run-comparator.mjs';
 import { runMigrations } from '../src/db/migrate.mjs';
 import { createClient, createPool, resolveLocalUser } from '../src/db/pg-client.mjs';
-import { executeHistoryImport, loadImportManifestFile, planImportManifestFile } from '../src/importer/history-importer.mjs';
+import {
+  executeHistoryImport,
+  loadImportManifestFile,
+  planImportManifestFile,
+  readLegacyStatementBatches,
+} from '../src/importer/history-importer.mjs';
 import { createFileObjectStore } from '../src/storage/object-store.mjs';
 import { createCodeStore, createDataStore, createStorePair } from '../src/storage/stores.mjs';
 import { sha256Hex } from '../src/util/crypto.mjs';
@@ -212,6 +217,229 @@ async function dropTestDb(adminConfig, dbName) {
   }
 }
 
+function mintProofToken({ keyId, secretBytes, environment = 'local', actorPersonId, ttlSeconds = 3600 }) {
+  const expEpoch = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const payload = `v1|${keyId}|${environment}|${randomUUID()}|${actorPersonId}|-|${expEpoch}`;
+  const sig = createHmac('sha256', secretBytes).update(payload, 'utf8').digest('hex');
+  return `${payload}|${sig}`;
+}
+
+async function seedProofIamOwner(pool, { companySlug, displayName, environment = 'local' }) {
+  const keyId = `k_proof_${randomBytes(4).toString('hex')}`;
+  const secretBytes = randomBytes(32);
+  const rootOrgId = randomUUID();
+  const companyOrgId = randomUUID();
+  const roleOwnerId = randomUUID();
+  const ownerPersonId = randomUUID();
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+    const reqHash = sha256Hex(JSON.stringify({ commandKind: 'iam.bootstrap_proof', companySlug }));
+    const seq = (await client.query(
+      `INSERT INTO platform.audit_journal (
+         environment, actor_person_id, recorded_as, target_org_id,
+         command_kind, command_key, request_sha256, body
+       ) VALUES ($1, NULL, 'service', NULL, 'iam.bootstrap_proof', $2, $3, '{}'::jsonb)
+       RETURNING seq`,
+      [environment, `proof-iam-bootstrap-${randomUUID()}`, reqHash],
+    )).rows[0].seq;
+
+    await client.query(
+      "INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'platform_root',$3),($2,'company',$3)",
+      [rootOrgId, companyOrgId, seq],
+    );
+    await client.query(
+      `INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq)
+       VALUES ($1,$2,'nusear','Nusear','active',$5),($3,$4,$6,$7,'active',$5)`,
+      [randomUUID(), rootOrgId, randomUUID(), companyOrgId, seq, companySlug, displayName || companySlug],
+    );
+    await client.query(
+      `INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4)`,
+      [randomUUID(), companyOrgId, rootOrgId, seq],
+    );
+    await client.query(
+      `INSERT INTO iam.database_context (singleton, environment, db_role_kind, tenant_org_id, company_slug, support_external_label, journal_seq)
+       VALUES (true, $1, 'company_working', $2, $3, 'Nusear support', $4)`,
+      [environment, companyOrgId, companySlug, seq],
+    );
+    await client.query(
+      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from, active_until)
+       VALUES ($1, $2, $3, pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
+      [keyId, secretBytes, environment],
+    );
+    await client.query(
+      "INSERT INTO iam.tools (id, display_name, is_nusear_only, is_customer_switchable, journal_seq) VALUES ('coherence','Coherence',false,true,$1),('platform_audit','Platform Audit',false,true,$1)",
+      [seq],
+    );
+    await client.query(
+      `INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq)
+       VALUES ($1,$2,'coherence','on','active',$4),($3,$2,'platform_audit','on','active',$4)`,
+      [randomUUID(), companyOrgId, randomUUID(), seq],
+    );
+
+    const ownerRights = [
+      'act:coherence.owner.init_company',
+      'act:coherence.owner.register_engine',
+      'act:coherence.owner.import_history',
+      'act:coherence.owner.record_baseline',
+      'act:coherence.owner.record_statement_batch',
+      'act:coherence.owner.carry_sent',
+      'act:coherence.owner.carry_approvals',
+      'act:coherence.owner.carry_decisions',
+      'act:coherence.owner.confirm_emit',
+      'act:coherence.owner.abandon_run',
+      'act:coherence.inputs.publish',
+      'act:coherence.approvals.register',
+      'act:coherence.files.register',
+      'act:coherence.overlays.record',
+      'act:coherence.checks.record',
+      'act:coherence.emit.materialize',
+      'act:coherence.run.launch',
+      'act:coherence.runs.read',
+      'act:coherence.inputs.read',
+      'act:coherence.outputs.read',
+      'act:coherence.decisions.read',
+      'act:coherence.checks.read',
+      'act:coherence.journal.read',
+      'act:coherence.bob.read',
+      'act:coherence.statements.read',
+      'act:coherence.upline.read',
+      'act:coherence.ledger.read',
+      'act:coherence.unpublished.read',
+    ];
+    for (const rightId of ownerRights) {
+      await client.query(
+        `INSERT INTO iam.rights (id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power, description, journal_seq)
+         VALUES ($1,'action','coherence','both','ordinary',true,$1,$2)`,
+        [rightId, seq],
+      );
+    }
+    await client.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleOwnerId, 'nusear_owner', seq]);
+    await client.query(
+      "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Nusear Owner',true,true,true,'active',$3)",
+      [randomUUID(), roleOwnerId, seq],
+    );
+    for (const rightId of ownerRights) {
+      await client.query(
+        "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
+        [randomUUID(), roleOwnerId, rightId, seq],
+      );
+    }
+    await client.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [ownerPersonId, seq]);
+    await client.query(
+      "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'Proof Importer','Proof Importer','proof.importer@nusear.example','active',$3)",
+      [randomUUID(), ownerPersonId, seq],
+    );
+    await client.query(
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'owner','[2020-01-01,)'::daterange,'active',$4)",
+      [randomUUID(), ownerPersonId, rootOrgId, seq],
+    );
+    await client.query(
+      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+      [randomUUID(), ownerPersonId, roleOwnerId, rootOrgId, seq],
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  return {
+    companyOrgId,
+    environment,
+    ownerToken: mintProofToken({ keyId, secretBytes, environment, actorPersonId: ownerPersonId }),
+  };
+}
+
+export async function ensureProofIamSubjectsForBatches(pool, { companyOrgId, environment, bridgeResult }) {
+  const entities = new Map();
+  const npns = new Set();
+  for (const batch of [...(bridgeResult?.historicalBatches || []), ...(bridgeResult?.methodCorrectionBatches || [])]) {
+    for (const line of (batch.agencyLines || [])) {
+      const ent = typeof line.entity === 'string' ? line.entity.trim() : '';
+      if (ent) entities.set(ent.toLowerCase(), ent);
+      const npn = typeof line.writingNpn === 'string' ? line.writingNpn.trim() : '';
+      if (npn) npns.add(npn);
+    }
+    for (const line of (batch.uplineLines || [])) {
+      const ent = typeof (line.sourceEntity ?? line.entity) === 'string' ? (line.sourceEntity ?? line.entity).trim() : '';
+      if (ent) entities.set(ent.toLowerCase(), ent);
+      const npn = typeof line.writingNpn === 'string' ? line.writingNpn.trim() : '';
+      if (npn) npns.add(npn);
+    }
+  }
+  if (entities.size === 0 && npns.size === 0) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+    const existingOrgs = new Set();
+    const orgRes = await client.query(
+      `SELECT pg_catalog.lower(pg_catalog.btrim(ov.slug)) AS s, pg_catalog.lower(pg_catalog.btrim(ov.display_name)) AS d
+       FROM iam.organization_versions ov WHERE ov.superseded_by_id IS NULL`,
+    );
+    for (const r of orgRes.rows) {
+      if (r.s) existingOrgs.add(r.s);
+      if (r.d) existingOrgs.add(r.d);
+    }
+    const existingNpns = new Set(
+      (await client.query('SELECT npn FROM iam.person_versions WHERE superseded_by_id IS NULL AND npn IS NOT NULL')).rows.map((r) => r.npn),
+    );
+    const missingEntities = [...entities.entries()].filter(([k]) => !existingOrgs.has(k));
+    const missingNpns = [...npns].filter((n) => !existingNpns.has(n));
+    if (missingEntities.length > 0 || missingNpns.length > 0) {
+      const seq = (await client.query(
+        `INSERT INTO platform.audit_journal (
+           environment, actor_person_id, recorded_as, target_org_id,
+           command_kind, command_key, request_sha256, body
+         ) VALUES ($1, NULL, 'service', $2::uuid, 'iam.seed_proof_subjects', $3, $4, '{}'::jsonb)
+         RETURNING seq`,
+        [environment, companyOrgId, `proof-iam-subjects-${randomUUID()}`, sha256Hex(JSON.stringify({ entities: missingEntities.length, npns: missingNpns.length }))],
+      )).rows[0].seq;
+      let slugIdx = 0;
+      for (const [key, display] of missingEntities) {
+        slugIdx += 1;
+        const orgId = randomUUID();
+        const base = key.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40).replace(/_+$/, '') || `ag_${slugIdx}`;
+        let slug = base;
+        while (existingOrgs.has(slug)) {
+          slug = `${base}_${slugIdx}`;
+          slugIdx += 1;
+        }
+        existingOrgs.add(slug);
+        existingOrgs.add(key);
+        await client.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'agency',$2)", [orgId, seq]);
+        await client.query(
+          "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,$3,$4,'active',$5)",
+          [randomUUID(), orgId, slug, display, seq],
+        );
+        await client.query(
+          "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4)",
+          [randomUUID(), orgId, companyOrgId, seq],
+        );
+      }
+      for (const npn of missingNpns) {
+        const pid = randomUUID();
+        await client.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
+        await client.query(
+          "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, journal_seq) VALUES ($1,$2,$3,$3,$4,$5,'active',$6)",
+          [randomUUID(), pid, `Proof Agent ${npn}`, `proof.npn.${npn.toLowerCase().replace(/[^a-z0-9]/g, '_')}@proof.example`, npn, seq],
+        );
+      }
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function snapshotTableCounts(pool) {
   const tables = [
     'runs',
@@ -336,10 +564,24 @@ export async function runHistoryProof({
     const dataStore = createDataStore({ backend: createFileObjectStore({ rootDir: dataRoot, label: `proof-data-${suffix}` }) });
     const stores = createStorePair({ codeStore, dataStore });
     const commands = createCommandLayer({ pool, companySlug: manifest.companySlug, stores });
-    const actor = { id: 'proof-runner', kind: 'owner', actingFor: null };
+    const proofIam = await seedProofIamOwner(pool, {
+      companySlug: manifest.companySlug,
+      displayName: manifest.displayName || manifest.companySlug,
+    });
+    const dbToken = proofIam.ownerToken;
+    const baseReadLegacyStatements = readLegacyStatements || readLegacyStatementBatches;
+    const wrappedReadLegacyStatements = async (opts) => {
+      const bridgeResult = await baseReadLegacyStatements(opts);
+      await ensureProofIamSubjectsForBatches(pool, {
+        companyOrgId: proofIam.companyOrgId,
+        environment: proofIam.environment,
+        bridgeResult,
+      });
+      return bridgeResult;
+    };
 
     await commands.initCompany({
-      actor,
+      dbToken,
       commandKey: `proof-init:${manifest.companySlug}`,
       slug: manifest.companySlug,
       displayName: manifest.displayName || manifest.companySlug,
@@ -353,13 +595,13 @@ export async function runHistoryProof({
       pool,
       stores,
       commands,
-      actor,
+      dbToken,
       manifest,
       verifyRebuild: true,
       recordCheck: true,
       tempBaseDir,
       ...(parseOverlay ? { parseOverlay } : {}),
-      ...(readLegacyStatements ? { readLegacyStatements } : {}),
+      readLegacyStatements: wrappedReadLegacyStatements,
     };
     const importReport = await executeHistoryImport(importOpts);
     if (!importReport.passed) {
@@ -394,21 +636,21 @@ export async function runHistoryProof({
     const objects = await verifyObjects(pool, stores, { deep: true });
 
     await commands.recordCheck({
-      actor,
+      dbToken,
       commandKey: `proof-l0-chain:${chain.headHash}`,
       checkKind: 'chain',
       passed: chain.passed,
       report: chain,
     });
     await commands.recordCheck({
-      actor,
+      dbToken,
       commandKey: `proof-l0-commitments:${sha256Hex(JSON.stringify(commitments))}`,
       checkKind: 'commitments',
       passed: commitments.passed,
       report: commitments,
     });
     await commands.recordCheck({
-      actor,
+      dbToken,
       commandKey: `proof-l0-objects:${sha256Hex(JSON.stringify(objects))}`,
       checkKind: 'objects',
       passed: objects.passed,
@@ -427,7 +669,7 @@ export async function runHistoryProof({
       pool,
       stores,
       commands,
-      actor,
+      dbToken,
       pythonPath: manifest.pythonPath || null,
       coherenceRepo: manifest.coherenceRepo || null,
       overlayCheckPath: manifest.overlayCheckPath || undefined,
@@ -483,7 +725,7 @@ export async function runHistoryProof({
     }
     const layer4Passed = layer4Moments.every((m) => m.passed);
     await commands.recordCheck({
-      actor,
+      dbToken,
       commandKey: `proof-l4:${sha256Hex(JSON.stringify(layer4Moments))}`,
       checkKind: 'journal_rebuild',
       passed: layer4Passed,
@@ -538,7 +780,7 @@ export async function runHistoryProof({
               requireConservation: Boolean(target.requireConservation),
               expectedEntityParity: target.expectedEntityParity || null,
               commands,
-              actor,
+              dbToken,
               tempBaseDir,
             });
           }
@@ -562,7 +804,7 @@ export async function runHistoryProof({
               requireConservation: Boolean(target.requireConservation),
               expectedEntityParity: target.expectedEntityParity || null,
               commands,
-              actor,
+              dbToken,
               tempBaseDir,
             });
           }

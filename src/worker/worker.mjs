@@ -25,7 +25,7 @@ export function createEngineWorker({
   companySlug,
   stores,
   commands,
-  workerActor = { id: `coherence-worker:${companySlug}`, kind: 'worker' },
+  workerToken,
   materializeEngine = undefined,
   rebuildWorkingOnDemand = null,
   tempBaseDir = tmpdir(),
@@ -40,6 +40,9 @@ export function createEngineWorker({
   onBeforeFinish = null, // Optional lifecycle callback invoked after artifact promotion and before recording finish.
   logger = createSafeLogger(),
 }) {
+  if (typeof workerToken !== 'string' || !workerToken.trim()) {
+    throw new AppError('Engine worker requires a signed workerToken.', 400, 'MISSING_WORKER_TOKEN');
+  }
   let running = false;
   let loopPromise = null;
   let activeSlot = null;
@@ -145,7 +148,7 @@ export function createEngineWorker({
         // Rejected review submissions are finalized without promoting bytes so they never stall the worker queue.
         const rejected = await slot.runExclusive((client) => commands.rejectReviewSubmission({
           client,
-          actor: workerActor,
+          dbToken: workerToken,
           submissionId: sub.id,
           status: 'rejected',
           reason: checked.error,
@@ -179,7 +182,7 @@ export function createEngineWorker({
       const finalExtends = storedFile.sha256 === extendsSha256 ? null : extendsSha256;
       const accepted = await slot.runExclusive((client) => commands.acceptReviewSubmission({
         client,
-        actor: workerActor,
+        dbToken: workerToken,
         commandKey: `save-review:${sub.command_key}`,
         submissionId: sub.id,
         storedFile,
@@ -196,7 +199,7 @@ export function createEngineWorker({
       // Finalize unexpected review-check errors as failed so a bad submission cannot wedge the worker.
       const failed = await slot.runExclusive((client) => commands.rejectReviewSubmission({
         client,
-        actor: workerActor,
+        dbToken: workerToken,
         submissionId: sub.id,
         status: err?.status === 409 ? 'rejected' : 'failed',
         reason: sanitizeErrorMessage(err, 'Review check failed.'),
@@ -240,7 +243,7 @@ export function createEngineWorker({
 
     const started = await slot.runExclusive((client) => commands.startStepAttempt({
       client,
-      actor: workerActor,
+      dbToken: workerToken,
       commandKey: `start-attempt:${req.req_id}`,
       runId: run.id,
       step: req.step,
@@ -320,7 +323,7 @@ export function createEngineWorker({
       if (proc.outcome === 'cancelled') {
         const res = await slot.runExclusive((client) => commands.cancelStepAttempt({
           client,
-          actor: workerActor,
+          dbToken: workerToken,
           commandKey: `cancel-attempt:${run.id}:${req.step}:${attemptNo}`,
           runId: run.id,
           step: req.step,
@@ -338,7 +341,7 @@ export function createEngineWorker({
           : 'Cancel status polling failed repeatedly; process group stopped.';
         const res = await slot.runExclusive((client) => commands.failStepAttempt({
           client,
-          actor: workerActor,
+          dbToken: workerToken,
           commandKey: `fail-attempt:${run.id}:${req.step}:${attemptNo}`,
           runId: run.id,
           step: req.step,
@@ -363,7 +366,7 @@ export function createEngineWorker({
         const reason = proc.tailLines.slice(-5).join(' | ') || `Step exited with code ${proc.exitCode} without recording completion in run.json.`;
         const res = await slot.runExclusive((client) => commands.failStepAttempt({
           client,
-          actor: workerActor,
+          dbToken: workerToken,
           commandKey: `fail-attempt:${run.id}:${req.step}:${attemptNo}`,
           runId: run.id,
           step: req.step,
@@ -490,7 +493,7 @@ export function createEngineWorker({
 
       const finished = await slot.runExclusive((client) => commands.finishStepAttempt({
         client,
-        actor: workerActor,
+        dbToken: workerToken,
         commandKey: `finish-attempt:${run.id}:${req.step}:${attemptNo}`,
         runId: run.id,
         step: req.step,
@@ -510,7 +513,7 @@ export function createEngineWorker({
       if (slot.isLost()) return { action: 'slot_lost', runId: run.id, step: req.step, attemptNo };
       const failed = await slot.runExclusive((client) => commands.failStepAttempt({
         client,
-        actor: workerActor,
+        dbToken: workerToken,
         commandKey: `fail-attempt:${run.id}:${req.step}:${attemptNo}`,
         runId: run.id,
         step: req.step,
@@ -537,7 +540,7 @@ export function createEngineWorker({
     if (!slot) return { action: 'slot_busy' };
     activeSlot = slot;
     try {
-      const rec = await reconcileInterruptedAttempts({ pool, slot, commands, workerActor });
+      const rec = await reconcileInterruptedAttempts({ pool, slot, commands, workerToken });
       if (slot.isLost()) return { action: 'slot_lost', reconciled: rec.interrupted.length };
 
       const rev = await processPendingReview(slot);

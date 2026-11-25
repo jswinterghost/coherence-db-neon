@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createClient } from '../src/db/pg-client.mjs';
-import { sha256Hex } from '../src/util/crypto.mjs';
-import { checkPgAvailable, createEmptyMigratedTestDb } from './helpers/test-db.mjs';
+import { canonicalJson, formatTimestampUtcUs, sha256Hex } from '../src/util/crypto.mjs';
+import { checkPgAvailable, createEmptyMigratedTestDb, withClusterCatalogLock } from './helpers/test-db.mjs';
 
 const pgCheck = await checkPgAvailable();
 
@@ -245,19 +245,19 @@ async function seedStandardIamWorld(pool, { environment = 'local' } = {}) {
       'act:coherence.bob.read', 'act:concurrence.calls.read', 'act:transmittals.read', 'act:transmittals.approve',
     ]);
 
-    // Organization versions (Acme declares support_ceiling_role_id)
-    for (const [orgId, slug, name, ceiling] of [
-      [ids.rootOrg, 'nusear', 'Nusear', null],
-      [ids.acmeOrg, 'acme', 'Acme Holdings', ids.roleSupportCeiling],
-      [ids.beaconOrg, 'beacon', 'Beacon Agency', null],
-      [ids.harborOrg, 'harbor', 'Harbor Agency', null],
-      [ids.eastTeamOrg, 'east_team', 'East Team', null],
-      [ids.northstarOrg, 'northstar', 'Northstar Group', null],
+    // Organization versions
+    for (const [orgId, slug, name] of [
+      [ids.rootOrg, 'nusear', 'Nusear'],
+      [ids.acmeOrg, 'acme', 'Acme Holdings'],
+      [ids.beaconOrg, 'beacon', 'Beacon Agency'],
+      [ids.harborOrg, 'harbor', 'Harbor Agency'],
+      [ids.eastTeamOrg, 'east_team', 'East Team'],
+      [ids.northstarOrg, 'northstar', 'Northstar Group'],
     ]) {
       await c.query(
-        `INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, support_ceiling_role_id, status, journal_seq)
-         VALUES ($1,$2,$3,$4,$5,'active',$6)`,
-        [randomUUID(), orgId, slug, name, ceiling, seq],
+        `INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq)
+         VALUES ($1,$2,$3,$4,'active',$5)`,
+        [randomUUID(), orgId, slug, name, seq],
       );
     }
 
@@ -338,37 +338,23 @@ async function seedStandardIamWorld(pool, { environment = 'local' } = {}) {
       );
     }
 
-    // Supervision chain at Beacon: leadManager -> teamManager -> agentA (sibling agentB unmanaged by leadManager)
-    for (const [mgr, sub] of [
-      [ids.leadManager, ids.teamManager],
-      [ids.teamManager, ids.agentA],
-    ]) {
-      await c.query(
-        `INSERT INTO iam.supervision_links (id, organization_id, manager_person_id, subordinate_person_id, valid_range, status, journal_seq)
-         VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)`,
-        [randomUUID(), ids.beaconOrg, mgr, sub, seq],
-      );
-    }
-
     // Role grants
     const grantSpecs = [
-      [ids.nusearOwner, ids.roleNusearOwner, ids.rootOrg, true, 'org_subtree', 'all_in_org'],
-      [ids.nusearSupport, ids.roleNusearSupport, ids.rootOrg, true, 'org_subtree', 'all_in_org'],
-      [ids.acmeOwner, ids.roleCustomerOwner, ids.acmeOrg, true, 'org_subtree', 'all_in_org'],
-      [ids.beaconManager, ids.roleAgencyManager, ids.beaconOrg, true, 'org_subtree', 'all_in_org'],
-      [ids.leadManager, ids.roleTeamManager, ids.beaconOrg, true, 'self_and_managed', 'all_in_org'],
-      [ids.teamManager, ids.roleTeamManager, ids.beaconOrg, true, 'self_and_managed', 'all_in_org'],
-      [ids.agentA, ids.roleSellingAgent, ids.beaconOrg, false, 'self', 'all_in_org'],
-      [ids.agentB, ids.roleSellingAgent, ids.beaconOrg, false, 'self', 'all_in_org'],
-      [ids.northstarAdmin, ids.roleCustomerOwner, ids.northstarOrg, true, 'org_subtree', 'all_in_org'],
+      [ids.nusearOwner, ids.roleNusearOwner, ids.rootOrg, true, 'org_subtree'],
+      [ids.nusearSupport, ids.roleNusearSupport, ids.rootOrg, true, 'org_subtree'],
+      [ids.acmeOwner, ids.roleCustomerOwner, ids.acmeOrg, true, 'org_subtree'],
+      [ids.beaconManager, ids.roleAgencyManager, ids.beaconOrg, true, 'org_subtree'],
+      [ids.agentA, ids.roleSellingAgent, ids.beaconOrg, false, 'self'],
+      [ids.agentB, ids.roleSellingAgent, ids.beaconOrg, false, 'self'],
+      [ids.northstarAdmin, ids.roleCustomerOwner, ids.northstarOrg, true, 'org_subtree'],
     ];
-    for (const [personId, roleId, orgId, incDesc, pMode, cMode] of grantSpecs) {
+    for (const [personId, roleId, orgId, incDesc, pMode] of grantSpecs) {
       await c.query(
         `INSERT INTO iam.role_grants (
            id, person_id, role_id, organization_id, include_descendants,
-           person_scope_mode, connection_scope_mode, valid_range, status, journal_seq
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,'[2020-01-01,)'::daterange,'active',$8)`,
-        [randomUUID(), personId, roleId, orgId, incDesc, pMode, cMode, seq],
+           person_scope_mode, valid_range, status, journal_seq
+         ) VALUES ($1,$2,$3,$4,$5,$6,'[2020-01-01,)'::daterange,'active',$7)`,
+        [randomUUID(), personId, roleId, orgId, incDesc, pMode, seq],
       );
     }
   });
@@ -390,7 +376,7 @@ test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 
   const iamTables = tblRes.rows.filter((r) => r.table_schema === 'iam');
   const secretTables = tblRes.rows.filter((r) => r.table_schema === 'iam_secret');
   const platformTables = tblRes.rows.filter((r) => r.table_schema === 'platform');
-  assert.ok(iamTables.length >= 21, `expected >= 21 iam base tables, found ${iamTables.length}`);
+  assert.equal(iamTables.length, 16, `expected 16 iam base tables, found ${iamTables.length}`);
   assert.ok(secretTables.some((r) => r.table_name === 'signing_keys'), 'expected iam_secret.signing_keys');
   assert.ok(platformTables.some((r) => r.table_name === 'audit_journal'), 'expected platform.audit_journal');
 
@@ -423,12 +409,10 @@ test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 
   // Internal views and internal per-person/secret functions MUST also return 42501 for platform_app.
   for (const sql of [
     'SELECT * FROM iam.v_all_memberships_live LIMIT 1',
+    'SELECT * FROM iam.v_organization_closure LIMIT 1',
     'SELECT * FROM iam.v_organization_closure_live LIMIT 1',
-    'SELECT * FROM iam.v_supervision_closure_live LIMIT 1',
     "SELECT iam_secret.hmac_sha256_hex('\\x01'::bytea, 'msg')",
     `SELECT * FROM iam.person_effective_grants('${randomUUID()}'::uuid, 'act:coherence.bob.read')`,
-    `SELECT * FROM iam.person_narrow_pairs('${randomUUID()}'::uuid, 'act:coherence.bob.read')`,
-    `SELECT * FROM iam.person_explicit_connection_pairs('${randomUUID()}'::uuid, 'act:concurrence.calls.read')`,
   ]) {
     await assert.rejects(
       () => runAsPlatformApp(db.pool, { readOnly: true }, (c) => c.query(sql)),
@@ -439,7 +423,7 @@ test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 
 
   const policyChecks = await import('../src/config/policy-checks.mjs');
   assert.equal(typeof policyChecks.verifyIamConfigInvariants, 'function', 'verifyIamConfigInvariants must be exported');
-  const audit = await policyChecks.verifyIamConfigInvariants(db.pool);
+  const audit = await withClusterCatalogLock(() => policyChecks.verifyIamConfigInvariants(db.pool));
   assert.equal(audit.passed, true, `IAM catalog audit failed:\n${audit.problems.join('\n')}`);
 
   // Negative catalog audit probes (Item 14): prove verifyIamConfigInvariants fails non-vacuously on
@@ -457,14 +441,16 @@ test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 
   });
 
   await t.test('Catalog audit fails on unexpected pg_auth_members grant involving platform roles', async () => {
-    await db.pool.query('GRANT platform_readonly TO platform_app');
-    try {
-      const bad = await policyChecks.verifyIamConfigInvariants(db.pool);
-      assert.equal(bad.passed, false, 'expected catalog audit to fail when platform_app is granted membership in platform_readonly');
-      assert.ok(bad.problems.some((p) => /pg_auth_members|platform_readonly|platform_app/i.test(p)), `expected pg_auth_members problem, got: ${bad.problems.join('; ')}`);
-    } finally {
-      await db.pool.query('REVOKE platform_readonly FROM platform_app');
-    }
+    await withClusterCatalogLock(async () => {
+      await db.pool.query('GRANT platform_readonly TO platform_app');
+      try {
+        const bad = await policyChecks.verifyIamConfigInvariants(db.pool);
+        assert.equal(bad.passed, false, 'expected catalog audit to fail when platform_app is granted membership in platform_readonly');
+        assert.ok(bad.problems.some((p) => /pg_auth_members|platform_readonly|platform_app/i.test(p)), `expected pg_auth_members problem, got: ${bad.problems.join('; ')}`);
+      } finally {
+        await db.pool.query('REVOKE platform_readonly FROM platform_app');
+      }
+    });
   });
 
   await t.test('Catalog audit fails when an iam base table is not covered by immutability lists', async () => {
@@ -480,38 +466,40 @@ test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 
   });
 
   await t.test('Round 2 Item 2: catalog audit fails when a non-superuser holds a platform role WITH ADMIN OPTION (INHERIT and SET false)', async () => {
-    const probeRole = `iam_audit_admin_probe_${randomUUID().replace(/-/g, '').slice(0, 8)}`;
-    await db.pool.query(`CREATE ROLE ${probeRole} NOLOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS`);
-    try {
-      await db.pool.query(`GRANT platform_readonly TO ${probeRole} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
-      const bad = await policyChecks.verifyIamConfigInvariants(db.pool);
-      assert.equal(bad.passed, false, 'expected catalog audit to fail when non-superuser holds platform role WITH ADMIN OPTION');
-      assert.ok(
-        bad.problems.some((p) => p.includes(probeRole) && /platform_readonly/i.test(p) && /admin/i.test(p)),
-        `expected problem citing ${probeRole}, platform_readonly, and admin, got: ${bad.problems.join('; ')}`,
-      );
+    await withClusterCatalogLock(async () => {
+      const probeRole = `iam_audit_admin_probe_${randomUUID().replace(/-/g, '').slice(0, 8)}`;
+      await db.pool.query(`CREATE ROLE ${probeRole} NOLOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS`);
+      try {
+        await db.pool.query(`GRANT platform_readonly TO ${probeRole} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
+        const bad = await policyChecks.verifyIamConfigInvariants(db.pool);
+        assert.equal(bad.passed, false, 'expected catalog audit to fail when non-superuser holds platform role WITH ADMIN OPTION');
+        assert.ok(
+          bad.problems.some((p) => p.includes(probeRole) && /platform_readonly/i.test(p) && /admin/i.test(p)),
+          `expected problem citing ${probeRole}, platform_readonly, and admin, got: ${bad.problems.join('; ')}`,
+        );
 
-      // Even with CREATEROLE, a non-Cloud-SQL non-superuser holding WITH ADMIN OPTION must still fail
-      await db.pool.query(`ALTER ROLE ${probeRole} CREATEROLE`);
-      const badCreaterole = await policyChecks.verifyIamConfigInvariants(db.pool);
-      assert.equal(badCreaterole.passed, false, 'expected catalog audit to fail for non-Cloud-SQL CREATEROLE holder with ADMIN OPTION');
-      assert.ok(
-        badCreaterole.problems.some((p) => p.includes(probeRole) && /platform_readonly/i.test(p) && /admin=true/i.test(p)),
-        `expected problem citing ${probeRole}, platform_readonly, and admin=true, got: ${badCreaterole.problems.join('; ')}`,
-      );
+        // Even with CREATEROLE, a non-Cloud-SQL non-superuser holding WITH ADMIN OPTION must still fail
+        await db.pool.query(`ALTER ROLE ${probeRole} CREATEROLE`);
+        const badCreaterole = await policyChecks.verifyIamConfigInvariants(db.pool);
+        assert.equal(badCreaterole.passed, false, 'expected catalog audit to fail for non-Cloud-SQL CREATEROLE holder with ADMIN OPTION');
+        assert.ok(
+          badCreaterole.problems.some((p) => p.includes(probeRole) && /platform_readonly/i.test(p) && /admin=true/i.test(p)),
+          `expected problem citing ${probeRole}, platform_readonly, and admin=true, got: ${badCreaterole.problems.join('; ')}`,
+        );
 
-      // Even ADMIN FALSE, INHERIT FALSE, SET FALSE for a non-bootstrap non-superuser must fail
-      await db.pool.query(`GRANT platform_readonly TO ${probeRole} WITH ADMIN FALSE, INHERIT FALSE, SET FALSE`);
-      const badEmpty = await policyChecks.verifyIamConfigInvariants(db.pool);
-      assert.equal(badEmpty.passed, false, 'expected catalog audit to fail for stray non-superuser pg_auth_members row on platform role');
-      assert.ok(
-        badEmpty.problems.some((p) => p.includes(probeRole) && /platform_readonly/i.test(p)),
-        `expected problem citing ${probeRole} and platform_readonly, got: ${badEmpty.problems.join('; ')}`,
-      );
-    } finally {
-      await db.pool.query(`REVOKE platform_readonly FROM ${probeRole}`).catch(() => {});
-      await db.pool.query(`DROP ROLE IF EXISTS ${probeRole}`).catch(() => {});
-    }
+        // Even ADMIN FALSE, INHERIT FALSE, SET FALSE for a non-bootstrap non-superuser must fail
+        await db.pool.query(`GRANT platform_readonly TO ${probeRole} WITH ADMIN FALSE, INHERIT FALSE, SET FALSE`);
+        const badEmpty = await policyChecks.verifyIamConfigInvariants(db.pool);
+        assert.equal(badEmpty.passed, false, 'expected catalog audit to fail for stray non-superuser pg_auth_members row on platform role');
+        assert.ok(
+          badEmpty.problems.some((p) => p.includes(probeRole) && /platform_readonly/i.test(p)),
+          `expected problem citing ${probeRole} and platform_readonly, got: ${badEmpty.problems.join('; ')}`,
+        );
+      } finally {
+        await db.pool.query(`REVOKE platform_readonly FROM ${probeRole}`).catch(() => {});
+        await db.pool.query(`DROP ROLE IF EXISTS ${probeRole}`).catch(() => {});
+      }
+    });
   });
 
   await t.test('Round 2 Item 3: catalog audit discovers every view in iam, iam_secret, and platform and refuses any platform_app or PUBLIC privilege and any platform_app schema CREATE', async () => {
@@ -590,47 +578,12 @@ test('Layer 7 [Immutability & Supersession]: UPDATE, DELETE, and TRUNCATE fail o
 
   const { ids } = await seedStandardIamWorld(db.pool);
 
-  // Populate remaining iam tables (person_contacts, person_external_identities, role_grantable_roles, role_grant_people, role_grant_connections)
-  let explicitGrantId;
   let personVersionId;
   let orgVersionId;
   let switchId;
   let agentGrantId;
 
   await inSerializableTx(db.pool, async (c) => {
-    const j = await appendAuditEntry(c, { commandKind: 'iam.seed_extra', commandKey: 'seed-extra-1' });
-    const seq = j.seq;
-
-    await c.query(
-      "INSERT INTO iam.person_contacts (id, person_id, contact_kind, contact_value, status, journal_seq) VALUES ($1,$2,'work_email','extra@beacon.example','active',$3)",
-      [randomUUID(), ids.agentA, seq],
-    );
-    await c.query(
-      "INSERT INTO iam.person_external_identities (id, person_id, organization_id, provider, external_id, status, journal_seq) VALUES ($1,$2,$3,'agent_register_v1','p-0001','active',$4)",
-      [randomUUID(), ids.agentA, ids.acmeOrg, seq],
-    );
-    await c.query(
-      "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-      [randomUUID(), ids.roleAgencyManager, ids.roleSellingAgent, seq],
-    );
-
-    explicitGrantId = randomUUID();
-    await c.query(
-      `INSERT INTO iam.role_grants (
-         id, person_id, role_id, organization_id, include_descendants,
-         person_scope_mode, connection_scope_mode, valid_range, status, journal_seq
-       ) VALUES ($1,$2,$3,$4,false,'explicit_people','explicit_connections','[2020-01-01,)'::daterange,'active',$5)`,
-      [explicitGrantId, ids.agentC, ids.roleExplicitReader, ids.beaconOrg, seq],
-    );
-    await c.query(
-      'INSERT INTO iam.role_grant_people (grant_id, target_person_id, journal_seq) VALUES ($1,$2,$3)',
-      [explicitGrantId, ids.agentA, seq],
-    );
-    await c.query(
-      'INSERT INTO iam.role_grant_connections (grant_id, connection_id, journal_seq) VALUES ($1,$2,$3)',
-      [explicitGrantId, ids.connOnyx, seq],
-    );
-
     personVersionId = (await c.query('SELECT id FROM iam.person_versions WHERE person_id = $1 AND superseded_by_id IS NULL', [ids.agentA])).rows[0].id;
     orgVersionId = (await c.query('SELECT id FROM iam.organization_versions WHERE organization_id = $1 AND superseded_by_id IS NULL', [ids.beaconOrg])).rows[0].id;
     switchId = (await c.query("SELECT id FROM iam.organization_tool_switches WHERE organization_id = $1 AND tool_id = 'coherence' AND superseded_by_id IS NULL", [ids.acmeOrg])).rows[0].id;
@@ -716,7 +669,7 @@ test('Layer 7 [Immutability & Supersession]: UPDATE, DELETE, and TRUNCATE fail o
      WHERE table_schema IN ('iam', 'platform') AND table_type = 'BASE TABLE'
      ORDER BY table_schema, table_name`,
   );
-  assert.ok(iamTablesRes.rows.length >= 22);
+  assert.equal(iamTablesRes.rows.length, 17);
 
   for (const replicaMode of [false, true]) {
     for (const row of iamTablesRes.rows) {
@@ -785,8 +738,8 @@ test('Layer 7 [Immutability & Supersession]: UPDATE, DELETE, and TRUNCATE fail o
     await c.query(
       `INSERT INTO iam.role_grants (
          id, person_id, role_id, organization_id, include_descendants,
-         person_scope_mode, connection_scope_mode, valid_range, status, replaces_id, journal_seq
-       ) VALUES ($1,$2,$3,$4,false,'self','all_in_org','[2020-01-01,)'::daterange,'active',$5,$6)`,
+         person_scope_mode, valid_range, status, replaces_id, journal_seq
+       ) VALUES ($1,$2,$3,$4,false,'self','[2020-01-01,)'::daterange,'active',$5,$6)`,
       [randomUUID(), ids.agentA, ids.roleSellingAgent, ids.beaconOrg, agentGrantId, seq],
     );
 
@@ -800,7 +753,7 @@ test('Layer 7 [Immutability & Supersession]: UPDATE, DELETE, and TRUNCATE fail o
 
   const oldPv = (await db.pool.query('SELECT superseded_by_id, superseded_journal_seq FROM iam.person_versions WHERE id = $1', [personVersionId])).rows[0];
   assert.equal(oldPv.superseded_by_id, newPersonVersionId);
-  assert.ok(Number(oldPv.superseded_journal_seq) >= 3);
+  assert.ok(Number(oldPv.superseded_journal_seq) >= 2);
 
   // Double-replacement of already-superseded row fails (23505)
   await assert.rejects(
@@ -929,7 +882,7 @@ test('Layer 7 [Signed Tokens Fail-Closed]: unset, blank, malformed, 1-bit tamper
     const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS orgs")).rows[0].orgs;
     assert.ok(wide.includes(ids.acmeOrg));
     const wr = (await c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')",
+      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
       [ids.beaconOrg, ids.agentA],
     )).rows[0];
     assert.equal(wr.actor_person_id, ids.acmeOwner);
@@ -967,7 +920,7 @@ test('Layer 7 [Signed Tokens Fail-Closed]: unset, blank, malformed, 1-bit tamper
     });
     await assert.rejects(
       () => runAsPlatformApp(db.pool, { token: tok, readOnly: false }, (c) => c.query(
-        "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')",
+        "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
         [ids.beaconOrg, ids.agentA],
       )),
       (err) => err?.code === '42501',
@@ -993,7 +946,7 @@ test('Layer 7 [Signed Tokens Fail-Closed]: unset, blank, malformed, 1-bit tamper
   });
   await assert.rejects(
     () => runAsPlatformApp(db.pool, { token: validToken, readOnly: false }, (c) => c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')",
+      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
       [ids.beaconOrg, ids.agentA],
     )),
     (err) => err?.code === '42501',
@@ -1031,25 +984,23 @@ test('Layer 7 [View-As Enforcement]: View-as refuses every write with 42501 VIEW
     assert.equal((await c.query("SELECT iam.has_right('act:coherence.bob.read') AS ok")).rows[0].ok, true);
   });
 
-  for (const domainKind of ['customer_domain', 'nusear_service']) {
-    await assert.rejects(
-      () => runAsPlatformApp(db.pool, { token: ownerAsAgent, readOnly: false }, (c) => c.query(
-        "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, $3)",
-        [ids.beaconOrg, ids.agentA, domainKind],
-      )),
-      (err) => err?.code === '42501' && /VIEW_AS_READ_ONLY/.test(err.message),
-      `View-as write (${domainKind}) in READ WRITE tx must fail with 42501 VIEW_AS_READ_ONLY`,
-    );
-  }
+  await assert.rejects(
+    () => runAsPlatformApp(db.pool, { token: ownerAsAgent, readOnly: false }, (c) => c.query(
+      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
+      [ids.beaconOrg, ids.agentA],
+    )),
+    (err) => err?.code === '42501' && /VIEW_AS_READ_ONLY/.test(err.message),
+    'View-as write in READ WRITE tx must fail with 42501 VIEW_AS_READ_ONLY',
+  );
 
-  // 2. Narrow viewer (Lead Manager, self_and_managed) viewing as Wide target (Acme Owner, org_subtree): viewer never widens!
-  const managerAsOwner = mintSignedToken({
-    keyId, secretBytes, environment, actorPersonId: ids.leadManager, viewAsPersonId: ids.acmeOwner,
+  // 2. Narrow viewer (Selling Agent A, self) viewing as Wide target (Acme Owner, org_subtree): viewer never widens!
+  const agentAsOwner = mintSignedToken({
+    keyId, secretBytes, environment, actorPersonId: ids.agentA, viewAsPersonId: ids.acmeOwner,
   });
-  await runAsPlatformApp(db.pool, { token: managerAsOwner, readOnly: true }, async (c) => {
+  await runAsPlatformApp(db.pool, { token: agentAsOwner, readOnly: true }, async (c) => {
     assert.deepEqual((await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v, []);
-    const people = (await c.query("SELECT iam.effective_narrow_person_ids('act:coherence.bob.read') AS v")).rows[0].v.sort();
-    assert.deepEqual(people, [ids.leadManager, ids.teamManager, ids.agentA].sort());
+    const people = (await c.query("SELECT iam.effective_narrow_person_ids('act:coherence.bob.read') AS v")).rows[0].v;
+    assert.deepEqual(people, [ids.agentA]);
     assert.ok(!people.includes(ids.agentB), 'sibling agent B must never leak into narrow viewer viewing as owner');
   });
 
@@ -1104,59 +1055,30 @@ test('Layer 7 [Eastern Business Day]: iam.business_today() handles America/New_Y
   }
 });
 
-test('Layer 7 [Scope Derivation & Descendant Flow]: org_subtree, self, self_and_managed (recursive tree + cycle rejection), explicit_people, include_descendants true/false, and allows_org_wide_scope', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7 [Scope Derivation & Descendant Flow]: org_subtree, self, include_descendants true/false, allows_org_wide_scope, and org-edge cycle rejection', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
   const { ids, keyId, secretBytes, environment } = await seedStandardIamWorld(db.pool);
 
-  // Add a non-descending grant at Acme for a dedicated person + an explicit_people grant for Agent C + empty explicit_people grant for Agent B
   const nonDescPerson = randomUUID();
-  const emptyExpPerson = randomUUID();
   await inSerializableTx(db.pool, async (c) => {
     const j = await appendAuditEntry(c, { commandKind: 'iam.scope_extras', commandKey: 'scope-extras-1' });
     const seq = j.seq;
 
-    for (const [pid, name, email] of [
-      [nonDescPerson, 'NoDesc Viewer', 'nodesc@acme.example'],
-      [emptyExpPerson, 'Empty Explicit', 'emptyexp@beacon.example'],
-    ]) {
-      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
-      await c.query(
-        "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)",
-        [randomUUID(), pid, name, email, seq],
-      );
-    }
+    await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [nonDescPerson, seq]);
+    await c.query(
+      "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'NoDesc Viewer','NoDesc Viewer','nodesc@acme.example','active',$3)",
+      [randomUUID(), nonDescPerson, seq],
+    );
     await c.query(
       "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
       [randomUUID(), nonDescPerson, ids.acmeOrg, seq],
     );
     await c.query(
-      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
-      [randomUUID(), emptyExpPerson, ids.beaconOrg, seq],
-    );
-
-    // include_descendants = false at Acme
-    await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,false,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)`,
+      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)`,
       [randomUUID(), nonDescPerson, ids.roleCustomerOwner, ids.acmeOrg, seq],
-    );
-
-    // explicit_people grant for Agent C pinned to [agentA, agentC]
-    const expGrantId = randomUUID();
-    await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,false,'explicit_people','all_in_org','[2020-01-01,)'::daterange,'active',$5)`,
-      [expGrantId, ids.agentC, ids.roleExplicitReader, ids.beaconOrg, seq],
-    );
-    await c.query('INSERT INTO iam.role_grant_people (grant_id, target_person_id, journal_seq) VALUES ($1,$2,$3),($1,$4,$3)', [expGrantId, ids.agentA, seq, ids.agentC]);
-
-    // Empty explicit_people grant (must fail closed to 0 pairs)
-    await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,false,'explicit_people','all_in_org','[2020-01-01,)'::daterange,'active',$5)`,
-      [randomUUID(), emptyExpPerson, ids.roleExplicitReader, ids.beaconOrg, seq],
     );
   });
 
@@ -1174,18 +1096,30 @@ test('Layer 7 [Scope Derivation & Descendant Flow]: org_subtree, self, self_and_
     assert.deepEqual(orgs, [ids.acmeOrg]);
   });
 
-  // 3. allows_org_wide_scope = false rejects org_subtree grant
+  // 3. allows_org_wide_scope = false rejects org_subtree grant and narrowing role_versions with live org_subtree grants
   await assert.rejects(
     () => inSerializableTx(db.pool, async (c) => {
       const j = await appendAuditEntry(c, { commandKind: 'iam.bad_wide', commandKey: 'bad-wide-grant' });
       await c.query(
-        `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-         VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)`,
+        `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
+         VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)`,
         [randomUUID(), ids.agentC, ids.roleSellingAgent, ids.beaconOrg, j.seq],
       );
     }),
     (err) => err?.code === '23514',
     'selling_agent (allows_org_wide_scope=false) must reject org_subtree grant',
+  );
+  const ownerRvId = (await db.pool.query('SELECT id FROM iam.role_versions WHERE role_id = $1 AND superseded_by_id IS NULL', [ids.roleCustomerOwner])).rows[0].id;
+  await assert.rejects(
+    () => inSerializableTx(db.pool, async (c) => {
+      const j = await appendAuditEntry(c, { commandKind: 'iam.narrow_wide_role', commandKey: 'narrow-wide-role-1' });
+      await c.query(
+        `INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, replaces_id, journal_seq)
+         VALUES ($1,$2,'Customer Owner Narrowed',true,false,false,'active',$3,$4)`,
+        [randomUUID(), ids.roleCustomerOwner, ownerRvId, j.seq],
+      );
+    }),
+    (err) => err?.code === '23514' && /ORG_WIDE_SCOPE_FORBIDDEN/.test(err.message),
   );
 
   // 4. self scope (derived strictly from agent_affiliations, zero organization_memberships)
@@ -1207,39 +1141,7 @@ test('Layer 7 [Scope Derivation & Descendant Flow]: org_subtree, self, self_and_
     'self-scoped agent must not write for another agent',
   );
 
-  // 5. self_and_managed: recursive supervision tree (Lead -> Team -> Agent A, excluding sibling Agent B)
-  const leadTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.leadManager });
-  await runAsPlatformApp(db.pool, { token: leadTok, readOnly: false }, async (c) => {
-    const pairs = (await c.query("SELECT org_id, person_id FROM iam.effective_narrow_pairs('act:transmittals.read')")).rows;
-    const beaconPeople = pairs.filter((r) => r.org_id === ids.beaconOrg).map((r) => r.person_id).sort();
-    assert.deepEqual(beaconPeople, [ids.leadManager, ids.teamManager, ids.agentA].sort());
-    assert.ok(!beaconPeople.includes(ids.agentB));
-    // Depth-2 subordinate write succeeds
-    const wr = (await c.query("SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)", [ids.beaconOrg, ids.agentA])).rows[0];
-    assert.equal(wr.actor_person_id, ids.leadManager);
-  });
-  await assert.rejects(
-    () => runAsPlatformApp(db.pool, { token: leadTok, readOnly: false }, (c) => c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
-      [ids.beaconOrg, ids.agentB],
-    )),
-    (err) => err?.code === '42501',
-    'manager must not write for unmanaged sibling agent B',
-  );
-
-  // Cycle rejection on iam.supervision_links (agentA -> leadManager) and iam.organization_edges (acme -> eastTeam)
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { commandKind: 'iam.sup_cycle', commandKey: 'sup-cycle-1' });
-      await c.query(
-        `INSERT INTO iam.supervision_links (id, organization_id, manager_person_id, subordinate_person_id, valid_range, status, journal_seq)
-         VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)`,
-        [randomUUID(), ids.beaconOrg, ids.agentA, ids.leadManager, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514',
-    'cycle in supervision_links must be rejected with 23514',
-  );
+  // 5. Cycle rejection on iam.organization_edges (acme -> eastTeam)
   await assert.rejects(
     () => inSerializableTx(db.pool, async (c) => {
       const j = await appendAuditEntry(c, { commandKind: 'iam.org_cycle', commandKey: 'org-cycle-1' });
@@ -1253,171 +1155,9 @@ test('Layer 7 [Scope Derivation & Descendant Flow]: org_subtree, self, self_and_
     (err) => err?.code === '23514',
     'cycle in organization_edges must be rejected with 23514',
   );
-
-  // 6. explicit_people (pinned set vs empty fail-closed)
-  const expTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.agentC });
-  await runAsPlatformApp(db.pool, { token: expTok, readOnly: false }, async (c) => {
-    const people = (await c.query("SELECT iam.effective_narrow_person_ids('act:transmittals.read') AS v")).rows[0].v.sort();
-    assert.deepEqual(people, [ids.agentA, ids.agentC].sort());
-    await c.query("SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)", [ids.beaconOrg, ids.agentA]);
-  });
-  await assert.rejects(
-    () => runAsPlatformApp(db.pool, { token: expTok, readOnly: false }, (c) => c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
-      [ids.beaconOrg, ids.agentB],
-    )),
-    (err) => err?.code === '42501',
-  );
-
-  const emptyExpTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: emptyExpPerson });
-  await runAsPlatformApp(db.pool, { token: emptyExpTok, readOnly: true }, async (c) => {
-    assert.deepEqual((await c.query("SELECT iam.effective_narrow_person_ids('act:transmittals.read') AS v")).rows[0].v, []);
-  });
 });
 
-test('Layer 7 [Connection Scope Modes]: all_in_org vs explicit_connections (including empty fail-closed, View-as intersection, and write guard)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
-  const db = await createEmptyMigratedTestDb();
-  t.after(() => db.cleanup());
-
-  const { ids, keyId, secretBytes, environment } = await seedStandardIamWorld(db.pool);
-
-  const expConnPerson = randomUUID();
-  const emptyConnPerson = randomUUID();
-  let allInOrgGrantId;
-
-  await inSerializableTx(db.pool, async (c) => {
-    const j = await appendAuditEntry(c, { commandKind: 'iam.conn_scopes', commandKey: 'conn-scopes-1' });
-    const seq = j.seq;
-
-    for (const [pid, name, email] of [
-      [expConnPerson, 'Pinned Conn Staff', 'pinnedconn@beacon.example'],
-      [emptyConnPerson, 'Empty Conn Staff', 'emptyconn@beacon.example'],
-    ]) {
-      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
-      await c.query(
-        "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)",
-        [randomUUID(), pid, name, email, seq],
-      );
-      await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
-        [randomUUID(), pid, ids.beaconOrg, seq],
-      );
-    }
-
-    const expGrantId = randomUUID();
-    await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,true,'org_subtree','explicit_connections','[2020-01-01,)'::daterange,'active',$5)`,
-      [expGrantId, expConnPerson, ids.roleAgencyManager, ids.beaconOrg, seq],
-    );
-    await c.query(
-      'INSERT INTO iam.role_grant_connections (grant_id, connection_id, journal_seq) VALUES ($1,$2,$3)',
-      [expGrantId, ids.connOnyx, seq],
-    );
-
-    await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,true,'org_subtree','explicit_connections','[2020-01-01,)'::daterange,'active',$5)`,
-      [randomUUID(), emptyConnPerson, ids.roleAgencyManager, ids.beaconOrg, seq],
-    );
-
-    allInOrgGrantId = (await c.query(
-      'SELECT id FROM iam.role_grants WHERE person_id = $1 AND role_id = $2 AND superseded_by_id IS NULL',
-      [ids.beaconManager, ids.roleAgencyManager],
-    )).rows[0].id;
-  });
-
-  // Attaching role_grant_connections to an all_in_org grant must fail (23514)
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { commandKind: 'iam.bad_conn_pin', commandKey: 'bad-conn-pin-1' });
-      await c.query(
-        'INSERT INTO iam.role_grant_connections (grant_id, connection_id, journal_seq) VALUES ($1,$2,$3)',
-        [allInOrgGrantId, ids.connOnyx, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514',
-  );
-
-  // 1. all_in_org (beaconManager): sees both connections
-  const mgrTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.beaconManager });
-  await runAsPlatformApp(db.pool, { token: mgrTok, readOnly: false }, async (c) => {
-    const allOrgs = (await c.query("SELECT iam.effective_all_connection_org_ids('act:concurrence.calls.read') AS v")).rows[0].v;
-    assert.ok(allOrgs.includes(ids.beaconOrg));
-    assert.equal((await c.query("SELECT iam.can_access_connection('act:concurrence.calls.read', $1::uuid, $2::uuid) AS ok", [ids.beaconOrg, ids.connOnyx])).rows[0].ok, true);
-    assert.equal((await c.query("SELECT iam.can_access_connection('act:concurrence.calls.read', $1::uuid, $2::uuid) AS ok", [ids.beaconOrg, ids.connEnrollHere])).rows[0].ok, true);
-    await c.query("SELECT * FROM iam.assert_can_write('act:concurrence.calls.tag', $1::uuid, NULL, 'customer_domain', $2::uuid)", [ids.beaconOrg, ids.connEnrollHere]);
-  });
-
-  // 2. explicit_connections (expConnPerson): connOnyx allowed, connEnrollHere denied
-  const expTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: expConnPerson });
-  await runAsPlatformApp(db.pool, { token: expTok, readOnly: false }, async (c) => {
-    assert.deepEqual((await c.query("SELECT iam.effective_all_connection_org_ids('act:concurrence.calls.read') AS v")).rows[0].v, []);
-    assert.deepEqual((await c.query("SELECT iam.effective_explicit_connection_ids('act:concurrence.calls.read') AS v")).rows[0].v, [ids.connOnyx]);
-    assert.equal((await c.query("SELECT iam.can_access_connection('act:concurrence.calls.read', $1::uuid, $2::uuid) AS ok", [ids.beaconOrg, ids.connOnyx])).rows[0].ok, true);
-    assert.equal((await c.query("SELECT iam.can_access_connection('act:concurrence.calls.read', $1::uuid, $2::uuid) AS ok", [ids.beaconOrg, ids.connEnrollHere])).rows[0].ok, false);
-    await c.query("SELECT * FROM iam.assert_can_write('act:concurrence.calls.tag', $1::uuid, NULL, 'customer_domain', $2::uuid)", [ids.beaconOrg, ids.connOnyx]);
-  });
-  await assert.rejects(
-    () => runAsPlatformApp(db.pool, { token: expTok, readOnly: false }, (c) => c.query(
-      "SELECT * FROM iam.assert_can_write('act:concurrence.calls.tag', $1::uuid, NULL, 'customer_domain', $2::uuid)",
-      [ids.beaconOrg, ids.connEnrollHere],
-    )),
-    (err) => err?.code === '42501',
-    'explicit_connections write to non-pinned connection must fail with 42501',
-  );
-
-  // 3. Empty explicit_connections fails closed
-  const emptyTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: emptyConnPerson });
-  await runAsPlatformApp(db.pool, { token: emptyTok, readOnly: true }, async (c) => {
-    assert.deepEqual((await c.query("SELECT iam.effective_all_connection_org_ids('act:concurrence.calls.read') AS v")).rows[0].v, []);
-    assert.deepEqual((await c.query("SELECT iam.effective_explicit_connection_ids('act:concurrence.calls.read') AS v")).rows[0].v, []);
-    assert.equal((await c.query("SELECT iam.can_access_connection('act:concurrence.calls.read', $1::uuid, $2::uuid) AS ok", [ids.beaconOrg, ids.connOnyx])).rows[0].ok, false);
-  });
-
-  // 4. View-as intersection: all_in_org viewer viewing as explicit_connections target -> only pinned connection allowed
-  const vaConnTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.acmeOwner, viewAsPersonId: expConnPerson });
-  await runAsPlatformApp(db.pool, { token: vaConnTok, readOnly: true }, async (c) => {
-    assert.deepEqual((await c.query("SELECT iam.effective_all_connection_org_ids('act:concurrence.calls.read') AS v")).rows[0].v, []);
-    assert.deepEqual((await c.query("SELECT iam.effective_explicit_connection_ids('act:concurrence.calls.read') AS v")).rows[0].v, [ids.connOnyx]);
-    assert.equal((await c.query("SELECT iam.can_access_connection('act:concurrence.calls.read', $1::uuid, $2::uuid) AS ok", [ids.beaconOrg, ids.connOnyx])).rows[0].ok, true);
-    assert.equal((await c.query("SELECT iam.can_access_connection('act:concurrence.calls.read', $1::uuid, $2::uuid) AS ok", [ids.beaconOrg, ids.connEnrollHere])).rows[0].ok, false);
-  });
-
-  // 5. Item 6: Omitted (NULL) p_connection_id in assert_can_write must NEVER match explicit_connections grants (fail closed!)
-  await t.test('Item 6: omitted (NULL) p_connection_id fails closed on explicit_connections grants', async () => {
-    for (const [label, tok] of [['pinned_explicit', expTok], ['empty_explicit', emptyTok]]) {
-      await assert.rejects(
-        () => runAsPlatformApp(db.pool, { token: tok, readOnly: false }, (c) => c.query(
-          "SELECT * FROM iam.assert_can_write('act:concurrence.calls.tag', $1::uuid, NULL, 'customer_domain', NULL)",
-          [ids.beaconOrg],
-        )),
-        (err) => err?.code === '42501',
-        `${label}: omitted (NULL) p_connection_id must fail closed on explicit_connections grant`,
-      );
-    }
-  });
-
-  // 6. Item 13: iam.can_access_connection returns strictly boolean false (never NULL or true) on any NULL argument
-  await t.test('Item 13: iam.can_access_connection returns strictly false on NULL arguments', async () => {
-    await runAsPlatformApp(db.pool, { token: mgrTok, readOnly: true }, async (c) => {
-      for (const [label, args] of [
-        ['null_right', [null, ids.beaconOrg, ids.connOnyx]],
-        ['null_org', ['act:concurrence.calls.read', null, ids.connOnyx]],
-        ['null_connection_on_all_in_org', ['act:concurrence.calls.read', ids.beaconOrg, null]],
-        ['all_null', [null, null, null]],
-      ]) {
-        const ok = (await c.query(
-          'SELECT iam.can_access_connection($1::text, $2::uuid, $3::uuid) AS ok',
-          args,
-        )).rows[0].ok;
-        assert.strictEqual(ok, false, `can_access_connection(${label}) must be strictly false, got ${String(ok)}`);
-      }
-    });
-  });
-});
-
-test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range across grants, memberships, affiliations, org edges, supervision links; data_date_range; prod_only vs dev_only', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range across grants, memberships, affiliations, and org edges; data_date_range; prod_only vs dev_only', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
@@ -1428,14 +1168,12 @@ test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range acr
   const expiredAffAgent = randomUUID();
   const expiredMemPerson = randomUUID();
   const datedDataPerson = randomUUID();
-  const formerSubAgent = randomUUID();
   const expiredChildOrg = randomUUID();
 
   await inSerializableTx(db.pool, async (c) => {
     const j = await appendAuditEntry(c, { environment, commandKind: 'iam.dated_seed', commandKey: 'dated-seed-1' });
     const seq = j.seq;
 
-    // Org whose parent edge ended today (half-open upper bound = today -> NOT active today)
     await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'agency',$2)", [expiredChildOrg, seq]);
     await c.query(
       "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'expired_agency','Expired Agency','active',$3)",
@@ -1453,7 +1191,6 @@ test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range acr
       [expiredAffAgent, 'Expired Aff Agent', 'expaff@beacon.example', '44444444'],
       [expiredMemPerson, 'Expired Mem Staff', 'expmem@beacon.example', null],
       [datedDataPerson, 'Dated Data Staff', 'dated@beacon.example', null],
-      [formerSubAgent, 'Former Sub Agent', 'formersub@beacon.example', '55555555'],
     ]) {
       await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
       await c.query(
@@ -1462,79 +1199,58 @@ test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range acr
       );
     }
 
-    // Active memberships for past/future/dated
     for (const pid of [pastGrantPerson, futureGrantPerson, datedDataPerson]) {
       await c.query(
         "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), pid, ids.beaconOrg, seq],
       );
     }
-    // Expired membership
     await c.query(
       `INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq)
        VALUES ($1,$2,$3,'employee',daterange(iam.business_today() - 30, iam.business_today(), '[)'),'active',$4)`,
       [randomUUID(), expiredMemPerson, ids.beaconOrg, seq],
     );
-    // Expired affiliation (half-open upper bound = today)
     await c.query(
       `INSERT INTO iam.agent_affiliations (id, person_id, npn, agency_org_id, split_bps, agent_file_name, valid_range, status, journal_seq)
        VALUES ($1,$2,'44444444',$3,8000,'Expired Aff Agent',daterange(iam.business_today() - 30, iam.business_today(), '[)'),'active',$4)`,
       [randomUUID(), expiredAffAgent, ids.beaconOrg, seq],
     );
-    // Active affiliation for formerSubAgent, but EXPIRED supervision link from leadManager
-    await c.query(
-      `INSERT INTO iam.agent_affiliations (id, person_id, npn, agency_org_id, split_bps, agent_file_name, valid_range, status, journal_seq)
-       VALUES ($1,$2,'55555555',$3,8000,'Former Sub Agent','[2020-01-01,)'::daterange,'active',$4)`,
-      [randomUUID(), formerSubAgent, ids.beaconOrg, seq],
-    );
-    await c.query(
-      `INSERT INTO iam.supervision_links (id, organization_id, manager_person_id, subordinate_person_id, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,daterange(iam.business_today() - 30, iam.business_today(), '[)'),'active',$5)`,
-      [randomUUID(), ids.beaconOrg, ids.leadManager, formerSubAgent, seq],
-    );
 
-    // Past grant
     await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org',daterange(iam.business_today() - 30, iam.business_today(), '[)'),'active',$5)`,
+      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,$4,true,'org_subtree',daterange(iam.business_today() - 30, iam.business_today(), '[)'),'active',$5)`,
       [randomUUID(), pastGrantPerson, ids.roleAgencyManager, ids.beaconOrg, seq],
     );
-    // Future grant
     await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org',daterange(iam.business_today() + 1, NULL, '[)'),'active',$5)`,
+      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,$4,true,'org_subtree',daterange(iam.business_today() + 1, NULL, '[)'),'active',$5)`,
       [randomUUID(), futureGrantPerson, ids.roleAgencyManager, ids.beaconOrg, seq],
     );
-    // Active grant on expired membership & expired affiliation
     await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org','[2020-01-01,)'::daterange,'active',$5)`,
+      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)`,
       [randomUUID(), expiredMemPerson, ids.roleAgencyManager, ids.beaconOrg, seq],
     );
     await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,false,'self','all_in_org','[2020-01-01,)'::daterange,'active',$5)`,
+      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,$4,false,'self','[2020-01-01,)'::daterange,'active',$5)`,
       [randomUUID(), expiredAffAgent, ids.roleSellingAgent, ids.beaconOrg, seq],
     );
-    // Grant with data_date_range = [2025-01-01, 2026-01-01)
     await c.query(
-      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, connection_scope_mode, data_date_range, valid_range, status, journal_seq)
-       VALUES ($1,$2,$3,$4,true,'org_subtree','all_in_org','[2025-01-01,2026-01-01)'::daterange,'[2020-01-01,)'::daterange,'active',$5)`,
+      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, data_date_range, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,$4,true,'org_subtree','[2025-01-01,2026-01-01)'::daterange,'[2020-01-01,)'::daterange,'active',$5)`,
       [randomUUID(), datedDataPerson, ids.roleAgencyManager, ids.beaconOrg, seq],
     );
   });
 
-  // Expired edge excluded from Acme Owner's subtree
   const ownerTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.acmeOwner });
   await runAsPlatformApp(db.pool, { token: ownerTok, readOnly: true }, async (c) => {
     const orgs = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v;
     assert.ok(!orgs.includes(expiredChildOrg), 'expired org edge must not flow down to child org');
-    // Environment scope in dev: dev_only allowed, prod_only denied
     assert.equal((await c.query("SELECT iam.has_right('act:coherence.dev_debug') AS ok")).rows[0].ok, true);
     assert.equal((await c.query("SELECT iam.has_right('act:coherence.prod_send') AS ok")).rows[0].ok, false);
   });
 
-  // Past grant, future grant, expired membership, expired affiliation all return empty scopes
   for (const [label, pid] of [
     ['past_grant', pastGrantPerson],
     ['future_grant', futureGrantPerson],
@@ -1548,14 +1264,6 @@ test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range acr
     });
   }
 
-  // Expired supervision link: leadManager does NOT see formerSubAgent
-  const leadTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.leadManager });
-  await runAsPlatformApp(db.pool, { token: leadTok, readOnly: true }, async (c) => {
-    const people = (await c.query("SELECT iam.effective_narrow_person_ids('act:transmittals.read') AS v")).rows[0].v;
-    assert.ok(!people.includes(formerSubAgent), 'expired supervision link must not expose former subordinate');
-  });
-
-  // data_date_range enforcement on reads and writes
   const datedTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: datedDataPerson });
   await runAsPlatformApp(db.pool, { token: datedTok, readOnly: false }, async (c) => {
     const inRange = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read', '2025-06-15'::date) AS v")).rows[0].v;
@@ -1564,18 +1272,17 @@ test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range acr
     assert.deepEqual(atUpper, []);
     const beforeLower = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read', '2024-12-31'::date) AS v")).rows[0].v;
     assert.deepEqual(beforeLower, []);
-    await c.query("SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, NULL, 'customer_domain', NULL, '2025-12-31'::date)", [ids.beaconOrg]);
+    await c.query("SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, NULL, '2025-12-31'::date)", [ids.beaconOrg]);
   });
   await assert.rejects(
     () => runAsPlatformApp(db.pool, { token: datedTok, readOnly: false }, (c) => c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, NULL, 'customer_domain', NULL, '2026-01-01'::date)",
+      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, NULL, '2026-01-01'::date)",
       [ids.beaconOrg],
     )),
     (err) => err?.code === '42501',
     'write outside data_date_range must fail with 42501',
   );
 
-  // Item 6: Omitting p_data_date (NULL) must match ONLY grants without a data_date_range (fail closed on date-restricted grants)
   await runAsPlatformApp(db.pool, { token: datedTok, readOnly: true }, async (c) => {
     assert.deepEqual(
       (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v,
@@ -1590,7 +1297,7 @@ test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range acr
   });
   await assert.rejects(
     () => runAsPlatformApp(db.pool, { token: datedTok, readOnly: false }, (c) => c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, NULL, 'customer_domain', NULL, NULL)",
+      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, NULL, NULL)",
       [ids.beaconOrg],
     )),
     (err) => err?.code === '42501',
@@ -1598,7 +1305,7 @@ test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range acr
   );
 });
 
-test('Layer 7 [Tool Switches, Nusear Bypass & Contractor Ceiling]: off/held/preview block customers, child override beats ancestor on, Nusear bypasses switches, is_nusear_only blocks customers, and support_ceiling_role_id caps customer_domain writes only', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7 [Tool Switches & Nusear Bypass]: off/held/preview block customers, ancestor held/off vetoes child on, Nusear bypasses switches, and is_nusear_only blocks customers', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
@@ -1640,7 +1347,7 @@ test('Layer 7 [Tool Switches, Nusear Bypass & Contractor Ceiling]: off/held/prev
   });
   await assert.rejects(
     () => runAsPlatformApp(db.pool, { token: ownerTok, readOnly: false }, (c) => c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')",
+      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
       [ids.beaconOrg, ids.agentA],
     )),
     (err) => err?.code === '42501',
@@ -1651,7 +1358,7 @@ test('Layer 7 [Tool Switches, Nusear Bypass & Contractor Ceiling]: off/held/prev
     const orgs = (await c.query("SELECT iam.effective_wide_org_ids('act:transmittals.read') AS v")).rows[0].v;
     assert.ok(orgs.includes(ids.beaconOrg));
     const wr = (await c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')",
+      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
       [ids.beaconOrg, ids.agentA],
     )).rows[0];
     assert.equal(wr.actor_person_id, ids.nusearSupport);
@@ -1715,7 +1422,7 @@ test('Layer 7 [Tool Switches, Nusear Bypass & Contractor Ceiling]: off/held/prev
     });
     await assert.rejects(
       () => runAsPlatformApp(db.pool, { token: ownerTok, readOnly: false }, (c) => c.query(
-        "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')",
+        "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
         [ids.beaconOrg, ids.agentA],
       )),
       (err) => err?.code === '42501',
@@ -1759,7 +1466,7 @@ test('Layer 7 [Tool Switches, Nusear Bypass & Contractor Ceiling]: off/held/prev
     });
     await assert.rejects(
       () => runAsPlatformApp(db.pool, { token: ownerTok, readOnly: false }, (c) => c.query(
-        "SELECT * FROM iam.assert_can_write('act:vault.archive.retrieve', $1::uuid, NULL, 'customer_domain')",
+        "SELECT * FROM iam.assert_can_write('act:vault.archive.retrieve', $1::uuid)",
         [ids.beaconOrg],
       )),
       (err) => err?.code === '42501',
@@ -1799,209 +1506,22 @@ test('Layer 7 [Tool Switches, Nusear Bypass & Contractor Ceiling]: off/held/prev
     assert.equal((await c.query("SELECT iam.has_right('act:control_center.read') AS ok")).rows[0].ok, true);
   });
 
-  // 5. Contractor ceiling: Nusear Support blocked on act:vault.archive.retrieve (outside ceiling) in customer_domain,
-  //    but allowed on act:coherence.run.manage in nusear_service!
-  await assert.rejects(
-    () => runAsPlatformApp(db.pool, { token: supportTok, readOnly: false }, (c) => c.query(
-      "SELECT * FROM iam.assert_can_write('act:vault.archive.retrieve', $1::uuid, NULL, 'customer_domain')",
-      [ids.beaconOrg],
-    )),
-    (err) => err?.code === '42501' && /CONTRACTOR_CEILING/.test(err.message),
-    'Nusear support customer_domain write outside support_ceiling_role_id must fail with 42501 CONTRACTOR_CEILING',
-  );
+  // 5. Nusear internal writes record recorded_as = 'nusear_support'; customer writes record 'self'
   await runAsPlatformApp(db.pool, { token: supportTok, readOnly: false }, async (c) => {
     const wr = (await c.query(
-      "SELECT * FROM iam.assert_can_write('act:coherence.run.manage', $1::uuid, NULL, 'nusear_service')",
+      "SELECT * FROM iam.assert_can_write('act:coherence.run.manage', $1::uuid)",
       [ids.beaconOrg],
     )).rows[0];
     assert.equal(wr.actor_person_id, ids.nusearSupport);
     assert.equal(wr.recorded_as, 'nusear_support');
   });
-  // Customer Owner CAN call act:vault.archive.retrieve (not capped by contractor ceiling)
   await runAsPlatformApp(db.pool, { token: ownerTok, readOnly: false }, async (c) => {
     const wr = (await c.query(
-      "SELECT * FROM iam.assert_can_write('act:vault.archive.retrieve', $1::uuid, NULL, 'customer_domain')",
+      "SELECT * FROM iam.assert_can_write('act:vault.archive.retrieve', $1::uuid)",
       [ids.beaconOrg],
     )).rows[0];
     assert.equal(wr.actor_person_id, ids.acmeOwner);
     assert.equal(wr.recorded_as, 'self');
-  });
-
-  // 6 & 7. Item 1: p_domain_kind IS NULL refused (22023) and NULL support_ceiling_role_id fails closed (42501)
-  await t.test('Item 1: assert_can_write refuses NULL p_domain_kind (22023) and fails closed on NULL support_ceiling_role_id', async () => {
-    await assert.rejects(
-      () => runAsPlatformApp(db.pool, { token: supportTok, readOnly: false }, (c) => c.query(
-        "SELECT * FROM iam.assert_can_write('act:vault.archive.retrieve', $1::uuid, NULL, NULL)",
-        [ids.beaconOrg],
-      )),
-      (err) => err?.code === '22023',
-      'assert_can_write must refuse NULL p_domain_kind with SQLSTATE 22023',
-    );
-    await assert.rejects(
-      () => runAsPlatformApp(db.pool, { token: ownerTok, readOnly: false }, (c) => c.query(
-        "SELECT * FROM iam.assert_can_write('act:vault.archive.retrieve', $1::uuid, NULL, NULL)",
-        [ids.beaconOrg],
-      )),
-      (err) => err?.code === '22023',
-      'assert_can_write must refuse NULL p_domain_kind for customer actors too (22023)',
-    );
-    await assert.rejects(
-      () => runAsPlatformApp(db.pool, { token: supportTok, readOnly: false }, (c) => c.query(
-        "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, NULL, 'customer_domain')",
-        [ids.northstarOrg],
-      )),
-      (err) => err?.code === '42501' && /CONTRACTOR_CEILING/.test(err.message),
-      'customer_domain write to customer organization with NULL support_ceiling_role_id must fail closed with 42501 CONTRACTOR_CEILING',
-    );
-  });
-});
-
-test('Layer 7 [Role Delegation Law]: a role can grant only roles whose rights it holds (enforced on role_grantable_roles insert, role_rights additions/revocations, and internal/org-wide escalation)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
-  const db = await createEmptyMigratedTestDb();
-  t.after(() => db.cleanup());
-
-  const { ids } = await seedStandardIamWorld(db.pool);
-
-  // Create controlled roles for testing delegation invariants
-  const roleParent = randomUUID();
-  const roleChild = randomUUID();
-  const roleOther = randomUUID();
-  const roleInternalSame = randomUUID();
-  const roleNarrowSame = randomUUID();
-  let grantableId;
-  let parentRightBobId;
-
-  await inSerializableTx(db.pool, async (c) => {
-    const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_setup', commandKey: 'deleg-setup-1' });
-    const seq = j.seq;
-
-    for (const [id, slug, display, internal, wide] of [
-      [roleParent, 'deleg_parent', 'Deleg Parent', false, true],
-      [roleChild, 'deleg_child', 'Deleg Child', false, false],
-      [roleOther, 'deleg_other', 'Deleg Other', false, false],
-      [roleInternalSame, 'deleg_internal', 'Deleg Internal', true, true],
-      [roleNarrowSame, 'deleg_narrow', 'Deleg Narrow', false, false],
-    ]) {
-      await c.query('INSERT INTO iam.roles (id, slug, journal_seq) VALUES ($1,$2,$3)', [id, slug, seq]);
-      await c.query(
-        "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,$3,false,$4,$5,'active',$6)",
-        [randomUUID(), id, display, internal, wide, seq],
-      );
-    }
-
-    parentRightBobId = randomUUID();
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [parentRightBobId, roleParent, seq]);
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:transmittals.read','active',$3)", [randomUUID(), roleParent, seq]);
-
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), roleChild, seq]);
-
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), roleOther, seq]);
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'col:coherence.statement_cash','active',$3)", [randomUUID(), roleOther, seq]);
-
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), roleInternalSame, seq]);
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), roleNarrowSame, seq]);
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:transmittals.read','active',$3)", [randomUUID(), roleNarrowSame, seq]);
-
-    // Valid delegation: roleParent holds all rights of roleChild
-    grantableId = randomUUID();
-    await c.query(
-      "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-      [grantableId, roleParent, roleChild, seq],
-    );
-  });
-
-  // 1. Granting a role holding an unheld right (col:coherence.statement_cash) must fail (23514)
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_bad1', commandKey: 'deleg-bad-1' });
-      await c.query(
-        "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-        [randomUUID(), roleParent, roleOther, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514' && /ROLE_DELEGATION_ESCALATION/.test(err.message),
-  );
-
-  // 2. Child cannot grant parent (missing act:transmittals.read)
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_bad2', commandKey: 'deleg-bad-2' });
-      await c.query(
-        "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-        [randomUUID(), roleChild, roleParent, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514',
-  );
-
-  // 3. Adding an unheld right to roleChild AFTER delegation exists must fail at COMMIT
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_bad3', commandKey: 'deleg-bad-3' });
-      await c.query(
-        "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'col:coherence.statement_cash','active',$3)",
-        [randomUUID(), roleChild, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514' && /ROLE_DELEGATION_ESCALATION/.test(err.message),
-  );
-
-  // 4. Revoking act:coherence.bob.read from roleParent while (roleParent -> roleChild) is active must fail at COMMIT
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_bad4', commandKey: 'deleg-bad-4' });
-      await c.query(
-        "INSERT INTO iam.role_rights (id, role_id, right_id, status, replaces_id, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','revoked',$3,$4)",
-        [randomUUID(), roleParent, parentRightBobId, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514' && /ROLE_DELEGATION_ESCALATION/.test(err.message),
-  );
-
-  // 5. Non-internal role cannot grant an is_nusear_internal = true role even with subset rights
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_bad5', commandKey: 'deleg-bad-5' });
-      await c.query(
-        "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-        [randomUUID(), roleParent, roleInternalSame, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514',
-  );
-
-  // 6. Narrow role (allows_org_wide_scope=false) cannot grant wide role (allows_org_wide_scope=true) even with same rights
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_bad6', commandKey: 'deleg-bad-6' });
-      await c.query(
-        "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-        [randomUUID(), roleNarrowSame, roleParent, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514',
-  );
-
-  // 7. After revoking the delegation link, revoking roleParent's right succeeds cleanly
-  await inSerializableTx(db.pool, async (c) => {
-    const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_revoke', commandKey: 'deleg-revoke-1' });
-    await c.query(
-      "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, replaces_id, journal_seq) VALUES ($1,$2,$3,'revoked',$4,$5)",
-      [randomUUID(), roleParent, roleChild, grantableId, j.seq],
-    );
-    await c.query(
-      "INSERT INTO iam.role_rights (id, role_id, right_id, status, replaces_id, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','revoked',$3,$4)",
-      [randomUUID(), roleParent, parentRightBobId, j.seq],
-    );
-  });
-
-  // Sanity: Nusear Owner can grant Customer Owner (exact superset of rights and flags)
-  await inSerializableTx(db.pool, async (c) => {
-    const j = await appendAuditEntry(c, { commandKind: 'iam.deleg_ok', commandKey: 'deleg-ok-1' });
-    await c.query(
-      "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-      [randomUUID(), ids.roleNusearOwner, ids.roleCustomerOwner, j.seq],
-    );
   });
 });
 
@@ -2017,7 +1537,7 @@ test('Layer 7 [Service Role Least-Privilege Transactions]: real SET LOCAL ROLE t
     await c.query('SET LOCAL ROLE platform_writer');
     await c.query("SELECT pg_catalog.set_config('app.session_token', $1, true)", [ownerTok]);
     const wr = (await c.query(
-      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')",
+      "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
       [ids.beaconOrg, ids.agentA],
     )).rows[0];
     assert.equal(wr.actor_person_id, ids.acmeOwner);
@@ -2040,22 +1560,40 @@ test('Layer 7 [Service Role Least-Privilege Transactions]: real SET LOCAL ROLE t
     'platform_writer must be denied iam_secret.signing_keys',
   );
 
-  // 2. platform_worker: inserts into platform.audit_journal (needs journal hash grants) + reads closure views (needs iam.business_today); denied iam writes & iam_secret
+  // 2. platform_worker: reads closure views (needs iam.business_today) and audit_journal SELECT,
+  //    but is DENIED INSERT on platform.audit_journal, DENIED EXECUTE on compute_journal_hash, denied iam writes & iam_secret.
   await inSerializableTx(db.pool, async (c) => {
     await c.query('SET LOCAL ROLE platform_worker');
-    const j = await appendAuditEntry(c, {
-      environment,
-      commandKind: 'iam.worker_tx',
-      commandKey: 'worker-real-tx-1',
-    });
-    assert.ok(Number(j.seq) >= 3);
     const orgClosure = (await c.query('SELECT COUNT(*)::int AS n FROM iam.v_organization_closure_live')).rows[0].n;
     assert.ok(orgClosure > 0, 'platform_worker must be able to read iam.v_organization_closure_live');
-    const supClosure = (await c.query('SELECT COUNT(*)::int AS n FROM iam.v_supervision_closure_live')).rows[0].n;
-    assert.ok(supClosure > 0, 'platform_worker must be able to read iam.v_supervision_closure_live');
     const memView = (await c.query('SELECT COUNT(*)::int AS n FROM iam.v_all_memberships_live')).rows[0].n;
     assert.ok(memView > 0, 'platform_worker must be able to read iam.v_all_memberships_live');
+    const jCnt = (await c.query('SELECT COUNT(*)::int AS n FROM platform.audit_journal')).rows[0].n;
+    assert.ok(jCnt >= 2, 'platform_worker must be able to read platform.audit_journal');
   });
+  await assert.rejects(
+    () => inSerializableTx(db.pool, async (c) => {
+      await c.query('SET LOCAL ROLE platform_worker');
+      await appendAuditEntry(c, {
+        environment,
+        commandKind: 'iam.worker_tx',
+        commandKey: 'worker-real-tx-1',
+      });
+    }),
+    (err) => err?.code === '42501',
+    'platform_worker must be denied INSERT on platform.audit_journal (app_cmd writes journals)',
+  );
+  await assert.rejects(
+    () => inSerializableTx(db.pool, async (c) => {
+      await c.query('SET LOCAL ROLE platform_worker');
+      await c.query(
+        "SELECT platform.compute_journal_hash(1, now(), 'local', NULL, 'service', NULL, 'iam.x', 'k', $1, $2, '{}'::jsonb)",
+        ['a'.repeat(64), '0'.repeat(64)],
+      );
+    }),
+    (err) => err?.code === '42501',
+    'platform_worker must be denied EXECUTE on platform.compute_journal_hash',
+  );
   await assert.rejects(
     () => inSerializableTx(db.pool, async (c) => {
       await c.query('SET LOCAL ROLE platform_worker');
@@ -2067,14 +1605,13 @@ test('Layer 7 [Service Role Least-Privilege Transactions]: real SET LOCAL ROLE t
   await assert.rejects(
     () => inSerializableTx(db.pool, async (c) => {
       await c.query('SET LOCAL ROLE platform_worker');
-      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.worker_bad_write', commandKey: 'worker-bad-write-1' });
-      await c.query("INSERT INTO iam.tools (id, display_name, journal_seq) VALUES ('worker_nope', 'Nope', $1)", [j.seq]);
+      await c.query("INSERT INTO iam.tools (id, display_name, journal_seq) VALUES ('worker_nope', 'Nope', 1)");
     }),
     (err) => err?.code === '42501',
     'platform_worker must be denied INSERT on iam tables',
   );
 
-  // 3. platform_iam_sync: inserts journal, iam roles/role_versions/role_rights/role_grantable_roles (delegation triggers!),
+  // 3. platform_iam_sync: inserts journal, iam roles/role_versions/role_rights,
   //    supersedes a versioned row, reads closure views, and manages iam_secret.signing_keys
   await inSerializableTx(db.pool, async (c) => {
     await c.query('SET LOCAL ROLE platform_iam_sync');
@@ -2102,17 +1639,10 @@ test('Layer 7 [Service Role Least-Privilege Transactions]: real SET LOCAL ROLE t
               ($4,$5,'act:coherence.bob.read','active',$3)`,
       [randomUUID(), syncedParent, seq, randomUUID(), syncedChild],
     );
-    // Triggers iam.trg_verify_role_grantable -> iam.assert_role_delegation_valid!
-    await c.query(
-      "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-      [randomUUID(), syncedParent, syncedChild, seq],
-    );
-    // Triggers iam.trg_verify_role_rights_delegation -> iam.assert_role_delegation_valid!
     await c.query(
       "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:transmittals.read','active',$3)",
       [randomUUID(), syncedParent, seq],
     );
-    // Triggers iam.trg_verify_role_version_invariants -> iam.assert_role_delegation_valid!
     const prevParentRv = (await c.query(
       'SELECT id FROM iam.role_versions WHERE role_id = $1 AND superseded_by_id IS NULL',
       [syncedParent],
@@ -2137,8 +1667,6 @@ test('Layer 7 [Service Role Least-Privilege Transactions]: real SET LOCAL ROLE t
     // Closure views under platform_iam_sync (calls iam.business_today)
     const orgClosure = (await c.query('SELECT COUNT(*)::int AS n FROM iam.v_organization_closure_live')).rows[0].n;
     assert.ok(orgClosure > 0);
-    const supClosure = (await c.query('SELECT COUNT(*)::int AS n FROM iam.v_supervision_closure_live')).rows[0].n;
-    assert.ok(supClosure > 0);
 
     // Signing key write under platform_iam_sync
     await c.query(
@@ -2152,11 +1680,9 @@ test('Layer 7 [Service Role Least-Privilege Transactions]: real SET LOCAL ROLE t
   await inSerializableTx(db.pool, async (c) => {
     await c.query('SET LOCAL ROLE platform_readonly');
     const jCnt = (await c.query('SELECT COUNT(*)::int AS n FROM platform.audit_journal')).rows[0].n;
-    assert.ok(jCnt >= 4);
+    assert.ok(jCnt >= 3);
     const orgClosure = (await c.query('SELECT COUNT(*)::int AS n FROM iam.v_organization_closure_live')).rows[0].n;
     assert.ok(orgClosure > 0);
-    const supClosure = (await c.query('SELECT COUNT(*)::int AS n FROM iam.v_supervision_closure_live')).rows[0].n;
-    assert.ok(supClosure > 0);
     const rolesCnt = (await c.query('SELECT COUNT(*)::int AS n FROM iam.roles')).rows[0].n;
     assert.ok(rolesCnt > 0);
   });
@@ -2178,7 +1704,7 @@ test('Layer 7 [Service Role Least-Privilege Transactions]: real SET LOCAL ROLE t
   );
 });
 
-test('Layer 7 [Append-Only Right Retirements]: iam.right_retirements replaces retired_journal_seq and disables reads, writes, and delegation checks', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7 [Append-Only Right Retirements]: iam.right_retirements replaces retired_journal_seq and disables reads and writes', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
@@ -2196,47 +1722,15 @@ test('Layer 7 [Append-Only Right Retirements]: iam.right_retirements replaces re
   // Before retirement, act:transmittals.approve works for Acme Owner and Nusear Support
   await runAsPlatformApp(db.pool, { token: ownerTok, readOnly: false }, async (c) => {
     assert.equal((await c.query("SELECT iam.has_right('act:transmittals.approve') AS ok")).rows[0].ok, true);
-    await c.query("SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')", [ids.beaconOrg, ids.agentA]);
+    await c.query("SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)", [ids.beaconOrg, ids.agentA]);
   });
 
-  // Create two roles for delegation check: target holds a right we will retire (act:concurrence.calls.tag) that granter lacks
-  const delegGranter = randomUUID();
-  const delegTarget = randomUUID();
-  await inSerializableTx(db.pool, async (c) => {
-    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.retire_setup', commandKey: 'retire-setup-1' });
-    for (const [rid, slug, name] of [
-      [delegGranter, 'ret_granter', 'Ret Granter'],
-      [delegTarget, 'ret_target', 'Ret Target'],
-    ]) {
-      await c.query('INSERT INTO iam.roles (id, slug, journal_seq) VALUES ($1,$2,$3)', [rid, slug, j.seq]);
-      await c.query(
-        "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,$3,false,false,false,'active',$4)",
-        [randomUUID(), rid, name, j.seq],
-      );
-    }
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), delegGranter, j.seq]);
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), delegTarget, j.seq]);
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:concurrence.calls.tag','active',$3)", [randomUUID(), delegTarget, j.seq]);
-  });
-
-  // Before retiring act:concurrence.calls.tag, delegGranter cannot grant delegTarget
-  await assert.rejects(
-    () => inSerializableTx(db.pool, async (c) => {
-      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.retire_deleg_before', commandKey: 'retire-deleg-before-1' });
-      await c.query(
-        "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-        [randomUUID(), delegGranter, delegTarget, j.seq],
-      );
-    }),
-    (err) => err?.code === '23514' && /ROLE_DELEGATION_ESCALATION/.test(err.message),
-  );
-
-  // Retire act:transmittals.approve and act:concurrence.calls.tag append-only under platform_iam_sync!
+  // Retire act:transmittals.approve append-only under platform_iam_sync!
   await inSerializableTx(db.pool, async (c) => {
     await c.query('SET LOCAL ROLE platform_iam_sync');
     const j = await appendAuditEntry(c, { environment, commandKind: 'iam.retire_rights', commandKey: 'retire-rights-1' });
     await c.query(
-      "INSERT INTO iam.right_retirements (right_id, reason, journal_seq) VALUES ('act:transmittals.approve', 'superseded workflow', $1), ('act:concurrence.calls.tag', 'deprecated tagging', $1)",
+      "INSERT INTO iam.right_retirements (right_id, reason, journal_seq) VALUES ('act:transmittals.approve', 'superseded workflow', $1)",
       [j.seq],
     );
   });
@@ -2249,23 +1743,13 @@ test('Layer 7 [Append-Only Right Retirements]: iam.right_retirements replaces re
     });
     await assert.rejects(
       () => runAsPlatformApp(db.pool, { token: tok, readOnly: false }, (c) => c.query(
-        "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid, 'customer_domain')",
+        "SELECT * FROM iam.assert_can_write('act:transmittals.approve', $1::uuid, $2::uuid)",
         [ids.beaconOrg, ids.agentA],
       )),
       (err) => err?.code === '42501',
       'retired right must fail assert_can_write with 42501',
     );
   }
-
-  // After retiring act:concurrence.calls.tag, delegGranter CAN grant delegTarget (retired right ignored)
-  await inSerializableTx(db.pool, async (c) => {
-    await c.query('SET LOCAL ROLE platform_iam_sync');
-    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.retire_deleg_after', commandKey: 'retire-deleg-after-1' });
-    await c.query(
-      "INSERT INTO iam.role_grantable_roles (id, granter_role_id, target_role_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-      [randomUUID(), delegGranter, delegTarget, j.seq],
-    );
-  });
 
   // Duplicate retirement fails PK (23505); UPDATE/DELETE/TRUNCATE fail (55000); platform_app gets 42501
   await assert.rejects(
@@ -2289,4 +1773,48 @@ test('Layer 7 [Append-Only Right Retirements]: iam.right_retirements replaces re
     () => runAsPlatformApp(db.pool, { readOnly: true }, (c) => c.query('SELECT * FROM iam.right_retirements LIMIT 1')),
     (err) => err?.code === '42501',
   );
+});
+
+test('Layer 7 [Release 1A Journal Hash Parity]: platform.compute_journal_hash uses canonical_json, sha256_text, and format_utc_us matching Node canonicalJson byte-for-byte', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const db = await createEmptyMigratedTestDb();
+  t.after(() => db.cleanup());
+
+  // Keys of varying lengths in nested objects distinguish canonical_json (COLLATE "C", no spaces)
+  // from PostgreSQL jsonb::text (length-first key sort + spaces after colons/commas).
+  const body = { z: 1, aa: { b: true, aaa: 'hello', a: null }, arr: [1, 'two', { zz: 2, a: 1 }] };
+  const actorId = randomUUID();
+  const orgId = randomUUID();
+  const reqSha = sha256Hex('r1a-hash-parity');
+  const prevHash = '0'.repeat(64);
+  const ts = '2026-11-24T15:30:45.123456Z';
+
+  const row = (await db.pool.query(
+    `SELECT platform.canonical_json($1::jsonb) AS cj,
+            platform.sha256_text('hello') AS sh,
+            platform.format_utc_us($2::timestamptz) AS fmt,
+            platform.compute_journal_hash(
+              7, $2::timestamptz, 'prod', $3::uuid, 'self', $4::uuid,
+              'iam.hash_parity', 'key-parity-1', $5, $6, $1::jsonb
+            ) AS h`,
+    [JSON.stringify(body), ts, actorId, orgId, reqSha, prevHash],
+  )).rows[0];
+
+  assert.equal(row.cj, canonicalJson(body));
+  assert.equal(row.sh, sha256Hex('hello'));
+  assert.equal(row.fmt, formatTimestampUtcUs(ts));
+
+  const expectedHash = sha256Hex(`platform-audit-journal-v1\n${canonicalJson({
+    actor_person_id: actorId,
+    body,
+    command_key: 'key-parity-1',
+    command_kind: 'iam.hash_parity',
+    environment: 'prod',
+    prev_hash: prevHash,
+    recorded_as: 'self',
+    recorded_at: formatTimestampUtcUs(ts),
+    request_sha256: reqSha,
+    seq: 7,
+    target_org_id: orgId,
+  })}`);
+  assert.equal(row.h, expectedHash, 'platform.compute_journal_hash must match Release 1A canonical_json serialization byte-for-byte');
 });

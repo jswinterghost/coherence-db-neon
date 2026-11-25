@@ -63,22 +63,16 @@ export const IAM_IMMUTABLE_TABLES = Object.freeze([
   'rights',
   'right_retirements',
   'roles',
-  'role_grant_people',
-  'role_grant_connections',
 ]);
 
 export const IAM_VERSIONED_TABLES = Object.freeze([
   'organization_versions',
   'organization_edges',
   'person_versions',
-  'person_contacts',
-  'person_external_identities',
   'organization_memberships',
   'agent_affiliations',
-  'supervision_links',
   'role_versions',
   'role_rights',
-  'role_grantable_roles',
   'role_grants',
   'organization_tool_switches',
 ]);
@@ -92,11 +86,9 @@ export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
   'iam.effective_any_org_ids(text, date)',
   'iam.effective_narrow_pairs(text, date)',
   'iam.effective_narrow_person_ids(text, date)',
-  'iam.effective_all_connection_org_ids(text, date)',
-  'iam.effective_explicit_connection_pairs(text, date)',
-  'iam.effective_explicit_connection_ids(text, date)',
-  'iam.can_access_connection(text, uuid, uuid, date)',
-  'iam.assert_can_write(text, uuid, uuid, text, uuid, date)',
+  'iam.assert_can_write(text, uuid, uuid, date)',
+  'app_views.coherence_effective_statement_batches(uuid)',
+  'app_views.coherence_run_stage(uuid, bigint)',
 ]);
 
 export const PLATFORM_APP_CMD_WHITELIST = Object.freeze([
@@ -112,7 +104,7 @@ export const PLATFORM_APP_CMD_WHITELIST = Object.freeze([
   'app_cmd.coherence_save_review_draft(uuid, text, integer, text, jsonb, text)',
   'app_cmd.coherence_save_review_decisions(text, text, bigint, uuid, text, jsonb, uuid, uuid, uuid)',
   'app_cmd.coherence_confirm_emit(text, text, bigint, uuid, uuid, text, uuid, uuid)',
-  'app_cmd.coherence_carry_sent(text, text, bigint, uuid, text, text, uuid, uuid)',
+  'app_cmd.coherence_carry_sent(text, text, bigint, uuid, text, text, uuid, uuid, jsonb)',
   'app_cmd.coherence_carry_approvals(text, text, bigint, uuid, text, uuid, uuid)',
   'app_cmd.coherence_carry_decisions(text, text, bigint, uuid, text, text, uuid)',
   'app_cmd.coherence_abandon_run(text, text, bigint, uuid, text, text, uuid)',
@@ -124,6 +116,7 @@ export const PLATFORM_APP_CMD_WHITELIST = Object.freeze([
   'app_cmd.coherence_record_check(text, text, text, boolean, jsonb, uuid, uuid, uuid)',
   'app_cmd.coherence_record_generated_overlay(text, text, uuid, uuid, text, text, integer, jsonb, uuid, uuid)',
   'app_cmd.coherence_materialize_emit(text, text, jsonb)',
+  'app_cmd.coherence_authorize_check_run()',
 ]);
 
 export const APP_CMD_WORKER_OR_OWNER_FUNCTIONS = Object.freeze([
@@ -131,6 +124,7 @@ export const APP_CMD_WORKER_OR_OWNER_FUNCTIONS = Object.freeze([
   'app_cmd.coherence_record_check(text, text, text, boolean, jsonb, uuid, uuid, uuid)',
   'app_cmd.coherence_record_generated_overlay(text, text, uuid, uuid, text, text, integer, jsonb, uuid, uuid)',
   'app_cmd.coherence_materialize_emit(text, text, jsonb)',
+  'app_cmd.coherence_authorize_check_run()',
 ]);
 
 export const APP_CMD_WORKER_ONLY_FUNCTIONS = Object.freeze([
@@ -141,6 +135,7 @@ export const APP_CMD_WORKER_ONLY_FUNCTIONS = Object.freeze([
   'app_cmd.coherence_interrupt_attempt(text, text, uuid, text, integer, text, uuid)',
   'app_cmd.coherence_accept_review_submission(text, text, jsonb)',
   'app_cmd.coherence_reject_review_submission(uuid, text, text)',
+  'app_cmd.coherence_expire_old_drafts()',
 ]);
 
 export const PLATFORM_WORKER_CMD_WHITELIST = Object.freeze([
@@ -168,6 +163,25 @@ export const APP_VIEWS_EXPECTED = Object.freeze([
   'coherence_entity_statement_reconciliation',
   'coherence_runs',
   'coherence_input_versions',
+  'coherence_input_changes',
+  'coherence_input_entries',
+  'coherence_staging_files',
+  'coherence_engine_versions',
+  'coherence_step_attempt_events',
+  'coherence_step_requests',
+  'coherence_cancel_requests',
+  'coherence_review_saves',
+  'coherence_emit_confirmations',
+  'coherence_carries',
+  'coherence_abandonments',
+  'coherence_review_submissions',
+  'coherence_review_drafts',
+  'coherence_approval_rows',
+  'coherence_review_configs',
+  'coherence_run_outputs',
+  'coherence_published_runs',
+  'coherence_entity_bundle_artifacts',
+  'coherence_review_drift_gate',
   'coherence_decision_commits',
   'coherence_decisions',
   'coherence_checks',
@@ -187,7 +201,6 @@ export const PLATFORM_ROLES = Object.freeze([
   'platform_view_owner',
   'platform_writer',
   'platform_versioner',
-  'platform_mask_reader',
   'platform_app',
   'platform_worker',
   'platform_iam_sync',
@@ -856,10 +869,8 @@ export async function verifyIamConfigInvariants(pool) {
       && !/\beffective_any_org_ids\b/i.test(p.qual || '')
       && !/\beffective_any_org_ids\b/i.test(p.with_check || '')
       && /effective_wide_org_ids/.test(p.qual || '')
-      && /database_context/.test(p.qual || '')
-      && /v_organization_closure_live/.test(p.qual || '')
     ))) {
-      problems.push(`Table coherence.${tbl} has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with iam.effective_wide_org_ids bounded against iam.database_context and iam.v_organization_closure_live, and must not use iam.effective_any_org_ids)`);
+      problems.push(`Table coherence.${tbl} has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with iam.effective_wide_org_ids and must not use iam.effective_any_org_ids)`);
     }
 
     const npnChkRes = await pool.query(
@@ -917,11 +928,11 @@ export async function verifyIamConfigInvariants(pool) {
       if (/\beffective_any_org_ids\b/i.test(qual) || /\beffective_any_org_ids\b/i.test(p.with_check || '')) {
         problems.push(`RLS policy ${p.policyname} on keyed table coherence.${p.tablename} must not use iam.effective_any_org_ids()`);
       }
-      if (!/effective_wide_org_ids/.test(qual) || !/database_context/.test(qual) || !/v_organization_closure_live/.test(qual)) {
-        problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must reference iam.effective_wide_org_ids bounded against iam.database_context and iam.v_organization_closure_live)`);
+      if (!/effective_wide_org_ids/.test(qual)) {
+        problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must reference iam.effective_wide_org_ids)`);
       }
-    } else if (!/effective_(wide|any)_org_ids/.test(qual) || !/database_context/.test(qual)) {
-      problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must scope IAM org helpers against iam.database_context)`);
+    } else if (!/effective_(wide|any)_org_ids/.test(qual)) {
+      problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must scope with IAM org helpers)`);
     }
   }
   for (const row of cohBaseTbls) {
@@ -934,8 +945,7 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
 
-  // Every platform_view_owner policy on platform.audit_journal must be FOR SELECT scoped with effective_wide_org_ids
-  // bounded against iam.database_context and iam.v_organization_closure_live.
+  // Every platform_view_owner policy on platform.audit_journal must be FOR SELECT scoped with effective_wide_org_ids.
   const auditViewPolRes = await pool.query(
     `SELECT policyname, cmd, qual
      FROM pg_catalog.pg_policies
@@ -947,10 +957,28 @@ export async function verifyIamConfigInvariants(pool) {
     p.cmd === 'SELECT'
     && !/\bhas_right\s*\(/i.test(p.qual || '')
     && /effective_wide_org_ids/.test(p.qual || '')
-    && /database_context/.test(p.qual || '')
-    && /v_organization_closure_live/.test(p.qual || '')
   ))) {
-    problems.push('Table platform.audit_journal has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with iam.effective_wide_org_ids bounded against iam.database_context and iam.v_organization_closure_live)');
+    problems.push('Table platform.audit_journal has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with iam.effective_wide_org_ids)');
+  }
+
+  // Confirm removed privileged write bypass objects do not exist.
+  const privTblRes = await pool.query(
+    `SELECT c.relname
+     FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'coherence' AND c.relname = 'privileged_write_grants'`,
+  );
+  if (privTblRes.rows.length > 0) {
+    problems.push('Removed table coherence.privileged_write_grants must not exist');
+  }
+  const privFnRes = await pool.query(
+    `SELECT p.proname
+     FROM pg_catalog.pg_proc p
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'coherence' AND p.proname IN ('begin_privileged_write', 'end_privileged_write')`,
+  );
+  for (const pf of privFnRes.rows) {
+    problems.push(`Removed privileged write function coherence.${pf.proname} must not exist`);
   }
 
   // No PUBLIC RLS policy may exist across managed schemas (a PERMISSIVE PUBLIC policy would bypass role-scoped RLS).
@@ -964,8 +992,20 @@ export async function verifyIamConfigInvariants(pool) {
     problems.push(`Forbidden PUBLIC RLS policy on ${pp.schemaname}.${pp.tablename}: ${pp.policyname}`);
   }
 
-  // platform_worker must hold zero write privileges on any coherence base table (zero privileges on schema_migrations)
-  // and every RLS policy on coherence.* applying to platform_worker must be FOR SELECT only.
+  // Legacy coherence_app and coherence_worker USING (true) RLS policies must be dropped.
+  const legacyRwPolRes = await pool.query(
+    `SELECT tablename, policyname
+     FROM pg_catalog.pg_policies
+     WHERE schemaname = 'coherence'
+       AND roles && ARRAY['coherence_app', 'coherence_worker']::name[]`,
+  );
+  for (const lrp of legacyRwPolRes.rows) {
+    problems.push(`Retired coherence_app/coherence_worker RLS policy still active on coherence.${lrp.tablename}: ${lrp.policyname}`);
+  }
+
+  // platform_worker must hold zero write privileges on any coherence base table (zero privileges on schema_migrations),
+  // zero INSERT/write privileges on platform.audit_journal, zero EXECUTE on platform journal hash functions,
+  // and only FOR SELECT RLS policies across coherence.* and platform.audit_journal.
   const workerForbiddenPrivs = ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN'];
   for (const row of cohBaseTbls) {
     const fq = `coherence.${row.table_name}`;
@@ -990,14 +1030,23 @@ export async function verifyIamConfigInvariants(pool) {
       }
     }
   }
+  for (const priv of workerForbiddenPrivs) {
+    const awRes = await pool.query(
+      'SELECT pg_catalog.has_table_privilege(\'platform_worker\', \'platform.audit_journal\', $1) AS hp',
+      [priv],
+    );
+    if (awRes.rows[0].hp) {
+      problems.push(`platform_worker must not hold ${priv} on platform.audit_journal`);
+    }
+  }
   const workerPolRes = await pool.query(
-    `SELECT tablename, policyname, cmd
+    `SELECT schemaname, tablename, policyname, cmd
      FROM pg_catalog.pg_policies
-     WHERE schemaname = 'coherence' AND 'platform_worker' = ANY(roles)`,
+     WHERE schemaname IN ('coherence', 'platform') AND 'platform_worker' = ANY(roles)`,
   );
   for (const wp of workerPolRes.rows) {
     if (wp.cmd !== 'SELECT') {
-      problems.push(`RLS policy ${wp.policyname} on coherence.${wp.tablename} grants platform_worker ${wp.cmd} (must be SELECT only)`);
+      problems.push(`RLS policy ${wp.policyname} on ${wp.schemaname}.${wp.tablename} grants platform_worker ${wp.cmd} (must be SELECT only)`);
     }
   }
 
@@ -1079,7 +1128,9 @@ export async function verifyIamConfigInvariants(pool) {
     problems.push('Expected internal coherence._cmd_* helper functions were not found in pg_proc');
   }
   for (const ifn of internalCohFnRes.rows) {
-    const expectedOwner = ifn.proname.startsWith('_resolve_') ? 'platform_versioner' : 'platform_writer';
+    const isResolve = ifn.proname.startsWith('_resolve_');
+    const expectedOwner = isResolve ? 'platform_versioner' : 'platform_writer';
+    const allowedRoles = new Set(isResolve ? ['platform_versioner', 'platform_writer'] : ['platform_writer']);
     const cfg = Array.isArray(ifn.proconfig) ? ifn.proconfig : [];
     if (!cfg.includes('search_path=pg_catalog')) {
       problems.push(`Internal function coherence.${ifn.proname} must pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
@@ -1088,7 +1139,7 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`Internal function coherence.${ifn.proname} must be owned by ${expectedOwner} (got ${ifn.owner_name})`);
     }
     for (const principal of ['public', ...PLATFORM_ROLES]) {
-      if (principal === expectedOwner) continue;
+      if (allowedRoles.has(principal)) continue;
       const exRes = await pool.query(
         'SELECT pg_catalog.has_function_privilege($1, $2::oid, \'EXECUTE\') AS hp',
         [principal, ifn.oid],
@@ -1262,6 +1313,9 @@ export async function verifyIamConfigInvariants(pool) {
       if (fn.pub_exec) {
         problems.push(`PUBLIC has EXECUTE privilege on ${fn.sig}`);
       }
+    }
+    if (fn.nspname === 'platform' && ['compute_journal_hash', 'canonical_json', 'sha256_text', 'format_utc_us'].includes(fn.proname) && fn.wrk_exec) {
+      problems.push(`platform_worker holds forbidden EXECUTE privilege on ${fn.sig}`);
     }
     if (fn.nspname === 'app_cmd') {
       if (!fn.prosecdef) {

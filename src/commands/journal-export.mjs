@@ -52,6 +52,8 @@ function normalizeExportRow(raw) {
   const clean = { ...raw };
   delete clean.journal_seq;
   delete clean.mac_key;
+  delete clean.organization_id;
+  delete clean.writing_person_id;
   if (clean.original_at) clean.original_at = formatTimestampUtcUs(clean.original_at);
   if (clean.decided_at) clean.decided_at = formatTimestampUtcUs(clean.decided_at);
   if (clean.byte_size !== undefined) clean.byte_size = Number(clean.byte_size);

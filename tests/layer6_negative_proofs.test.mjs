@@ -22,6 +22,7 @@ import { runMigrations } from '../src/db/migrate.mjs';
 import { createClient, createPool, resolveLocalUser } from '../src/db/pg-client.mjs';
 import { createMemoryObjectStore } from '../src/storage/object-store.mjs';
 import { createCodeStore, createDataStore, createStorePair } from '../src/storage/stores.mjs';
+import { seedCoherenceIamFixture } from './helpers/iam-harness.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
 import {
   buildSyntheticEmitDataset,
@@ -65,11 +66,12 @@ async function createLayer6TestEnv({ companySlug = 'acme', displayName = 'Acme' 
   const stores = createStorePair({ codeStore, dataStore });
   const commands = createCommandLayer({ pool, companySlug, stores });
   const tempDir = await mkdtemp(join(tmpdir(), `coherence-l6-${suffix}-`));
-  const ownerActor = { id: 'l6-owner', kind: 'owner', actingFor: null };
-  const workerActor = { id: `coherence-worker:${companySlug}`, kind: 'worker' };
+  const iam = await seedCoherenceIamFixture(pool, { companySlug, displayName });
+  const ownerToken = iam.tokens.owner;
+  const workerToken = iam.tokens.worker;
 
   await commands.initCompany({
-    actor: ownerActor,
+    dbToken: ownerToken,
     commandKey: `l6-init-${suffix}`,
     slug: companySlug,
     displayName,
@@ -101,7 +103,7 @@ async function createLayer6TestEnv({ companySlug = 'acme', displayName = 'Acme' 
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  return { dbName, companySlug, displayName, pgConfig, pool, codeStore, dataStore, stores, commands, tempDir, ownerActor, workerActor, registerWorker, cleanup };
+  return { dbName, companySlug, displayName, pgConfig, pool, codeStore, dataStore, stores, commands, tempDir, iam, ownerToken, workerToken, registerWorker, cleanup };
 }
 
 async function createEmptyTestDb() {
@@ -370,7 +372,7 @@ async function runFullDecisionPipeline(env, worker, {
   adjustRevisionDecisions = null,
 }) {
   const launch = await env.commands.launchRun({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: `${keyPrefix}-launch`,
     statementDate,
     origin,
@@ -382,7 +384,7 @@ async function runFullDecisionPipeline(env, worker, {
 
   let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await env.commands.saveReviewDecisions({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: `${keyPrefix}-bible`,
     expectedJournalSeq: seq,
     runId,
@@ -394,7 +396,7 @@ async function runFullDecisionPipeline(env, worker, {
   if (Array.isArray(bibleRevisionDecisions) && bibleRevisionDecisions.length > 0) {
     seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
     await env.commands.saveReviewDecisions({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `${keyPrefix}-bible-rev`,
       expectedJournalSeq: seq,
       runId,
@@ -406,7 +408,7 @@ async function runFullDecisionPipeline(env, worker, {
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   let adjSave = await env.commands.saveReviewDecisions({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: `${keyPrefix}-adjust`,
     expectedJournalSeq: seq,
     runId,
@@ -417,7 +419,7 @@ async function runFullDecisionPipeline(env, worker, {
   if (Array.isArray(adjustRevisionDecisions) && adjustRevisionDecisions.length > 0) {
     seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
     adjSave = await env.commands.saveReviewDecisions({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: `${keyPrefix}-adjust-rev`,
       expectedJournalSeq: seq,
       runId,
@@ -428,7 +430,7 @@ async function runFullDecisionPipeline(env, worker, {
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await env.commands.confirmEmit({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: `${keyPrefix}-emit-confirm`,
     expectedJournalSeq: seq,
     runId,
@@ -471,7 +473,7 @@ test('Layer 6 [Mutations 1 & 2 - Bible & Adjust Decision Perturbations]: each fa
     companySlug: env.companySlug,
     stores: env.stores,
     commands: env.commands,
-    workerActor: env.workerActor,
+    workerToken: env.workerToken,
     materializeEngine: createDecisionAwareMockEngineMaterializer(),
     tempBaseDir: env.tempDir,
   }));
@@ -559,7 +561,7 @@ test('Layer 6 [Mutations 1 & 2 - Bible & Adjust Decision Perturbations]: each fa
 
   // --- MUTATION 2: Adjust decision mutation (CORRECT variance item agency Beacon -> Harbor, $40.00 downline) ---
   await env.commands.abandonRun({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'abandon-run-b-for-c',
     runId: runB,
     typedPhrase: 'abandon 2026-11-02',
@@ -610,7 +612,7 @@ test('Layer 6 [Mutations 1 & 2 - Bible & Adjust Decision Perturbations]: each fa
 
   // Record a non_vacuous_mutation check row proving Mutations 1 & 2 failed at the exact expected gates.
   const chkRes = await env.commands.recordCheck({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'l6-check-mut-1-2',
     checkKind: 'non_vacuous_mutation',
     passed: true,
@@ -771,7 +773,7 @@ test('Layer 6 [Mutation 5 - Journal Tamper & Cutoff Isolation]: 1-char NDJSON ta
   t.after(() => env.cleanup());
 
   const d1 = await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'l6-m5-t1',
     commitKind: 'historical_baseline',
     headerContract: 'v2',
@@ -785,7 +787,7 @@ test('Layer 6 [Mutation 5 - Journal Tamper & Cutoff Isolation]: 1-char NDJSON ta
   const seqT1 = d1.journalSeq;
 
   const d2 = await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'l6-m5-t2',
     parentCommitId: d1.result.decisionCommitId,
     commitKind: 'historical_baseline',

@@ -1377,7 +1377,7 @@ export async function compareDbRuns({
   expectedEntityParity = null,
   checkKind = null,
   commands = null,
-  actor = null,
+  dbToken = null,
   tempBaseDir = tmpdir(),
 }) {
   const tmpLeft = await mkdtemp(join(tempBaseDir, 'coherence-cmp-left-'));
@@ -1401,12 +1401,12 @@ export async function compareDbRuns({
       leftLabel: `run:${leftRunId}`,
       rightLabel: rightRunId ? `run:${rightRunId}` : rightFolderDir,
     });
-    if (commands && actor) {
+    if (commands && dbToken) {
       const resolvedCheckKind = checkKind || (mode === 'shadow' ? 'shadow' : (mode === 'replay' || mode === 'substance' ? 'replay' : 'trial_comparison'));
       const digest = sha256Hex(JSON.stringify(report));
       const keyDigest = sha256Hex(canonicalJson([resolvedCheckKind, leftRunId, rightRunId || rightFolderDir || null, digest]));
       await commands.recordCheck({
-        actor,
+        dbToken,
         commandKey: `check-${resolvedCheckKind}:${keyDigest}`,
         checkKind: resolvedCheckKind,
         runId: leftRunId,

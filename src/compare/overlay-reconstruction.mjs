@@ -90,7 +90,7 @@ export async function verifyOverlayReconstruction({
   pool,
   stores,
   commands = null,
-  actor = null,
+  dbToken = null,
   parseOverlay = parseApprovalsFile,
   pythonPath = null,
   coherenceRepo = null,
@@ -386,13 +386,13 @@ export async function verifyOverlayReconstruction({
     problems,
   };
 
-  if (commands && actor) {
+  if (commands && dbToken) {
     const digest = sha256Hex(JSON.stringify({
       passed: report.passed,
       checkpoints: results.map((r) => [r.decisionCommitId, r.origSha256, r.genSha256, r.passed]),
     }));
     await commands.recordCheck({
-      actor,
+      dbToken,
       commandKey: `check-overlay-reconstruction:${digest}`,
       checkKind: 'overlay_reconstruction',
       runId: Array.isArray(runIds) && runIds.length === 1 ? runIds[0] : null,

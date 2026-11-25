@@ -2528,7 +2528,7 @@ export async function importSingleRunFolder({
   pool,
   stores,
   commands,
-  actor,
+  dbToken,
   companySlug,
   runItem,
   nusearSaves = [],
@@ -3059,7 +3059,7 @@ export async function importSingleRunFolder({
     }
     : null;
   const res = await commands.importHistoricalRun({
-    actor,
+    dbToken,
     commandKey: cmdKey,
     run: {
       origin: runItem.origin,
@@ -3132,7 +3132,7 @@ export async function executeHistoryImport({
   pool,
   stores,
   commands,
-  actor,
+  dbToken,
   manifest,
   importConfig = null,
   parseOverlay = parseApprovalsFile,
@@ -3317,7 +3317,7 @@ export async function executeHistoryImport({
         pool,
         stores,
         commands,
-        actor,
+        dbToken,
         companySlug: manifest.companySlug,
         runItem: item,
         nusearSaves: saves,
@@ -3433,7 +3433,7 @@ export async function executeHistoryImport({
 
       if (res.newCommit) {
         await commands.recordDecisionBaseline({
-          actor,
+          dbToken,
           commandKey: makeHashedCommandKey('import-overlay-checkpoint', [manifest.companySlug, label, promoted.sha256]),
           decisionCommitId: res.commitId,
           parentCommitId: res.newCommit.parentCommitId,
@@ -3469,11 +3469,24 @@ export async function executeHistoryImport({
   if (standaloneOverlayArchive.length > 0) {
     const keyHash = sha256Hex(JSON.stringify(standaloneOverlayArchive.map((x) => [x.file.relPath, x.file.fileSha256]).sort()));
     await commands.importStandaloneFiles({
-      actor,
+      dbToken,
       commandKey: makeHashedCommandKey('import-overlay-checkpoints-archive', [manifest.companySlug, keyHash]),
       files: standaloneOverlayArchive.map((x) => x.file),
       storedFiles: standaloneOverlayArchive.map((x) => x.storedFile),
     });
+  }
+
+  // Index standing input Sent/statements_<YYYYMMDD>.csv digests so any non-abandoned company_import
+  // run whose Emit statements file matches standing Sent/ byte-for-byte also receives a sent carry.
+  const standingSentShaByKey = new Map();
+  if (manifest.currentInputDir && Array.isArray(manifest.currentInputFiles)) {
+    for (const relPath of manifest.currentInputFiles) {
+      const mk = normalizeMacKey(relPath);
+      if (/^sent\/statements_\d{8}\.csv$/.test(mk)) {
+        const absPath = join(manifest.currentInputDir, ...relPath.split('/'));
+        standingSentShaByKey.set(mk, fingerprintBytes(await readFile(absPath)).sha256);
+      }
+    }
   }
 
   // Prepare environment-proven sent markers for non-abandoned company_import runs (applied after standing input base exists).
@@ -3481,15 +3494,23 @@ export async function executeHistoryImport({
   const declaredSentKeys = new Set();
   const pendingCompanySentCarries = [];
   const handledSentDates = new Set();
+  const sentCandidatesByDate = new Map();
   for (const item of (manifest.companyRuns || [])) {
     if (item.abandoned) continue;
-    const sentProv = companySentRecords[item.statementDate] || item.sentProvenance || null;
-    if (!sentProv || sentProv.sent === false) continue;
+    const explicitProv = item.sentProvenance || companySentRecords[item.statementDate] || null;
+    if (explicitProv && explicitProv.sent === false) continue;
 
-    handledSentDates.add(item.statementDate);
     const imported = runIdBySource.get(`${item.origin}:${item.sourceFolder}`);
+    const sentMacKey = `sent/statements_${item.statementDate.replaceAll('-', '')}.csv`;
+    const standingSentSha = standingSentShaByKey.get(sentMacKey) ?? null;
+
+    if (!explicitProv && !standingSentSha) continue;
+
     if (!imported?.runId) {
-      report.problems.push(`Declared sent record for ${item.statementDate} (${item.sourceFolder}) has no imported run.`);
+      if (explicitProv) {
+        handledSentDates.add(item.statementDate);
+        report.problems.push(`Declared sent record for ${item.statementDate} (${item.sourceFolder}) has no imported run.`);
+      }
       continue;
     }
 
@@ -3504,36 +3525,71 @@ export async function executeHistoryImport({
       [imported.runId, expectedStatementsRel],
     );
     if (emitCheck.rows.length === 0) {
-      report.problems.push(
-        `Declared sent record for ${item.statementDate} (${item.sourceFolder}) has no finished Emit statements file (${expectedStatementsRel}).`,
-      );
+      if (explicitProv) {
+        handledSentDates.add(item.statementDate);
+        report.problems.push(
+          `Declared sent record for ${item.statementDate} (${item.sourceFolder}) has no finished Emit statements file (${expectedStatementsRel}).`,
+        );
+      }
       continue;
     }
 
-    const sentMacKey = `sent/statements_${item.statementDate.replaceAll('-', '')}.csv`;
-    // Always exclude every manifest-declared sent date with a finished Emit from standing base entries
+    const sentProv = explicitProv
+      || (emitCheck.rows[0].file_sha256 === standingSentSha
+        ? { sent: true, source: 'standing-input/Sent' }
+        : null);
+    if (!sentProv) continue;
+
+    const list = sentCandidatesByDate.get(item.statementDate) || [];
+    list.push({
+      runId: imported.runId,
+      item,
+      sentProv,
+      sentMacKey,
+      explicitRun: Boolean(item.sentProvenance && item.sentProvenance.sent !== false),
+    });
+    sentCandidatesByDate.set(item.statementDate, list);
+  }
+
+  for (const [statementDate, candidates] of sentCandidatesByDate.entries()) {
+    handledSentDates.add(statementDate);
+    let chosen = candidates[0];
+    if (candidates.length > 1) {
+      const explicitRuns = candidates.filter((c) => c.explicitRun);
+      if (explicitRuns.length === 1) {
+        chosen = explicitRuns[0];
+      } else {
+        const folders = candidates.map((c) => c.item.sourceFolder).join(', ');
+        report.problems.push(
+          `Multiple non-abandoned runs match sent statements for ${statementDate} without explicit provenance (${folders}).`,
+        );
+        continue;
+      }
+    }
+
+    // Always exclude every proven sent date with a finished Emit from standing base entries
     // whether or not its carry already exists in PostgreSQL, keeping re-import idempotent.
-    declaredSentKeys.add(sentMacKey);
+    declaredSentKeys.add(chosen.sentMacKey);
 
     const existingCarry = await pool.query(
       "SELECT id FROM coherence.carries WHERE statement_date = $1::date AND carry_kind = 'sent'",
-      [item.statementDate],
+      [statementDate],
     );
     if (existingCarry.rows.length > 0) {
       report.companySentCarries.push({
-        runId: imported.runId,
-        statementDate: item.statementDate,
+        runId: chosen.runId,
+        statementDate,
         alreadyRecorded: true,
-        source: sentProv.source || 'company-environment',
+        source: chosen.sentProv.source || 'company-environment',
       });
       continue;
     }
 
     pendingCompanySentCarries.push({
-      runId: imported.runId,
-      item,
-      sentProv,
-      sentMacKey,
+      runId: chosen.runId,
+      item: chosen.item,
+      sentProv: chosen.sentProv,
+      sentMacKey: chosen.sentMacKey,
     });
   }
 
@@ -3592,7 +3648,7 @@ export async function executeHistoryImport({
         });
         const parsed = await parseOverlay(overlayAbs, { ...parseOpts, parentPath: null });
         await commands.registerApprovalsFile({
-          actor,
+          dbToken,
           commandKey: `import-current-overlay:${manifest.companySlug}:${overlayStored.sha256}`,
           storedFile: overlayStored,
           headerKind: parsed.headerKind,
@@ -3604,7 +3660,7 @@ export async function executeHistoryImport({
         let standingCommitId = standingRes.commitId;
         if (standingRes.newCommit) {
           await commands.recordDecisionBaseline({
-            actor,
+            dbToken,
             commandKey: `import-standing-decision-head:${manifest.companySlug}:${overlayStored.sha256}`,
             decisionCommitId: standingRes.commitId,
             parentCommitId: standingRes.newCommit.parentCommitId,
@@ -3620,7 +3676,7 @@ export async function executeHistoryImport({
           if (currentHead !== standingCommitId) {
             const headId = randomUUID();
             const baselineRes = await commands.recordDecisionBaseline({
-              actor,
+              dbToken,
               commandKey: `import-standing-decision-head:${manifest.companySlug}:${overlayStored.sha256}`,
               decisionCommitId: headId,
               parentCommitId: standingCommitId,
@@ -3644,7 +3700,7 @@ export async function executeHistoryImport({
         }
         expectedStandingCommitId = standingCommitId;
         await commands.importStandaloneFiles({
-          actor,
+          dbToken,
           commandKey: `import-standing-overlay-receipt:${manifest.companySlug}:${overlayStored.sha256}`,
           files: [{
             area: 'other',
@@ -3678,7 +3734,7 @@ export async function executeHistoryImport({
     const baseEntries = entries.filter((e) => !declaredSentKeys.has(normalizeMacKey(e.relPath)));
     const entriesDigest = sha256Hex(JSON.stringify(baseEntries.map((e) => [e.relPath, e.fileSha256]).sort()));
     const ivRes = await commands.publishInputVersion({
-      actor,
+      dbToken,
       commandKey: `import-current-input:${manifest.companySlug}:${entriesDigest}`,
       lineKind: 'standing',
       sourceKind: effectiveConfig.currentInputSourceKind,
@@ -3702,7 +3758,7 @@ export async function executeHistoryImport({
     );
     if (existingStanding.rows.length === 0) {
       await commands.publishInputVersion({
-        actor,
+        dbToken,
         commandKey: `import-standing-base:${manifest.companySlug}`,
         lineKind: 'standing',
         sourceKind: 'company_import',
@@ -3715,7 +3771,7 @@ export async function executeHistoryImport({
       const { runId, item, sentProv } = pending;
       const sourceRef = sentProv.source || 'company-environment';
       const carryRes = await commands.carrySent({
-        actor,
+        dbToken,
         commandKey: makeHashedCommandKey('import-company-sent', [manifest.companySlug, item.sourceFolder, item.statementDate]),
         runId,
         typedPhrase: `sent ${item.statementDate}`,
@@ -3769,7 +3825,7 @@ export async function executeHistoryImport({
     }
     const keyHash = sha256Hex(JSON.stringify(files.map((f) => [f.area, f.relPath, f.fileSha256]).sort()));
     const res = await commands.importStandaloneFiles({
-      actor,
+      dbToken,
       commandKey: `import-standalone:${manifest.companySlug}:${keyHash}`,
       files,
       storedFiles,
@@ -3807,7 +3863,7 @@ export async function executeHistoryImport({
         promoted.sha256,
       ]);
       const res = await commands.recordStatementBatch({
-        actor,
+        dbToken,
         commandKey: cmdKey,
         batchKind: 'historical_sent',
         statementDate: batch.statementDate,
@@ -3843,7 +3899,7 @@ export async function executeHistoryImport({
       }));
       const cmdKey = `import-method-correction:${manifest.companySlug}:${corr.statementDate}:${contentDigest}`;
       const res = await commands.recordStatementBatch({
-        actor,
+        dbToken,
         commandKey: cmdKey,
         batchKind: 'method_correction',
         statementDate: corr.statementDate,
@@ -3869,7 +3925,7 @@ export async function executeHistoryImport({
     if (correctionManifestEntries.length > 0) {
       const corrHash = sha256Hex(JSON.stringify(correctionManifestEntries.map((x) => [x.file.relPath, x.file.fileSha256]).sort()));
       await commands.importStandaloneFiles({
-        actor,
+        dbToken,
         commandKey: `import-method-correction-manifests:${manifest.companySlug}:${corrHash}`,
         files: correctionManifestEntries.map((x) => x.file),
         storedFiles: correctionManifestEntries.map((x) => x.storedFile),
@@ -3907,7 +3963,7 @@ export async function executeHistoryImport({
       contentType: 'application/json',
     });
     await commands.importStandaloneFiles({
-      actor,
+      dbToken,
       commandKey: `import-nusear-sqlite:${manifest.companySlug}:${promoted.sha256}`,
       files: [{
         area: 'nusear_record',
@@ -4069,7 +4125,7 @@ export async function executeHistoryImport({
   if (recordCheck) {
     const reportDigest = createHash('sha256').update(JSON.stringify(report)).digest('hex');
     await commands.recordCheck({
-      actor,
+      dbToken,
       commandKey: makeHashedCommandKey('check-import', [manifest.companySlug, reportDigest]),
       checkKind: 'import',
       passed: report.passed,

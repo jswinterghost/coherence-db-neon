@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { createCommandLayer } from '../src/commands/command-layer.mjs';
 import { verifyChain, verifyCommitments, verifyObjects } from '../src/commands/journal-export.mjs';
 import { createClient } from '../src/db/pg-client.mjs';
 import {
@@ -30,6 +31,7 @@ import {
   seedEngineVersion,
   seedStandingInput,
 } from './helpers/fixtures.mjs';
+import { createRoleScopedTestPool, seedCoherenceIamFixture } from './helpers/iam-harness.mjs';
 import { checkPgAvailable, createTestEnv } from './helpers/test-db.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -37,7 +39,7 @@ const pgCheck = await checkPgAvailable();
 
 async function runToBibleWaiting(env, worker, { statementDate = '2026-11-21', origin = 'app', engineVersionId, rerunReason = null } = {}) {
   const launch = await env.commands.launchRun({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: `launch-${origin}-${statementDate}-${Date.now()}-${Math.random()}`,
     statementDate,
     origin,
@@ -146,7 +148,7 @@ test('Layer 3 [State Machine as Data]: reusable machine validation, strict SQL R
   const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:PRIOR#effective:2026-01-01' });
   await seedStandingInput(env, { withPriorOverlay: { version: 'v2', rows: [row0], csv: makeOverlayCsv([row0]) } });
 
-  const l1 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'sm-r1', statementDate: '2026-11-21', engineVersionId });
+  const l1 = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'sm-r1', statementDate: '2026-11-21', engineVersionId });
   const r1 = l1.result.runId;
   observedAttemptStates.add('requested');
   await recordStage(r1, { openRequestStep: 'assign' });
@@ -157,7 +159,7 @@ test('Layer 3 [State Machine as Data]: reusable machine validation, strict SQL R
     companySlug: env.companySlug,
     stores: env.stores,
     commands: env.commands,
-    workerActor: env.workerActor,
+    workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(),
     tempBaseDir: env.tempDir,
     onAfterStart: async ({ run, step }) => {
@@ -171,46 +173,46 @@ test('Layer 3 [State Machine as Data]: reusable machine validation, strict SQL R
 
   let seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [r1])).rows[0].latest_journal_seq);
   const bibleRows = [row0, sampleApprovalRow({ record_id: 'policy:carrier_a:P10001#effective:2026-01-01' })];
-  await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'sm-b1', expectedJournalSeq: seq, runId: r1, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv(bibleRows), 'utf8') });
+  await env.commands.submitReview({ dbToken: env.ownerToken, commandKey: 'sm-b1', expectedJournalSeq: seq, runId: r1, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv(bibleRows), 'utf8') });
   assert.equal((await worker.runOnce()).action, 'review_accepted');
   assert.equal((await worker.runOnce()).action, 'step_finished');
   await recordStage(r1, { bibleFinished: true, adjustFinished: true, hasAdjustSaveForCurrentAdjust: false });
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [r1])).rows[0].latest_journal_seq);
-  await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'sm-b2', expectedJournalSeq: seq, runId: r1, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv([...bibleRows, sampleApprovalRow({ note: 'b2' })]), 'utf8') });
+  await env.commands.submitReview({ dbToken: env.ownerToken, commandKey: 'sm-b2', expectedJournalSeq: seq, runId: r1, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv([...bibleRows, sampleApprovalRow({ note: 'b2' })]), 'utf8') });
   assert.equal((await worker.runOnce()).action, 'review_accepted');
   observedAttemptStates.add('superseded');
   assert.equal((await worker.runOnce()).action, 'step_finished');
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [r1])).rows[0].latest_journal_seq);
   const adjRows = [...bibleRows, sampleApprovalRow({ note: 'b2' }), sampleApprovalRow({ record_id: 'carrier_a~direct~P10001~100.00~2026-11' })];
-  await env.commands.submitReview({ actor: env.ownerActor, commandKey: 'sm-a1', expectedJournalSeq: seq, runId: r1, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv(adjRows), 'utf8') });
+  await env.commands.submitReview({ dbToken: env.ownerToken, commandKey: 'sm-a1', expectedJournalSeq: seq, runId: r1, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv(adjRows), 'utf8') });
   const adjAcc = await worker.runOnce();
   assert.equal(adjAcc.action, 'review_accepted');
   await recordStage(r1, { bibleFinished: true, adjustFinished: true, hasAdjustSaveForCurrentAdjust: true });
 
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [r1])).rows[0].latest_journal_seq);
-  await env.commands.confirmEmit({ actor: env.ownerActor, commandKey: 'sm-e1', expectedJournalSeq: seq, runId: r1, adjustReviewSaveId: adjAcc.reviewSaveId, typedPhrase: 'create statements for 2026-11-21' });
+  await env.commands.confirmEmit({ dbToken: env.ownerToken, commandKey: 'sm-e1', expectedJournalSeq: seq, runId: r1, adjustReviewSaveId: adjAcc.reviewSaveId, typedPhrase: 'create statements for 2026-11-21' });
   await recordStage(r1, { openRequestStep: 'emit' });
   assert.equal((await worker.runOnce()).action, 'step_finished');
   await recordStage(r1, { emitFinished: true });
 
-  await env.commands.abandonRun({ actor: env.ownerActor, commandKey: 'sm-ab1', runId: r1, typedPhrase: 'abandon 2026-11-21', reason: 'state walkthrough' });
+  await env.commands.abandonRun({ dbToken: env.ownerToken, commandKey: 'sm-ab1', runId: r1, typedPhrase: 'abandon 2026-11-21', reason: 'state walkthrough' });
   await recordStage(r1, { abandoned: true });
 
-  const l2 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'sm-r2', statementDate: '2026-11-22', engineVersionId });
+  const l2 = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'sm-r2', statementDate: '2026-11-22', engineVersionId });
   const failWorker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer({ failStep: 'assign' }), tempBaseDir: env.tempDir,
   }));
   assert.equal((await failWorker.runOnce()).action, 'step_failed');
   observedAttemptStates.add('failed');
   await recordStage(l2.result.runId, { latestNonSupersededEndKind: 'failed' });
 
-  const l3 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'sm-r3', statementDate: '2026-11-23', engineVersionId });
+  const l3 = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'sm-r3', statementDate: '2026-11-23', engineVersionId });
   const killer = env.registerClient(await createClient(env.pgConfig));
   const dieWorker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir, livenessIntervalMs: 50,
     onAfterStart: async ({ slot }) => {
       await killer.query('SELECT pg_catalog.pg_terminate_backend($1)', [slot.backendPid]);
@@ -218,17 +220,17 @@ test('Layer 3 [State Machine as Data]: reusable machine validation, strict SQL R
     },
   }));
   assert.equal((await dieWorker.runOnce()).action, 'slot_lost');
-  const rec = await reconcileInterruptedAttempts({ pool: env.pool, commands: env.commands, workerActor: env.workerActor });
+  const rec = await reconcileInterruptedAttempts({ pool: env.pool, commands: env.commands, workerToken: env.workerToken });
   assert.equal(rec.interrupted.length, 1);
   observedAttemptStates.add('interrupted');
   await recordStage(l3.result.runId, { latestNonSupersededEndKind: 'interrupted' });
 
-  const l4 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'sm-r4', statementDate: '2026-11-24', engineVersionId });
+  const l4 = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'sm-r4', statementDate: '2026-11-24', engineVersionId });
   const cancelWorker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer({ sleepStep: 'assign', sleepSeconds: 20 }), tempBaseDir: env.tempDir, cancelPollMs: 80,
     onAfterStart: async ({ run }) => {
-      await env.commands.requestCancel({ actor: env.ownerActor, commandKey: 'sm-c4', runId: run.id, step: 'assign', attemptNo: 1, typedPhrase: 'cancel 2026-11-24', reason: 'sm test' });
+      await env.commands.requestCancel({ dbToken: env.ownerToken, commandKey: 'sm-c4', runId: run.id, step: 'assign', attemptNo: 1, typedPhrase: 'cancel 2026-11-24', reason: 'sm test' });
     },
   }));
   assert.equal((await cancelWorker.runOnce()).action, 'step_cancelled');
@@ -246,43 +248,83 @@ test('Layer 3 [Idempotency & Permissions]: idempotent resend acts once, reused c
   const { engineVersionId } = await seedEngineVersion(env);
   await seedStandingInput(env);
 
-  const withheldStaff = { id: 'staff-withheld', kind: 'nusear_staff', customers: ['acme'], withheld: ['run-coherence'] };
+  const iam = env.iam;
+  const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
+  const appCommands = createCommandLayer({ pool: appPool, companySlug: env.companySlug, stores: env.stores });
+
+  // Database-only IAM additive role enforcement: Nusear Admin lacking coherence_operator role and
+  // coherence_operator granted only on another company (Northstar) are both refused with 403 (42501).
   await assert.rejects(
-    () => env.commands.launchRun({ actor: withheldStaff, commandKey: 'wh-launch', statementDate: '2026-11-21', engineVersionId }),
-    /held back/i,
+    () => appCommands.launchRun({ dbToken: iam.tokens.adminNoCoh, commandKey: 'wh-launch', statementDate: '2026-11-21', engineVersionId }),
+    (err) => err?.status === 403 && err?.code === 'FORBIDDEN',
   );
-  const wrongCustStaff = { id: 'staff-other', kind: 'nusear_staff', customers: ['beacon'], withheld: [] };
   await assert.rejects(
-    () => env.commands.launchRun({ actor: wrongCustStaff, commandKey: 'wc-launch', statementDate: '2026-11-21', engineVersionId }),
-    /not assigned/i,
+    () => appCommands.launchRun({ dbToken: iam.tokens.wrongCoOperator, commandKey: 'wc-launch', statementDate: '2026-11-21', engineVersionId }),
+    (err) => err?.status === 403 && err?.code === 'FORBIDDEN',
   );
 
-  const supportActor = { id: 'test-owner', kind: 'owner', actingFor: 'acme' };
-  const first = await env.commands.launchRun({
-    actor: supportActor, commandKey: 'launch-idem-key', statementDate: '2026-11-21', engineVersionId,
+  // Nusear owner / operator direct writes record acting_for = 'nusear_support'
+  const first = await appCommands.launchRun({
+    dbToken: iam.tokens.owner, commandKey: 'launch-idem-key', statementDate: '2026-11-21', engineVersionId,
   });
   assert.equal(first.idempotent, false);
   const jeRow = await env.pool.query('SELECT acting_for FROM coherence.journal_entries WHERE seq = $1', [String(first.journalSeq)]);
-  assert.equal(jeRow.rows[0].acting_for, 'acme');
+  assert.equal(jeRow.rows[0].acting_for, 'nusear_support');
 
-  const resend = await env.commands.launchRun({
-    actor: supportActor, commandKey: 'launch-idem-key', statementDate: '2026-11-21', engineVersionId,
+  // Item 8: Replay returns the FULL stored result object verbatim (including folderNumber, statementDate, origin, etc.)
+  const resend = await appCommands.launchRun({
+    dbToken: iam.tokens.owner, commandKey: 'launch-idem-key', statementDate: '2026-11-21', engineVersionId,
   });
   assert.equal(resend.idempotent, true);
   assert.equal(resend.journalSeq, first.journalSeq);
-  assert.equal(resend.result.runId, first.result.runId);
+  assert.deepEqual(resend.result, first.result, 'idempotent replay must return the complete stored result object');
 
   await assert.rejects(
-    () => env.commands.launchRun({ actor: supportActor, commandKey: 'launch-idem-key', statementDate: '2026-11-22', engineVersionId }),
-    /already used for a different request/i,
+    () => appCommands.launchRun({ dbToken: iam.tokens.owner, commandKey: 'launch-idem-key', statementDate: '2026-11-22', engineVersionId }),
+    (err) => err?.status === 409 && /already used for a different request/i.test(err.message),
   );
   await assert.rejects(
-    () => env.commands.launchRun({ actor: { id: 'test-owner', kind: 'owner', actingFor: null }, commandKey: 'launch-idem-key', statementDate: '2026-11-21', engineVersionId }),
-    /already used for a different request/i,
+    () => appCommands.launchRun({ dbToken: iam.tokens.operator, commandKey: 'launch-idem-key', statementDate: '2026-11-21', engineVersionId }),
+    (err) => err?.status === 409 && /already used for a different request/i.test(err.message),
   );
   await assert.rejects(
-    () => env.commands.abandonRun({ actor: supportActor, commandKey: 'launch-idem-key', runId: first.result.runId, typedPhrase: 'abandon 2026-11-21', reason: 'test' }),
-    /already used for a different request/i,
+    () => appCommands.abandonRun({ dbToken: iam.tokens.owner, commandKey: 'launch-idem-key', runId: first.result.runId, typedPhrase: 'abandon 2026-11-21', reason: 'test' }),
+    (err) => err?.status === 409 && /already used for a different request/i.test(err.message),
+  );
+
+  // Item 8: request_sha256 covers EVERY array in normalized requests (changing an array element with same commandKey refuses 409).
+  const fA = await env.dataStore.promoteBytes(Buffer.from('a,b\n1,2\n', 'utf8'), { relPath: 'hist/a.csv', checksPassed: true });
+  const fB = await env.dataStore.promoteBytes(Buffer.from('a,b\n3,4\n', 'utf8'), { relPath: 'hist/b.csv', checksPassed: true });
+  const hist1 = await appCommands.importHistoricalRun({
+    dbToken: iam.tokens.owner,
+    commandKey: 'hist-array-hash-key',
+    run: { origin: 'company_import', statementDate: '2026-10-01', sourceFolder: 'company-runs/2026-10-01-idem', emitMode: 'coherence' },
+    inputVersion: { reason: 'idem array test' },
+    inputEntries: [{ relPath: 'hist/a.csv', fileSha256: fA.sha256 }],
+    storedFiles: [fA],
+  });
+  const histReplay = await appCommands.importHistoricalRun({
+    dbToken: iam.tokens.owner,
+    commandKey: 'hist-array-hash-key',
+    run: { origin: 'company_import', statementDate: '2026-10-01', sourceFolder: 'company-runs/2026-10-01-idem', emitMode: 'coherence' },
+    inputVersion: { reason: 'idem array test' },
+    inputEntries: [{ relPath: 'hist/a.csv', fileSha256: fA.sha256 }],
+    storedFiles: [fA],
+  });
+  assert.equal(histReplay.idempotent, true);
+  assert.equal(histReplay.result.runId, hist1.result.runId);
+  assert.equal(histReplay.result.alreadyImported, false);
+  await assert.rejects(
+    () => appCommands.importHistoricalRun({
+      dbToken: iam.tokens.owner,
+      commandKey: 'hist-array-hash-key',
+      run: { origin: 'company_import', statementDate: '2026-10-01', sourceFolder: 'company-runs/2026-10-01-idem', emitMode: 'coherence' },
+      inputVersion: { reason: 'idem array test' },
+      inputEntries: [{ relPath: 'hist/b.csv', fileSha256: fB.sha256 }],
+      storedFiles: [fB],
+    }),
+    (err) => err?.status === 409 && /already used for a different request/i.test(err.message),
+    'reusing commandKey with different inputEntries array content must refuse with 409',
   );
 });
 
@@ -295,7 +337,7 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
   await seedStandingInput(env, { withPriorOverlay: { version: 'v2', rows: [row0], csv: makeOverlayCsv([row0]) } });
 
   const worker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
   }));
 
@@ -305,11 +347,11 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
   const rowBible2 = sampleApprovalRow({ record_id: 'policy:carrier_a:P10001#effective:2026-01-01', note: 'tab2' });
   const [r1, r2] = await Promise.allSettled([
     env.commands.submitReview({
-      actor: env.ownerActor, commandKey: 'sub-tab-1', expectedJournalSeq: latestSeq,
+      dbToken: env.ownerToken, commandKey: 'sub-tab-1', expectedJournalSeq: latestSeq,
       runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv([row0, rowBible1]), 'utf8'),
     }),
     env.commands.submitReview({
-      actor: env.ownerActor, commandKey: 'sub-tab-2', expectedJournalSeq: latestSeq,
+      dbToken: env.ownerToken, commandKey: 'sub-tab-2', expectedJournalSeq: latestSeq,
       runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv([row0, rowBible2]), 'utf8'),
     }),
   ]);
@@ -323,30 +365,30 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
   assert.equal(adj1.attemptNo, 1);
 
   await env.commands.saveReviewDraft({
-    actor: env.ownerActor, runId, surface: 'adjust', attemptNo: 1, born: 'b1', checksum: 'c1', rows: [{ record_id: 'x' }],
+    dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 1, born: 'b1', checksum: 'c1', rows: [{ record_id: 'x' }],
   });
-  assert.ok(await env.commands.getReviewDraft({ runId, surface: 'adjust', attemptNo: 1 }));
+  assert.ok(await env.commands.getReviewDraft({ dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 1 }));
   await assert.rejects(
-    () => env.commands.saveReviewDraft({ actor: env.ownerActor, runId, surface: 'adjust', attemptNo: 2, born: 'b1', checksum: 'c1', rows: [] }),
+    () => env.commands.saveReviewDraft({ dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 2, born: 'b1', checksum: 'c1', rows: [] }),
     /current finished/i,
   );
 
   const seqBeforeResave = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   const rowBibleResave = sampleApprovalRow({ record_id: 'policy:carrier_a:P10001#effective:2026-01-01', note: 'bible-resave' });
   await env.commands.submitReview({
-    actor: env.ownerActor, commandKey: 'sub-bible-resave', expectedJournalSeq: seqBeforeResave,
+    dbToken: env.ownerToken, commandKey: 'sub-bible-resave', expectedJournalSeq: seqBeforeResave,
     runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv([row0, rowBibleResave]), 'utf8'),
   });
   assert.equal((await worker.runOnce()).action, 'review_accepted');
   const adj2 = await worker.runOnce();
   assert.equal(adj2.action, 'step_finished');
   assert.equal(adj2.attemptNo, 2);
-  assert.equal(await env.commands.getReviewDraft({ runId, surface: 'adjust', attemptNo: 2 }), null);
+  assert.equal(await env.commands.getReviewDraft({ dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 2 }), null);
 
   const seqAfterAdj2 = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   const rowAdj1 = sampleApprovalRow({ record_id: 'carrier_a~direct~P10001~100.00~2026-11', note: 'adj-1' });
   await env.commands.submitReview({
-    actor: env.ownerActor, commandKey: 'sub-adj-1', expectedJournalSeq: seqAfterAdj2,
+    dbToken: env.ownerToken, commandKey: 'sub-adj-1', expectedJournalSeq: seqAfterAdj2,
     runId, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv([row0, rowBibleResave, rowAdj1]), 'utf8'),
   });
   const accAdj1 = await worker.runOnce();
@@ -355,7 +397,7 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
   const seqAfterAdj1 = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await assert.rejects(
     () => env.commands.submitReview({
-      actor: env.ownerActor, commandKey: 'sub-bible-after-adj', expectedJournalSeq: seqAfterAdj1,
+      dbToken: env.ownerToken, commandKey: 'sub-bible-after-adj', expectedJournalSeq: seqAfterAdj1,
       runId, surface: 'bible', csvBytes: Buffer.from(makeOverlayCsv([row0, rowBibleResave]), 'utf8'),
     }),
     /Adjust review was saved/i,
@@ -363,12 +405,12 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
 
   const rowAdj2 = sampleApprovalRow({ record_id: 'carrier_a~direct~P10001~100.00~2026-11', note: 'adj-2' });
   await env.commands.submitReview({
-    actor: env.ownerActor, commandKey: 'sub-adj-2', expectedJournalSeq: seqAfterAdj1,
+    dbToken: env.ownerToken, commandKey: 'sub-adj-2', expectedJournalSeq: seqAfterAdj1,
     runId, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv([row0, rowBibleResave, rowAdj1, rowAdj2]), 'utf8'),
   });
   await assert.rejects(
     () => env.commands.confirmEmit({
-      actor: env.ownerActor, commandKey: 'emit-while-pending', expectedJournalSeq: seqAfterAdj1,
+      dbToken: env.ownerToken, commandKey: 'emit-while-pending', expectedJournalSeq: seqAfterAdj1,
       runId, adjustReviewSaveId: accAdj1.reviewSaveId, typedPhrase: 'create statements for 2026-11-21',
     }),
     /review submission is waiting/i,
@@ -380,21 +422,21 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
   const seqReady = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await assert.rejects(
     () => env.commands.confirmEmit({
-      actor: env.ownerActor, commandKey: 'emit-stale-save', expectedJournalSeq: seqReady,
+      dbToken: env.ownerToken, commandKey: 'emit-stale-save', expectedJournalSeq: seqReady,
       runId, adjustReviewSaveId: accAdj1.reviewSaveId, typedPhrase: 'create statements for 2026-11-21',
     }),
     /newest Adjust review save/i,
   );
 
   await env.commands.confirmEmit({
-    actor: env.ownerActor, commandKey: 'emit-ok', expectedJournalSeq: seqReady,
+    dbToken: env.ownerToken, commandKey: 'emit-ok', expectedJournalSeq: seqReady,
     runId, adjustReviewSaveId: accAdj2.reviewSaveId, typedPhrase: 'create statements for 2026-11-21',
   });
 
   const seqAfterConfirm = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   await assert.rejects(
     () => env.commands.submitReview({
-      actor: env.ownerActor, commandKey: 'sub-adj-after-emit-confirm', expectedJournalSeq: seqAfterConfirm,
+      dbToken: env.ownerToken, commandKey: 'sub-adj-after-emit-confirm', expectedJournalSeq: seqAfterConfirm,
       runId, surface: 'adjust', csvBytes: Buffer.from(makeOverlayCsv([row0, rowBibleResave, rowAdj1, rowAdj2]), 'utf8'),
     }),
     /open request|Emit/i,
@@ -403,7 +445,7 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
   assert.equal((await worker.runOnce()).action, 'step_finished');
 
   await assert.rejects(
-    () => env.commands.saveReviewDraft({ actor: env.ownerActor, runId, surface: 'adjust', attemptNo: 2, born: 'b1', checksum: 'c2', rows: [] }),
+    () => env.commands.saveReviewDraft({ dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 2, born: 'b1', checksum: 'c2', rows: [] }),
     /after Emit/i,
   );
 });
@@ -464,20 +506,20 @@ test('Layer 3 [Review & Input Verification]: rejected review submission does not
   await seedStandingInput(env, { withPriorOverlay: { version: 'v2', rows: [row0], csv: makeOverlayCsv([row0]) } });
 
   const worker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
   }));
 
-  const launch = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'launch-rev-test', statementDate: '2026-11-21', engineVersionId });
+  const launch = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'launch-rev-test', statementDate: '2026-11-21', engineVersionId });
   const runId = launch.result.runId;
   for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
 
-  assert.equal((await reconcileInterruptedAttempts({ pool: env.pool, commands: env.commands, workerActor: env.workerActor })).interrupted.length, 0);
+  assert.equal((await reconcileInterruptedAttempts({ pool: env.pool, commands: env.commands, workerToken: env.workerToken })).interrupted.length, 0);
 
   const badCsv = makeOverlayCsv([sampleApprovalRow({ record_id: 'policy:carrier_a:OTHER#effective:2026-01-01' })]);
   const seq1 = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   const badSub = await env.commands.submitReview({
-    actor: env.ownerActor, commandKey: 'sub-bad', expectedJournalSeq: seq1, runId, surface: 'bible', csvBytes: Buffer.from(badCsv, 'utf8'),
+    dbToken: env.ownerToken, commandKey: 'sub-bad', expectedJournalSeq: seq1, runId, surface: 'bible', csvBytes: Buffer.from(badCsv, 'utf8'),
   });
   const objectsBefore = env.dataBackend.listObjectNames().filter((n) => n.startsWith('objects/')).length;
   assert.equal((await worker.runOnce()).action, 'review_rejected');
@@ -486,17 +528,17 @@ test('Layer 3 [Review & Input Verification]: rejected review submission does not
 
   const goodCsv = makeOverlayCsv([row0, sampleApprovalRow({ record_id: 'policy:carrier_a:P10001#effective:2026-01-01' })]);
   await env.commands.submitReview({
-    actor: env.ownerActor, commandKey: 'sub-good', expectedJournalSeq: seq1, runId, surface: 'bible', csvBytes: Buffer.from(goodCsv, 'utf8'),
+    dbToken: env.ownerToken, commandKey: 'sub-good', expectedJournalSeq: seq1, runId, surface: 'bible', csvBytes: Buffer.from(goodCsv, 'utf8'),
   });
   assert.equal((await worker.runOnce()).action, 'review_accepted');
   assert.equal((await worker.runOnce()).action, 'step_finished');
   assert.equal((await verifyObjects(env.pool, env.stores, { deep: true })).passed, true);
 
   const mutWorker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer({ mutateFrozenInputStep: 'assign' }), tempBaseDir: env.tempDir,
   }));
-  const launch2 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'launch-mut', statementDate: '2026-11-22', engineVersionId });
+  const launch2 = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'launch-mut', statementDate: '2026-11-22', engineVersionId });
   assert.equal((await mutWorker.runOnce()).action, 'step_failed');
   assert.equal((await env.pool.query('SELECT stage FROM coherence.run_states WHERE id = $1::uuid', [launch2.result.runId])).rows[0].stage, 'failed');
 });
@@ -508,18 +550,18 @@ test('Layer 3 [Worker Death & Reconciliation]: worker death mid-step and before 
   const { engineVersionId } = await seedEngineVersion(env);
   await seedStandingInput(env);
 
-  const launch = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'launch-kill', statementDate: '2026-11-21', engineVersionId });
+  const launch = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'launch-kill', statementDate: '2026-11-21', engineVersionId });
   const runId = launch.result.runId;
   const adminKiller = env.registerClient(await createClient(env.pgConfig));
 
   let refusedWhileOwned = false;
   const dyingWorker1 = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir, livenessIntervalMs: 50,
     onAfterStart: async ({ slot }) => {
       await assert.rejects(
         () => env.commands.interruptStepAttempt({
-          actor: env.workerActor, commandKey: 'illegal-interrupt-while-alive', runId, step: 'assign', attemptNo: 1,
+          dbToken: env.workerToken, commandKey: 'illegal-interrupt-while-alive', runId, step: 'assign', attemptNo: 1,
         }),
         /owning worker still holds the slot/i,
       );
@@ -531,14 +573,14 @@ test('Layer 3 [Worker Death & Reconciliation]: worker death mid-step and before 
   assert.equal((await dyingWorker1.runOnce()).action, 'slot_lost');
   assert.equal(refusedWhileOwned, true);
 
-  const rec1 = await reconcileInterruptedAttempts({ pool: env.pool, commands: env.commands, workerActor: env.workerActor });
+  const rec1 = await reconcileInterruptedAttempts({ pool: env.pool, commands: env.commands, workerToken: env.workerToken });
   assert.equal(rec1.interrupted.length, 1);
   assert.equal((await env.pool.query('SELECT stage FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].stage, 'interrupted');
 
   // Kill worker after step completion on disk but before DB finish commit; attempt must never become finished.
-  await env.commands.requestRetry({ actor: env.ownerActor, commandKey: 'retry-assign-2', runId, step: 'assign' });
+  await env.commands.requestRetry({ dbToken: env.ownerToken, commandKey: 'retry-assign-2', runId, step: 'assign' });
   const dyingWorker2 = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir, livenessIntervalMs: 50,
     onBeforeFinish: async ({ slot }) => {
       await adminKiller.query('SELECT pg_catalog.pg_terminate_backend($1)', [slot.backendPid]);
@@ -554,19 +596,19 @@ test('Layer 3 [Worker Death & Reconciliation]: worker death mid-step and before 
 
   // A replacement worker holding the slot on a new connection reconciles the dead worker's open attempt cleanly.
   const healthyWorker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer(), tempBaseDir: env.tempDir,
   }));
   const idleAfterRec = await healthyWorker.runOnce();
   assert.equal(idleAfterRec.reconciled, 1);
 
-  await env.commands.requestRetry({ actor: env.ownerActor, commandKey: 'retry-assign-3', runId, step: 'assign' });
+  await env.commands.requestRetry({ dbToken: env.ownerToken, commandKey: 'retry-assign-3', runId, step: 'assign' });
   const okAssign = await healthyWorker.runOnce();
   assert.equal(okAssign.action, 'step_finished');
   assert.equal(okAssign.attemptNo, 3);
   assert.equal(okAssign.nextStep, 'attribute');
 
-  assert.equal((await reconcileInterruptedAttempts({ pool: env.pool, commands: env.commands, workerActor: env.workerActor })).interrupted.length, 0);
+  assert.equal((await reconcileInterruptedAttempts({ pool: env.pool, commands: env.commands, workerToken: env.workerToken })).interrupted.length, 0);
 });
 
 test('Layer 3 [Cancel, Timeout & Process Group Safety]: typed cancel stops grandchild, timeout stops hung step, cancel-poll errors escalate, and killProcessGroup reports EPERM', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
@@ -577,11 +619,11 @@ test('Layer 3 [Cancel, Timeout & Process Group Safety]: typed cancel stops grand
   await seedStandingInput(env);
 
   const grandchildPidFile = join(env.tempDir, 'grandchild.pid');
-  const launch1 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'launch-cancel', statementDate: '2026-11-21', engineVersionId });
+  const launch1 = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'launch-cancel', statementDate: '2026-11-21', engineVersionId });
   const run1 = launch1.result.runId;
 
   const cancelWorker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer({ sleepStep: 'assign', sleepSeconds: 30, spawnGrandchildPidFile: grandchildPidFile }),
     tempBaseDir: env.tempDir, cancelPollMs: 100,
   }));
@@ -598,7 +640,7 @@ test('Layer 3 [Cancel, Timeout & Process Group Safety]: typed cancel stops grand
   assert.ok(grandchildPid > 0, 'grandchild process should have spawned');
 
   await env.commands.requestCancel({
-    actor: env.ownerActor, commandKey: 'cancel-run1', runId: run1, step: 'assign', attemptNo: 1,
+    dbToken: env.ownerToken, commandKey: 'cancel-run1', runId: run1, step: 'assign', attemptNo: 1,
     typedPhrase: 'cancel 2026-11-21', reason: 'stop test step',
   });
 
@@ -610,9 +652,9 @@ test('Layer 3 [Cancel, Timeout & Process Group Safety]: typed cancel stops grand
   try { process.kill(grandchildPid, 0); } catch { grandchildAlive = false; }
   assert.equal(grandchildAlive, false, 'process-group kill must terminate grandchild processes too');
 
-  const launch2 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'launch-timeout', statementDate: '2026-11-22', engineVersionId });
+  const launch2 = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'launch-timeout', statementDate: '2026-11-22', engineVersionId });
   const timeoutWorker = env.registerWorker(createEngineWorker({
-    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug, stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createMockEngineMaterializer({ sleepStep: 'assign', sleepSeconds: 30 }),
     tempBaseDir: env.tempDir, stepTimeoutMs: 600,
   }));
@@ -671,7 +713,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   const codePromo = (rel, txt) => env.codeStore.promoteBytes(Buffer.from(txt, 'utf8'), { relPath: rel, checksPassed: true });
   await assert.rejects(
     async () => env.commands.registerEngineVersion({
-      actor: env.ownerActor,
+      dbToken: env.ownerToken,
       commandKey: 'legacy-missing-web',
       label: 'legacy-bad',
       coherenceCommit: '809c6ea',
@@ -692,7 +734,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   await seedStandingInput(env, { commandKey: 'sync-standing-input' });
   const reconfKey = 'carrier_a~direct~PAT SAMPLE~100.00~2026-10';
   const baseDec = await env.commands.recordDecisionBaseline({
-    actor: env.ownerActor,
+    dbToken: env.ownerToken,
     commandKey: 'sync-baseline',
     commitKind: 'historical_baseline',
     decisions: [{
@@ -707,13 +749,13 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
 
   const worker = env.registerWorker(createEngineWorker({
     pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
-    stores: env.stores, commands: env.commands, workerActor: env.workerActor,
+    stores: env.stores, commands: env.commands, workerToken: env.workerToken,
     materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: reconfKey }),
     tempBaseDir: env.tempDir,
   }));
 
   // Launch Run 1 (auto-inherits standing prior_decision_commit_id) and Run 2 (for S-8 carry check later)
-  const l1 = await env.commands.launchRun({ actor: env.ownerActor, commandKey: 'sync-l1', statementDate: '2026-10-31', engineVersionId });
+  const l1 = await env.commands.launchRun({ dbToken: env.ownerToken, commandKey: 'sync-l1', statementDate: '2026-10-31', engineVersionId });
   const run1Id = l1.result.runId;
   assert.equal(l1.result.priorDecisionCommitId, baseDec.result.decisionCommitId);
 
@@ -729,7 +771,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   // Incomplete Bible save (missing 1 of 2 queue items) refused by PostgreSQL
   await assert.rejects(
     () => env.commands.saveReviewDecisions({
-      actor: env.ownerActor, commandKey: 'sync-bible-incomplete', expectedJournalSeq: seq,
+      dbToken: env.ownerToken, commandKey: 'sync-bible-incomplete', expectedJournalSeq: seq,
       runId: run1Id, surface: 'bible',
       decisions: [{ recordId: bibleQ[0].record_id, disposition: 'CONFIRM' }],
     }),
@@ -739,7 +781,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   // Stale expectedJournalSeq refused with 409 STALE_JOURNAL_POSITION
   await assert.rejects(
     () => env.commands.saveReviewDecisions({
-      actor: env.ownerActor, commandKey: 'sync-bible-stale', expectedJournalSeq: seq - 1,
+      dbToken: env.ownerToken, commandKey: 'sync-bible-stale', expectedJournalSeq: seq - 1,
       runId: run1Id, surface: 'bible',
       decisions: bibleQ.map((q) => ({ recordId: q.record_id, disposition: 'CONFIRM' })),
     }),
@@ -749,7 +791,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   // Concurrent race of two Bible saves at the same expectedJournalSeq -> exactly one succeeds, one fails
   const [raceA, raceB] = await Promise.allSettled([
     env.commands.saveReviewDecisions({
-      actor: env.ownerActor, commandKey: 'sync-bible-race-1', expectedJournalSeq: seq,
+      dbToken: env.ownerToken, commandKey: 'sync-bible-race-1', expectedJournalSeq: seq,
       runId: run1Id, surface: 'bible',
       decisions: [
         { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: 'tab-1' },
@@ -757,7 +799,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
       ],
     }),
     env.commands.saveReviewDecisions({
-      actor: env.ownerActor, commandKey: 'sync-bible-race-2', expectedJournalSeq: seq,
+      dbToken: env.ownerToken, commandKey: 'sync-bible-race-2', expectedJournalSeq: seq,
       runId: run1Id, surface: 'bible',
       decisions: [
         { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: 'tab-2' },
@@ -773,7 +815,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
 
   // Idempotent resend with same commandKey + identical payload succeeds without duplicating rows
   const idemRes = await env.commands.saveReviewDecisions({
-    actor: env.ownerActor, commandKey: winnerKey, expectedJournalSeq: seq,
+    dbToken: env.ownerToken, commandKey: winnerKey, expectedJournalSeq: seq,
     runId: run1Id, surface: 'bible',
     decisions: [
       { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: winnerNote },
@@ -786,7 +828,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   // Command key reuse with different payload refused with 409 COMMAND_KEY_CONFLICT
   await assert.rejects(
     () => env.commands.saveReviewDecisions({
-      actor: env.ownerActor, commandKey: winnerKey, expectedJournalSeq: seq,
+      dbToken: env.ownerToken, commandKey: winnerKey, expectedJournalSeq: seq,
       runId: run1Id, surface: 'bible',
       decisions: [
         { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: 'changed' },
@@ -807,7 +849,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   // Duplicate Bible re-save with identical decisions refused with 409 DUPLICATE_REVIEW_SAVE
   await assert.rejects(
     () => env.commands.saveReviewDecisions({
-      actor: env.ownerActor, commandKey: 'sync-bible-dup-noop', expectedJournalSeq: seq,
+      dbToken: env.ownerToken, commandKey: 'sync-bible-dup-noop', expectedJournalSeq: seq,
       runId: run1Id, surface: 'bible',
       decisions: [
         { recordId: bibleQ[0].record_id, disposition: 'CONFIRM', note: winnerNote },
@@ -819,7 +861,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
 
   // Changed Bible re-save while waiting for Adjust supersedes Adjust attempt 1 and triggers Adjust attempt 2
   await env.commands.saveReviewDecisions({
-    actor: env.ownerActor, commandKey: 'sync-bible-revise', expectedJournalSeq: seq,
+    dbToken: env.ownerToken, commandKey: 'sync-bible-revise', expectedJournalSeq: seq,
     runId: run1Id, surface: 'bible',
     decisions: [{ recordId: bibleQ[0].record_id, disposition: 'CORRECT', agency: 'Beacon', status: 'ACTIVE_PAYING', note: 'updated bible' }],
   });
@@ -831,7 +873,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
   await assert.rejects(
     () => env.commands.saveReviewDecisions({
-      actor: env.ownerActor, commandKey: 'sync-adj-no-reconfirm', expectedJournalSeq: seq,
+      dbToken: env.ownerToken, commandKey: 'sync-adj-no-reconfirm', expectedJournalSeq: seq,
       runId: run1Id, surface: 'adjust',
       decisions: [{ recordId: 'carrier_b~direct~CASEY MOCK~250.00~2026-10', disposition: 'CONFIRM' }],
     }),
@@ -840,7 +882,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
 
   // Valid Adjust save with fresh decision on reconfirm item + new item
   const adjSave = await env.commands.saveReviewDecisions({
-    actor: env.ownerActor, commandKey: 'sync-adj-valid', expectedJournalSeq: seq,
+    dbToken: env.ownerToken, commandKey: 'sync-adj-valid', expectedJournalSeq: seq,
     runId: run1Id, surface: 'adjust',
     decisions: [
       { recordId: reconfKey, disposition: 'CONFIRM', approvedAmount: '100.00', approvedAgency: 'Beacon', approvedAgent: '11111111' },
@@ -852,7 +894,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   // Confirm Emit + CR-1 (Adjust save refused after Emit confirmation)
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [run1Id])).rows[0].latest_journal_seq);
   await env.commands.confirmEmit({
-    actor: env.ownerActor, commandKey: 'sync-confirm-emit', expectedJournalSeq: seq,
+    dbToken: env.ownerToken, commandKey: 'sync-confirm-emit', expectedJournalSeq: seq,
     runId: run1Id, adjustReviewSaveId: adjSave.result.reviewSaveId, typedPhrase: 'create statements for 2026-10-31',
   });
   const emitStep = await worker.runOnce();
@@ -870,7 +912,7 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   // Carry decisions forward: advances standing decision head without adding a new input_versions row
   const ivCountBefore = (await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.input_versions')).rows[0].n;
   const carry1 = await env.commands.carryDecisions({
-    actor: env.ownerActor, commandKey: 'sync-carry-dec-1', runId: run1Id, typedPhrase: 'carry 2026-10-31',
+    dbToken: env.ownerToken, commandKey: 'sync-carry-dec-1', runId: run1Id, typedPhrase: 'carry 2026-10-31',
   });
   assert.equal(carry1.result.nothingNew, false);
   assert.equal(carry1.result.carriedDecisionCommitId, adjSave.result.decisionCommitId);
@@ -879,26 +921,26 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
 
   // Second carryDecisions on same commit marks nothing_new = true
   const carry2 = await env.commands.carryDecisions({
-    actor: env.ownerActor, commandKey: 'sync-carry-dec-2', runId: run1Id, typedPhrase: 'carry 2026-10-31',
+    dbToken: env.ownerToken, commandKey: 'sync-carry-dec-2', runId: run1Id, typedPhrase: 'carry 2026-10-31',
   });
   assert.equal(carry2.result.nothingNew, true);
 
   // S-8 out-of-order decision carry refusal: a run branching off baseDec cannot overwrite the newer standing head!
   const lOld = await env.commands.launchRun({
-    actor: env.ownerActor, commandKey: 'sync-launch-old', statementDate: '2026-11-15',
+    dbToken: env.ownerToken, commandKey: 'sync-launch-old', statementDate: '2026-11-15',
     priorDecisionCommitId: baseDec.result.decisionCommitId, engineVersionId,
   });
   const oldRunId = lOld.result.runId;
   for (let i = 0; i < 3; i++) assert.equal((await worker.runOnce()).action, 'step_finished');
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [oldRunId])).rows[0].latest_journal_seq);
   await env.commands.saveReviewDecisions({
-    actor: env.ownerActor, commandKey: 'sync-old-bible', expectedJournalSeq: seq, runId: oldRunId, surface: 'bible',
+    dbToken: env.ownerToken, commandKey: 'sync-old-bible', expectedJournalSeq: seq, runId: oldRunId, surface: 'bible',
     decisions: bibleQ.map((q) => ({ recordId: q.record_id, disposition: 'CONFIRM', note: 'divergent' })),
   });
   assert.equal((await worker.runOnce()).action, 'step_finished');
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [oldRunId])).rows[0].latest_journal_seq);
   const oldAdj = await env.commands.saveReviewDecisions({
-    actor: env.ownerActor, commandKey: 'sync-old-adj', expectedJournalSeq: seq, runId: oldRunId, surface: 'adjust',
+    dbToken: env.ownerToken, commandKey: 'sync-old-adj', expectedJournalSeq: seq, runId: oldRunId, surface: 'adjust',
     decisions: [
       { recordId: reconfKey, disposition: 'CONFIRM', approvedAmount: '100.00', approvedAgency: 'Beacon', approvedAgent: '11111111' },
       { recordId: 'carrier_b~direct~CASEY MOCK~250.00~2026-10', disposition: 'CONFIRM', approvedAmount: '250.00', approvedAgency: 'Harbor', approvedAgent: '33333333' },
@@ -906,14 +948,14 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
   });
   seq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [oldRunId])).rows[0].latest_journal_seq);
   await env.commands.confirmEmit({
-    actor: env.ownerActor, commandKey: 'sync-old-emit', expectedJournalSeq: seq, runId: oldRunId,
+    dbToken: env.ownerToken, commandKey: 'sync-old-emit', expectedJournalSeq: seq, runId: oldRunId,
     adjustReviewSaveId: oldAdj.result.reviewSaveId, typedPhrase: 'create statements for 2026-11-15',
   });
   assert.equal((await worker.runOnce()).action, 'step_finished');
 
   await assert.rejects(
     () => env.commands.carryDecisions({
-      actor: env.ownerActor, commandKey: 'sync-carry-s8-refuse', runId: oldRunId, typedPhrase: 'carry 2026-11-15',
+      dbToken: env.ownerToken, commandKey: 'sync-carry-s8-refuse', runId: oldRunId, typedPhrase: 'carry 2026-11-15',
     }),
     /does not extend the standing decision head/i,
   );

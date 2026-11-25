@@ -22,4 +22,5 @@ const files = collectMjs(ROOT);
 for (const file of files) {
   execFileSync(process.execPath, ['--check', file], { stdio: 'inherit' });
 }
+
 console.log(`Syntax check passed: ${files.length} .mjs files (${files.map((f) => relative(ROOT, f)).length} checked).`);
