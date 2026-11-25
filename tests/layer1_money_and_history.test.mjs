@@ -6,8 +6,9 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { buildCommitments, hashDecisions } from '../src/commands/commitments.mjs';
 import { exportJournalNdjson, rebuildFromJournalExport, verifyChain, verifyCommitments } from '../src/commands/journal-export.mjs';
+import { queryRunEntityReconciliation } from '../src/compare/run-comparator.mjs';
 import { ALL_BUSINESS_TABLES } from '../src/config/policy-checks.mjs';
-import { buildConnectionConfig, createClient } from '../src/db/pg-client.mjs';
+import { buildConnectionConfig, createClient, withRequestTx } from '../src/db/pg-client.mjs';
 import { generateOverlayCsv, OVERLAY_V1_COLUMNS, OVERLAY_V2_COLUMNS } from '../src/decisions/overlay-generator.mjs';
 import { computeJournalHash, GENESIS_HASH, hashInputChanges, hashInputEntries, sha256Hex } from '../src/util/crypto.mjs';
 import { parseCsv } from '../src/util/csv.mjs';
@@ -26,6 +27,7 @@ import {
   SYNTHETIC_LEDGER_COLUMNS,
   SYNTHETIC_RUN_COLUMNS,
 } from './helpers/fixtures.mjs';
+import { createRoleScopedTestPool } from './helpers/iam-harness.mjs';
 import { checkPgAvailable, createEmptyMigratedTestDb, createTestEnv, getAdminPgConfig } from './helpers/test-db.mjs';
 
 const pgCheck = await checkPgAvailable();
@@ -1044,8 +1046,8 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   assert.equal(lineageRes.rows[0].sheet_name, 'Detail');
   assert.equal(Number(lineageRes.rows[0].source_row_no), 42);
 
-  // Verify entity statement reconciliation view ties to $0.00 on every entity and Acme Upline
-  const recon1 = (await env.pool.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [run1Id])).rows;
+  // Verify entity statement reconciliation ties to $0.00 on every entity and Acme Upline
+  const recon1 = await queryRunEntityReconciliation(env.pool, run1Id);
   assert.equal(recon1.length, 4); // Acme ($0.00 downline), Beacon, Harbor, and Acme Upline
   for (const row of recon1) {
     assert.equal(row.reconciled, true, `Entity ${row.statement_entity} failed reconciliation: variance=${row.variance}`);
@@ -1185,7 +1187,7 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   assert.equal(unwoundAg.amount, '-80.00', 'NULL-split cancel must unwind -80.00 from Beacon');
   assert.equal(unwoundUp.amount, '-20.00', 'NULL-split cancel must unwind -20.00 from Acme Upline');
 
-  const recon2 = (await env.pool.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [run2Id])).rows;
+  const recon2 = await queryRunEntityReconciliation(env.pool, run2Id);
   assert.ok(recon2.every((r) => r.reconciled === true && r.variance === '0.00'));
 
   // 3. Multi-run cumulative reconciliation across Sent Run 1 (2026-10-31) -> Run 3 (2026-11-30) with REVERSAL + RESTATED + NEW
@@ -1297,13 +1299,16 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   assert.equal((await wMulti2.runOnce()).action, 'step_finished');
 
   // Verify cumulative entity statements across BOTH dates (2026-10-31 + 2026-11-30) tie to Run 2's ledger!
-  const reconMulti = (await envMulti.pool.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [mRun2])).rows;
+  const reconMulti = await queryRunEntityReconciliation(envMulti.pool, mRun2);
   assert.ok(reconMulti.every((r) => r.reconciled === true && r.variance === '0.00'));
   const byEntMulti = Object.fromEntries(reconMulti.map((r) => [r.statement_entity, r.statement_total]));
   assert.equal(byEntMulti.Beacon, '120.00', 'Beacon must reflect $200.00 - $80.00 reversal = $120.00');
   assert.equal(byEntMulti.Harbor, '280.00', 'Harbor must reflect $200.00 + $80.00 restatement = $280.00');
   assert.equal(byEntMulti['Acme Upline'], '125.00', 'Upline must remain $125.00 net across reversal and restatement');
-  const perDate = (await envMulti.pool.query("SELECT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS d, statement_entity, net_amount FROM coherence_views.v_entity_statement_date_totals ORDER BY statement_date, statement_entity")).rows;
+  const multiAppPool = createRoleScopedTestPool(envMulti.pool, 'platform_app');
+  const perDate = await withRequestTx(multiAppPool, envMulti.ownerToken, async (tx) => (
+    (await tx.query("SELECT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS d, statement_entity, net_amount FROM app_views.coherence_statement_date_totals ORDER BY statement_date, statement_entity")).rows
+  ), { readOnly: true });
   assert.ok(perDate.some((r) => r.d === '2026-10-31' && r.statement_entity === 'Beacon' && r.net_amount === '200.00'));
   assert.ok(perDate.some((r) => r.d === '2026-11-30' && r.statement_entity === 'Beacon' && r.net_amount === '-80.00'));
   assert.ok(perDate.some((r) => r.d === '2026-11-30' && r.statement_entity === 'Harbor' && r.net_amount === '80.00'));
@@ -1319,6 +1324,6 @@ test('Layer 1 [Emit Materializer & Conservation]: loads BoB, Ledger, and Stateme
   await rebuildFromJournalExport(rebuiltDb.pool, ndjson);
   assert.equal((await verifyChain(rebuiltDb.pool)).passed, true);
   assert.equal((await verifyCommitments(rebuiltDb.pool)).passed, true);
-  const rebuiltRecon = (await rebuiltDb.pool.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [run1Id])).rows;
+  const rebuiltRecon = await queryRunEntityReconciliation(rebuiltDb.pool, run1Id);
   assert.deepEqual(rebuiltRecon, recon1);
 });

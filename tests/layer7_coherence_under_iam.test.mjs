@@ -826,20 +826,62 @@ test('Layer 7B [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE
     }
   }
 
-  // 2. Every legacy coherence_views.* view and coherence.run_states must refuse platform_app with 42501
-  const legacyViews = await env.pool.query(
+  // 2. Retired schema coherence_views must not exist, and every coherence.* view must refuse platform_app with 42501.
+  const viewsSchema = await env.pool.query(
+    "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'coherence_views'",
+  );
+  assert.equal(viewsSchema.rows.length, 0, 'retired schema coherence_views must not exist');
+
+  const internalViews = await env.pool.query(
     `SELECT table_schema, table_name
      FROM information_schema.views
-     WHERE table_schema IN ('coherence', 'coherence_views')
+     WHERE table_schema = 'coherence'
      ORDER BY table_schema, table_name`,
   );
-  assert.ok(legacyViews.rows.length >= 10);
-  for (const v of legacyViews.rows) {
+  assert.ok(internalViews.rows.length >= 2);
+  for (const v of internalViews.rows) {
     await assert.rejects(
       () => runAsPlatformApp(env.pool, { readOnly: true }, (c) => c.query(`SELECT * FROM "${v.table_schema}"."${v.table_name}" LIMIT 1`)),
       (err) => err?.code === '42501',
-      `platform_app must get 42501 on legacy view ${v.table_schema}.${v.table_name}`,
+      `platform_app must get 42501 on internal view ${v.table_schema}.${v.table_name}`,
     );
+  }
+
+  // 2b. Every internal app_views._read_* helper refuses platform_worker and platform_writer with 42501,
+  //     while platform_readonly keeps EXECUTE (like platform_app) so SELECT on app_views.* works.
+  const readHelpers = (await env.pool.query(
+    `SELECT p.proname, pg_catalog.oidvectortypes(p.proargtypes) AS arg_types
+     FROM pg_catalog.pg_proc p
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'app_views' AND p.proname LIKE '\\_read\\_%' ESCAPE '\\'
+     ORDER BY p.proname`,
+  )).rows;
+  assert.ok(readHelpers.length >= 20, `expected >= 20 app_views._read_* helpers, got ${readHelpers.length}`);
+  const sampleArgsFor = (argTypes) => {
+    if (!argTypes) return '';
+    return argTypes.split(',').map((t) => {
+      const tt = t.trim();
+      if (tt === 'text') return "'act:coherence.runs.read'";
+      if (tt === 'boolean') return 'false';
+      if (tt === 'uuid') return `'${randomUUID()}'::uuid`;
+      return 'NULL';
+    }).join(', ');
+  };
+  for (const h of readHelpers) {
+    const callSql = `SELECT app_views.${h.proname}(${sampleArgsFor(h.arg_types)})`;
+    for (const roleName of ['platform_worker', 'platform_writer']) {
+      await assert.rejects(
+        () => runAsRole(env.pool, roleName, { readOnly: true }, (c) => c.query(callSql)),
+        (err) => err?.code === '42501',
+        `${roleName} must get 42501 on internal helper app_views.${h.proname}`,
+      );
+    }
+  }
+  for (const viewName of ['coherence_bob', 'coherence_runs']) {
+    const res = await runAsRole(env.pool, 'platform_readonly', { readOnly: true }, (c) => (
+      c.query(`SELECT COUNT(*)::int AS n FROM app_views.${viewName}`)
+    ));
+    assert.equal(res.rows[0].n, 0, `platform_readonly smoke SELECT on app_views.${viewName} without token must succeed with 0 rows`);
   }
 
   // 3. Backfill function and worker-only app_cmd functions must refuse platform_app with 42501
@@ -1505,19 +1547,27 @@ test('Layer 7B [Audience Row & Column Isolation]: Agent (own NPN + zero dollars 
     );
   });
 
-  // 9. Retired Migration 006 GUCs and legacy roles yield 0 rows
-  for (const [role, settings] of [
-    ['coherence_entity_manager_ro', { 'app.access_tier': 'entity_manager' }],
-    ['coherence_agency_manager_ro', { 'app.allowed_entities': 'Beacon' }],
-    ['coherence_agent_ro', { 'app.allowed_entities': 'Beacon', 'app.actor_npn': '11111111' }],
-  ]) {
-    const legacyCount = await runAsRole(env.pool, role, { readOnly: true }, async (c) => {
-      for (const [k, v] of Object.entries(settings)) {
-        await c.query('SELECT pg_catalog.set_config($1, $2, true)', [k, v]);
-      }
-      return (await c.query('SELECT COUNT(*)::int AS n FROM coherence.bob_policies')).rows[0].n;
-    });
-    assert.equal(legacyCount, 0, `retired Migration 006 role ${role} must see 0 rows`);
+  // 9. Any retired pre-IAM roles still present cluster-wide hold zero grants and fail with 42501.
+  const retiredRolesPresent = (await env.pool.query(
+    `SELECT rolname FROM pg_catalog.pg_roles
+     WHERE rolname = ANY($1::text[])
+     ORDER BY rolname`,
+    [[
+      'coherence_app', 'coherence_worker', 'coherence_readonly',
+      'coherence_entity_manager_ro', 'coherence_agency_manager_ro',
+      'coherence_agent_ro', 'coherence_retention_ro', 'coherence_investor_ro',
+    ]],
+  )).rows.map((r) => r.rolname);
+  for (const role of retiredRolesPresent) {
+    await assert.rejects(
+      () => runAsRole(env.pool, role, { readOnly: true }, async (c) => {
+        await c.query("SELECT pg_catalog.set_config('app.access_tier', 'entity_manager', true)");
+        await c.query("SELECT pg_catalog.set_config('app.allowed_entities', 'Beacon', true)");
+        return c.query('SELECT COUNT(*)::int AS n FROM coherence.bob_policies');
+      }),
+      (err) => err?.code === '42501',
+      `retired pre-IAM role ${role} must get SQLSTATE 42501 on coherence.bob_policies`,
+    );
   }
 });
 
@@ -1941,24 +1991,48 @@ test('Layer 7B [InitPlan Performance Guard]: EXPLAIN on keyed app_views evaluate
     return out;
   };
 
+  const readCallRe = /\b(?:app_views\.)?_read_\w+\s*\(/;
+  const fieldStrings = (val) => (
+    typeof val === 'string'
+      ? [val]
+      : (Array.isArray(val) ? val.filter((item) => typeof item === 'string') : [])
+  );
+
   const inspectReadNodes = (planRoot) => {
     const allRefStrings = collectPlanRefStrings(planRoot).join('\n');
     const readInitPlans = [];
     const readHashedSubPlans = [];
     const readPerRowSubPlans = [];
     const readHighLoopNodes = [];
+    const readInlineScanCalls = [];
 
     const walk = (node, enclosingSubplan = null, enclosingRel = null) => {
       const ownSubplan = node['Subplan Name'] || enclosingSubplan;
       const ownRel = node['Subplan Name'] ? (node['Parent Relationship'] || enclosingRel) : enclosingRel;
+      const isInitPlanNode = ownRel === 'InitPlan' || Boolean(ownSubplan && (ownSubplan.startsWith('InitPlan ') || ownSubplan.startsWith('CTE ')));
+      const nodeType = node['Node Type'] || '';
       const fnName = node['Function Name'] || '';
       const fnSchema = node.Schema || '';
+
+      // Fail on any _read_* call in Filter, Index Cond, Join Filter, or a non-InitPlan-Result Output.
+      const forbiddenKeys = nodeType === 'Result' && isInitPlanNode
+        ? ['Filter', 'Index Cond', 'Join Filter']
+        : ['Filter', 'Index Cond', 'Join Filter', 'Output'];
+      for (const key of forbiddenKeys) {
+        for (const text of fieldStrings(node[key])) {
+          const match = text.match(readCallRe);
+          if (match) {
+            readInlineScanCalls.push(`${nodeType}[${key}]:${match[0].replace(/\($/, '')}`);
+          }
+        }
+      }
+
       const ownStrings = Object.entries(node)
         .filter(([k]) => k !== 'Plans')
         .flatMap(([, v]) => (Array.isArray(v) ? v : [v]))
         .filter((v) => typeof v === 'string')
         .join(' ');
-      const isReadFnScan = node['Node Type'] === 'Function Scan' && fnSchema === 'app_views' && fnName.startsWith('_read_');
+      const isReadFnScan = nodeType === 'Function Scan' && fnSchema === 'app_views' && fnName.startsWith('_read_');
       const hasReadExpr = /app_views\._read_\w+/.test(ownStrings);
       if (isReadFnScan || hasReadExpr) {
         const label = isReadFnScan ? `app_views.${fnName}` : (ownStrings.match(/app_views\._read_\w+/) || ['app_views._read_'])[0];
@@ -1966,7 +2040,7 @@ test('Layer 7B [InitPlan Performance Guard]: EXPLAIN on keyed app_views evaluate
         if (loops > 1) {
           readHighLoopNodes.push(`${label} in ${ownSubplan || 'main'} (Actual Loops=${loops})`);
         }
-        if (ownRel === 'InitPlan' || (ownSubplan && ownSubplan.startsWith('InitPlan '))) {
+        if (isInitPlanNode) {
           readInitPlans.push(`${ownSubplan}:${label}`);
         } else if (ownSubplan && ownSubplan.startsWith('SubPlan ')) {
           const spNum = ownSubplan.match(/^SubPlan (\d+)/)?.[1];
@@ -1983,12 +2057,45 @@ test('Layer 7B [InitPlan Performance Guard]: EXPLAIN on keyed app_views evaluate
       for (const child of node.Plans || []) walk(child, ownSubplan, ownRel);
     };
     walk(planRoot);
-    return { readInitPlans, readHashedSubPlans, readPerRowSubPlans, readHighLoopNodes };
+    return { readInitPlans, readHashedSubPlans, readPerRowSubPlans, readHighLoopNodes, readInlineScanCalls };
   };
+
+  // Non-vacuity self-test: inspectReadNodes must flag _read_* in Filter, Index Cond, Join Filter, and Output.
+  for (const [key, sampleNode] of [
+    ['Filter', { 'Node Type': 'Seq Scan', Filter: '(organization_id = ANY (app_views._read_bob_wide_orgs()))', 'Actual Loops': 1 }],
+    ['Index Cond', { 'Node Type': 'Index Scan', 'Index Cond': '(organization_id = ANY (app_views._read_bob_wide_orgs()))', 'Actual Loops': 1 }],
+    ['Join Filter', { 'Node Type': 'Nested Loop', 'Join Filter': '(bp.organization_id = ANY (app_views._read_bob_wide_orgs()))', 'Actual Loops': 1 }],
+    ['Output', { 'Node Type': 'Seq Scan', Output: ['bp.policy_id', 'app_views._read_upline_cash_orgs()'], 'Actual Loops': 1 }],
+  ]) {
+    const res = inspectReadNodes(sampleNode);
+    assert.ok(
+      res.readInlineScanCalls.some((s) => s.includes(`[${key}]:`)),
+      `InitPlan guard must flag _read_* call in ${key}, got ${JSON.stringify(res.readInlineScanCalls)}`,
+    );
+  }
 
   const agentTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.agentA });
   const emTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.acmeEntityMgr });
   const beaconMgrTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.beaconManager });
+
+  // Live PG 17 EXPLAIN self-test: direct _read_* in a scan Filter or Output is caught on real EXPLAIN JSON.
+  await runAsRole(env.pool, 'platform_view_owner', { readOnly: true }, async (c) => {
+    await c.query("SELECT pg_catalog.set_config('app.session_token', $1, true)", [emTok]);
+    const badFilterPlan = (await c.query(
+      'EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) SELECT policy_id FROM coherence.bob_policies WHERE organization_id = ANY(app_views._read_bob_wide_orgs())',
+    )).rows[0]['QUERY PLAN'][0].Plan;
+    assert.ok(
+      inspectReadNodes(badFilterPlan).readInlineScanCalls.some((s) => /\[(?:Filter|Index Cond)\]:/.test(s)),
+      `InitPlan guard must catch live PG 17 inline _read_* in Filter/Index Cond:\n${JSON.stringify(badFilterPlan, null, 2)}`,
+    );
+    const badOutputPlan = (await c.query(
+      'EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) SELECT policy_id, app_views._read_upline_cash_orgs() FROM coherence.bob_policies',
+    )).rows[0]['QUERY PLAN'][0].Plan;
+    assert.ok(
+      inspectReadNodes(badOutputPlan).readInlineScanCalls.some((s) => s.includes('[Output]:')),
+      `InitPlan guard must catch live PG 17 inline _read_* in scan Output:\n${JSON.stringify(badOutputPlan, null, 2)}`,
+    );
+  });
 
   const checks = [
     // Narrow self caller with both sent and unsent runs (exercises wide InitPlans + narrow hashed SubPlans on both runs).
@@ -2031,7 +2138,7 @@ test('Layer 7B [InitPlan Performance Guard]: EXPLAIN on keyed app_views evaluate
       }
     }
 
-    const { readInitPlans, readHashedSubPlans, readPerRowSubPlans, readHighLoopNodes } = inspectReadNodes(planRoot);
+    const { readInitPlans, readHashedSubPlans, readPerRowSubPlans, readHighLoopNodes, readInlineScanCalls } = inspectReadNodes(planRoot);
     assert.ok(
       readInitPlans.length > 0,
       `${chk.label} on app_views.${chk.viewName} must match non-zero app_views._read_* InitPlans:\n${JSON.stringify(planRoot, null, 2)}`,
@@ -2051,6 +2158,11 @@ test('Layer 7B [InitPlan Performance Guard]: EXPLAIN on keyed app_views evaluate
       readHighLoopNodes,
       [],
       `${chk.label} on app_views.${chk.viewName} must evaluate every app_views._read_* node at most once per statement (found ${JSON.stringify(readHighLoopNodes)})`,
+    );
+    assert.deepEqual(
+      readInlineScanCalls,
+      [],
+      `${chk.label} on app_views.${chk.viewName} must have ZERO inline _read_* calls in scan Filter/Index Cond/Join Filter/Output (found ${JSON.stringify(readInlineScanCalls)})`,
     );
   }
 });
@@ -4917,14 +5029,90 @@ test('Layer 7B [Fix3-2 - Catalog Audit Non-Vacuous _resolve_* and _cmd_* Loop & 
       await env.pool.query('REVOKE EXECUTE ON FUNCTION platform.compute_journal_hash(BIGINT, TIMESTAMPTZ, TEXT, UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB) FROM platform_worker');
     }
 
-    await env.pool.query('CREATE POLICY bob_policies_legacy_probe ON coherence.bob_policies FOR ALL TO coherence_app USING (true) WITH CHECK (true)');
+    await env.pool.query('GRANT EXECUTE ON FUNCTION app_views._read_bob_wide_orgs() TO platform_worker');
     try {
       const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
-      assert.equal(bad.passed, false, 'legacy coherence_app USING (true) policy must fail audit');
-      assert.ok(bad.problems.some((p) => /coherence_app/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+      assert.equal(bad.passed, false, 'granting EXECUTE on app_views._read_bob_wide_orgs to platform_worker must fail audit');
+      assert.ok(bad.problems.some((p) => /_read_bob_wide_orgs/i.test(p) && /platform_worker/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
     } finally {
-      await env.pool.query('DROP POLICY IF EXISTS bob_policies_legacy_probe ON coherence.bob_policies');
+      await env.pool.query('REVOKE EXECUTE ON FUNCTION app_views._read_bob_wide_orgs() FROM platform_worker');
     }
+
+    await env.pool.query('REVOKE EXECUTE ON FUNCTION app_views._read_bob_wide_orgs() FROM platform_readonly');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'revoking EXECUTE on app_views._read_bob_wide_orgs from platform_readonly must fail audit');
+      assert.ok(bad.problems.some((p) => /_read_bob_wide_orgs/i.test(p) && /platform_readonly/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+    } finally {
+      await env.pool.query('GRANT EXECUTE ON FUNCTION app_views._read_bob_wide_orgs() TO platform_readonly');
+    }
+
+    await env.pool.query('GRANT SELECT (policy_id) ON app_views.coherence_bob TO PUBLIC');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'granting column-level SELECT on app_views.coherence_bob to PUBLIC must fail audit');
+      assert.ok(bad.problems.some((p) => /PUBLIC/i.test(p) && /column-level/i.test(p) && /coherence_bob/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+    } finally {
+      await env.pool.query('REVOKE SELECT (policy_id) ON app_views.coherence_bob FROM PUBLIC');
+    }
+
+    await env.pool.query("CREATE FUNCTION coherence.upline_entity_label() RETURNS TEXT LANGUAGE sql SET search_path = pg_catalog AS $$ SELECT ''::text $$");
+    await env.pool.query('REVOKE ALL ON FUNCTION coherence.upline_entity_label() FROM PUBLIC');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'retired Migration 006 helper coherence.upline_entity_label must fail audit');
+      assert.ok(bad.problems.some((p) => /Retired Migration 006 helper/i.test(p) && /upline_entity_label/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+    } finally {
+      await env.pool.query('DROP FUNCTION IF EXISTS coherence.upline_entity_label()');
+    }
+
+    await env.pool.query('CREATE SCHEMA coherence_views');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'creating retired schema coherence_views must fail audit');
+      assert.ok(bad.problems.some((p) => /coherence_views/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+    } finally {
+      await env.pool.query('DROP SCHEMA IF EXISTS coherence_views');
+    }
+
+    await withClusterCatalogLock(async () => {
+      const hasLegacyRole = (await env.pool.query("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'coherence_app'")).rows.length > 0;
+      if (!hasLegacyRole) {
+        await env.pool.query('CREATE ROLE coherence_app NOLOGIN NOINHERIT NOBYPASSRLS');
+      }
+      try {
+        await env.pool.query('CREATE POLICY bob_policies_legacy_probe ON coherence.bob_policies FOR ALL TO coherence_app USING (true) WITH CHECK (true)');
+        try {
+          const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+          assert.equal(bad.passed, false, 'legacy coherence_app USING (true) policy must fail audit');
+          assert.ok(bad.problems.some((p) => /coherence_app/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+        } finally {
+          await env.pool.query('DROP POLICY IF EXISTS bob_policies_legacy_probe ON coherence.bob_policies');
+        }
+
+        await env.pool.query('GRANT SELECT ON coherence.runs TO coherence_app');
+        try {
+          const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+          assert.equal(bad.passed, false, 'granting SELECT on coherence.runs to retired coherence_app must fail audit');
+          assert.ok(bad.problems.some((p) => /coherence_app/i.test(p) && /runs/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+        } finally {
+          await env.pool.query('REVOKE SELECT ON coherence.runs FROM coherence_app');
+        }
+
+        await env.pool.query('GRANT SELECT (policy_id) ON app_views.coherence_bob TO coherence_app');
+        try {
+          const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+          assert.equal(bad.passed, false, 'granting column-level SELECT on app_views.coherence_bob to retired coherence_app must fail audit');
+          assert.ok(bad.problems.some((p) => /coherence_app/i.test(p) && /column-level/i.test(p) && /coherence_bob/i.test(p)), `unexpected problems: ${bad.problems.join('; ')}`);
+        } finally {
+          await env.pool.query('REVOKE SELECT (policy_id) ON app_views.coherence_bob FROM coherence_app');
+        }
+      } finally {
+        if (!hasLegacyRole) {
+          await env.pool.query('DROP ROLE IF EXISTS coherence_app');
+        }
+      }
+    });
   });
 });
 
@@ -5801,5 +5989,480 @@ test('Layer 7B [Release C1 Item 8 - Time-Consistent Chains in iam.v_organization
       assert.notEqual(histBatch.agency_net_total, null, 'Nusear Owner bypasses tool switches and keeps batch totals');
       assert.notEqual(histBatch.upline_net_total, null);
     });
+  });
+});
+
+test('Layer 7B [Release C2 - Holding Company Above Tenant]: non-internal org above tenant is followed only through today live chains (live parent and grandparent reach tenant; expired former parent and expired grandparent do not; tool switches follow same rule)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createCoherenceIamTestEnv();
+  t.after(() => env.cleanup());
+
+  const { ids, keyId, secretBytes, environment } = await seedCoherenceIamWorld(env.pool);
+  const tok = (personId, viewAsPersonId = null) => mintSignedToken({
+    keyId, secretBytes, environment, actorPersonId: personId, viewAsPersonId,
+  });
+
+  const holdingCo = randomUUID();
+  const formerParentCo = randomUUID();
+  const grandHoldingCo = randomUUID();
+  const expiredGrandHoldingCo = randomUUID();
+  const sisterCo = randomUUID();
+  const archivedAgency = randomUUID();
+  const movedOutAgency = randomUUID();
+
+  const holdingExec = randomUUID();
+  const holdingNoDesc = randomUUID();
+  const holdingMemTenantGrant = randomUUID();
+  const grandHoldingExec = randomUUID();
+  const expiredGrandExec = randomUUID();
+  const formerParentExec = randomUUID();
+  const formerParentMemTenantGrant = randomUUID();
+  const sisterExec = randomUUID();
+  const roleHoldingWriter = randomUUID();
+
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_holding_setup', commandKey: 'c2-holding-setup' });
+    const seq = j.seq;
+
+    for (const [oid, kind, slug, name, status] of [
+      [grandHoldingCo, 'company', 'grand_holding', 'Grand Holding Co', 'active'],
+      [expiredGrandHoldingCo, 'company', 'expired_grand_holding', 'Expired Grand Holding Co', 'active'],
+      [holdingCo, 'company', 'holding_co', 'Holding Co', 'active'],
+      [formerParentCo, 'company', 'former_parent', 'Former Parent Co', 'active'],
+      [sisterCo, 'company', 'sister_co', 'Sister Co', 'active'],
+      [archivedAgency, 'agency', 'archived_old_ag', 'Archived Old Agency', 'archived'],
+      [movedOutAgency, 'agency', 'moved_out_ag', 'Moved Out Agency', 'active'],
+    ]) {
+      await c.query('INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,$2,$3)', [oid, kind, seq]);
+      await c.query(
+        'INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6)',
+        [randomUUID(), oid, slug, name, status, seq],
+      );
+    }
+
+    // Reparent acmeOrg: under formerParentCo [2020-01-01, 2025-01-01), then under holdingCo [2025-01-01, ).
+    const acmeEdgeId = (await c.query(
+      'SELECT id FROM iam.organization_edges WHERE child_org_id = $1 AND superseded_by_id IS NULL',
+      [ids.acmeOrg],
+    )).rows[0].id;
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, replaces_id, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2025-01-01)'::daterange,'active',$4,$5)",
+      [randomUUID(), ids.acmeOrg, formerParentCo, acmeEdgeId, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2025-01-01,)'::daterange,'active',$4)",
+      [randomUUID(), ids.acmeOrg, holdingCo, seq],
+    );
+
+    // Parent chains above holdingCo and formerParentCo, plus sisterCo and historical agencies under acmeOrg.
+    for (const [child, parent, rng] of [
+      [grandHoldingCo, ids.rootOrg, '[2020-01-01,)'],
+      [expiredGrandHoldingCo, ids.rootOrg, '[2020-01-01,)'],
+      [formerParentCo, ids.rootOrg, '[2020-01-01,)'],
+      [holdingCo, expiredGrandHoldingCo, '[2020-01-01,2024-01-01)'],
+      [holdingCo, grandHoldingCo, '[2024-01-01,)'],
+      [sisterCo, holdingCo, '[2025-01-01,)'],
+      [archivedAgency, ids.acmeOrg, '[2020-01-01,2024-06-01)'],
+      [movedOutAgency, ids.acmeOrg, '[2020-01-01,2024-06-01)'],
+      [movedOutAgency, ids.northstarOrg, '[2024-06-01,)'],
+    ]) {
+      await c.query(
+        "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4::daterange,'active',$5)",
+        [randomUUID(), child, parent, rng, seq],
+      );
+    }
+
+    // Non-internal write+read role for testing assert_can_write from holding company vs former parent.
+    await c.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleHoldingWriter, 'holding_writer', seq]);
+    await c.query(
+      "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Holding Writer',false,false,true,'active',$3)",
+      [randomUUID(), roleHoldingWriter, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.inputs.publish','active',$3)",
+      [randomUUID(), roleHoldingWriter, seq],
+    );
+
+    for (const [pid, name, email, memOrg] of [
+      [holdingExec, 'Holding Exec', 'holding.exec@example.test', holdingCo],
+      [holdingNoDesc, 'Holding NoDesc', 'holding.nodesc@example.test', holdingCo],
+      [holdingMemTenantGrant, 'Holding Mem Tenant Grant', 'holding.mem.tenant@example.test', holdingCo],
+      [grandHoldingExec, 'Grand Holding Exec', 'grand.exec@example.test', grandHoldingCo],
+      [expiredGrandExec, 'Expired Grand Exec', 'expired.grand@example.test', expiredGrandHoldingCo],
+      [formerParentExec, 'Former Parent Exec', 'former.parent@example.test', formerParentCo],
+      [formerParentMemTenantGrant, 'Former Parent Mem Tenant', 'former.mem.tenant@example.test', formerParentCo],
+      [sisterExec, 'Sister Exec', 'sister.exec@example.test', sisterCo],
+    ]) {
+      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
+      await c.query(
+        "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)",
+        [randomUUID(), pid, name, email, seq],
+      );
+      await c.query(
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'owner','[2020-01-01,)'::daterange,'active',$4)",
+        [randomUUID(), pid, memOrg, seq],
+      );
+    }
+
+    for (const [pid, roleId, orgId, incDesc] of [
+      [holdingExec, ids.roleEntityManager, holdingCo, true],
+      [holdingExec, roleHoldingWriter, holdingCo, true],
+      [holdingNoDesc, ids.roleEntityManager, holdingCo, false],
+      [holdingMemTenantGrant, ids.roleEntityManager, ids.acmeOrg, true],
+      [grandHoldingExec, ids.roleEntityManager, grandHoldingCo, true],
+      [expiredGrandExec, ids.roleEntityManager, expiredGrandHoldingCo, true],
+      [expiredGrandExec, ids.roleEntityManager, holdingCo, true],
+      [formerParentExec, ids.roleEntityManager, formerParentCo, true],
+      [formerParentExec, roleHoldingWriter, formerParentCo, true],
+      [formerParentMemTenantGrant, ids.roleEntityManager, ids.acmeOrg, true],
+      [formerParentMemTenantGrant, roleHoldingWriter, ids.acmeOrg, true],
+      [sisterExec, ids.roleEntityManager, sisterCo, true],
+    ]) {
+      await c.query(
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,'org_subtree','[2020-01-01,)'::daterange,'active',$6)",
+        [randomUUID(), pid, roleId, orgId, incDesc, seq],
+      );
+    }
+  });
+
+  await seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'c2-hold-r1', markSent: true });
+  await env.commands.recordStatementBatch({
+    dbToken: env.ownerToken,
+    commandKey: 'c2-hold-hist-batch',
+    batchKind: 'historical_sent',
+    statementDate: '2024-05-31',
+    reason: 'Historical rows for archived and moved-out agencies under Acme',
+    agencyLines: [
+      {
+        entity: 'Archived Old Agency', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~ARCHOLD~50.00~2024-05', sourceFile: 'hist.csv', sourceRowNo: 1,
+        grossComm: '50.00', amount: '40.00',
+      },
+      {
+        entity: 'Moved Out Agency', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~MOVEDOUT~60.00~2024-05', sourceFile: 'hist.csv', sourceRowNo: 2,
+        grossComm: '60.00', amount: '48.00',
+      },
+    ],
+    uplineLines: [],
+  });
+  await env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys()');
+
+  const expectedLiveTenantOrgs = [ids.acmeOrg, ids.beaconOrg, ids.harborOrg, ids.eastTeamOrg].sort();
+
+  // 1. Live holding company and live grandparent reach the tenant's live tree (strictly tenant-bounded: no holdingCo/sisterCo/archived/movedOut).
+  for (const [label, pid] of [
+    ['holdingExec', holdingExec],
+    ['grandHoldingExec', grandHoldingExec],
+    ['View-as holdingExec', null],
+  ]) {
+    const token = pid ? tok(pid) : tok(ids.nusearOwner, holdingExec);
+    await runAsPlatformApp(env.pool, { token, readOnly: true }, async (c) => {
+      const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v.sort();
+      assert.deepEqual(wide, expectedLiveTenantOrgs, `${label} must reach Acme live tree only (no holdingCo, sisterCo, archived, or movedOut)`);
+      const bobEntities = (await c.query('SELECT DISTINCT entity FROM app_views.coherence_bob ORDER BY entity')).rows.map((r) => r.entity);
+      assert.deepEqual(bobEntities, ['Beacon', 'East Team', 'Harbor'], `${label} must read Acme BoB rows`);
+      const histCount = (await c.query(
+        "SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines WHERE entity IN ('Archived Old Agency', 'Moved Out Agency')",
+      )).rows[0].n;
+      assert.equal(histCount, 0, `${label} (above tenant, live chains only) must not read pre-acquisition archived/moved-out agency rows`);
+    });
+  }
+
+  // Holding company member with direct grant on tenant reaches tenant's live AND historical tree (grant anchored at tenant).
+  await runAsPlatformApp(env.pool, { token: tok(holdingMemTenantGrant), readOnly: true }, async (c) => {
+    const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v;
+    assert.ok(wide.includes(ids.acmeOrg) && wide.includes(ids.beaconOrg) && wide.includes(archivedAgency) && wide.includes(movedOutAgency));
+    assert.ok(!wide.includes(holdingCo) && !wide.includes(sisterCo));
+  });
+
+  // Holding company executive can authorize writes at tenantOrg via assert_can_write.
+  const holdWrite = await runAsPlatformApp(env.pool, { token: tok(holdingExec), readOnly: true }, (c) => (
+    c.query("SELECT actor_person_id, recorded_as FROM iam.assert_can_write('act:coherence.inputs.publish', $1::uuid)", [ids.acmeOrg])
+  ));
+  assert.equal(holdWrite.rows[0].actor_person_id, holdingExec);
+  assert.equal(holdWrite.rows[0].recorded_as, 'self');
+
+  // 2. Expired former parent, expired grandparent, non-descending holding grant, and sister company get 0 orgs and 0 rows everywhere.
+  for (const [label, token] of [
+    ['holdingNoDesc', tok(holdingNoDesc)],
+    ['expiredGrandExec', tok(expiredGrandExec)],
+    ['formerParentExec', tok(formerParentExec)],
+    ['View-as formerParentExec', tok(ids.nusearOwner, formerParentExec)],
+    ['formerParentMemTenantGrant', tok(formerParentMemTenantGrant)],
+    ['sisterExec', tok(sisterExec)],
+  ]) {
+    await runAsPlatformApp(env.pool, { token, readOnly: true }, async (c) => {
+      assert.deepEqual((await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], `${label} must get 0 wide orgs`);
+      assert.deepEqual((await c.query("SELECT iam.effective_any_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], `${label} must get 0 any orgs`);
+      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n, 0, `${label} must see 0 BoB rows`);
+      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n, 0, `${label} must see 0 statement lines`);
+      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger')).rows[0].n, 0, `${label} must see 0 ledger rows`);
+    });
+  }
+
+  for (const [label, pid] of [['formerParentExec', formerParentExec], ['formerParentMemTenantGrant', formerParentMemTenantGrant]]) {
+    await assert.rejects(
+      () => runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, (c) => (
+        c.query("SELECT * FROM iam.assert_can_write('act:coherence.inputs.publish', $1::uuid)", [ids.acmeOrg])
+      )),
+      (err) => err?.code === '42501',
+      `${label} must be refused 42501 on iam.assert_can_write`,
+    );
+  }
+
+  // 3. Tool switches above the tenant: expired former parent switch=off/held has ZERO effect; live holdingCo switch=held vetoes non-internal callers while Nusear internal bypasses.
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_former_parent_off', commandKey: 'c2-former-parent-off' });
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','off','active',$3)",
+      [randomUUID(), formerParentCo, j.seq],
+    );
+  });
+  for (const [label, pid] of [['acmeEntityMgr', ids.acmeEntityMgr], ['holdingExec', holdingExec]]) {
+    await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+      assert.ok((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n > 0, `former parent switch=off must not block ${label}`);
+    });
+  }
+
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_holding_held', commandKey: 'c2-holding-held' });
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, hold_reason, status, journal_seq) VALUES ($1,$2,'coherence','held','holding company hold','active',$3)",
+      [randomUUID(), holdingCo, j.seq],
+    );
+  });
+  for (const [label, pid] of [['acmeEntityMgr', ids.acmeEntityMgr], ['holdingExec', holdingExec], ['holdingMemTenantGrant', holdingMemTenantGrant]]) {
+    await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+      assert.deepEqual((await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], `live holdingCo switch=held must veto ${label} (including archived/moved orgs)`);
+      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n, 0, `live holdingCo switch=held must hide all statement lines from ${label}`);
+    });
+  }
+  await runAsPlatformApp(env.pool, { token: tok(ids.nusearOwner), readOnly: true }, async (c) => {
+    const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v;
+    assert.ok(wide.includes(ids.acmeOrg) && wide.includes(archivedAgency) && wide.includes(movedOutAgency), 'Nusear Owner must bypass holdingCo switch=held and retain live + historical orgs');
+  });
+});
+
+test('Layer 7B [Release C2 Fix1 - Unified Tool-Switch Chain]: holdingCo preview with root on blocks live/archived/moved-out orgs, expired direct root edge cannot bypass holdingCo or grandHoldingCo preview, and on-only at holdingCo reaches live/archived/moved-out orgs for Entity Manager', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createCoherenceIamTestEnv();
+  t.after(() => env.cleanup());
+
+  const { ids, keyId, secretBytes, environment } = await seedCoherenceIamWorld(env.pool);
+  const tok = (personId, viewAsPersonId = null) => mintSignedToken({
+    keyId, secretBytes, environment, actorPersonId: personId, viewAsPersonId,
+  });
+
+  const grandHoldingCo = randomUUID();
+  const holdingCo = randomUUID();
+  const archivedAgency = randomUUID();
+  const movedOutAgency = randomUUID();
+  const holdingExec = randomUUID();
+
+  let acmeSwitchId;
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_fix1_switch_setup', commandKey: 'c2-fix1-switch-setup' });
+    const seq = j.seq;
+
+    for (const [oid, kind, slug, name, status] of [
+      [grandHoldingCo, 'company', 'grand_holding_sw', 'Grand Holding SW', 'active'],
+      [holdingCo, 'company', 'holding_sw', 'Holding SW', 'active'],
+      [archivedAgency, 'agency', 'archived_sw_ag', 'Archived SW Agency', 'archived'],
+      [movedOutAgency, 'agency', 'moved_out_sw_ag', 'Moved Out SW Agency', 'active'],
+    ]) {
+      await c.query('INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,$2,$3)', [oid, kind, seq]);
+      await c.query(
+        'INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6)',
+        [randomUUID(), oid, slug, name, status, seq],
+      );
+    }
+
+    // Tenant acmeOrg moved from DIRECTLY under rootOrg [2020-01-01, 2025-01-01) to under holdingCo [2025-01-01, ),
+    // with holdingCo -> grandHoldingCo -> rootOrg live today.
+    const acmeEdgeId = (await c.query(
+      'SELECT id FROM iam.organization_edges WHERE child_org_id = $1 AND superseded_by_id IS NULL',
+      [ids.acmeOrg],
+    )).rows[0].id;
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, replaces_id, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2025-01-01)'::daterange,'active',$4,$5)",
+      [randomUUID(), ids.acmeOrg, ids.rootOrg, acmeEdgeId, seq],
+    );
+    for (const [child, parent, rng] of [
+      [grandHoldingCo, ids.rootOrg, '[2020-01-01,)'],
+      [holdingCo, grandHoldingCo, '[2020-01-01,)'],
+      [ids.acmeOrg, holdingCo, '[2025-01-01,)'],
+      [archivedAgency, ids.acmeOrg, '[2020-01-01,2024-06-01)'],
+      [movedOutAgency, ids.acmeOrg, '[2020-01-01,2024-06-01)'],
+      [movedOutAgency, ids.northstarOrg, '[2024-06-01,)'],
+    ]) {
+      await c.query(
+        "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4::daterange,'active',$5)",
+        [randomUUID(), child, parent, rng, seq],
+      );
+    }
+
+    await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [holdingExec, seq]);
+    await c.query(
+      "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'Holding SW Exec','Holding SW Exec','holding.sw.exec@example.test','active',$3)",
+      [randomUUID(), holdingExec, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'owner','[2020-01-01,)'::daterange,'active',$4)",
+      [randomUUID(), holdingExec, holdingCo, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+      [randomUUID(), holdingExec, ids.roleEntityManager, holdingCo, seq],
+    );
+
+    acmeSwitchId = (await c.query(
+      "SELECT id FROM iam.organization_tool_switches WHERE organization_id = $1 AND tool_id = 'coherence' AND superseded_by_id IS NULL",
+      [ids.acmeOrg],
+    )).rows[0].id;
+  });
+
+  await seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'c2-fix1-sw-r1', markSent: true });
+  await env.commands.recordStatementBatch({
+    dbToken: env.ownerToken,
+    commandKey: 'c2-fix1-sw-hist-batch',
+    batchKind: 'historical_sent',
+    statementDate: '2024-05-31',
+    reason: 'Historical rows for archived and moved-out agencies under Acme',
+    agencyLines: [
+      {
+        entity: 'Archived SW Agency', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~ARCHSW~50.00~2024-05', sourceFile: 'hist_sw.csv', sourceRowNo: 1,
+        grossComm: '50.00', amount: '40.00',
+      },
+      {
+        entity: 'Moved Out SW Agency', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~MOVEDSW~60.00~2024-05', sourceFile: 'hist_sw.csv', sourceRowNo: 2,
+        grossComm: '60.00', amount: '48.00',
+      },
+    ],
+    uplineLines: [],
+  });
+  await env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys()');
+
+  const expectedLiveOrgs = [ids.acmeOrg, ids.beaconOrg, ids.harborOrg, ids.eastTeamOrg].sort();
+  const expectedAllTenantOrgs = [...expectedLiveOrgs, archivedAgency, movedOutAgency].sort();
+
+  // 1. 'on' ONLY on holdingCo (revoke acmeOrg's own switch; no switch on rootOrg) reaches live, archived, and moved-out orgs for acmeEntityMgr.
+  const holdingOnId = randomUUID();
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_fix1_holding_only_on', commandKey: 'c2-fix1-holding-only-on' });
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, replaces_id, journal_seq) VALUES ($1,$2,'coherence','on','revoked',$3,$4)",
+      [randomUUID(), ids.acmeOrg, acmeSwitchId, j.seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','on','active',$3)",
+      [holdingOnId, holdingCo, j.seq],
+    );
+  });
+
+  await runAsPlatformApp(env.pool, { token: tok(ids.acmeEntityMgr), readOnly: true }, async (c) => {
+    const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v.sort();
+    assert.deepEqual(wide, expectedAllTenantOrgs, 'on-only at holdingCo must reach live, archived, and moved-out orgs for tenant Entity Manager');
+    const bobEntities = (await c.query('SELECT DISTINCT entity FROM app_views.coherence_bob ORDER BY entity')).rows.map((r) => r.entity);
+    assert.deepEqual(bobEntities, ['Beacon', 'East Team', 'Harbor'], 'on-only at holdingCo must expose live BoB rows to tenant Entity Manager');
+    const histEntities = (await c.query(
+      "SELECT DISTINCT entity FROM app_views.coherence_statement_agency_lines WHERE entity IN ('Archived SW Agency', 'Moved Out SW Agency') ORDER BY entity",
+    )).rows.map((r) => r.entity);
+    assert.deepEqual(histEntities, ['Archived SW Agency', 'Moved Out SW Agency'], 'on-only at holdingCo must expose archived and moved-out statement rows to tenant Entity Manager');
+  });
+
+  await runAsPlatformApp(env.pool, { token: tok(holdingExec), readOnly: true }, async (c) => {
+    const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v.sort();
+    assert.deepEqual(wide, expectedLiveOrgs, 'holdingExec (grant above tenant) still reaches only live tenant orgs');
+  });
+
+  // 2. holdingCo 'preview' with rootOrg 'on' (plus expired direct rootOrg -> acmeOrg edge) blocks live, archived, and moved-out orgs alike.
+  const rootOnId = randomUUID();
+  const holdingPreviewId = randomUUID();
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_fix1_holding_preview_root_on', commandKey: 'c2-fix1-holding-preview-root-on' });
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','on','active',$3)",
+      [rootOnId, ids.rootOrg, j.seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, replaces_id, journal_seq) VALUES ($1,$2,'coherence','preview','active',$3,$4)",
+      [holdingPreviewId, holdingCo, holdingOnId, j.seq],
+    );
+  });
+
+  for (const [label, pid] of [['acmeEntityMgr', ids.acmeEntityMgr], ['holdingExec', holdingExec]]) {
+    await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+      assert.deepEqual(
+        (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v,
+        [],
+        `holdingCo preview with root on must block live, archived, and moved-out orgs for ${label}`,
+      );
+      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n, 0, `holdingCo preview must hide BoB from ${label}`);
+      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n, 0, `holdingCo preview must hide live, archived, and moved-out statements from ${label}`);
+    });
+  }
+  await runAsPlatformApp(env.pool, { token: tok(ids.nusearOwner), readOnly: true }, async (c) => {
+    const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v.sort();
+    assert.deepEqual(wide, expectedAllTenantOrgs, 'Nusear Owner must bypass holdingCo preview and retain live, archived, and moved-out orgs');
+  });
+
+  // 3. grandHoldingCo 'preview' (depth 2 above tenant) with rootOrg 'on' and expired direct rootOrg -> acmeOrg edge (depth 1):
+  //    the expired depth-1 root edge must NOT outrank or bypass live grandHoldingCo 'preview'.
+  const grandPreviewId = randomUUID();
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_fix1_grand_preview_root_on', commandKey: 'c2-fix1-grand-preview-root-on' });
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, replaces_id, journal_seq) VALUES ($1,$2,'coherence','preview','revoked',$3,$4)",
+      [randomUUID(), holdingCo, holdingPreviewId, j.seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','preview','active',$3)",
+      [grandPreviewId, grandHoldingCo, j.seq],
+    );
+  });
+
+  for (const [label, pid] of [['acmeEntityMgr', ids.acmeEntityMgr], ['holdingExec', holdingExec]]) {
+    await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+      assert.deepEqual(
+        (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v,
+        [],
+        `expired direct rootOrg edge must not bypass live grandHoldingCo preview for ${label}`,
+      );
+      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n, 0);
+      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n, 0);
+    });
+  }
+
+  // 4. Once grandHoldingCo preview is revoked, rootOrg 'on' falls through last; rootOrg 'held' vetoes holdingCo 'on'.
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_fix1_root_fallback', commandKey: 'c2-fix1-root-fallback' });
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, replaces_id, journal_seq) VALUES ($1,$2,'coherence','preview','revoked',$3,$4)",
+      [randomUUID(), grandHoldingCo, grandPreviewId, j.seq],
+    );
+  });
+  await runAsPlatformApp(env.pool, { token: tok(ids.acmeEntityMgr), readOnly: true }, async (c) => {
+    const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v.sort();
+    assert.deepEqual(wide, expectedAllTenantOrgs, 'rootOrg on must fall through last when no closer ancestor sets a switch');
+  });
+
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_fix1_root_held_veto', commandKey: 'c2-fix1-root-held-veto' });
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','on','active',$3)",
+      [randomUUID(), holdingCo, j.seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, hold_reason, status, replaces_id, journal_seq) VALUES ($1,$2,'coherence','held','root hold','active',$3,$4)",
+      [randomUUID(), ids.rootOrg, rootOnId, j.seq],
+    );
+  });
+  await runAsPlatformApp(env.pool, { token: tok(ids.acmeEntityMgr), readOnly: true }, async (c) => {
+    assert.deepEqual(
+      (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v,
+      [],
+      'rootOrg held switch must still veto holdingCo on across live, archived, and moved-out orgs',
+    );
   });
 });

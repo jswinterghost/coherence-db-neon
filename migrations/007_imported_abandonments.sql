@@ -50,15 +50,4 @@ BEGIN
 END;
 $$;
 
-DO $$
-DECLARE
-  v_role text;
-BEGIN
-  REVOKE ALL ON FUNCTION coherence.trg_abandonments_before() FROM PUBLIC;
-  FOREACH v_role IN ARRAY ARRAY['coherence_readonly', 'coherence_app', 'coherence_worker'] LOOP
-    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = v_role) THEN
-      EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION coherence.trg_abandonments_before() TO %I', v_role);
-    END IF;
-  END LOOP;
-END;
-$$;
+REVOKE ALL ON FUNCTION coherence.trg_abandonments_before() FROM PUBLIC;

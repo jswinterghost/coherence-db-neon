@@ -39,7 +39,10 @@ export const ALL_BUSINESS_TABLES = Object.freeze([
   'checks',
 ]);
 
-export const SCOPED_RECIPIENT_ROLES = Object.freeze([
+export const RETIRED_COHERENCE_ROLES = Object.freeze([
+  'coherence_app',
+  'coherence_worker',
+  'coherence_readonly',
   'coherence_entity_manager_ro',
   'coherence_agency_manager_ro',
   'coherence_agent_ro',
@@ -242,6 +245,13 @@ export const CLOUDSQL_IAM_MEMBER_MARKER_ROLES = Object.freeze([
 const FORBIDDEN_BUSINESS_PRIVS = Object.freeze(['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']);
 const ALL_RELATION_PRIVS = Object.freeze(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
 const ALL_COLUMN_PRIVS = Object.freeze(['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']);
+const MANAGED_SCHEMAS = Object.freeze(['platform', 'iam_secret', 'iam', 'coherence', 'app_views', 'app_cmd']);
+
+function hasExactPrivileges(value, expected) {
+  if (!Array.isArray(value) || value.length !== expected.length) return false;
+  const set = new Set(value);
+  return set.size === expected.length && expected.every((item) => set.has(item));
+}
 
 export function parsePgHbaConf(text) {
   const rules = [];
@@ -389,10 +399,37 @@ export function validateCloudSqlConfig(config) {
     problems.push('databaseFlags["log_statement"] should be "none" (use pgaudit with log_parameter=off instead)');
   }
 
-  const roles = config.roles || {};
-  const appPrivs = roles.coherence_app?.businessTables;
-  if (!Array.isArray(appPrivs) || appPrivs.length !== 2 || !appPrivs.includes('SELECT') || !appPrivs.includes('INSERT')) {
-    problems.push('roles.coherence_app.businessTables must be strictly ["SELECT", "INSERT"]');
+  const roles = config.roles && typeof config.roles === 'object' ? config.roles : {};
+  for (const retiredRole of RETIRED_COHERENCE_ROLES) {
+    if (Object.prototype.hasOwnProperty.call(roles, retiredRole)) {
+      problems.push(`roles.${retiredRole} is a retired pre-IAM role and must not be declared`);
+    }
+  }
+  for (const roleName of PLATFORM_ROLES) {
+    if (!roles[roleName] || typeof roles[roleName] !== 'object') {
+      problems.push(`roles.${roleName} must be declared`);
+    }
+  }
+  if (!hasExactPrivileges(roles.platform_app?.businessTables, [])) {
+    problems.push('roles.platform_app.businessTables must be strictly [] (zero base-table access)');
+  }
+  if (!hasExactPrivileges(roles.platform_app?.appViews, ['SELECT'])) {
+    problems.push('roles.platform_app.appViews must be strictly ["SELECT"]');
+  }
+  if (!hasExactPrivileges(roles.platform_app?.appCmd, ['EXECUTE'])) {
+    problems.push('roles.platform_app.appCmd must be strictly ["EXECUTE"]');
+  }
+  if (!hasExactPrivileges(roles.platform_worker?.businessTables, ['SELECT'])) {
+    problems.push('roles.platform_worker.businessTables must be strictly ["SELECT"]');
+  }
+  if (!hasExactPrivileges(roles.platform_worker?.appCmd, ['EXECUTE'])) {
+    problems.push('roles.platform_worker.appCmd must be strictly ["EXECUTE"]');
+  }
+  if (!hasExactPrivileges(roles.platform_writer?.businessTables, ['SELECT', 'INSERT'])) {
+    problems.push('roles.platform_writer.businessTables must be strictly ["SELECT", "INSERT"]');
+  }
+  if (!hasExactPrivileges(roles.platform_readonly?.businessTables, ['SELECT'])) {
+    problems.push('roles.platform_readonly.businessTables must be strictly ["SELECT"]');
   }
 
   return { passed: problems.length === 0, problems };
@@ -405,222 +442,28 @@ export async function verifyCloudSqlConfigFile(filePath = DEFAULT_CLOUDSQL_CONFI
 }
 
 export async function verifyDatabaseConfigInvariants(pool) {
-  const problems = [];
-
-  for (const tbl of ALL_BUSINESS_TABLES) {
-    const fq = `coherence.${tbl}`;
-
-    const appRes = await pool.query(
-      `SELECT
-         pg_catalog.has_table_privilege('coherence_app', $1, 'SELECT') AS sel,
-         pg_catalog.has_table_privilege('coherence_app', $1, 'INSERT') AS ins,
-         pg_catalog.has_table_privilege('coherence_app', $1, 'UPDATE') AS upd,
-         pg_catalog.has_table_privilege('coherence_app', $1, 'DELETE') AS del,
-         pg_catalog.has_table_privilege('coherence_app', $1, 'TRUNCATE') AS trn,
-         pg_catalog.has_table_privilege('coherence_app', $1, 'REFERENCES') AS ref,
-         pg_catalog.has_table_privilege('coherence_app', $1, 'TRIGGER') AS trg`,
-      [fq],
-    );
-    const a = appRes.rows[0];
-    if (!a.sel || !a.ins) problems.push(`coherence_app missing SELECT or INSERT on ${fq}`);
-    for (const [k, label] of [['upd', 'UPDATE'], ['del', 'DELETE'], ['trn', 'TRUNCATE'], ['ref', 'REFERENCES'], ['trg', 'TRIGGER']]) {
-      if (a[k]) problems.push(`coherence_app has forbidden privilege ${label} on ${fq}`);
-    }
-
-    const wrkRes = await pool.query(
-      `SELECT
-         pg_catalog.has_table_privilege('coherence_worker', $1, 'SELECT') AS sel,
-         pg_catalog.has_table_privilege('coherence_worker', $1, 'INSERT') AS ins,
-         pg_catalog.has_table_privilege('coherence_worker', $1, 'UPDATE') AS upd,
-         pg_catalog.has_table_privilege('coherence_worker', $1, 'DELETE') AS del,
-         pg_catalog.has_table_privilege('coherence_worker', $1, 'TRUNCATE') AS trn,
-         pg_catalog.has_table_privilege('coherence_worker', $1, 'REFERENCES') AS ref,
-         pg_catalog.has_table_privilege('coherence_worker', $1, 'TRIGGER') AS trg`,
-      [fq],
-    );
-    const w = wrkRes.rows[0];
-    if (!w.sel || !w.ins) problems.push(`coherence_worker missing SELECT or INSERT on ${fq}`);
-    for (const [k, label] of [['upd', 'UPDATE'], ['del', 'DELETE'], ['trn', 'TRUNCATE'], ['ref', 'REFERENCES'], ['trg', 'TRIGGER']]) {
-      if (w[k]) problems.push(`coherence_worker has forbidden privilege ${label} on ${fq}`);
-    }
-
-    const roRes = await pool.query(
-      `SELECT
-         pg_catalog.has_table_privilege('coherence_readonly', $1, 'SELECT') AS sel,
-         pg_catalog.has_table_privilege('coherence_readonly', $1, 'INSERT') AS ins,
-         pg_catalog.has_table_privilege('coherence_readonly', $1, 'UPDATE') AS upd,
-         pg_catalog.has_table_privilege('coherence_readonly', $1, 'DELETE') AS del,
-         pg_catalog.has_table_privilege('coherence_readonly', $1, 'TRUNCATE') AS trn`,
-      [fq],
-    );
-    const ro = roRes.rows[0];
-    if (!ro.sel) problems.push(`coherence_readonly missing SELECT on ${fq}`);
-    for (const [k, label] of [['ins', 'INSERT'], ['upd', 'UPDATE'], ['del', 'DELETE'], ['trn', 'TRUNCATE']]) {
-      if (ro[k]) problems.push(`coherence_readonly has forbidden privilege ${label} on ${fq}`);
-    }
-
-    const pubRes = await pool.query(
-      `SELECT
-         pg_catalog.has_table_privilege('public', $1, 'SELECT') AS sel,
-         pg_catalog.has_table_privilege('public', $1, 'INSERT') AS ins,
-         pg_catalog.has_table_privilege('public', $1, 'UPDATE') AS upd,
-         pg_catalog.has_table_privilege('public', $1, 'DELETE') AS del,
-         pg_catalog.has_table_privilege('public', $1, 'TRUNCATE') AS trn`,
-      [fq],
-    );
-    const pub = pubRes.rows[0];
-    for (const [k, label] of [['sel', 'SELECT'], ['ins', 'INSERT'], ['upd', 'UPDATE'], ['del', 'DELETE'], ['trn', 'TRUNCATE']]) {
-      if (pub[k]) problems.push(`PUBLIC has forbidden privilege ${label} on ${fq}`);
-    }
-  }
-
-  const subPrivRes = await pool.query(
-    `SELECT
-       pg_catalog.has_table_privilege('coherence_app', 'coherence.review_submissions', 'UPDATE') AS app_upd,
-       pg_catalog.has_table_privilege('coherence_app', 'coherence.review_submissions', 'DELETE') AS app_del,
-       pg_catalog.has_table_privilege('coherence_app', 'coherence.review_submissions', 'TRUNCATE') AS app_trn,
-       pg_catalog.has_table_privilege('coherence_worker', 'coherence.review_submissions', 'DELETE') AS wrk_del,
-       pg_catalog.has_table_privilege('coherence_worker', 'coherence.review_submissions', 'TRUNCATE') AS wrk_trn`,
-  );
-  const sp = subPrivRes.rows[0];
-  if (sp.app_upd || sp.app_del || sp.app_trn) {
-    problems.push('coherence_app must not have UPDATE, DELETE, or TRUNCATE on coherence.review_submissions');
-  }
-  if (sp.wrk_del || sp.wrk_trn) {
-    problems.push('coherence_worker must not have DELETE or TRUNCATE on coherence.review_submissions');
-  }
-
-  const schemaPub = await pool.query(
-    `SELECT pg_catalog.has_schema_privilege('public', 'coherence', 'USAGE') AS usage,
-            pg_catalog.has_schema_privilege('public', 'coherence', 'CREATE') AS create,
-            pg_catalog.has_schema_privilege('public', 'coherence_views', 'USAGE') AS views_usage,
-            pg_catalog.has_schema_privilege('public', 'coherence_views', 'CREATE') AS views_create`,
-  );
-  if (schemaPub.rows[0].usage || schemaPub.rows[0].create) {
-    problems.push('PUBLIC must have zero privileges on schema coherence');
-  }
-  if (schemaPub.rows[0].views_usage || schemaPub.rows[0].views_create) {
-    problems.push('PUBLIC must have zero privileges on schema coherence_views');
-  }
-
-  for (const roleName of SCOPED_RECIPIENT_ROLES) {
-    const roleRes = await pool.query(
-      'SELECT rolname, rolinherit, rolbypassrls, rolcanlogin FROM pg_catalog.pg_roles WHERE rolname = $1',
-      [roleName],
-    );
-    if (roleRes.rows.length === 0) {
-      problems.push(`Missing scoped read-only role ${roleName}`);
-      continue;
-    }
-    const r = roleRes.rows[0];
-    if (r.rolbypassrls) problems.push(`Scoped role ${roleName} must have NOBYPASSRLS`);
-    if (r.rolinherit) problems.push(`Scoped role ${roleName} must have NOINHERIT`);
-    for (const internalTbl of ['journal_entries', 'decision_commits', 'decisions', 'engine_versions', 'stored_files', 'input_versions', 'input_entries']) {
-      const privRes = await pool.query(
-        "SELECT pg_catalog.has_table_privilege($1, $2, 'SELECT') AS sel, pg_catalog.has_table_privilege($1, $2, 'INSERT') AS ins",
-        [roleName, `coherence.${internalTbl}`],
-      );
-      if (privRes.rows[0].sel || privRes.rows[0].ins) {
-        problems.push(`Scoped role ${roleName} must not have access to coherence.${internalTbl}`);
-      }
-    }
-  }
-
-  for (const rlsTbl of [...ALL_BUSINESS_TABLES, 'review_submissions', 'review_drafts']) {
-    const rlsRes = await pool.query(
-      `SELECT c.relrowsecurity, c.relforcerowsecurity,
-              (SELECT pg_catalog.count(*)::int FROM pg_catalog.pg_policies p
-               WHERE p.schemaname = 'coherence' AND p.tablename = c.relname) AS pol_cnt
-       FROM pg_catalog.pg_class c
-       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-       WHERE n.nspname = 'coherence' AND c.relname = $1`,
-      [rlsTbl],
-    );
-    if (rlsRes.rows.length === 0 || !rlsRes.rows[0].relrowsecurity || !rlsRes.rows[0].relforcerowsecurity) {
-      problems.push(`Table coherence.${rlsTbl} must have ENABLE + FORCE ROW LEVEL SECURITY`);
-    } else if (rlsRes.rows[0].pol_cnt < 1) {
-      problems.push(`Table coherence.${rlsTbl} must have at least one RLS policy`);
-    }
-  }
-
-  const trigRes = await pool.query(
-    `SELECT c.relname AS table_name,
-            t.tgname AS trigger_name,
-            t.tgenabled,
-            pg_catalog.pg_get_triggerdef(t.oid) AS def
-     FROM pg_catalog.pg_trigger t
-     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
-     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = 'coherence' AND NOT t.tgisinternal`,
-  );
-  const trigByKey = new Map(trigRes.rows.map((r) => [`${r.table_name}:${r.trigger_name}`, r]));
-
-  for (const tbl of ALL_BUSINESS_TABLES) {
-    const tr = trigByKey.get(`${tbl}:trg_immutable`);
-    if (!tr) {
-      problems.push(`Missing append-only trigger trg_immutable on coherence.${tbl}`);
-      continue;
-    }
-    if (tr.tgenabled !== 'A') {
-      problems.push(`Trigger trg_immutable on coherence.${tbl} must be ENABLE ALWAYS (tgenabled='A'), got '${tr.tgenabled}'`);
-    }
-    for (const op of ['BEFORE', 'UPDATE', 'DELETE', 'TRUNCATE', 'coherence.forbid_mutation']) {
-      if (!tr.def.includes(op)) {
-        problems.push(`Trigger trg_immutable on coherence.${tbl} definition missing ${op}: ${tr.def}`);
-      }
-    }
-  }
-
-  for (const trigName of ['trg_review_submissions_guard', 'trg_review_submissions_no_trunc']) {
-    const tr = trigByKey.get(`review_submissions:${trigName}`);
-    if (!tr || tr.tgenabled !== 'A') {
-      problems.push(`Trigger ${trigName} on coherence.review_submissions must exist and be ENABLE ALWAYS (tgenabled='A')`);
-    }
-  }
-
-  const fnRes = await pool.query(
-    `SELECT p.oid, n.nspname, p.proname, p.proconfig, pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec
-     FROM pg_catalog.pg_proc p
-     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-     WHERE n.nspname IN ('coherence', 'coherence_views')
-     ORDER BY n.nspname, p.proname`,
-  );
-  if (fnRes.rows.length === 0) {
-    problems.push('No functions found in schemas coherence / coherence_views');
-  }
-  for (const fn of fnRes.rows) {
-    const cfg = Array.isArray(fn.proconfig) ? fn.proconfig : [];
-    if (!cfg.includes('search_path=pg_catalog')) {
-      problems.push(`Function ${fn.nspname}.${fn.proname} does not pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
-    }
-    if (fn.pub_exec) {
-      problems.push(`PUBLIC has EXECUTE privilege on ${fn.nspname}.${fn.proname}`);
-    }
-  }
-
-  return {
-    passed: problems.length === 0,
-    checkedBusinessTables: ALL_BUSINESS_TABLES.length,
-    checkedFunctions: fnRes.rows.length,
-    forbiddenBusinessPrivileges: FORBIDDEN_BUSINESS_PRIVS,
-    problems,
-  };
+  return verifyIamConfigInvariants(pool);
 }
 
 export async function verifyIamConfigInvariants(pool) {
   const problems = [];
 
   // 1. All platform_* roles must exist and be non-superuser, NOINHERIT, NOBYPASSRLS.
+  const rolesRes = await pool.query(
+    `SELECT rolname, rolsuper, rolinherit, rolbypassrls, rolconfig
+     FROM pg_catalog.pg_roles
+     WHERE rolname = ANY($1::text[])`,
+    [[...PLATFORM_ROLES, ...RETIRED_COHERENCE_ROLES]],
+  );
+  const roleByName = new Map(rolesRes.rows.map((r) => [r.rolname, r]));
+  const existingRetiredRoles = RETIRED_COHERENCE_ROLES.filter((r) => roleByName.has(r));
+
   for (const roleName of PLATFORM_ROLES) {
-    const res = await pool.query(
-      'SELECT rolname, rolsuper, rolinherit, rolbypassrls, rolconfig FROM pg_catalog.pg_roles WHERE rolname = $1',
-      [roleName],
-    );
-    if (res.rows.length === 0) {
+    const r = roleByName.get(roleName);
+    if (!r) {
       problems.push(`Missing platform role ${roleName}`);
       continue;
     }
-    const r = res.rows[0];
     if (r.rolsuper) problems.push(`Role ${roleName} must not be SUPERUSER`);
     if (r.rolbypassrls) problems.push(`Role ${roleName} must have NOBYPASSRLS`);
     if (r.rolinherit) problems.push(`Role ${roleName} must have NOINHERIT`);
@@ -682,20 +525,50 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
 
-  // 2. PUBLIC must have zero privileges on all platform, IAM, Coherence, app_views, and app_cmd schemas.
-  const allManagedSchemas = ['platform', 'iam_secret', 'iam', 'coherence', 'coherence_views', 'app_views', 'app_cmd'];
-  for (const schema of allManagedSchemas) {
-    const res = await pool.query(
-      `SELECT pg_catalog.has_schema_privilege('public', $1, 'USAGE') AS u,
-              pg_catalog.has_schema_privilege('public', $1, 'CREATE') AS c`,
-      [schema],
-    );
-    if (res.rows[0].u || res.rows[0].c) {
-      problems.push(`PUBLIC must have zero privileges on schema ${schema}`);
+  // 2. Retired schema coherence_views must not exist; PUBLIC and retired roles hold zero privileges
+  //    on all managed schemas; platform_app holds USAGE strictly on iam, app_views, app_cmd and zero CREATE.
+  const retiredSchemaRes = await pool.query(
+    "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'coherence_views'",
+  );
+  if (retiredSchemaRes.rows.length > 0) {
+    problems.push('Retired schema coherence_views must not exist');
+  }
+
+  const schemaPrincipals = ['public', 'platform_app', ...existingRetiredRoles];
+  const schemaPrivRes = await pool.query(
+    `SELECT p.principal,
+            s.schema_name,
+            pg_catalog.has_schema_privilege(p.principal, s.schema_name, 'USAGE') AS has_usage,
+            pg_catalog.has_schema_privilege(p.principal, s.schema_name, 'CREATE') AS has_create
+     FROM pg_catalog.unnest($1::text[]) AS p(principal)
+     CROSS JOIN pg_catalog.unnest($2::text[]) AS s(schema_name)`,
+    [schemaPrincipals, MANAGED_SCHEMAS],
+  );
+  const allowedAppUsageSchemas = new Set(['iam', 'app_views', 'app_cmd']);
+  for (const row of schemaPrivRes.rows) {
+    if (row.principal === 'public') {
+      if (row.has_usage || row.has_create) {
+        problems.push(`PUBLIC must have zero privileges on schema ${row.schema_name}`);
+      }
+    } else if (row.principal === 'platform_app') {
+      if (!allowedAppUsageSchemas.has(row.schema_name) && row.has_usage) {
+        problems.push(`platform_app must not hold USAGE on schema ${row.schema_name}`);
+      }
+      if (row.has_create) {
+        problems.push(`platform_app must not hold CREATE on schema ${row.schema_name}`);
+      }
+    } else if (row.has_usage || row.has_create) {
+      problems.push(`Retired role ${row.principal} must have zero privileges on schema ${row.schema_name}`);
     }
   }
 
-  // 3. platform_app and PUBLIC must have ZERO privileges on EVERY base table in coherence, iam, iam_secret, platform.
+  // 3. Base-table lockdown (batched):
+  //    - platform_app, PUBLIC, and any existing retired roles hold ZERO relation/column privileges on all base tables.
+  //    - platform_worker holds SELECT on all 31 business tables, ZERO write privileges across coherence.* and platform.audit_journal,
+  //      and ZERO privileges on coherence.schema_migrations.
+  //    - platform_writer holds strictly SELECT and INSERT on all 31 business tables (no UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER/MAINTAIN)
+  //      and ZERO DELETE/TRUNCATE on coherence.review_submissions.
+  //    - platform_readonly holds strictly SELECT on all 31 business tables.
   const tblRes = await pool.query(
     `SELECT n.nspname AS table_schema,
             c.relname AS table_name,
@@ -706,81 +579,153 @@ export async function verifyIamConfigInvariants(pool) {
        AND c.relkind IN ('r', 'p')
      ORDER BY n.nspname, c.relname`,
   );
-  for (const row of tblRes.rows) {
-    const fq = `${row.table_schema}.${row.table_name}`;
-    for (const principal of ['platform_app', 'public']) {
-      for (const priv of ALL_RELATION_PRIVS) {
-        const pRes = await pool.query(
-          'SELECT pg_catalog.has_table_privilege($1, $2::oid, $3) AS has_priv',
-          [principal, row.table_oid, priv],
-        );
-        if (pRes.rows[0].has_priv) {
-          problems.push(`${principal} must not hold ${priv} on base table ${fq}`);
+  const cohBaseTbls = tblRes.rows.filter((r) => r.table_schema === 'coherence');
+  const cohTblSet = new Set(cohBaseTbls.map((r) => r.table_name));
+  const businessTblSet = new Set(ALL_BUSINESS_TABLES);
+  for (const tbl of [...ALL_BUSINESS_TABLES, 'review_submissions', 'review_drafts']) {
+    if (!cohTblSet.has(tbl)) {
+      problems.push(`Expected coherence base table coherence.${tbl} is missing`);
+    }
+  }
+
+  const baseTblOids = tblRes.rows.map((r) => r.table_oid);
+  const tblInfoByOid = new Map(tblRes.rows.map((r) => [Number(r.table_oid), r]));
+  const lockedPrincipals = ['platform_app', 'public', ...existingRetiredRoles];
+  const baseRelPrincipals = [...lockedPrincipals, 'platform_worker', 'platform_writer', 'platform_readonly'];
+
+  const [baseRelPrivRes, baseColPrivRes, pvSelRes] = await Promise.all([
+    pool.query(
+      `SELECT t.table_oid, p.principal, pr.priv
+       FROM pg_catalog.unnest($1::oid[]) AS t(table_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
+       WHERE pg_catalog.has_table_privilege(p.principal, t.table_oid, pr.priv)`,
+      [baseTblOids, baseRelPrincipals, ALL_RELATION_PRIVS],
+    ),
+    pool.query(
+      `SELECT t.table_oid, p.principal, pr.priv
+       FROM pg_catalog.unnest($1::oid[]) AS t(table_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
+       WHERE pg_catalog.has_any_column_privilege(p.principal, t.table_oid, pr.priv)`,
+      [baseTblOids, [...lockedPrincipals, 'platform_worker'], ALL_COLUMN_PRIVS],
+    ),
+    pool.query(
+      `SELECT t.table_oid
+       FROM pg_catalog.unnest($1::oid[]) AS t(table_oid)
+       WHERE pg_catalog.has_table_privilege('platform_view_owner', t.table_oid, 'SELECT')`,
+      [cohBaseTbls.map((r) => r.table_oid)],
+    ),
+  ]);
+
+  const lockedPrincipalSet = new Set(lockedPrincipals);
+  const workerForbiddenPrivs = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
+  const writerForbiddenBizPrivs = new Set(['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
+  const roForbiddenBizPrivs = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
+
+  const roleTablePrivs = new Map();
+  for (const row of baseRelPrivRes.rows) {
+    const tbl = tblInfoByOid.get(Number(row.table_oid));
+    const fq = `${tbl.table_schema}.${tbl.table_name}`;
+    const key = `${row.principal}:${fq}`;
+    let pset = roleTablePrivs.get(key);
+    if (!pset) {
+      pset = new Set();
+      roleTablePrivs.set(key, pset);
+    }
+    pset.add(row.priv);
+
+    if (lockedPrincipalSet.has(row.principal)) {
+      problems.push(`${row.principal} must not hold ${row.priv} on base table ${fq}`);
+    } else if (row.principal === 'platform_worker') {
+      if (tbl.table_schema === 'coherence') {
+        if (tbl.table_name === 'schema_migrations' || workerForbiddenPrivs.has(row.priv)) {
+          problems.push(`platform_worker must not hold ${row.priv} on base table ${fq}`);
         }
+      } else if (fq === 'platform.audit_journal' && workerForbiddenPrivs.has(row.priv)) {
+        problems.push(`platform_worker must not hold ${row.priv} on platform.audit_journal`);
       }
-      for (const priv of ALL_COLUMN_PRIVS) {
-        const cRes = await pool.query(
-          'SELECT pg_catalog.has_any_column_privilege($1, $2::oid, $3) AS has_priv',
-          [principal, row.table_oid, priv],
-        );
-        if (cRes.rows[0].has_priv) {
-          problems.push(`${principal} must not hold column-level ${priv} on base table ${fq}`);
-        }
+    } else if (row.principal === 'platform_writer' && tbl.table_schema === 'coherence') {
+      if (businessTblSet.has(tbl.table_name) && writerForbiddenBizPrivs.has(row.priv)) {
+        problems.push(`platform_writer has forbidden privilege ${row.priv} on ${fq}`);
+      } else if (tbl.table_name === 'review_submissions' && ['DELETE', 'TRUNCATE'].includes(row.priv)) {
+        problems.push(`platform_writer must not have ${row.priv} on coherence.review_submissions`);
+      }
+    } else if (row.principal === 'platform_readonly' && tbl.table_schema === 'coherence') {
+      if (businessTblSet.has(tbl.table_name) && roForbiddenBizPrivs.has(row.priv)) {
+        problems.push(`platform_readonly has forbidden privilege ${row.priv} on ${fq}`);
       }
     }
   }
 
-  // 4. platform_app schema lockdown: USAGE only on iam, app_views, app_cmd; ZERO CREATE everywhere;
-  //    ZERO privileges for platform_app and PUBLIC on EVERY view in coherence, coherence_views, iam, iam_secret, platform.
-  const allowedAppUsageSchemas = new Set(['iam', 'app_views', 'app_cmd']);
-  for (const schema of allManagedSchemas) {
-    const sRes = await pool.query(
-      `SELECT pg_catalog.has_schema_privilege('platform_app', $1, 'USAGE') AS u,
-              pg_catalog.has_schema_privilege('platform_app', $1, 'CREATE') AS c`,
-      [schema],
-    );
-    if (!allowedAppUsageSchemas.has(schema) && sRes.rows[0].u) {
-      problems.push(`platform_app must not hold USAGE on schema ${schema}`);
+  for (const tbl of ALL_BUSINESS_TABLES) {
+    const fq = `coherence.${tbl}`;
+    const writerSet = roleTablePrivs.get(`platform_writer:${fq}`);
+    if (!writerSet?.has('SELECT') || !writerSet?.has('INSERT')) {
+      problems.push(`platform_writer missing SELECT or INSERT on ${fq}`);
     }
-    if (sRes.rows[0].c) {
-      problems.push(`platform_app must not hold CREATE on schema ${schema}`);
+    if (!roleTablePrivs.get(`platform_readonly:${fq}`)?.has('SELECT')) {
+      problems.push(`platform_readonly missing SELECT on ${fq}`);
+    }
+    if (!roleTablePrivs.get(`platform_worker:${fq}`)?.has('SELECT')) {
+      problems.push(`platform_worker missing SELECT on ${fq}`);
     }
   }
+
+  for (const row of baseColPrivRes.rows) {
+    const tbl = tblInfoByOid.get(Number(row.table_oid));
+    const fq = `${tbl.table_schema}.${tbl.table_name}`;
+    if (lockedPrincipalSet.has(row.principal)) {
+      problems.push(`${row.principal} must not hold column-level ${row.priv} on base table ${fq}`);
+    } else if (row.principal === 'platform_worker' && tbl.table_schema === 'coherence') {
+      if (tbl.table_name === 'schema_migrations' || ['INSERT', 'UPDATE', 'REFERENCES'].includes(row.priv)) {
+        problems.push(`platform_worker must not hold column-level ${row.priv} on base table ${fq}`);
+      }
+    }
+  }
+
+  // 4. Views lockdown (batched): ZERO privileges for platform_app, PUBLIC, and retired roles on
+  //    every view in coherence, iam, iam_secret, platform.
   const viewRes = await pool.query(
     `SELECT n.nspname AS schema_name,
             c.relname AS view_name,
             c.oid AS view_oid
      FROM pg_catalog.pg_class c
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname IN ('coherence', 'coherence_views', 'iam', 'iam_secret', 'platform')
+     WHERE n.nspname IN ('coherence', 'iam', 'iam_secret', 'platform')
        AND c.relkind IN ('v', 'm')
      ORDER BY n.nspname, c.relname`,
   );
   if (viewRes.rows.length === 0) {
-    problems.push('No views found in schemas coherence / coherence_views / iam / iam_secret / platform');
+    problems.push('No views found in schemas coherence / iam / iam_secret / platform');
   }
-  for (const row of viewRes.rows) {
-    const fq = `${row.schema_name}.${row.view_name}`;
-    for (const principal of ['platform_app', 'public']) {
-      for (const priv of ALL_RELATION_PRIVS) {
-        const vRes = await pool.query(
-          'SELECT pg_catalog.has_table_privilege($1, $2::oid, $3) AS has_priv',
-          [principal, row.view_oid, priv],
-        );
-        if (vRes.rows[0].has_priv) {
-          problems.push(`${principal} must not hold ${priv} on view ${fq}`);
-        }
-      }
-      for (const priv of ALL_COLUMN_PRIVS) {
-        const cRes = await pool.query(
-          'SELECT pg_catalog.has_any_column_privilege($1, $2::oid, $3) AS has_priv',
-          [principal, row.view_oid, priv],
-        );
-        if (cRes.rows[0].has_priv) {
-          problems.push(`${principal} must not hold column-level ${priv} on view ${fq}`);
-        }
-      }
-    }
+  const viewOids = viewRes.rows.map((r) => r.view_oid);
+  const viewInfoByOid = new Map(viewRes.rows.map((r) => [Number(r.view_oid), r]));
+  const [viewRelPrivRes, viewColPrivRes] = await Promise.all([
+    pool.query(
+      `SELECT v.view_oid, p.principal, pr.priv
+       FROM pg_catalog.unnest($1::oid[]) AS v(view_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
+       WHERE pg_catalog.has_table_privilege(p.principal, v.view_oid, pr.priv)`,
+      [viewOids, lockedPrincipals, ALL_RELATION_PRIVS],
+    ),
+    pool.query(
+      `SELECT v.view_oid, p.principal, pr.priv
+       FROM pg_catalog.unnest($1::oid[]) AS v(view_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
+       WHERE pg_catalog.has_any_column_privilege(p.principal, v.view_oid, pr.priv)`,
+      [viewOids, lockedPrincipals, ALL_COLUMN_PRIVS],
+    ),
+  ]);
+  for (const row of viewRelPrivRes.rows) {
+    const v = viewInfoByOid.get(Number(row.view_oid));
+    problems.push(`${row.principal} must not hold ${row.priv} on view ${v.schema_name}.${v.view_name}`);
+  }
+  for (const row of viewColPrivRes.rows) {
+    const v = viewInfoByOid.get(Number(row.view_oid));
+    problems.push(`${row.principal} must not hold column-level ${row.priv} on view ${v.schema_name}.${v.view_name}`);
   }
 
   // 4b. Audit app_views and app_cmd schemas: zero copied base tables, 100% security_barrier + platform_view_owner.
@@ -808,6 +753,52 @@ export async function verifyIamConfigInvariants(pool) {
      WHERE n.nspname = 'app_views' AND c.relkind = 'v'
      ORDER BY c.relname`,
   );
+  const appViewOids = appViewsRes.rows.map((v) => v.view_oid);
+  const [appViewPrivRes, appViewColPrivRes] = await Promise.all([
+    pool.query(
+      `SELECT v.view_oid, p.principal, pr.priv
+       FROM pg_catalog.unnest($1::oid[]) AS v(view_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
+       WHERE pg_catalog.has_table_privilege(p.principal, v.view_oid, pr.priv)`,
+      [appViewOids, lockedPrincipals, ALL_RELATION_PRIVS],
+    ),
+    pool.query(
+      `SELECT v.view_oid, p.principal, pr.priv
+       FROM pg_catalog.unnest($1::oid[]) AS v(view_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
+       WHERE pg_catalog.has_any_column_privilege(p.principal, v.view_oid, pr.priv)`,
+      [appViewOids, lockedPrincipals, ALL_COLUMN_PRIVS],
+    ),
+  ]);
+  const appViewInfoByOid = new Map(appViewsRes.rows.map((v) => [Number(v.view_oid), v]));
+  const appViewSelectOids = new Set();
+  for (const row of appViewPrivRes.rows) {
+    const v = appViewInfoByOid.get(Number(row.view_oid));
+    const fq = `app_views.${v.view_name}`;
+    if (row.principal === 'public') {
+      problems.push(`PUBLIC must not hold ${row.priv} on ${fq}`);
+    } else if (row.principal === 'platform_app') {
+      if (row.priv === 'SELECT') appViewSelectOids.add(Number(row.view_oid));
+      else problems.push(`platform_app must not hold ${row.priv} on ${fq}`);
+    } else {
+      problems.push(`Retired role ${row.principal} must not hold ${row.priv} on ${fq}`);
+    }
+  }
+  for (const row of appViewColPrivRes.rows) {
+    if (row.principal === 'platform_app' && row.priv === 'SELECT') continue;
+    const v = appViewInfoByOid.get(Number(row.view_oid));
+    const fq = `app_views.${v.view_name}`;
+    if (row.principal === 'public') {
+      problems.push(`PUBLIC must not hold column-level ${row.priv} on ${fq}`);
+    } else if (row.principal === 'platform_app') {
+      problems.push(`platform_app must not hold column-level ${row.priv} on ${fq}`);
+    } else {
+      problems.push(`Retired role ${row.principal} must not hold column-level ${row.priv} on ${fq}`);
+    }
+  }
+
   const keyedHelperRe = /effective_wide_org_ids|_read_(bob_wide_orgs|agency_statement_wide_orgs|statement_cash_wide_orgs|upline_statement_orgs|ledger_orgs)\b/;
   const forbiddenKeyedAnyRe = /\b(effective_any_org_ids|_read_(has_run_meta_access|can_see_unsent_run_meta|has_statement_batch_access|can_see_unsent_batch_meta))\b/i;
 
@@ -828,15 +819,8 @@ export async function verifyIamConfigInvariants(pool) {
     if (v.view_name === 'coherence_entity_statement_reconciliation' && forbiddenKeyedAnyRe.test(v.view_def || '')) {
       problems.push(`View ${fq} must not use iam.effective_any_org_ids() or metadata-only _read_* helpers`);
     }
-    for (const priv of ALL_RELATION_PRIVS) {
-      const pubRes = await pool.query('SELECT pg_catalog.has_table_privilege(\'public\', $1::oid, $2) AS hp', [v.view_oid, priv]);
-      if (pubRes.rows[0].hp) problems.push(`PUBLIC must not hold ${priv} on ${fq}`);
-      const appRes = await pool.query('SELECT pg_catalog.has_table_privilege(\'platform_app\', $1::oid, $2) AS hp', [v.view_oid, priv]);
-      if (priv === 'SELECT') {
-        if (!appRes.rows[0].hp) problems.push(`platform_app is missing SELECT on ${fq}`);
-      } else if (appRes.rows[0].hp) {
-        problems.push(`platform_app must not hold ${priv} on ${fq}`);
-      }
+    if (!appViewSelectOids.has(Number(v.view_oid))) {
+      problems.push(`platform_app is missing SELECT on ${fq}`);
     }
   }
   for (const expectedView of APP_VIEWS_EXPECTED) {
@@ -845,17 +829,52 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
 
-  // 4c. Coherence under IAM: FORCE RLS on every Coherence business table + platform.audit_journal,
-  //     FKs to iam.organizations/iam.people + platform_view_owner policies + zero retired Migration 006 policies/functions.
-  const cohRlsRes = await pool.query(
-    `SELECT n.nspname AS schema_name, c.relname AS table_name, c.relrowsecurity, c.relforcerowsecurity,
-            (SELECT pg_catalog.count(*)::int FROM pg_catalog.pg_policies p
-             WHERE p.schemaname = n.nspname AND p.tablename = c.relname) AS pol_cnt
-     FROM pg_catalog.pg_class c
-     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-     WHERE (n.nspname = 'coherence' AND c.relkind IN ('r', 'p') AND c.relname <> 'schema_migrations')
-        OR (n.nspname = 'platform' AND c.relname = 'audit_journal')`,
-  );
+  // 4c. Coherence under IAM: FORCE RLS, ENABLE ALWAYS immutability triggers, FKs to iam.organizations/iam.people,
+  //     platform_view_owner policies, and zero retired pre-IAM policies or helper functions.
+  const [cohRlsRes, cohTrigRes, fkRes, npnChkRes] = await Promise.all([
+    pool.query(
+      `SELECT n.nspname AS schema_name, c.relname AS table_name, c.relrowsecurity, c.relforcerowsecurity,
+              (SELECT pg_catalog.count(*)::int FROM pg_catalog.pg_policies p
+               WHERE p.schemaname = n.nspname AND p.tablename = c.relname) AS pol_cnt
+       FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE (n.nspname = 'coherence' AND c.relkind IN ('r', 'p') AND c.relname <> 'schema_migrations')
+          OR (n.nspname = 'platform' AND c.relname = 'audit_journal')`,
+    ),
+    pool.query(
+      `SELECT c.relname AS table_name,
+              t.tgname AS trigger_name,
+              t.tgenabled,
+              pg_catalog.pg_get_triggerdef(t.oid) AS def
+       FROM pg_catalog.pg_trigger t
+       JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'coherence' AND NOT t.tgisinternal`,
+    ),
+    pool.query(
+      `SELECT c.relname AS table_name, a.attname AS col_name, rn.nspname || '.' || rc.relname AS ref_tbl
+       FROM pg_catalog.pg_constraint con
+       JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid
+       JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace
+       JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = con.conkey[1]
+       WHERE n.nspname = 'coherence' AND c.relname = ANY($1::text[])
+         AND con.contype = 'f' AND pg_catalog.array_length(con.conkey, 1) = 1`,
+      [COHERENCE_IAM_FK_TABLES],
+    ),
+    pool.query(
+      `SELECT c.relname AS table_name, con.conname
+       FROM pg_catalog.pg_constraint con
+       JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'coherence' AND c.relname = ANY($1::text[]) AND con.contype = 'c'
+         AND pg_catalog.pg_get_constraintdef(con.oid) ~ 'writing_npn'
+         AND pg_catalog.pg_get_constraintdef(con.oid) ~ 'writing_person_id'`,
+      [COHERENCE_IAM_FK_TABLES],
+    ),
+  ]);
+
   for (const r of cohRlsRes.rows) {
     if (!r.relrowsecurity || !r.relforcerowsecurity) {
       problems.push(`Table ${r.schema_name}.${r.table_name} must have ENABLE + FORCE ROW LEVEL SECURITY`);
@@ -865,121 +884,125 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
 
-  for (const tbl of COHERENCE_IAM_FK_TABLES) {
-    const fkRes = await pool.query(
-      `SELECT a.attname AS col_name, rn.nspname || '.' || rc.relname AS ref_tbl
-       FROM pg_catalog.pg_constraint con
-       JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
-       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-       JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid
-       JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace
-       JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = con.conkey[1]
-       WHERE n.nspname = 'coherence' AND c.relname = $1 AND con.contype = 'f' AND pg_catalog.array_length(con.conkey, 1) = 1`,
-      [tbl],
-    );
-    const hasOrgFk = fkRes.rows.some((f) => f.col_name === 'organization_id' && f.ref_tbl === 'iam.organizations');
-    const hasPerFk = fkRes.rows.some((f) => f.col_name === 'writing_person_id' && f.ref_tbl === 'iam.people');
-    if (!hasOrgFk) problems.push(`Table coherence.${tbl} is missing organization_id FK to iam.organizations`);
-    if (!hasPerFk) problems.push(`Table coherence.${tbl} is missing writing_person_id FK to iam.people`);
-
-    const viewPolRes = await pool.query(
-      `SELECT policyname, cmd, qual, with_check
-       FROM pg_catalog.pg_policies
-       WHERE schemaname = 'coherence' AND tablename = $1 AND 'platform_view_owner' = ANY(roles)`,
-      [tbl],
-    );
-    if (viewPolRes.rows.length === 0) {
-      problems.push(`Table coherence.${tbl} is missing platform_view_owner RLS policy`);
-    } else if (!viewPolRes.rows.every((p) => (
-      p.cmd === 'SELECT'
-      && !forbiddenKeyedAnyRe.test(p.qual || '')
-      && !forbiddenKeyedAnyRe.test(p.with_check || '')
-      && keyedHelperRe.test(p.qual || '')
-    ))) {
-      problems.push(`Table coherence.${tbl} has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with wide/scoped IAM helpers and must not use iam.effective_any_org_ids)`);
+  const cohTrigByKey = new Map(cohTrigRes.rows.map((r) => [`${r.table_name}:${r.trigger_name}`, r]));
+  for (const tbl of ALL_BUSINESS_TABLES) {
+    const tr = cohTrigByKey.get(`${tbl}:trg_immutable`);
+    if (!tr) {
+      problems.push(`Missing append-only trigger trg_immutable on coherence.${tbl}`);
+      continue;
     }
+    if (tr.tgenabled !== 'A') {
+      problems.push(`Trigger trg_immutable on coherence.${tbl} must be ENABLE ALWAYS (tgenabled='A'), got '${tr.tgenabled}'`);
+    }
+    for (const op of ['BEFORE', 'UPDATE', 'DELETE', 'TRUNCATE', 'coherence.forbid_mutation']) {
+      if (!tr.def.includes(op)) {
+        problems.push(`Trigger trg_immutable on coherence.${tbl} definition missing ${op}: ${tr.def}`);
+      }
+    }
+  }
+  for (const trigName of ['trg_review_submissions_guard', 'trg_review_submissions_no_trunc']) {
+    const tr = cohTrigByKey.get(`review_submissions:${trigName}`);
+    if (!tr || tr.tgenabled !== 'A') {
+      problems.push(`Trigger ${trigName} on coherence.review_submissions must exist and be ENABLE ALWAYS (tgenabled='A')`);
+    }
+  }
 
-    const npnChkRes = await pool.query(
-      `SELECT con.conname
-       FROM pg_catalog.pg_constraint con
-       JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
-       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-       WHERE n.nspname = 'coherence' AND c.relname = $1 AND con.contype = 'c'
-         AND pg_catalog.pg_get_constraintdef(con.oid) ~ 'writing_npn'
-         AND pg_catalog.pg_get_constraintdef(con.oid) ~ 'writing_person_id'`,
-      [tbl],
-    );
-    if (npnChkRes.rows.length === 0) {
+  const fkByTable = new Map();
+  for (const f of fkRes.rows) {
+    const list = fkByTable.get(f.table_name) || [];
+    list.push(f);
+    fkByTable.set(f.table_name, list);
+  }
+  const npnChkTables = new Set(npnChkRes.rows.map((r) => r.table_name));
+
+  // Fetch all policies across managed schemas once and validate every policy rule in memory.
+  const allPolRes = await pool.query(
+    `SELECT schemaname, tablename, policyname, cmd, roles::text[] AS roles, qual, with_check
+     FROM pg_catalog.pg_policies
+     WHERE schemaname IN ('coherence', 'platform', 'iam', 'iam_secret')
+     ORDER BY schemaname, tablename, policyname`,
+  );
+  const fkTableSet = new Set(COHERENCE_IAM_FK_TABLES);
+  const retiredRoleSet = new Set(RETIRED_COHERENCE_ROLES);
+  const cohViewPolTables = new Set();
+  const auditViewPols = [];
+  const legacyGucRe = /rls_allowed_entities|rls_actor_npn|rls_access_tier|app\.allowed_entities|app\.actor_npn|app\.access_tier/;
+
+  for (const p of allPolRes.rows) {
+    const roleList = Array.isArray(p.roles) ? p.roles : [];
+    const qual = p.qual || '';
+    const withCheck = p.with_check || '';
+
+    if (roleList.includes('public')) {
+      problems.push(`Forbidden PUBLIC RLS policy on ${p.schemaname}.${p.tablename}: ${p.policyname}`);
+    }
+    const matchedRetired = roleList.filter((r) => retiredRoleSet.has(r));
+    if (matchedRetired.length > 0) {
+      problems.push(`Retired ${matchedRetired.join('/')} RLS policy still active on ${p.schemaname}.${p.tablename}: ${p.policyname}`);
+    }
+    if (p.schemaname === 'coherence' && legacyGucRe.test(qual)) {
+      problems.push(`Retired Migration 006 policy still active on ${p.schemaname}.${p.tablename}: ${p.policyname}`);
+    }
+    if ((p.schemaname === 'coherence' || p.schemaname === 'platform') && roleList.includes('platform_worker') && p.cmd !== 'SELECT') {
+      problems.push(`RLS policy ${p.policyname} on ${p.schemaname}.${p.tablename} grants platform_worker ${p.cmd} (must be SELECT only)`);
+    }
+    if (p.schemaname === 'coherence' && roleList.includes('platform_view_owner')) {
+      cohViewPolTables.add(p.tablename);
+      if (p.cmd !== 'SELECT') {
+        problems.push(`RLS policy ${p.policyname} on coherence.${p.tablename} grants platform_view_owner ${p.cmd} (must be SELECT only)`);
+      }
+      if (/\bhas_right\s*\(/i.test(qual)) {
+        problems.push(`RLS policy ${p.policyname} on coherence.${p.tablename} uses unscoped iam.has_right()`);
+      }
+      if (fkTableSet.has(p.tablename)) {
+        if (forbiddenKeyedAnyRe.test(qual) || forbiddenKeyedAnyRe.test(withCheck)) {
+          problems.push(`RLS policy ${p.policyname} on keyed table coherence.${p.tablename} must not use iam.effective_any_org_ids()`);
+        }
+        if (!keyedHelperRe.test(qual)) {
+          problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must reference wide/scoped IAM read helpers)`);
+        }
+      } else if (!/(effective_(wide|any)_org_ids|app_views\._read_)/.test(qual)) {
+        problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must scope with IAM org helpers)`);
+      }
+    }
+    if (p.schemaname === 'platform' && p.tablename === 'audit_journal' && roleList.includes('platform_view_owner')) {
+      auditViewPols.push(p);
+    }
+  }
+
+  for (const tbl of COHERENCE_IAM_FK_TABLES) {
+    const fks = fkByTable.get(tbl) || [];
+    if (!fks.some((f) => f.col_name === 'organization_id' && f.ref_tbl === 'iam.organizations')) {
+      problems.push(`Table coherence.${tbl} is missing organization_id FK to iam.organizations`);
+    }
+    if (!fks.some((f) => f.col_name === 'writing_person_id' && f.ref_tbl === 'iam.people')) {
+      problems.push(`Table coherence.${tbl} is missing writing_person_id FK to iam.people`);
+    }
+    if (!cohViewPolTables.has(tbl)) {
+      problems.push(`Table coherence.${tbl} is missing platform_view_owner RLS policy`);
+    }
+    if (!npnChkTables.has(tbl)) {
       problems.push(`Table coherence.${tbl} is missing CHECK constraint requiring writing_person_id IS NULL when writing_npn IS NULL`);
     }
-
-    const bfTrigRes = await pool.query(
-      `SELECT t.tgenabled, pg_catalog.pg_get_triggerdef(t.oid) AS def
-       FROM pg_catalog.pg_trigger t
-       JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
-       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-       WHERE n.nspname = 'coherence' AND c.relname = $1 AND t.tgname = 'trg_guard_iam_fk_backfill'`,
-      [tbl],
-    );
-    if (bfTrigRes.rows.length !== 1 || bfTrigRes.rows[0].tgenabled !== 'A' || !bfTrigRes.rows[0].def.includes('guard_iam_fk_backfill')) {
+    const bfTr = cohTrigByKey.get(`${tbl}:trg_guard_iam_fk_backfill`);
+    if (!bfTr || bfTr.tgenabled !== 'A' || !bfTr.def.includes('guard_iam_fk_backfill')) {
       problems.push(`Table coherence.${tbl} must carry ENABLE ALWAYS trg_guard_iam_fk_backfill trigger`);
     }
   }
 
-  // Every platform_view_owner policy across ALL coherence.* tables must be FOR SELECT and IAM-scoped
-  // (never USING (true) and never bare iam.has_right()), and every coherence table readable by
-  // platform_view_owner must have at least one platform_view_owner RLS policy.
-  const cohBaseTbls = tblRes.rows.filter((r) => r.table_schema === 'coherence');
-  const fkTableSet = new Set(COHERENCE_IAM_FK_TABLES);
-  const allCohViewPolRes = await pool.query(
-    `SELECT tablename, policyname, cmd, qual, with_check
-     FROM pg_catalog.pg_policies
-     WHERE schemaname = 'coherence' AND 'platform_view_owner' = ANY(roles)
-     ORDER BY tablename, policyname`,
-  );
-  if (allCohViewPolRes.rows.length === 0) {
+  if (cohViewPolTables.size === 0) {
     problems.push('Schema coherence has no platform_view_owner RLS policies');
   }
-  const cohViewPolTables = new Set();
-  for (const p of allCohViewPolRes.rows) {
-    cohViewPolTables.add(p.tablename);
-    const qual = p.qual || '';
-    if (p.cmd !== 'SELECT') {
-      problems.push(`RLS policy ${p.policyname} on coherence.${p.tablename} grants platform_view_owner ${p.cmd} (must be SELECT only)`);
-    }
-    if (/\bhas_right\s*\(/i.test(qual)) {
-      problems.push(`RLS policy ${p.policyname} on coherence.${p.tablename} uses unscoped iam.has_right()`);
-    }
-    if (fkTableSet.has(p.tablename)) {
-      if (forbiddenKeyedAnyRe.test(qual) || forbiddenKeyedAnyRe.test(p.with_check || '')) {
-        problems.push(`RLS policy ${p.policyname} on keyed table coherence.${p.tablename} must not use iam.effective_any_org_ids()`);
-      }
-      if (!keyedHelperRe.test(qual)) {
-        problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must reference wide/scoped IAM read helpers)`);
-      }
-    } else if (!/(effective_(wide|any)_org_ids|app_views\._read_)/.test(qual)) {
-      problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must scope with IAM org helpers)`);
-    }
-  }
+  const pvReadableOids = new Set(pvSelRes.rows.map((r) => Number(r.table_oid)));
   for (const row of cohBaseTbls) {
-    const pvSelRes = await pool.query(
-      'SELECT pg_catalog.has_table_privilege(\'platform_view_owner\', $1::oid, \'SELECT\') AS hp',
-      [row.table_oid],
-    );
-    if (pvSelRes.rows[0].hp && !cohViewPolTables.has(row.table_name)) {
+    if (pvReadableOids.has(Number(row.table_oid)) && !cohViewPolTables.has(row.table_name)) {
       problems.push(`Table coherence.${row.table_name} grants SELECT to platform_view_owner without a platform_view_owner RLS policy`);
     }
   }
 
-  // Every platform_view_owner policy on platform.audit_journal must be FOR SELECT scoped with effective_wide_org_ids.
-  const auditViewPolRes = await pool.query(
-    `SELECT policyname, cmd, qual
-     FROM pg_catalog.pg_policies
-     WHERE schemaname = 'platform' AND tablename = 'audit_journal' AND 'platform_view_owner' = ANY(roles)`,
-  );
-  if (auditViewPolRes.rows.length === 0) {
+  if (auditViewPols.length === 0) {
     problems.push('Table platform.audit_journal is missing platform_view_owner RLS policy');
-  } else if (!auditViewPolRes.rows.every((p) => (
+  } else if (!auditViewPols.every((p) => (
     p.cmd === 'SELECT'
     && !/\bhas_right\s*\(/i.test(p.qual || '')
     && /effective_wide_org_ids/.test(p.qual || '')
@@ -987,128 +1010,95 @@ export async function verifyIamConfigInvariants(pool) {
     problems.push('Table platform.audit_journal has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with iam.effective_wide_org_ids)');
   }
 
-  // Confirm removed privileged write bypass objects do not exist.
-  const privTblRes = await pool.query(
-    `SELECT c.relname
-     FROM pg_catalog.pg_class c
-     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = 'coherence' AND c.relname = 'privileged_write_grants'`,
-  );
+  // Confirm removed privileged write bypass objects and Migration 006 helper functions do not exist.
+  const [privTblRes, retiredFnRes] = await Promise.all([
+    pool.query(
+      `SELECT c.relname
+       FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'coherence' AND c.relname = 'privileged_write_grants'`,
+    ),
+    pool.query(
+      `SELECT p.proname
+       FROM pg_catalog.pg_proc p
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+       WHERE n.nspname = 'coherence'
+         AND p.proname IN (
+           'begin_privileged_write', 'end_privileged_write',
+           'rls_allowed_entities', 'rls_actor_npn', 'rls_access_tier',
+           'upline_entity_label', 'batch_is_official_sent',
+           'attempt_is_published_run', 'batch_is_published_for_em'
+         )`,
+    ),
+  ]);
   if (privTblRes.rows.length > 0) {
     problems.push('Removed table coherence.privileged_write_grants must not exist');
   }
-  const privFnRes = await pool.query(
-    `SELECT p.proname
-     FROM pg_catalog.pg_proc p
-     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-     WHERE n.nspname = 'coherence' AND p.proname IN ('begin_privileged_write', 'end_privileged_write')`,
-  );
-  for (const pf of privFnRes.rows) {
-    problems.push(`Removed privileged write function coherence.${pf.proname} must not exist`);
-  }
-
-  // No PUBLIC RLS policy may exist across managed schemas (a PERMISSIVE PUBLIC policy would bypass role-scoped RLS).
-  const publicPolRes = await pool.query(
-    `SELECT schemaname, tablename, policyname
-     FROM pg_catalog.pg_policies
-     WHERE schemaname IN ('coherence', 'platform', 'iam', 'iam_secret')
-       AND 'public' = ANY(roles)`,
-  );
-  for (const pp of publicPolRes.rows) {
-    problems.push(`Forbidden PUBLIC RLS policy on ${pp.schemaname}.${pp.tablename}: ${pp.policyname}`);
-  }
-
-  // Legacy coherence_app and coherence_worker USING (true) RLS policies must be dropped.
-  const legacyRwPolRes = await pool.query(
-    `SELECT tablename, policyname
-     FROM pg_catalog.pg_policies
-     WHERE schemaname = 'coherence'
-       AND roles && ARRAY['coherence_app', 'coherence_worker']::name[]`,
-  );
-  for (const lrp of legacyRwPolRes.rows) {
-    problems.push(`Retired coherence_app/coherence_worker RLS policy still active on coherence.${lrp.tablename}: ${lrp.policyname}`);
-  }
-
-  // platform_worker must hold zero write privileges on any coherence base table (zero privileges on schema_migrations),
-  // zero INSERT/write privileges on platform.audit_journal, zero EXECUTE on platform journal hash functions,
-  // and only FOR SELECT RLS policies across coherence.* and platform.audit_journal.
-  const workerForbiddenPrivs = ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN'];
-  for (const row of cohBaseTbls) {
-    const fq = `coherence.${row.table_name}`;
-    const privsToDeny = row.table_name === 'schema_migrations' ? ALL_RELATION_PRIVS : workerForbiddenPrivs;
-    for (const priv of privsToDeny) {
-      const wpRes = await pool.query(
-        'SELECT pg_catalog.has_table_privilege(\'platform_worker\', $1::oid, $2) AS hp',
-        [row.table_oid, priv],
-      );
-      if (wpRes.rows[0].hp) {
-        problems.push(`platform_worker must not hold ${priv} on base table ${fq}`);
-      }
-    }
-    const colPrivsToDeny = row.table_name === 'schema_migrations' ? ALL_COLUMN_PRIVS : ['INSERT', 'UPDATE', 'REFERENCES'];
-    for (const priv of colPrivsToDeny) {
-      const wcRes = await pool.query(
-        'SELECT pg_catalog.has_any_column_privilege(\'platform_worker\', $1::oid, $2) AS hp',
-        [row.table_oid, priv],
-      );
-      if (wcRes.rows[0].hp) {
-        problems.push(`platform_worker must not hold column-level ${priv} on base table ${fq}`);
-      }
-    }
-  }
-  for (const priv of workerForbiddenPrivs) {
-    const awRes = await pool.query(
-      'SELECT pg_catalog.has_table_privilege(\'platform_worker\', \'platform.audit_journal\', $1) AS hp',
-      [priv],
-    );
-    if (awRes.rows[0].hp) {
-      problems.push(`platform_worker must not hold ${priv} on platform.audit_journal`);
-    }
-  }
-  const workerPolRes = await pool.query(
-    `SELECT schemaname, tablename, policyname, cmd
-     FROM pg_catalog.pg_policies
-     WHERE schemaname IN ('coherence', 'platform') AND 'platform_worker' = ANY(roles)`,
-  );
-  for (const wp of workerPolRes.rows) {
-    if (wp.cmd !== 'SELECT') {
-      problems.push(`RLS policy ${wp.policyname} on ${wp.schemaname}.${wp.tablename} grants platform_worker ${wp.cmd} (must be SELECT only)`);
+  const removedPrivilegedFns = new Set(['begin_privileged_write', 'end_privileged_write']);
+  for (const rf of retiredFnRes.rows) {
+    if (removedPrivilegedFns.has(rf.proname)) {
+      problems.push(`Removed privileged write function coherence.${rf.proname} must not exist`);
+    } else {
+      problems.push(`Retired Migration 006 helper function still exists: coherence.${rf.proname}`);
     }
   }
 
-  const legacyPolRes = await pool.query(
-    `SELECT schemaname, tablename, policyname, roles, qual
-     FROM pg_catalog.pg_policies
-     WHERE schemaname = 'coherence'
-       AND (
-         roles && $1::name[]
-         OR COALESCE(qual, '') ~ 'rls_allowed_entities|rls_actor_npn|rls_access_tier|app\\.allowed_entities|app\\.actor_npn|app\\.access_tier'
-       )`,
-    [SCOPED_RECIPIENT_ROLES],
-  );
-  for (const lp of legacyPolRes.rows) {
-    problems.push(`Retired Migration 006 policy still active on ${lp.schemaname}.${lp.tablename}: ${lp.policyname}`);
-  }
-  const legacyFnRes = await pool.query(
-    `SELECT p.proname
-     FROM pg_catalog.pg_proc p
-     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-     WHERE n.nspname = 'coherence' AND p.proname IN ('rls_allowed_entities', 'rls_actor_npn', 'rls_access_tier')`,
-  );
-  for (const lf of legacyFnRes.rows) {
-    problems.push(`Retired Migration 006 helper function still exists: coherence.${lf.proname}`);
+  // Audit coherence.backfill_iam_foreign_keys, internal coherence._resolve_* / _cmd_*, and app_views._read_*.
+  const allAuditPrincipals = ['public', ...PLATFORM_ROLES, ...existingRetiredRoles];
+  const [bfFnRes, internalCohFnRes, tipViewRes] = await Promise.all([
+    pool.query(
+      `SELECT p.oid, p.prosecdef, r.rolname AS owner_name, p.proconfig
+       FROM pg_catalog.pg_proc p
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+       JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
+       WHERE n.nspname = 'coherence' AND p.proname = 'backfill_iam_foreign_keys'`,
+    ),
+    pool.query(
+      `SELECT p.oid, n.nspname AS schema_name, p.proname, p.proconfig, p.prosecdef, r.rolname AS owner_name,
+              pg_catalog.pg_get_functiondef(p.oid) AS fn_def
+       FROM pg_catalog.pg_proc p
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+       JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
+       WHERE (n.nspname = 'coherence' AND (
+                p.proname LIKE '\\_resolve\\_%' ESCAPE '\\'
+                OR p.proname LIKE '\\_cmd\\_%' ESCAPE '\\'
+              ))
+          OR (n.nspname = 'app_views' AND p.proname LIKE '\\_read\\_%' ESCAPE '\\')`,
+    ),
+    pool.query(
+      `SELECT c.oid, r.rolname AS owner_name, c.reloptions
+       FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
+       WHERE n.nspname = 'coherence' AND c.relname = 'v_run_latest_journal_seq' AND c.relkind = 'v'`,
+    ),
+  ]);
+
+  const specialFnOids = [
+    ...bfFnRes.rows.map((r) => r.oid),
+    ...internalCohFnRes.rows.map((r) => r.oid),
+  ];
+  const specialFnExecRes = specialFnOids.length > 0
+    ? await pool.query(
+      `SELECT f.fn_oid, p.principal
+       FROM pg_catalog.unnest($1::oid[]) AS f(fn_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       WHERE pg_catalog.has_function_privilege(p.principal, f.fn_oid, 'EXECUTE')`,
+      [specialFnOids, allAuditPrincipals],
+    )
+    : { rows: [] };
+  const execByFnOid = new Map();
+  for (const row of specialFnExecRes.rows) {
+    const oid = Number(row.fn_oid);
+    let set = execByFnOid.get(oid);
+    if (!set) {
+      set = new Set();
+      execByFnOid.set(oid, set);
+    }
+    set.add(row.principal);
   }
 
-  // Audit coherence.backfill_iam_foreign_keys across EVERY platform role + PUBLIC:
-  // strictly platform_versioner (owner) and platform_migrator may hold EXECUTE.
   const bfAllowedSet = new Set(BACKFILL_ALLOWED_ROLES);
-  const bfFnRes = await pool.query(
-    `SELECT p.oid, p.prosecdef, r.rolname AS owner_name, p.proconfig
-     FROM pg_catalog.pg_proc p
-     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-     JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
-     WHERE n.nspname = 'coherence' AND p.proname = 'backfill_iam_foreign_keys'`,
-  );
   if (bfFnRes.rows.length !== 1 || !bfFnRes.rows[0].prosecdef || bfFnRes.rows[0].owner_name !== 'platform_versioner') {
     problems.push('coherence.backfill_iam_foreign_keys must be SECURITY DEFINER owned by platform_versioner');
   } else {
@@ -1116,48 +1106,23 @@ export async function verifyIamConfigInvariants(pool) {
     if (!bfCfg.includes('search_path=pg_catalog')) {
       problems.push(`coherence.backfill_iam_foreign_keys must pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(bfCfg)})`);
     }
-    const bfOid = bfFnRes.rows[0].oid;
-    for (const principal of ['public', ...PLATFORM_ROLES]) {
-      const exRes = await pool.query(
-        'SELECT pg_catalog.has_function_privilege($1, $2::oid, \'EXECUTE\') AS hp',
-        [principal, bfOid],
-      );
+    const holders = execByFnOid.get(Number(bfFnRes.rows[0].oid)) || new Set();
+    for (const principal of allAuditPrincipals) {
       if (bfAllowedSet.has(principal)) {
-        if (!exRes.rows[0].hp) {
-          problems.push(`${principal} is missing EXECUTE on coherence.backfill_iam_foreign_keys`);
-        }
-      } else if (exRes.rows[0].hp) {
+        if (!holders.has(principal)) problems.push(`${principal} is missing EXECUTE on coherence.backfill_iam_foreign_keys`);
+      } else if (holders.has(principal)) {
         problems.push(`${principal} holds forbidden EXECUTE privilege on coherence.backfill_iam_foreign_keys`);
       }
     }
   }
 
-  // Internal coherence._resolve_* / coherence._cmd_* helpers and app_views._read_* shared rights checks
-  // must pin SET search_path = pg_catalog and be owned/callable strictly by their respective platform roles.
-  const internalCohFnRes = await pool.query(
-    `SELECT p.oid, n.nspname AS schema_name, p.proname, p.proconfig, p.prosecdef, r.rolname AS owner_name,
-            pg_catalog.pg_get_functiondef(p.oid) AS fn_def
-     FROM pg_catalog.pg_proc p
-     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-     JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
-     WHERE (n.nspname = 'coherence' AND (
-              p.proname LIKE '\\_resolve\\_%' ESCAPE '\\'
-              OR p.proname LIKE '\\_cmd\\_%' ESCAPE '\\'
-            ))
-        OR (n.nspname = 'app_views' AND p.proname LIKE '\\_read\\_%' ESCAPE '\\')`,
-  );
   const resolveFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'coherence' && f.proname.startsWith('_resolve_'));
   const cmdFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'coherence' && f.proname.startsWith('_cmd_'));
   const readFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'app_views' && f.proname.startsWith('_read_'));
-  if (resolveFns.length === 0) {
-    problems.push('Expected internal coherence._resolve_* helper functions were not found in pg_proc');
-  }
-  if (cmdFns.length === 0) {
-    problems.push('Expected internal coherence._cmd_* helper functions were not found in pg_proc');
-  }
-  if (readFns.length === 0) {
-    problems.push('Expected shared app_views._read_* rights helper functions were not found in pg_proc');
-  }
+  if (resolveFns.length === 0) problems.push('Expected internal coherence._resolve_* helper functions were not found in pg_proc');
+  if (cmdFns.length === 0) problems.push('Expected internal coherence._cmd_* helper functions were not found in pg_proc');
+  if (readFns.length === 0) problems.push('Expected shared app_views._read_* rights helper functions were not found in pg_proc');
+
   const readWideOnlyFns = new Set([
     '_read_tenant_right',
     '_read_has_full_tenant_right',
@@ -1200,13 +1165,14 @@ export async function verifyIamConfigInvariants(pool) {
     if (isRead && readWideOnlyFns.has(ifn.proname) && forbiddenKeyedAnyRe.test(ifn.fn_def || '')) {
       problems.push(`Wide/scoped read helper ${fqFn} must not use iam.effective_any_org_ids()`);
     }
-    for (const principal of ['public', ...PLATFORM_ROLES]) {
-      if (allowedRoles.has(principal)) continue;
-      const exRes = await pool.query(
-        'SELECT pg_catalog.has_function_privilege($1, $2::oid, \'EXECUTE\') AS hp',
-        [principal, ifn.oid],
-      );
-      if (exRes.rows[0].hp) {
+    const holders = execByFnOid.get(Number(ifn.oid)) || new Set();
+    for (const reqRole of allowedRoles) {
+      if (!holders.has(reqRole)) {
+        problems.push(`${reqRole} is missing EXECUTE on internal function ${fqFn}`);
+      }
+    }
+    for (const principal of allAuditPrincipals) {
+      if (!allowedRoles.has(principal) && holders.has(principal)) {
         problems.push(`${principal} holds forbidden EXECUTE privilege on internal function ${fqFn}`);
       }
     }
@@ -1214,13 +1180,6 @@ export async function verifyIamConfigInvariants(pool) {
 
   // Narrow definer helper view coherence.v_run_latest_journal_seq must be owned by platform_readonly,
   // carry security_barrier=true, and grant SELECT strictly to platform_readonly and platform_view_owner.
-  const tipViewRes = await pool.query(
-    `SELECT c.oid, r.rolname AS owner_name, c.reloptions
-     FROM pg_catalog.pg_class c
-     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-     JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
-     WHERE n.nspname = 'coherence' AND c.relname = 'v_run_latest_journal_seq' AND c.relkind = 'v'`,
-  );
   if (tipViewRes.rows.length !== 1) {
     problems.push('Expected narrow definer helper view coherence.v_run_latest_journal_seq is missing');
   } else {
@@ -1235,17 +1194,18 @@ export async function verifyIamConfigInvariants(pool) {
     if (opts.includes('security_invoker=true')) {
       problems.push('View coherence.v_run_latest_journal_seq must not set security_invoker=true');
     }
+    const tipPrivRes = await pool.query(
+      `SELECT p.principal
+       FROM pg_catalog.unnest($1::text[]) AS p(principal)
+       WHERE pg_catalog.has_table_privilege(p.principal, $2::oid, 'SELECT')`,
+      [allAuditPrincipals, tv.oid],
+    );
+    const tipHolders = new Set(tipPrivRes.rows.map((r) => r.principal));
     const allowedTipReaders = new Set(['platform_readonly', 'platform_view_owner']);
-    for (const principal of ['public', ...PLATFORM_ROLES]) {
-      const selRes = await pool.query(
-        'SELECT pg_catalog.has_table_privilege($1, $2::oid, \'SELECT\') AS hp',
-        [principal, tv.oid],
-      );
+    for (const principal of allAuditPrincipals) {
       if (allowedTipReaders.has(principal)) {
-        if (!selRes.rows[0].hp) {
-          problems.push(`${principal} is missing SELECT on coherence.v_run_latest_journal_seq`);
-        }
-      } else if (selRes.rows[0].hp) {
+        if (!tipHolders.has(principal)) problems.push(`${principal} is missing SELECT on coherence.v_run_latest_journal_seq`);
+      } else if (tipHolders.has(principal)) {
         problems.push(`${principal} holds forbidden SELECT privilege on coherence.v_run_latest_journal_seq`);
       }
     }
@@ -1254,16 +1214,14 @@ export async function verifyIamConfigInvariants(pool) {
   // 5. Verify every iam base table is covered by IAM_IMMUTABLE_TABLES or IAM_VERSIONED_TABLES (disjoint),
   //    all iam tables and platform.audit_journal carry ENABLE ALWAYS immutability triggers, and
   //    all versioned iam tables carry BEFORE INSERT platform_versioner supersession triggers.
-  const immutableSet = new Set(IAM_IMMUTABLE_TABLES);
   const versionedSet = new Set(IAM_VERSIONED_TABLES);
+  const immutableSet = new Set(IAM_IMMUTABLE_TABLES);
   for (const tbl of IAM_IMMUTABLE_TABLES) {
     if (versionedSet.has(tbl)) {
       problems.push(`Table iam.${tbl} appears in both IAM_IMMUTABLE_TABLES and IAM_VERSIONED_TABLES`);
     }
   }
-  const actualIamTables = new Set(
-    tblRes.rows.filter((r) => r.table_schema === 'iam').map((r) => r.table_name),
-  );
+  const actualIamTables = new Set(tblRes.rows.filter((r) => r.table_schema === 'iam').map((r) => r.table_name));
   for (const tbl of actualIamTables) {
     if (!immutableSet.has(tbl) && !versionedSet.has(tbl)) {
       problems.push(`Base table iam.${tbl} is not covered by IAM_IMMUTABLE_TABLES or IAM_VERSIONED_TABLES`);
@@ -1274,27 +1232,33 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`Expected iam base table iam.${tbl} is missing`);
     }
   }
-  const actualPlatformTables = new Set(
-    tblRes.rows.filter((r) => r.table_schema === 'platform').map((r) => r.table_name),
-  );
-  for (const tbl of actualPlatformTables) {
+  for (const tbl of tblRes.rows.filter((r) => r.table_schema === 'platform').map((r) => r.table_name)) {
     if (tbl !== 'audit_journal') {
       problems.push(`Unexpected base table platform.${tbl} is not covered by platform immutability checks`);
     }
   }
 
-  const trigRes = await pool.query(
-    `SELECT n.nspname AS schema_name,
-            c.relname AS table_name,
-            t.tgname AS trigger_name,
-            t.tgenabled,
-            pg_catalog.pg_get_triggerdef(t.oid) AS def
-     FROM pg_catalog.pg_trigger t
-     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
-     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname IN ('iam', 'platform') AND NOT t.tgisinternal`,
-  );
-  const trigByKey = new Map(trigRes.rows.map((r) => [`${r.schema_name}.${r.table_name}:${r.trigger_name}`, r]));
+  const [iamTrigRes, supFnRes] = await Promise.all([
+    pool.query(
+      `SELECT n.nspname AS schema_name,
+              c.relname AS table_name,
+              t.tgname AS trigger_name,
+              t.tgenabled,
+              pg_catalog.pg_get_triggerdef(t.oid) AS def
+       FROM pg_catalog.pg_trigger t
+       JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname IN ('iam', 'platform') AND NOT t.tgisinternal`,
+    ),
+    pool.query(
+      `SELECT p.prosecdef, r.rolname AS owner_name
+       FROM pg_catalog.pg_proc p
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+       JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
+       WHERE n.nspname = 'platform' AND p.proname = 'stamp_superseded_before_insert'`,
+    ),
+  ]);
+  const trigByKey = new Map(iamTrigRes.rows.map((r) => [`${r.schema_name}.${r.table_name}:${r.trigger_name}`, r]));
 
   for (const fq of ['platform.audit_journal', ...IAM_IMMUTABLE_TABLES.map((t) => `iam.${t}`)]) {
     const tr = trigByKey.get(`${fq}:trg_immutable`);
@@ -1302,7 +1266,6 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`Missing ENABLE ALWAYS trg_immutable on ${fq}`);
     }
   }
-
   for (const tbl of IAM_VERSIONED_TABLES) {
     const fq = `iam.${tbl}`;
     const trImm = trigByKey.get(`${fq}:trg_immutable`);
@@ -1318,21 +1281,13 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`Missing BEFORE INSERT trg_01_supersede on versioned table ${fq}`);
     }
   }
-
-  // Verify stamp_superseded_before_insert is SECURITY DEFINER owned by platform_versioner.
-  const supFnRes = await pool.query(
-    `SELECT p.prosecdef, r.rolname AS owner_name
-     FROM pg_catalog.pg_proc p
-     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-     JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
-     WHERE n.nspname = 'platform' AND p.proname = 'stamp_superseded_before_insert'`,
-  );
   if (supFnRes.rows.length !== 1 || !supFnRes.rows[0].prosecdef || supFnRes.rows[0].owner_name !== 'platform_versioner') {
     problems.push('platform.stamp_superseded_before_insert() must be SECURITY DEFINER owned by platform_versioner');
   }
 
-  // 6. All functions across platform, iam_secret, iam, app_views, app_cmd pin SET search_path = pg_catalog
-  //    and revoke EXECUTE from PUBLIC; every app_cmd.* function is SECURITY DEFINER owned by platform_writer;
+  // 6. All functions across ALL managed schemas (platform, iam_secret, iam, coherence, app_views, app_cmd)
+  //    pin SET search_path = pg_catalog and revoke EXECUTE from PUBLIC and retired roles;
+  //    every app_cmd.* function is SECURITY DEFINER owned by platform_writer;
   //    platform_app holds EXECUTE strictly on PLATFORM_APP_FUNCTION_WHITELIST + PLATFORM_APP_CMD_WHITELIST;
   //    platform_readonly holds ZERO EXECUTE on app_cmd.*; platform_worker holds EXECUTE strictly on PLATFORM_WORKER_CMD_WHITELIST.
   const fnRes = await pool.query(
@@ -1350,13 +1305,28 @@ export async function verifyIamConfigInvariants(pool) {
      FROM pg_catalog.pg_proc p
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
      JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
-     WHERE n.nspname IN ('platform', 'iam_secret', 'iam', 'coherence', 'coherence_views', 'app_views', 'app_cmd')
+     WHERE n.nspname = ANY($1::text[])
      ORDER BY n.nspname, p.proname`,
+    [MANAGED_SCHEMAS],
   );
-  const iamScopeFns = fnRes.rows.filter((f) => ['platform', 'iam_secret', 'iam', 'app_views', 'app_cmd'].includes(f.nspname));
+  if (existingRetiredRoles.length > 0 && fnRes.rows.length > 0) {
+    const retiredFnExecRes = await pool.query(
+      `SELECT f.fn_oid, p.principal
+       FROM pg_catalog.unnest($1::oid[]) AS f(fn_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       WHERE pg_catalog.has_function_privilege(p.principal, f.fn_oid, 'EXECUTE')`,
+      [fnRes.rows.map((f) => f.oid), existingRetiredRoles],
+    );
+    const fnByOid = new Map(fnRes.rows.map((f) => [Number(f.oid), f]));
+    for (const row of retiredFnExecRes.rows) {
+      const fn = fnByOid.get(Number(row.fn_oid));
+      problems.push(`Retired role ${row.principal} holds forbidden EXECUTE privilege on ${fn.sig}`);
+    }
+  }
+
   const appCmdFns = fnRes.rows.filter((f) => f.nspname === 'app_cmd');
-  if (iamScopeFns.length === 0) {
-    problems.push('No functions found in schemas platform / iam_secret / iam / app_cmd');
+  if (fnRes.rows.length === 0) {
+    problems.push('No functions found in managed schemas');
   }
   const combinedWhitelist = [...PLATFORM_APP_FUNCTION_WHITELIST, ...PLATFORM_APP_CMD_WHITELIST];
   const whitelistSet = new Set(combinedWhitelist);
@@ -1367,14 +1337,12 @@ export async function verifyIamConfigInvariants(pool) {
   const foundWorkerCmd = new Set();
 
   for (const fn of fnRes.rows) {
-    if (['platform', 'iam_secret', 'iam', 'app_views', 'app_cmd'].includes(fn.nspname)) {
-      const cfg = Array.isArray(fn.proconfig) ? fn.proconfig : [];
-      if (!cfg.includes('search_path=pg_catalog')) {
-        problems.push(`Function ${fn.sig} does not pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
-      }
-      if (fn.pub_exec) {
-        problems.push(`PUBLIC has EXECUTE privilege on ${fn.sig}`);
-      }
+    const cfg = Array.isArray(fn.proconfig) ? fn.proconfig : [];
+    if (!cfg.includes('search_path=pg_catalog')) {
+      problems.push(`Function ${fn.sig} does not pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
+    }
+    if (fn.pub_exec) {
+      problems.push(`PUBLIC has EXECUTE privilege on ${fn.sig}`);
     }
     if (fn.nspname === 'platform' && ['compute_journal_hash', 'canonical_json', 'sha256_text', 'format_utc_us'].includes(fn.proname) && fn.wrk_exec) {
       problems.push(`platform_worker holds forbidden EXECUTE privilege on ${fn.sig}`);
@@ -1428,13 +1396,15 @@ export async function verifyIamConfigInvariants(pool) {
 
   return {
     passed: problems.length === 0,
+    checkedBusinessTables: ALL_BUSINESS_TABLES.length,
     checkedIamTables: IAM_IMMUTABLE_TABLES.length + IAM_VERSIONED_TABLES.length,
     checkedBaseTables: tblRes.rows.length,
     checkedViews: viewRes.rows.length,
     checkedAppViews: appViewsRes.rows.length,
-    checkedFunctions: iamScopeFns.length,
+    checkedFunctions: fnRes.rows.length,
     checkedAppCmdFunctions: appCmdFns.length,
     checkedInternalCoherenceFunctions: internalCohFnRes.rows.length,
+    forbiddenBusinessPrivileges: FORBIDDEN_BUSINESS_PRIVS,
     problems,
   };
 }

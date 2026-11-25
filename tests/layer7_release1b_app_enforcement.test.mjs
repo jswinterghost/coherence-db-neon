@@ -1793,7 +1793,7 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     }
   });
 
-  await t.test('Fix1 Item 4: app_views._read_current_finished_attempt scopes steps by right (runs.read any, outputs.read emit only, decisions.read bible/adjust only)', async () => {
+  await t.test('Fix1 Item 4: platform_readonly keeps working app_views SELECT (coherence_bob & coherence_runs) while app_views._read_current_finished_attempt denies platform_worker and scopes steps by right as platform_view_owner', async () => {
     const inp = await env.dataStore.promoteBytes(Buffer.from('k\nsteps\n', 'utf8'), { relPath: 'imp_steps.csv', checksPassed: true });
     const stepImp = await env.commands.importHistoricalRun({
       dbToken: env.ownerToken,
@@ -1808,14 +1808,45 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     });
     const stepRunId = stepImp.result.runId;
     const allSteps = ['assign', 'attribute', 'bible', 'adjust', 'emit'];
-    const querySteps = async (token) => withRequestTx(appPool, token, async (tx) => {
+
+    // platform_worker still gets 42501 on app_views._read_* helpers.
+    for (const sql of [
+      `SELECT app_views._read_current_finished_attempt('${stepRunId}'::uuid, 'emit')`,
+      'SELECT app_views._read_bob_wide_orgs()',
+    ]) {
+      await assert.rejects(
+        () => withRequestTx(workerPool, iam.tokenFor(customPeople.runsReadOnly), (tx) => tx.query(sql), { readOnly: true }),
+        (err) => err?.code === '42501',
+        `platform_worker must get 42501 on internal helper: ${sql}`,
+      );
+    }
+
+    // platform_readonly keeps EXECUTE on app_views._read_* (like platform_app) so SELECT on app_views.* works.
+    const readonlyHelperPool = createRoleScopedTestPool(env.pool, 'platform_readonly');
+    const roRuns = await withRequestTx(
+      readonlyHelperPool,
+      iam.tokenFor(customPeople.runsReadOnly),
+      (tx) => tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs'),
+      { readOnly: true },
+    );
+    assert.ok(roRuns.rows[0].n > 0, 'platform_readonly must read app_views.coherence_runs with valid token');
+    const roBob = await withRequestTx(
+      readonlyHelperPool,
+      iam.tokens.entityMgr,
+      (tx) => tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob'),
+      { readOnly: true },
+    );
+    assert.ok(roBob.rows[0].n > 0, 'platform_readonly must read app_views.coherence_bob with valid token');
+
+    const viewOwnerPool = createRoleScopedTestPool(env.pool, 'platform_view_owner');
+    const querySteps = async (token) => withRequestTx(viewOwnerPool, token, async (tx) => {
       const out = {};
       for (const step of allSteps) {
         const res = await tx.query('SELECT app_views._read_current_finished_attempt($1::uuid, $2) AS id', [stepRunId, step]);
         out[step] = res.rows[0].id;
       }
       return out;
-    });
+    }, { readOnly: true });
 
     const runsRes = await querySteps(iam.tokenFor(customPeople.runsReadOnly));
     for (const s of allSteps) assert.notEqual(runsRes[s], null, `runs.read must see step ${s}`);

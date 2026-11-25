@@ -844,12 +844,18 @@ export function createWebHandlers({
     const { commandKey, checkKind, deep = false } = b;
     // Database-enforced authorization gate runs before touching any verifier reader or object store.
     await appCmd.authorizeCheckRun({ dbToken });
-    const verifyPool = readonlyPool || pool;
+    if (!readonlyPool || readonlyPool === pool) {
+      throw new AppError('Read-only check pool is not configured.', 503, 'CHECK_READER_NOT_CONFIGURED');
+    }
     let report;
-    if (checkKind === 'chain') report = await verifyChain(verifyPool);
-    else if (checkKind === 'commitments') report = await verifyCommitments(verifyPool);
-    else if (checkKind === 'objects') report = await verifyObjects(verifyPool, stores, { deep: Boolean(deep) });
-    else throw new AppError('Unsupported on-demand checkKind (use chain, commitments, or objects).', 400, 'INVALID_CHECK_KIND');
+    try {
+      if (checkKind === 'chain') report = await verifyChain(readonlyPool);
+      else if (checkKind === 'commitments') report = await verifyCommitments(readonlyPool);
+      else if (checkKind === 'objects') report = await verifyObjects(readonlyPool, stores, { deep: Boolean(deep) });
+      else throw new AppError('Unsupported on-demand checkKind (use chain, commitments, or objects).', 400, 'INVALID_CHECK_KIND');
+    } catch (err) {
+      throw mapPgError(err);
+    }
     const recorded = await appCmd.recordCheck({
       commandKey,
       checkKind,

@@ -701,6 +701,68 @@ function discoverSubstanceArtifacts(sideMap, { entity = null } = {}) {
   };
 }
 
+export async function queryRunEntityReconciliation(pool, runId) {
+  const res = await pool.query(
+    `WITH rm AS (
+       SELECT attempt_event_id FROM coherence.run_materializations WHERE run_id = $1::uuid
+     ),
+     eff AS (
+       SELECT batch_id FROM coherence.run_effective_statement_batches($1::uuid)
+     ),
+     stmt_ag AS (
+       SELECT sal.entity AS statement_entity, 'agency'::text AS account_kind,
+              COALESCE(pg_catalog.sum(sal.amount), 0.00)::numeric(14,2) AS statement_total
+       FROM coherence.statement_agency_lines sal
+       JOIN eff ON eff.batch_id = sal.batch_id
+       GROUP BY sal.entity
+     ),
+     led_ag AS (
+       SELECT clr.entity AS statement_entity, 'agency'::text AS account_kind,
+              COALESCE(pg_catalog.sum(clr.downline_amount), 0.00)::numeric(14,2) AS ledger_total
+       FROM coherence.coherent_ledger_rows clr
+       JOIN rm ON rm.attempt_event_id = clr.attempt_event_id
+       GROUP BY clr.entity
+     ),
+     ag_joined AS (
+       SELECT COALESCE(s.statement_entity, l.statement_entity) AS statement_entity,
+              'agency'::text AS account_kind,
+              COALESCE(s.statement_total, 0.00)::numeric(14,2) AS statement_total,
+              COALESCE(l.ledger_total, 0.00)::numeric(14,2) AS ledger_total
+       FROM stmt_ag s
+       FULL OUTER JOIN led_ag l ON l.statement_entity = s.statement_entity
+     ),
+     up_joined AS (
+       SELECT COALESCE((SELECT display_name || ' Upline' FROM coherence.company_meta LIMIT 1), 'Upline') AS statement_entity,
+              'upline'::text AS account_kind,
+              COALESCE((
+                SELECT pg_catalog.sum(sul.amount)
+                FROM coherence.statement_upline_lines sul
+                JOIN eff ON eff.batch_id = sul.batch_id
+              ), 0.00)::numeric(14,2) AS statement_total,
+              COALESCE((
+                SELECT pg_catalog.sum(clr.upline_amount)
+                FROM coherence.coherent_ledger_rows clr
+                JOIN rm ON rm.attempt_event_id = clr.attempt_event_id
+              ), 0.00)::numeric(14,2) AS ledger_total
+     ),
+     combined AS (
+       SELECT * FROM ag_joined
+       UNION ALL
+       SELECT * FROM up_joined
+     )
+     SELECT statement_entity,
+            account_kind,
+            statement_total::text AS statement_total,
+            ledger_total::text AS ledger_total,
+            (statement_total - ledger_total)::numeric(14,2)::text AS variance,
+            (statement_total = ledger_total) AS reconciled
+     FROM combined
+     ORDER BY account_kind ASC, statement_entity COLLATE "C" ASC`,
+    [runId],
+  );
+  return res.rows;
+}
+
 async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = null, expectedEntityParity = null }) {
   const matCheck = await pool.query(
     'SELECT attempt_event_id, ledger_gross_total::text AS ledger_gross_total FROM coherence.run_materializations WHERE run_id = $1::uuid',
@@ -732,18 +794,13 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
     return { checked: false, passed: true, reason: 'left run has no run_materializations row' };
   }
 
-  const recRes = await pool.query(
-    `SELECT statement_entity, account_kind, statement_total::text AS statement_total,
-            ledger_total::text AS ledger_total, variance::text AS variance, reconciled
-     FROM coherence_views.v_entity_statement_reconciliation($1::uuid)`,
-    [leftRunId],
-  );
+  const recRows = await queryRunEntityReconciliation(pool, leftRunId);
   const perEntityTotals = {};
   const entityVariancesCents = {};
   let ledgerRemainderCents = 0n;
   let unreconciledEntities = 0;
 
-  for (const r of recRes.rows) {
+  for (const r of recRows) {
     const stmtCents = parseCents(r.statement_total) ?? 0n;
     const varCents = parseCents(r.variance) ?? 0n;
     perEntityTotals[r.statement_entity] = formatCents(stmtCents);
@@ -788,11 +845,30 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
 
   const ROUNDING_ADJUSTMENT_SRC_TYPE = 'rounding_adjustment';
   const totalsRes = await pool.query(
-    `SELECT pg_catalog.to_char(t.statement_date, 'YYYY-MM-DD') AS statement_date,
-            t.statement_entity, t.account_kind, t.src_type, t.payment_month,
-            t.line_count::bigint AS line_count, t.net_amount::text AS net_amount
-     FROM coherence_views.v_entity_statement_totals t
-     JOIN coherence.run_effective_statement_batches($1::uuid) eff ON eff.batch_id = t.batch_id`,
+    `WITH eff AS (
+       SELECT batch_id FROM coherence.run_effective_statement_batches($1::uuid)
+     ),
+     upline_label AS (
+       SELECT COALESCE((SELECT display_name || ' Upline' FROM coherence.company_meta LIMIT 1), 'Upline') AS label
+     ),
+     lines AS (
+       SELECT sal.batch_id, sal.statement_date, sal.entity AS statement_entity,
+              'agency'::text AS account_kind, sal.src_type, sal.payment_date, sal.amount
+       FROM coherence.statement_agency_lines sal
+       JOIN eff ON eff.batch_id = sal.batch_id
+       UNION ALL
+       SELECT sul.batch_id, sul.statement_date, (SELECT label FROM upline_label) AS statement_entity,
+              'upline'::text AS account_kind, sul.src_type, sul.payment_date, sul.amount
+       FROM coherence.statement_upline_lines sul
+       JOIN eff ON eff.batch_id = sul.batch_id
+     )
+     SELECT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS statement_date,
+            statement_entity, account_kind, src_type,
+            pg_catalog.to_char(payment_date, 'YYYY-MM') AS payment_month,
+            pg_catalog.count(*)::bigint AS line_count,
+            COALESCE(pg_catalog.sum(amount), 0.00)::numeric(14,2)::text AS net_amount
+     FROM lines
+     GROUP BY batch_id, statement_date, statement_entity, account_kind, src_type, pg_catalog.to_char(payment_date, 'YYYY-MM')`,
     [leftRunId],
   );
   const distinctDates = new Set();
@@ -819,13 +895,9 @@ async function evaluateDbEntityStatementsGate(pool, { leftRunId, rightRunId = nu
       [rightRunId],
     );
     if (rightMat.rows.length > 0) {
-      const rightRecRes = await pool.query(
-        `SELECT statement_entity, statement_total::text AS statement_total
-         FROM coherence_views.v_entity_statement_reconciliation($1::uuid)`,
-        [rightRunId],
-      );
+      const rightRecRows = await queryRunEntityReconciliation(pool, rightRunId);
       const rightTotals = {};
-      for (const r of rightRecRes.rows) rightTotals[r.statement_entity] = r.statement_total;
+      for (const r of rightRecRows) rightTotals[r.statement_entity] = r.statement_total;
       const allEntities = [...new Set([...Object.keys(perEntityTotals), ...Object.keys(rightTotals)])].sort();
       entityCentDeltas = {};
       let differingEntities = 0;

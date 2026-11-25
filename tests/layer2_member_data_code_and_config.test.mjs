@@ -12,9 +12,11 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createCommandLayer } from '../src/commands/command-layer.mjs';
 import {
+  PLATFORM_ROLES,
   validateCloudSqlConfig,
   verifyCloudSqlConfigFile,
   verifyDatabaseConfigInvariants,
+  verifyIamConfigInvariants,
   verifyPgHbaFile,
 } from '../src/config/policy-checks.mjs';
 import { createClient, withRequestTx } from '../src/db/pg-client.mjs';
@@ -594,7 +596,19 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
   const dbCfg = await verifyDatabaseConfigInvariants(env.pool);
   assert.equal(dbCfg.passed, true, `Database config audit failed:\n${dbCfg.problems.join('\n')}`);
   assert.equal(dbCfg.checkedBusinessTables, 31);
+  assert.equal(dbCfg.checkedAppViews, 39);
+  assert.equal(dbCfg.checkedAppCmdFunctions, 33);
   assert.ok(dbCfg.checkedFunctions >= 40);
+
+  const iamCfg = await verifyIamConfigInvariants(env.pool);
+  assert.equal(iamCfg.passed, true, `IAM config audit failed:\n${iamCfg.problems.join('\n')}`);
+  assert.equal(iamCfg.checkedBusinessTables, dbCfg.checkedBusinessTables);
+
+  // Retired schema coherence_views must not exist.
+  const viewsSchema = await env.pool.query(
+    "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'coherence_views'",
+  );
+  assert.equal(viewsSchema.rows.length, 0, 'retired schema coherence_views must not exist');
 
   const client = env.registerClient(await createClient(env.pgConfig));
   await client.query(`
@@ -607,22 +621,54 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
   assert.equal(hashRes.rows[0].h, sha256Hex('hello'));
   await client.query('RESET search_path');
 
-  await client.query('SET ROLE coherence_app');
-  for (const [tbl, lockMode] of [
-    ['journal_entries', 'EXCLUSIVE'],
-    ['runs', 'SHARE'],
-    ['input_entries', 'ACCESS EXCLUSIVE'],
-  ]) {
-    await assert.rejects(async () => {
-      await client.query('BEGIN');
-      try {
-        await client.query(`LOCK TABLE coherence.${tbl} IN ${lockMode} MODE`);
-      } finally {
-        await client.query('ROLLBACK').catch(() => {});
+  // Active platform_* roles cannot escalate table locks on business tables.
+  for (const roleName of ['platform_app', 'platform_writer', 'platform_worker']) {
+    await client.query(`SET ROLE ${roleName}`);
+    try {
+      for (const [tbl, lockMode] of [
+        ['journal_entries', 'EXCLUSIVE'],
+        ['runs', 'SHARE'],
+        ['input_entries', 'ACCESS EXCLUSIVE'],
+      ]) {
+        await assert.rejects(async () => {
+          await client.query('BEGIN');
+          try {
+            await client.query(`LOCK TABLE coherence.${tbl} IN ${lockMode} MODE`);
+          } finally {
+            await client.query('ROLLBACK').catch(() => {});
+          }
+        }, /permission denied/i, `${roleName} must not acquire ${lockMode} lock on coherence.${tbl}`);
       }
-    }, /permission denied/i);
+    } finally {
+      await client.query('RESET ROLE');
+    }
   }
-  await client.query('RESET ROLE');
+
+  // Any pre-IAM retired roles still present cluster-wide must hold zero privileges on coherence.*.
+  const existingRetired = (await client.query(
+    `SELECT rolname FROM pg_catalog.pg_roles
+     WHERE rolname = ANY($1::text[])
+     ORDER BY rolname`,
+    [[
+      'coherence_app', 'coherence_worker', 'coherence_readonly',
+      'coherence_entity_manager_ro', 'coherence_agency_manager_ro',
+      'coherence_agent_ro', 'coherence_retention_ro', 'coherence_investor_ro',
+    ]],
+  )).rows.map((r) => r.rolname);
+  for (const retiredRole of existingRetired) {
+    await client.query(`SET ROLE ${retiredRole}`);
+    try {
+      for (const sql of ['SELECT * FROM coherence.runs LIMIT 1', 'SELECT * FROM coherence.bob_policies LIMIT 1']) {
+        await assert.rejects(
+          () => client.query(sql),
+          (err) => err?.code === '42501',
+          `retired role ${retiredRole} must get 42501 on: ${sql}`,
+        );
+      }
+    } finally {
+      await client.query('RESET ROLE');
+    }
+  }
 
   const hba = await verifyPgHbaFile({ pool: env.pool });
   assert.equal(hba.passed, true, `pg_hba.conf check failed: ${hba.problems.join('; ')}`);
@@ -649,16 +695,35 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
   assert.deepEqual(csql.config.ipConfiguration.authorizedNetworks, []);
   assert.equal(csql.config.databaseFlags['pgaudit.log_parameter'], 'off');
   assert.equal(csql.config.databaseFlags['log_parameter_max_length'], '0');
+  for (const roleName of PLATFORM_ROLES) {
+    assert.ok(csql.config.roles[roleName], `cloudsql-instance.json must declare ${roleName}`);
+  }
+  assert.deepEqual(csql.config.roles.platform_app.businessTables, []);
+  assert.deepEqual(csql.config.roles.platform_worker.businessTables, ['SELECT']);
+  assert.deepEqual(csql.config.roles.platform_writer.businessTables, ['SELECT', 'INSERT']);
+  assert.deepEqual(csql.config.roles.platform_readonly.businessTables, ['SELECT']);
+  for (const retired of ['coherence_app', 'coherence_worker', 'coherence_readonly']) {
+    assert.equal(csql.config.roles[retired], undefined, `cloudsql-instance.json must retire ${retired}`);
+  }
 
   const badCsql = validateCloudSqlConfig({
     ...csql.config,
     ipConfiguration: { ...csql.config.ipConfiguration, requireSsl: false, authorizedNetworks: [{ value: '0.0.0.0/0' }] },
     databaseFlags: { ...csql.config.databaseFlags, 'pgaudit.log_parameter': 'on' },
+    roles: {
+      ...csql.config.roles,
+      coherence_app: { businessTables: ['SELECT', 'INSERT'] },
+      platform_app: { businessTables: ['SELECT'], appViews: ['SELECT'], appCmd: ['EXECUTE'] },
+      platform_worker: { businessTables: ['SELECT', 'INSERT'], appCmd: ['EXECUTE'] },
+    },
   });
   assert.equal(badCsql.passed, false);
   assert.ok(badCsql.problems.some((p) => /requireSsl/i.test(p)));
   assert.ok(badCsql.problems.some((p) => /authorizedNetworks/i.test(p)));
   assert.ok(badCsql.problems.some((p) => /pgaudit\.log_parameter/i.test(p)));
+  assert.ok(badCsql.problems.some((p) => /coherence_app/i.test(p)));
+  assert.ok(badCsql.problems.some((p) => /platform_app/i.test(p)));
+  assert.ok(badCsql.problems.some((p) => /platform_worker/i.test(p)));
 });
 
 test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline/financial walls, security_barrier side-channel defense across all 5 scoped roles, and View-As refusal on review saves', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {

@@ -12,7 +12,7 @@ import { assertLocalPgHost, assertSafeStoresDir, ensureProofIamSubjectsForBatche
 import { createCommandLayer } from '../src/commands/command-layer.mjs';
 import { compareDatabasesAsOf, exportJournalNdjson, rebuildFromJournalExport, verifyChain, verifyCommitments } from '../src/commands/journal-export.mjs';
 import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstruction.mjs';
-import { compareCsvExactText, compareDbRuns, compareRunFolders, mapEntitiesCsv } from '../src/compare/run-comparator.mjs';
+import { compareCsvExactText, compareDbRuns, compareRunFolders, mapEntitiesCsv, queryRunEntityReconciliation } from '../src/compare/run-comparator.mjs';
 import { createPool, withRequestTx } from '../src/db/pg-client.mjs';
 import { formatOverlayCsvFromRows, generateOverlayCsv } from '../src/decisions/overlay-generator.mjs';
 import {
@@ -1237,16 +1237,18 @@ test('Layer 4 [Pre-Coherence 5 Sent Dates & 2 Method Corrections]: imports via p
   assert.equal(batches.filter((b) => b.batch_kind === 'historical_sent').length, 5);
   assert.equal(batches.filter((b) => b.batch_kind === 'method_correction').length, 2);
 
-  // Verify cumulative totals through coherence_views:
+  // Verify cumulative totals through app_views as platform_app:
   // Beacon: 100 (3/25) + 80*3 (4/29..6/30) + 100 (7/31) - 20 (8/1 split) = 420.00
   // Acme: 50 (7/31, excluded from 8/1 split) = 50.00
   // Acme Upline: 20*3 (4/29..6/30) + 20 (8/1 split) - 60 (8/31 take-back) = 20.00
-  const entTotals = (await env.pool.query(
-    `SELECT statement_entity, SUM(net_amount)::numeric(14,2)::text AS total
-     FROM coherence_views.v_entity_statement_date_totals
-     GROUP BY statement_entity
-     ORDER BY statement_entity COLLATE "C"`,
-  )).rows;
+  const entTotals = await withRequestTx(createRoleScopedTestPool(env.pool, 'platform_app'), env.ownerToken, async (tx) => (
+    (await tx.query(
+      `SELECT statement_entity, SUM(net_amount)::numeric(14,2)::text AS total
+       FROM app_views.coherence_statement_date_totals
+       GROUP BY statement_entity
+       ORDER BY statement_entity COLLATE "C"`,
+    )).rows
+  ), { readOnly: true });
   assert.deepEqual(entTotals, [
     { statement_entity: 'Acme', total: '50.00' },
     { statement_entity: 'Acme Upline', total: '20.00' },
@@ -1891,10 +1893,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
   // Correct direction (agency +20.00, upline -20.00) passes deferred conservation trigger with $0.00 variance
   const good = await runNegConservationCheck(false);
   await good.materialize();
-  const recon = (await good.env.pool.query(
-    'SELECT statement_entity, statement_total::text, ledger_total::text, variance::text, reconciled FROM coherence_views.v_entity_statement_reconciliation($1::uuid)',
-    [good.runId],
-  )).rows;
+  const recon = await queryRunEntityReconciliation(good.env.pool, good.runId);
   assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'));
   const byEnt = Object.fromEntries(recon.map((r) => [r.statement_entity, r.statement_total]));
   assert.deepEqual(byEnt, {
@@ -2177,12 +2176,16 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   assert.equal(rep.methodCorrectionBatchesImported, 2);
 
   // Verify every date's upline total in PostgreSQL matches exact-per-file rounded totals and cumulative upline equals 8/1 split (+12.00)
-  const uplineByDate = (await env.pool.query(
-    `SELECT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS dt, net_amount::text AS total
-     FROM coherence_views.v_entity_statement_date_totals
-     WHERE account_kind = 'upline'
-     ORDER BY statement_date ASC`,
-  )).rows;
+  const plxAppPool = createRoleScopedTestPool(env.pool, 'platform_app');
+  const uplineByDate = await withRequestTx(plxAppPool, env.ownerToken, async (tx) => (
+    (await tx.query(
+      `SELECT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS dt, SUM(net_amount)::numeric(14,2)::text AS total
+       FROM app_views.coherence_statement_date_totals
+       WHERE account_kind = 'upline'
+       GROUP BY statement_date
+       ORDER BY statement_date ASC`,
+    )).rows
+  ), { readOnly: true });
   assert.deepEqual(uplineByDate, [
     { dt: '2026-04-29', total: '100.03' },
     { dt: '2026-05-31', total: '40.02' },
@@ -2202,12 +2205,14 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   assert.deepEqual(nonzeroPlxRecords, [], 'every plxSpark upline record_id (including rounding lines) must net to 0.00 after 8/31 take-back');
 
   // Verify cumulative entity totals across all batches
-  const entTotals = (await env.pool.query(
-    `SELECT statement_entity, SUM(net_amount)::numeric(14,2)::text AS total
-     FROM coherence_views.v_entity_statement_date_totals
-     GROUP BY statement_entity
-     ORDER BY statement_entity COLLATE "C"`,
-  )).rows;
+  const entTotals = await withRequestTx(plxAppPool, env.ownerToken, async (tx) => (
+    (await tx.query(
+      `SELECT statement_entity, SUM(net_amount)::numeric(14,2)::text AS total
+       FROM app_views.coherence_statement_date_totals
+       GROUP BY statement_entity
+       ORDER BY statement_entity COLLATE "C"`,
+    )).rows
+  ), { readOnly: true });
   // Acme: 50.00 (7/31)
   // Acme Upline: 100.03 + 40.02 + 30.02 + 12.00 - 170.07 = 12.00
   // Beacon: 125 (3/25) + 240 (4/29) + 80 (5/31) + 80 (6/30) + 300 (7/31) - 20 (8/1) = 805.00
@@ -2431,33 +2436,33 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     statementsCsv: stmtCsv,
   });
 
-  const recon = (await envMat.pool.query(
-    'SELECT statement_entity, statement_total::text, ledger_total::text, variance::text, reconciled FROM coherence_views.v_entity_statement_reconciliation($1::uuid)',
-    [runId],
-  )).rows;
+  const recon = await queryRunEntityReconciliation(envMat.pool, runId);
   assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'));
   assert.deepEqual(
     Object.fromEntries(recon.map((r) => [r.statement_entity, r.statement_total])),
     { 'Acme Upline': '100.00', Beacon: '400.00' },
   );
 
-  // Verify v_entity_statement_totals separates typed rounding_adjustment rows from statement (src_type, payment_month) rows,
+  // Verify app_views.coherence_statement_totals separates typed rounding_adjustment rows from statement (src_type, payment_month) rows,
   // and Layer 3 run-comparator line counts exclude synthetic rounding adjustments while keeping exact entity parity.
-  const viewTotals = (await envMat.pool.query(
-    `SELECT t.account_kind, t.src_type, t.payment_month, t.line_count::int AS line_count, t.net_amount::text AS net_amount
-     FROM coherence_views.v_entity_statement_totals t
-     JOIN coherence.run_effective_statement_batches($1::uuid) eff ON eff.batch_id = t.batch_id
-     WHERE t.src_type = 'rounding_adjustment'
-     ORDER BY t.statement_date ASC`,
-    [runId],
-  )).rows;
+  const viewTotals = await withRequestTx(createRoleScopedTestPool(envMat.pool, 'platform_app'), envMat.ownerToken, async (tx) => (
+    (await tx.query(
+      `SELECT t.account_kind, t.src_type, t.payment_month, t.line_count::int AS line_count, t.net_amount::text AS net_amount
+       FROM app_views.coherence_statement_totals t
+       JOIN app_views.coherence_effective_statement_batches($1::uuid) eff ON eff.batch_id = t.batch_id
+       WHERE t.src_type = 'rounding_adjustment'
+       ORDER BY t.statement_date ASC`,
+      [runId],
+    )).rows
+  ), { readOnly: true });
   assert.deepEqual(viewTotals, [
     { account_kind: 'upline', src_type: 'rounding_adjustment', payment_month: null, line_count: 1, net_amount: '-0.02' },
     { account_kind: 'upline', src_type: 'rounding_adjustment', payment_month: null, line_count: 1, net_amount: '0.02' },
   ]);
 
+  const roPool = createRoleScopedTestPool(envMat.pool, 'platform_readonly');
   const cmpParity = await compareDbRuns({
-    pool: envMat.pool,
+    pool: roPool,
     stores: envMat.stores,
     leftRunId: runId,
     rightRunId: runId,
@@ -2471,7 +2476,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     },
     tempBaseDir: envMat.tempDir,
   });
-  assert.equal(cmpParity.passed, true, `Layer 3 comparator parity failed: ${cmpParity.problems.join('; ')}`);
+  assert.equal(cmpParity.passed, true, `Layer 3 comparator parity as platform_readonly failed: ${cmpParity.problems.join('; ')}`);
   assert.equal(cmpParity.gates.gate4.entityStatements.dbReconciliation.totalLines, 22);
   assert.equal(cmpParity.gates.gate4.entityStatements.dbReconciliation.roundingAdjustmentLines, 2);
 });
@@ -3196,7 +3201,7 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
     assert.equal(stage, 'abandoned');
   }
 
-  // Never published: findLatestPublishedRun skips 2026-11-15 and returns 2026-11-11; attempt_is_published_run is false!
+  // Never published: findLatestPublishedRun skips 2026-11-15 and returns 2026-11-11; abandoned run is absent from app_views.coherence_published_runs!
   const iamFix9 = env.iam;
   const appPoolFix9 = createRoleScopedTestPool(env.pool, 'platform_app');
   const latestPub = await findLatestPublishedRun(appPoolFix9, iamFix9.tokens.entityMgr);
@@ -3205,8 +3210,10 @@ test('Layer 4 [Fix 9 - Abandoned Imported Company Runs & Partly Finished Run Reb
     "SELECT id FROM coherence.step_attempt_events WHERE run_id = $1::uuid AND step = 'emit' AND event_kind = 'finished'",
     [ab1115],
   )).rows[0].id;
-  const isPub = (await env.pool.query('SELECT coherence.attempt_is_published_run($1::uuid) AS pub', [abEmitEv])).rows[0].pub;
-  assert.equal(isPub, false, 'abandoned imported company run emit attempt must never be published');
+  const pubMatches = await withRequestTx(appPoolFix9, env.ownerToken, async (tx) => (
+    (await tx.query('SELECT id FROM app_views.coherence_published_runs WHERE id = $1::uuid OR emit_attempt_event_id = $2::uuid', [ab1115, abEmitEv])).rows
+  ), { readOnly: true });
+  assert.equal(pubMatches.length, 0, 'abandoned imported company run emit attempt must never be published');
 
   // Never carried: carrySent on abandoned imported company run is refused by PostgreSQL
   await env.commands.publishInputVersion({

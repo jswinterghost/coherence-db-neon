@@ -24,18 +24,40 @@
     "log_statement": "none"
   },
   "roles": {
-    "coherence_app": {
-      "businessTables": ["SELECT", "INSERT"],
-      "reviewSubmissions": ["SELECT", "INSERT"],
-      "reviewDrafts": ["SELECT", "INSERT", "UPDATE", "DELETE"]
+    "platform_app": {
+      "businessTables": [],
+      "appViews": ["SELECT"],
+      "appCmd": ["EXECUTE"]
     },
-    "coherence_worker": {
+    "platform_worker": {
+      "businessTables": ["SELECT"],
+      "appCmd": ["EXECUTE"]
+    },
+    "platform_writer": {
       "businessTables": ["SELECT", "INSERT"],
       "reviewSubmissions": ["SELECT", "INSERT", "UPDATE"],
-      "reviewDrafts": ["SELECT", "INSERT", "UPDATE", "DELETE"]
+      "reviewDrafts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+      "auditJournal": ["SELECT", "INSERT"]
     },
-    "coherence_readonly": {
-      "businessTables": ["SELECT"]
+    "platform_readonly": {
+      "businessTables": ["SELECT"],
+      "appViews": ["SELECT"]
+    },
+    "platform_view_owner": {
+      "businessTables": ["SELECT"],
+      "securityBarrierViews": true
+    },
+    "platform_versioner": {
+      "versionedSupersession": true,
+      "fkBackfill": true
+    },
+    "platform_iam_sync": {
+      "iamTables": ["SELECT", "INSERT"],
+      "signingKeys": ["SELECT", "INSERT", "UPDATE"],
+      "auditJournal": ["SELECT", "INSERT"]
+    },
+    "platform_migrator": {
+      "migrations": true
     }
   }
 }

@@ -505,9 +505,9 @@ ALTER FUNCTION app_cmd.coherence_authorize_check_run() OWNER TO platform_writer;
 REVOKE ALL ON FUNCTION app_cmd.coherence_authorize_check_run() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_cmd.coherence_authorize_check_run() TO platform_app, platform_worker;
 
--- Re-assert base-table and legacy-schema lockdown for platform_app and PUBLIC.
-REVOKE ALL ON SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;
-REVOKE ALL ON ALL TABLES IN SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;
-REVOKE ALL ON ALL SEQUENCES IN SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;
-REVOKE ALL ON ALL FUNCTIONS IN SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;
+-- Re-assert base-table lockdown for platform_app and PUBLIC.
+REVOKE ALL ON SCHEMA coherence FROM PUBLIC, platform_app;
+REVOKE ALL ON ALL TABLES IN SCHEMA coherence FROM PUBLIC, platform_app;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA coherence FROM PUBLIC, platform_app;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA coherence FROM PUBLIC, platform_app;
 REVOKE CREATE ON SCHEMA app_views, app_cmd FROM PUBLIC, platform_app;

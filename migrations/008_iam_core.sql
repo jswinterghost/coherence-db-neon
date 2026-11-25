@@ -1137,6 +1137,18 @@ AS $$
       pg_catalog.lower(t.eff_range) DESC,
       t.depth ASC
   ),
+  live_ancestors AS (
+    SELECT a.ancestor_org_id AS org_id, pg_catalog.min(a.depth) AS depth, ao.org_kind
+    FROM dc
+    JOIN raw_closure a
+      ON dc.db_role_kind = 'company_working'
+     AND a.descendant_org_id = dc.tenant_org_id
+     AND a.depth > 0
+     AND NOT a.has_archived
+     AND a.eff_range @> iam.business_today()
+    JOIN iam.organizations ao ON ao.id = a.ancestor_org_id
+    GROUP BY a.ancestor_org_id, ao.org_kind
+  ),
   scoped_closure AS MATERIALIZED (
     SELECT
       c.ancestor_org_id,
@@ -1144,14 +1156,77 @@ AS $$
       c.depth,
       c.eff_range,
       c.has_archived,
-      COALESCE(tc.has_archived, false) AS tenant_has_archived
+      COALESCE(tc.has_archived, false) AS tenant_has_archived,
+      (dc.db_role_kind = 'control' OR tc.descendant_org_id IS NOT NULL) AS is_target_org,
+      (dc.db_role_kind = 'company_working' AND anc_tc.descendant_org_id IS NOT NULL) AS ancestor_in_tenant
     FROM dc
     JOIN raw_closure c ON true
+    JOIN iam.organizations ao ON ao.id = c.ancestor_org_id
     LEFT JOIN tc ON tc.descendant_org_id = c.descendant_org_id
+    LEFT JOIN tc anc_tc ON anc_tc.descendant_org_id = c.ancestor_org_id
     WHERE dc.db_role_kind = 'control'
-       OR (dc.db_role_kind = 'company_working' AND tc.descendant_org_id IS NOT NULL AND c.eff_range && tc.eff_range)
+       OR (
+         dc.db_role_kind = 'company_working'
+         AND tc.descendant_org_id IS NOT NULL
+         AND c.eff_range && tc.eff_range
+         AND (
+           anc_tc.descendant_org_id IS NOT NULL
+           OR (
+             ao.org_kind = 'platform_root'
+             AND (
+               tc.has_archived
+               OR NOT (tc.eff_range @> iam.business_today())
+               OR (NOT c.has_archived AND c.eff_range @> iam.business_today())
+             )
+           )
+           OR (
+             ao.org_kind <> 'platform_root'
+             AND EXISTS (SELECT 1 FROM live_ancestors la WHERE la.org_id = c.ancestor_org_id)
+             AND NOT c.has_archived
+             AND c.eff_range @> iam.business_today()
+           )
+         )
+       )
+       OR (
+         dc.db_role_kind = 'company_working'
+         AND tc.descendant_org_id IS NULL
+         AND ao.org_kind <> 'platform_root'
+         AND NOT c.has_archived
+         AND c.eff_range @> iam.business_today()
+         AND EXISTS (SELECT 1 FROM live_ancestors la WHERE la.org_id = c.ancestor_org_id)
+         AND EXISTS (SELECT 1 FROM live_ancestors ld WHERE ld.org_id = c.descendant_org_id)
+       )
+  ),
+  switch_chain AS MATERIALIZED (
+    SELECT
+      swc.descendant_org_id AS target_org_id,
+      swc.ancestor_org_id AS switch_org_id,
+      0 AS tier,
+      swc.depth AS ord
+    FROM dc
+    JOIN scoped_closure swc ON dc.db_role_kind = 'control'
+    UNION ALL
+    SELECT
+      swc.descendant_org_id AS target_org_id,
+      swc.ancestor_org_id AS switch_org_id,
+      1 AS tier,
+      swc.depth AS ord
+    FROM dc
+    JOIN scoped_closure swc
+      ON dc.db_role_kind = 'company_working'
+     AND swc.is_target_org
+     AND swc.ancestor_in_tenant
+    UNION ALL
+    SELECT
+      tc.descendant_org_id AS target_org_id,
+      la.org_id AS switch_org_id,
+      CASE WHEN la.org_kind = 'platform_root' THEN 3 ELSE 2 END AS tier,
+      la.depth AS ord
+    FROM dc
+    JOIN tc ON dc.db_role_kind = 'company_working'
+    JOIN live_ancestors la ON true
   )
-  SELECT
+  SELECT DISTINCT
     g.id,
     c.descendant_org_id,
     g.person_scope_mode,
@@ -1177,6 +1252,7 @@ AS $$
    AND gov.superseded_by_id IS NULL AND gov.status = 'active'
   JOIN scoped_closure c
     ON c.ancestor_org_id = g.organization_id
+   AND c.is_target_org
    AND (g.include_descendants OR c.depth = 0)
   WHERE g.person_id = p_person_id
     AND g.superseded_by_id IS NULL
@@ -1233,20 +1309,20 @@ AS $$
         (
           SELECT ts.switch_state
           FROM iam.organization_tool_switches ts
-          JOIN scoped_closure swc
-            ON swc.ancestor_org_id = ts.organization_id
-           AND swc.descendant_org_id = c.descendant_org_id
+          JOIN switch_chain swc
+            ON swc.target_org_id = c.descendant_org_id
+           AND swc.switch_org_id = ts.organization_id
           WHERE ts.tool_id = r.tool_id
             AND ts.superseded_by_id IS NULL AND ts.status = 'active'
-          ORDER BY swc.depth ASC
+          ORDER BY swc.tier ASC, swc.ord ASC
           LIMIT 1
         ) = 'on'
         AND NOT EXISTS (
           SELECT 1
           FROM iam.organization_tool_switches ts
-          JOIN scoped_closure swc
-            ON swc.ancestor_org_id = ts.organization_id
-           AND swc.descendant_org_id = c.descendant_org_id
+          JOIN switch_chain swc
+            ON swc.target_org_id = c.descendant_org_id
+           AND swc.switch_org_id = ts.organization_id
           WHERE ts.tool_id = r.tool_id
             AND ts.superseded_by_id IS NULL AND ts.status = 'active'
             AND ts.switch_state IN ('held', 'off')

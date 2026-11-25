@@ -473,4 +473,49 @@ test('Layer 5 [JSON Review API & Decision History]: serves bible.json/adjust.jso
   assert.equal(hist.body.history.length, 1);
   assert.equal(hist.body.history[0].replacesDecisionId, null);
   assert.equal(hist.body.history[0].note, 'first');
+
+  // Finding 8 guard: POST /checks/run without readonlyPool refuses 503 CHECK_READER_NOT_CONFIGURED
+  // (never falls back to pool), while unauthorized callers still get 403 first.
+  currentToken = iam.tokens.agentA;
+  const unauthNoRo = await reqJson('/api/coherence/beacon/checks/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ commandKey: 'no-ro-unauth', checkKind: 'chain' }),
+  });
+  assert.equal(unauthNoRo.status, 403);
+
+  currentToken = iam.tokens.owner;
+  const noRo = await reqJson('/api/coherence/beacon/checks/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ commandKey: 'no-ro-owner', checkKind: 'chain' }),
+  });
+  assert.equal(noRo.status, 503);
+  assert.equal(noRo.body.code, 'CHECK_READER_NOT_CONFIGURED');
+
+  // Passing the writing pool as readonlyPool is also refused with 503 CHECK_READER_NOT_CONFIGURED.
+  const samePoolHandlers = createWebHandlers({ pool: appPool, readonlyPool: appPool, companySlug: env.companySlug, stores: env.stores });
+  await assert.rejects(
+    () => samePoolHandlers.runVerificationCheck(iam.tokens.owner, { commandKey: 'same-pool-chk', checkKind: 'chain' }),
+    (err) => err?.status === 503 && err?.code === 'CHECK_READER_NOT_CONFIGURED',
+  );
+
+  // Misconfigured distinct readonlyPool (e.g. platform_app hitting 42501 on coherence.*) maps through mapPgError to 403 FORBIDDEN (never raw 500).
+  const badRoPool = createRoleScopedTestPool(env.pool, 'platform_app');
+  const badRoHandlers = createWebHandlers({ pool: appPool, readonlyPool: badRoPool, companySlug: env.companySlug, stores: env.stores });
+  const badRouter = createCoherenceRouter({
+    handlersByCompany: new Map([[env.companySlug, badRoHandlers]]),
+    authenticate: async () => iam.tokens.owner,
+  });
+  const badServer = createServer((req, res) => { void badRouter(req, res); });
+  await new Promise((resolvePromise) => badServer.listen(0, '127.0.0.1', resolvePromise));
+  t.after(() => new Promise((resolvePromise) => badServer.close(resolvePromise)));
+  const badRes = await fetch(`http://127.0.0.1:${badServer.address().port}/api/coherence/beacon/checks/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ commandKey: 'bad-ro-chk', checkKind: 'chain' }),
+  });
+  const badBody = await badRes.json();
+  assert.equal(badRes.status, 403);
+  assert.equal(badBody.code, 'FORBIDDEN');
 });

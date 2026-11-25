@@ -17,7 +17,7 @@ import {
   exportJournalNdjson,
   rebuildFromJournalExport,
 } from '../src/commands/journal-export.mjs';
-import { compareDbRuns, compareRunFolders } from '../src/compare/run-comparator.mjs';
+import { compareDbRuns, compareRunFolders, queryRunEntityReconciliation } from '../src/compare/run-comparator.mjs';
 import { runMigrations } from '../src/db/migrate.mjs';
 import { createClient, createPool, resolveLocalUser } from '../src/db/pg-client.mjs';
 import { createMemoryObjectStore } from '../src/storage/object-store.mjs';
@@ -498,7 +498,7 @@ test('Layer 6 [Mutations 1 & 2 - Bible & Adjust Decision Perturbations]: each fa
   });
 
   // Sanity check: Run A reconciles to $0.00 across all entities.
-  const recA = (await env.pool.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [runA])).rows;
+  const recA = await queryRunEntityReconciliation(env.pool, runA);
   assert.ok(recA.length >= 3);
   assert.ok(recA.every((r) => r.reconciled === true && r.variance === '0.00'));
 
@@ -533,7 +533,7 @@ test('Layer 6 [Mutations 1 & 2 - Bible & Adjust Decision Perturbations]: each fa
   assert.ok(chainB[1].replaces_decision_id, 'mutated Bible decision must link replaces_decision_id');
 
   // Mutated Run B must still reconcile to $0.00 on its own ledger.
-  const recB = (await env.pool.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [runB])).rows;
+  const recB = await queryRunEntityReconciliation(env.pool, runB);
   assert.ok(recB.every((r) => r.reconciled === true && r.variance === '0.00'));
 
   const cmpBible = await compareDbRuns({
@@ -584,7 +584,7 @@ test('Layer 6 [Mutations 1 & 2 - Bible & Adjust Decision Perturbations]: each fa
     }],
   });
 
-  const recC = (await env.pool.query('SELECT * FROM coherence_views.v_entity_statement_reconciliation($1::uuid)', [runC])).rows;
+  const recC = await queryRunEntityReconciliation(env.pool, runC);
   assert.ok(recC.every((r) => r.reconciled === true && r.variance === '0.00'));
 
   const cmpAdjust = await compareDbRuns({

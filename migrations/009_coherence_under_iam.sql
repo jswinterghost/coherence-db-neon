@@ -495,39 +495,8 @@ ALTER FUNCTION coherence._resolve_entity_org_id(TEXT, TEXT, JSONB) OWNER TO plat
 ALTER FUNCTION coherence._resolve_writing_person_id(TEXT, TEXT, JSONB) OWNER TO platform_versioner;
 ALTER FUNCTION coherence.backfill_iam_foreign_keys(JSONB, JSONB) OWNER TO platform_versioner;
 
--- 3. Replace Migration 006's GUC-based RLS policies, legacy coherence_app/coherence_worker
--- bypass policies, and helper functions with IAM-based FORCE RLS.
-DROP POLICY IF EXISTS bob_policies_internal_rw ON coherence.bob_policies;
-DROP POLICY IF EXISTS bob_policies_entity_manager ON coherence.bob_policies;
-DROP POLICY IF EXISTS bob_policies_agency_manager ON coherence.bob_policies;
-DROP POLICY IF EXISTS bob_policies_agent ON coherence.bob_policies;
-DROP POLICY IF EXISTS bob_policies_retention ON coherence.bob_policies;
-DROP POLICY IF EXISTS bob_policies_investor ON coherence.bob_policies;
-
-DROP POLICY IF EXISTS bob_policy_financials_internal_rw ON coherence.bob_policy_financials;
-DROP POLICY IF EXISTS bob_policy_financials_entity_manager ON coherence.bob_policy_financials;
-DROP POLICY IF EXISTS bob_policy_financials_agency_manager ON coherence.bob_policy_financials;
-DROP POLICY IF EXISTS bob_policy_financials_investor ON coherence.bob_policy_financials;
-
-DROP POLICY IF EXISTS statement_agency_lines_internal_rw ON coherence.statement_agency_lines;
-DROP POLICY IF EXISTS statement_agency_lines_entity_manager ON coherence.statement_agency_lines;
-DROP POLICY IF EXISTS statement_agency_lines_agency_manager ON coherence.statement_agency_lines;
-DROP POLICY IF EXISTS statement_agency_lines_agent ON coherence.statement_agency_lines;
-DROP POLICY IF EXISTS statement_agency_lines_retention ON coherence.statement_agency_lines;
-
-DROP POLICY IF EXISTS statement_upline_lines_internal_rw ON coherence.statement_upline_lines;
-DROP POLICY IF EXISTS statement_upline_lines_entity_manager ON coherence.statement_upline_lines;
-
-DROP POLICY IF EXISTS coherent_ledger_rows_internal_rw ON coherence.coherent_ledger_rows;
-DROP POLICY IF EXISTS coherent_ledger_rows_entity_manager ON coherence.coherent_ledger_rows;
-
-DROP FUNCTION IF EXISTS coherence.rls_allowed_entities();
-DROP FUNCTION IF EXISTS coherence.rls_actor_npn();
-DROP FUNCTION IF EXISTS coherence.rls_access_tier();
-
--- Enable and force RLS across ALL 31 Coherence business tables + review_submissions + review_drafts
--- (every Coherence domain table), keeping legacy coherence_readonly SELECT policies and adding
--- platform service-role policies (old coherence_app and coherence_worker policies are gone).
+-- 3. Enable and force IAM-based Row-Level Security across ALL 31 Coherence business tables +
+-- review_submissions + review_drafts (strictly platform_* service roles and platform_view_owner).
 DO $$
 DECLARE
   v_tbl TEXT;
@@ -574,15 +543,6 @@ BEGIN
       EXECUTE pg_catalog.format(
         'CREATE POLICY %I ON coherence.%I FOR INSERT TO platform_writer WITH CHECK (true)',
         v_tbl || '_platform_writer_ins', v_tbl
-      );
-    END IF;
-
-    -- Keep legacy coherence_readonly SELECT policy on tables newly put under FORCE RLS
-    -- (old coherence_app and coherence_worker USING (true) policies are dropped; runtime uses platform_*).
-    IF v_tbl NOT IN ('bob_policies', 'bob_policy_financials', 'statement_agency_lines', 'statement_upline_lines', 'coherent_ledger_rows') THEN
-      EXECUTE pg_catalog.format(
-        'CREATE POLICY %I ON coherence.%I FOR SELECT TO coherence_readonly USING (true)',
-        v_tbl || '_legacy_internal_ro', v_tbl
       );
     END IF;
   END LOOP;
@@ -996,6 +956,8 @@ BEGIN
   ] LOOP
     EXECUTE 'ALTER FUNCTION ' || v_sig || ' OWNER TO platform_view_owner';
     EXECUTE 'REVOKE ALL ON FUNCTION ' || v_sig || ' FROM PUBLIC';
+    -- PostgreSQL checks EXECUTE on functions inside views and RLS policies against current_user,
+    -- so both app_views.* readers (platform_app and platform_readonly) require EXECUTE here.
     EXECUTE 'GRANT EXECUTE ON FUNCTION ' || v_sig || ' TO platform_view_owner, platform_app, platform_readonly';
   END LOOP;
 END;
@@ -1235,7 +1197,7 @@ CREATE POLICY coherent_ledger_rows_iam_read ON coherence.coherent_ledger_rows
   );
 
 -- 4. Grant platform_view_owner the exact base-table SELECT and read-helper privileges it needs under
--- FORCE RLS (zero privileges granted to platform_app or PUBLIC on coherence/coherence_views).
+-- FORCE RLS (zero privileges granted to platform_app or PUBLIC on coherence).
 GRANT USAGE ON SCHEMA coherence, iam, platform, app_views TO platform_view_owner;
 GRANT SELECT ON
   coherence.company_meta,
@@ -7300,6 +7262,7 @@ $$;
 DO $$
 DECLARE
   v_tbl TEXT;
+  v_role TEXT;
 BEGIN
   GRANT USAGE ON SCHEMA app_cmd TO platform_app, platform_worker, platform_writer;
   GRANT USAGE ON SCHEMA coherence TO platform_versioner, platform_migrator, platform_worker, platform_readonly;
@@ -7409,11 +7372,7 @@ BEGIN
     coherence.hash_statement_upline_lines(UUID),
     coherence.hash_bob_rows(UUID),
     coherence.hash_ledger_rows(UUID),
-    coherence.run_effective_statement_batches(UUID),
-    coherence.upline_entity_label(),
-    coherence.batch_is_official_sent(UUID),
-    coherence.attempt_is_published_run(UUID),
-    coherence.batch_is_published_for_em(UUID)
+    coherence.run_effective_statement_batches(UUID)
   TO platform_readonly;
 
   -- platform_worker: strictly SELECT on Coherence domain tables + run_states (ZERO INSERT/UPDATE/DELETE,
@@ -7494,11 +7453,24 @@ BEGIN
     coherence._resolve_writing_person_id(TEXT, TEXT, JSONB)
   TO platform_writer;
 
-  -- Hard lockdown: revoke EVERY Coherence and coherence_views privilege from platform_app and PUBLIC.
-  REVOKE ALL ON SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;
-  REVOKE ALL ON ALL TABLES IN SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;
-  REVOKE ALL ON ALL SEQUENCES IN SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;
-  REVOKE ALL ON ALL FUNCTIONS IN SCHEMA coherence, coherence_views FROM PUBLIC, platform_app;
+  -- Hard lockdown: revoke EVERY Coherence privilege from platform_app and PUBLIC,
+  -- and revoke any leftover privileges from retired pre-IAM roles if present cluster-wide.
+  REVOKE ALL ON SCHEMA coherence FROM PUBLIC, platform_app;
+  REVOKE ALL ON ALL TABLES IN SCHEMA coherence FROM PUBLIC, platform_app;
+  REVOKE ALL ON ALL SEQUENCES IN SCHEMA coherence FROM PUBLIC, platform_app;
+  REVOKE ALL ON ALL FUNCTIONS IN SCHEMA coherence FROM PUBLIC, platform_app;
   REVOKE CREATE ON SCHEMA app_views, app_cmd FROM PUBLIC, platform_app;
+  FOREACH v_role IN ARRAY ARRAY[
+    'coherence_app', 'coherence_worker', 'coherence_readonly',
+    'coherence_entity_manager_ro', 'coherence_agency_manager_ro',
+    'coherence_agent_ro', 'coherence_retention_ro', 'coherence_investor_ro'
+  ] LOOP
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = v_role) THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON SCHEMA coherence, platform, iam, iam_secret, app_views, app_cmd FROM %I', v_role);
+      EXECUTE pg_catalog.format('REVOKE ALL ON ALL TABLES IN SCHEMA coherence, platform, iam, iam_secret, app_views, app_cmd FROM %I', v_role);
+      EXECUTE pg_catalog.format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA coherence, platform, iam, iam_secret, app_views, app_cmd FROM %I', v_role);
+      EXECUTE pg_catalog.format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA coherence, platform, iam, iam_secret, app_views, app_cmd FROM %I', v_role);
+    END IF;
+  END LOOP;
 END;
 $$;
