@@ -1026,23 +1026,18 @@ SELECT person_id, agency_org_id AS organization_id, 'agent'::text AS capacity, v
 FROM iam.agent_affiliations
 WHERE superseded_by_id IS NULL AND status = 'active';
 
--- Unified organization closure (never directly readable by platform_app or PUBLIC).
--- In a company_working database (tenant T), an organization that had an overlapping non-future active
--- edge under T and has since moved (has a current live edge elsewhere) or been archived stays in T's
--- tree at its latest non-future active edge inside T's tree (so T's writes/backfill, T/ancestor staff
--- reads, and the org's own manager read all work in T's database while grants anchored at its new
--- upline never reach T's database). Outside T's retained tree (and in control DBs), active orgs follow
--- their current active edge and archived orgs follow their single latest non-future active edge.
+-- Unified time-consistent organization closure (never directly readable by platform_app or PUBLIC).
+-- Each active non-future edge carries a valid_range; a chain from an ancestor down to a descendant
+-- counts only for the dates every link in it was true at the same time (carrying the intersection
+-- eff_range down the recursion and keeping a chain only while eff_range is non-empty).
+-- Detached active orgs (active status with no current live edge anywhere) carry no expired edges.
 CREATE OR REPLACE VIEW iam.v_organization_closure AS
-WITH RECURSIVE non_future_edges AS (
+WITH RECURSIVE valid_edges AS (
   SELECT
-    e.id,
     e.child_org_id,
     e.parent_org_id,
     e.valid_range,
-    e.journal_seq,
-    (cov.status = 'archived') AS is_archived_child,
-    (cov.status = 'active' AND e.valid_range @> iam.business_today()) AS is_current_live
+    (cov.status = 'archived') AS is_archived_child
   FROM iam.organization_edges e
   JOIN iam.organization_versions cov
     ON cov.organization_id = e.child_org_id
@@ -1050,93 +1045,49 @@ WITH RECURSIVE non_future_edges AS (
   WHERE e.superseded_by_id IS NULL
     AND e.status = 'active'
     AND pg_catalog.lower(e.valid_range) <= iam.business_today()
-),
-tenant_ever(org_id, eff_range, depth) AS (
-  SELECT dc.tenant_org_id, pg_catalog.daterange('-infinity'::date, 'infinity'::date, '[]'), 0
-  FROM iam.database_context dc
-  WHERE dc.singleton = true
-    AND dc.db_role_kind = 'company_working'
-    AND dc.tenant_org_id IS NOT NULL
-  UNION ALL
-  SELECT nfe.child_org_id, te.eff_range * nfe.valid_range, te.depth + 1
-  FROM tenant_ever te
-  JOIN non_future_edges nfe
-    ON nfe.parent_org_id = te.org_id
-   AND te.eff_range && nfe.valid_range
-  WHERE te.depth < 32
-) CYCLE org_id SET is_cycle USING path,
-tenant_retained_edges AS (
-  SELECT DISTINCT ON (nfe.child_org_id)
-    nfe.child_org_id,
-    nfe.parent_org_id,
-    nfe.is_archived_child
-  FROM non_future_edges nfe
-  JOIN iam.database_context dc
-    ON dc.singleton = true
-   AND dc.db_role_kind = 'company_working'
-   AND dc.tenant_org_id IS NOT NULL
-  WHERE nfe.child_org_id <> dc.tenant_org_id
-    AND EXISTS (
-      SELECT 1 FROM tenant_ever te
-      WHERE NOT te.is_cycle
-        AND te.org_id = nfe.parent_org_id
-        AND te.eff_range && nfe.valid_range
-    )
     AND (
-      nfe.is_archived_child
-      OR nfe.is_current_live
+      cov.status = 'archived'
+      OR e.valid_range @> iam.business_today()
       OR EXISTS (
-        SELECT 1 FROM non_future_edges live_e
-        WHERE live_e.child_org_id = nfe.child_org_id
-          AND live_e.is_current_live
+        SELECT 1 FROM iam.organization_edges live_e
+        WHERE live_e.child_org_id = e.child_org_id
+          AND live_e.superseded_by_id IS NULL
+          AND live_e.status = 'active'
+          AND live_e.valid_range @> iam.business_today()
       )
     )
-  ORDER BY
-    nfe.child_org_id,
-    nfe.is_current_live DESC,
-    pg_catalog.lower(nfe.valid_range) DESC,
-    nfe.journal_seq DESC,
-    nfe.id DESC
 ),
-effective_edges AS (
-  SELECT child_org_id, parent_org_id, is_archived_child
-  FROM tenant_retained_edges
-  UNION ALL
-  SELECT nfe.child_org_id, nfe.parent_org_id, false AS is_archived_child
-  FROM non_future_edges nfe
-  WHERE nfe.is_current_live
-    AND NOT EXISTS (SELECT 1 FROM tenant_retained_edges tre WHERE tre.child_org_id = nfe.child_org_id)
-  UNION ALL
-  SELECT arch.child_org_id, arch.parent_org_id, true AS is_archived_child
-  FROM (
-    SELECT DISTINCT ON (nfe.child_org_id)
-      nfe.child_org_id,
-      nfe.parent_org_id
-    FROM non_future_edges nfe
-    WHERE nfe.is_archived_child
-      AND NOT EXISTS (SELECT 1 FROM tenant_retained_edges tre WHERE tre.child_org_id = nfe.child_org_id)
-    ORDER BY nfe.child_org_id, pg_catalog.lower(nfe.valid_range) DESC, nfe.journal_seq DESC, nfe.id DESC
-  ) arch
-),
-tree(ancestor_org_id, descendant_org_id, depth, has_archived) AS (
-  SELECT ov.organization_id, ov.organization_id, 0, (ov.status = 'archived')
+chains(ancestor_org_id, descendant_org_id, depth, eff_range, has_archived) AS (
+  SELECT
+    ov.organization_id,
+    ov.organization_id,
+    0,
+    pg_catalog.daterange('-infinity'::date, 'infinity'::date, '[]'),
+    (ov.status = 'archived')
   FROM iam.organization_versions ov
   WHERE ov.superseded_by_id IS NULL
   UNION ALL
-  SELECT t.ancestor_org_id, ee.child_org_id, t.depth + 1,
-         (t.has_archived OR ee.is_archived_child)
-  FROM tree t
-  JOIN effective_edges ee ON ee.parent_org_id = t.descendant_org_id
-  WHERE t.depth < 32
+  SELECT
+    c.ancestor_org_id,
+    e.child_org_id,
+    c.depth + 1,
+    c.eff_range * e.valid_range,
+    (c.has_archived OR e.is_archived_child)
+  FROM chains c
+  JOIN valid_edges e
+    ON e.parent_org_id = c.descendant_org_id
+   AND c.eff_range && e.valid_range
+  WHERE c.depth < 32
 ) CYCLE descendant_org_id SET is_cycle USING path
-SELECT DISTINCT ancestor_org_id, descendant_org_id, depth, has_archived
-FROM tree
+SELECT DISTINCT ancestor_org_id, descendant_org_id, depth, eff_range, has_archived
+FROM chains
 WHERE NOT is_cycle;
 
 CREATE OR REPLACE VIEW iam.v_organization_closure_live AS
-SELECT ancestor_org_id, descendant_org_id, depth
+SELECT DISTINCT ancestor_org_id, descendant_org_id, depth
 FROM iam.v_organization_closure
-WHERE NOT has_archived;
+WHERE NOT has_archived
+  AND eff_range @> iam.business_today();
 
 -- Single per-person effective grant evaluator (enforces active person, active role, active grant org,
 -- active governing membership, dated valid_range, fail-closed data_date_range, hierarchy flow-down,
@@ -1159,6 +1110,47 @@ RETURNS TABLE (
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+  WITH dc AS (
+    SELECT db_role_kind, tenant_org_id, environment
+    FROM iam.database_context
+    WHERE singleton = true
+  ),
+  raw_closure AS MATERIALIZED (
+    SELECT c.ancestor_org_id, c.descendant_org_id, c.depth, c.eff_range, c.has_archived
+    FROM dc
+    JOIN iam.v_organization_closure c
+      ON dc.db_role_kind = 'company_working'
+      OR (dc.db_role_kind = 'control' AND NOT c.has_archived AND c.eff_range @> iam.business_today())
+  ),
+  tc AS (
+    SELECT DISTINCT ON (t.descendant_org_id)
+      t.descendant_org_id,
+      t.eff_range,
+      t.has_archived
+    FROM dc
+    JOIN raw_closure t
+      ON dc.db_role_kind = 'company_working'
+     AND t.ancestor_org_id = dc.tenant_org_id
+    ORDER BY
+      t.descendant_org_id,
+      (t.eff_range @> iam.business_today()) DESC,
+      pg_catalog.lower(t.eff_range) DESC,
+      t.depth ASC
+  ),
+  scoped_closure AS MATERIALIZED (
+    SELECT
+      c.ancestor_org_id,
+      c.descendant_org_id,
+      c.depth,
+      c.eff_range,
+      c.has_archived,
+      COALESCE(tc.has_archived, false) AS tenant_has_archived
+    FROM dc
+    JOIN raw_closure c ON true
+    LEFT JOIN tc ON tc.descendant_org_id = c.descendant_org_id
+    WHERE dc.db_role_kind = 'control'
+       OR (dc.db_role_kind = 'company_working' AND tc.descendant_org_id IS NOT NULL AND c.eff_range && tc.eff_range)
+  )
   SELECT
     g.id,
     c.descendant_org_id,
@@ -1179,17 +1171,13 @@ AS $$
    AND NOT EXISTS (SELECT 1 FROM iam.right_retirements ret WHERE ret.right_id = r.id)
   JOIN iam.tools t
     ON t.id = r.tool_id
-  JOIN iam.database_context dc ON dc.singleton = true
+  JOIN dc ON true
   JOIN iam.organization_versions gov
     ON gov.organization_id = g.organization_id
    AND gov.superseded_by_id IS NULL AND gov.status = 'active'
-  JOIN iam.v_organization_closure c
+  JOIN scoped_closure c
     ON c.ancestor_org_id = g.organization_id
    AND (g.include_descendants OR c.depth = 0)
-  LEFT JOIN iam.v_organization_closure tc
-    ON dc.db_role_kind = 'company_working'
-   AND tc.ancestor_org_id = dc.tenant_org_id
-   AND tc.descendant_org_id = c.descendant_org_id
   WHERE g.person_id = p_person_id
     AND g.superseded_by_id IS NULL
     AND g.status = 'active'
@@ -1205,24 +1193,21 @@ AS $$
       OR (r.environment_scope = 'dev_only' AND dc.environment IN ('dev', 'local'))
     )
     AND (
-      (dc.db_role_kind = 'control' AND NOT c.has_archived)
+      (NOT c.tenant_has_archived AND NOT c.has_archived)
       OR (
         dc.db_role_kind = 'company_working'
-        AND tc.descendant_org_id IS NOT NULL
-        AND (
-          (NOT tc.has_archived AND NOT c.has_archived)
-          OR (
-            tc.has_archived
-            AND c.has_archived
-            AND c.depth > 0
-            AND g.include_descendants = true
-            AND g.person_scope_mode = 'org_subtree'
-            AND EXISTS (
-              SELECT 1 FROM iam.v_organization_closure_live lcg
-              WHERE (lcg.ancestor_org_id = dc.tenant_org_id AND lcg.descendant_org_id = g.organization_id)
-                 OR (lcg.ancestor_org_id = g.organization_id AND lcg.descendant_org_id = dc.tenant_org_id)
+        AND c.tenant_has_archived
+        AND c.has_archived
+        AND c.depth > 0
+        AND g.include_descendants = true
+        AND g.person_scope_mode = 'org_subtree'
+        AND EXISTS (
+          SELECT 1 FROM scoped_closure lcg
+          WHERE NOT lcg.has_archived
+            AND (
+              (lcg.ancestor_org_id = dc.tenant_org_id AND lcg.descendant_org_id = g.organization_id)
+              OR (lcg.ancestor_org_id = g.organization_id AND lcg.descendant_org_id = dc.tenant_org_id)
             )
-          )
         )
       )
     )
@@ -1235,8 +1220,10 @@ AS $$
       OR (NOT rv.is_nusear_internal AND EXISTS (
         SELECT 1 FROM iam.v_all_memberships_live m
         JOIN iam.organizations mo ON mo.id = m.organization_id AND mo.org_kind <> 'platform_root'
-        JOIN iam.v_organization_closure_live mc
-          ON mc.ancestor_org_id = m.organization_id AND mc.descendant_org_id = g.organization_id
+        JOIN scoped_closure mc
+          ON mc.ancestor_org_id = m.organization_id
+         AND mc.descendant_org_id = g.organization_id
+         AND NOT mc.has_archived
         WHERE m.person_id = g.person_id AND m.valid_range @> iam.business_today()
       ))
     )
@@ -1246,8 +1233,9 @@ AS $$
         (
           SELECT ts.switch_state
           FROM iam.organization_tool_switches ts
-          JOIN iam.v_organization_closure swc
-            ON swc.ancestor_org_id = ts.organization_id AND swc.descendant_org_id = c.descendant_org_id
+          JOIN scoped_closure swc
+            ON swc.ancestor_org_id = ts.organization_id
+           AND swc.descendant_org_id = c.descendant_org_id
           WHERE ts.tool_id = r.tool_id
             AND ts.superseded_by_id IS NULL AND ts.status = 'active'
           ORDER BY swc.depth ASC
@@ -1256,8 +1244,9 @@ AS $$
         AND NOT EXISTS (
           SELECT 1
           FROM iam.organization_tool_switches ts
-          JOIN iam.v_organization_closure swc
-            ON swc.ancestor_org_id = ts.organization_id AND swc.descendant_org_id = c.descendant_org_id
+          JOIN scoped_closure swc
+            ON swc.ancestor_org_id = ts.organization_id
+           AND swc.descendant_org_id = c.descendant_org_id
           WHERE ts.tool_id = r.tool_id
             AND ts.superseded_by_id IS NULL AND ts.status = 'active'
             AND ts.switch_state IN ('held', 'off')

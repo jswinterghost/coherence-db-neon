@@ -89,6 +89,28 @@ export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
   'iam.assert_can_write(text, uuid, uuid, date)',
   'app_views.coherence_effective_statement_batches(uuid)',
   'app_views.coherence_run_stage(uuid, bigint)',
+  'app_views._read_tenant_right(text)',
+  'app_views._read_has_full_tenant_right(text)',
+  'app_views._read_bob_wide_orgs()',
+  'app_views._read_bob_narrow_pairs()',
+  'app_views._read_agency_statement_wide_orgs()',
+  'app_views._read_agency_statement_narrow_pairs()',
+  'app_views._read_statement_cash_wide_orgs()',
+  'app_views._read_statement_cash_narrow_pairs()',
+  'app_views._read_unpublished_wide_orgs()',
+  'app_views._read_unpublished_narrow_pairs()',
+  'app_views._read_upline_cash_orgs()',
+  'app_views._read_upline_statement_orgs()',
+  'app_views._read_ledger_orgs()',
+  'app_views._read_reconciliation_orgs(boolean)',
+  'app_views._read_has_full_entity_finance()',
+  'app_views._read_has_run_meta_access()',
+  'app_views._read_can_see_unsent_run_meta()',
+  'app_views._read_has_statement_batch_access()',
+  'app_views._read_can_see_unsent_batch_meta()',
+  'app_views._read_published_emit_attempts()',
+  'app_views._read_published_emit_attempt_ids(boolean)',
+  'app_views._read_current_finished_attempt(uuid, text)',
 ]);
 
 export const PLATFORM_APP_CMD_WHITELIST = Object.freeze([
@@ -182,6 +204,7 @@ export const APP_VIEWS_EXPECTED = Object.freeze([
   'coherence_published_runs',
   'coherence_entity_bundle_artifacts',
   'coherence_review_drift_gate',
+  'coherence_journal_gate',
   'coherence_decision_commits',
   'coherence_decisions',
   'coherence_checks',
@@ -785,6 +808,9 @@ export async function verifyIamConfigInvariants(pool) {
      WHERE n.nspname = 'app_views' AND c.relkind = 'v'
      ORDER BY c.relname`,
   );
+  const keyedHelperRe = /effective_wide_org_ids|_read_(bob_wide_orgs|agency_statement_wide_orgs|statement_cash_wide_orgs|upline_statement_orgs|ledger_orgs)\b/;
+  const forbiddenKeyedAnyRe = /\b(effective_any_org_ids|_read_(has_run_meta_access|can_see_unsent_run_meta|has_statement_batch_access|can_see_unsent_batch_meta))\b/i;
+
   const foundAppViews = new Set();
   for (const v of appViewsRes.rows) {
     foundAppViews.add(v.view_name);
@@ -799,8 +825,8 @@ export async function verifyIamConfigInvariants(pool) {
     if (opts.includes('security_invoker=true')) {
       problems.push(`View ${fq} must not set security_invoker=true (platform_app has zero base-table SELECT)`);
     }
-    if (v.view_name === 'coherence_entity_statement_reconciliation' && /\beffective_any_org_ids\b/i.test(v.view_def || '')) {
-      problems.push(`View ${fq} must not use iam.effective_any_org_ids()`);
+    if (v.view_name === 'coherence_entity_statement_reconciliation' && forbiddenKeyedAnyRe.test(v.view_def || '')) {
+      problems.push(`View ${fq} must not use iam.effective_any_org_ids() or metadata-only _read_* helpers`);
     }
     for (const priv of ALL_RELATION_PRIVS) {
       const pubRes = await pool.query('SELECT pg_catalog.has_table_privilege(\'public\', $1::oid, $2) AS hp', [v.view_oid, priv]);
@@ -866,11 +892,11 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`Table coherence.${tbl} is missing platform_view_owner RLS policy`);
     } else if (!viewPolRes.rows.every((p) => (
       p.cmd === 'SELECT'
-      && !/\beffective_any_org_ids\b/i.test(p.qual || '')
-      && !/\beffective_any_org_ids\b/i.test(p.with_check || '')
-      && /effective_wide_org_ids/.test(p.qual || '')
+      && !forbiddenKeyedAnyRe.test(p.qual || '')
+      && !forbiddenKeyedAnyRe.test(p.with_check || '')
+      && keyedHelperRe.test(p.qual || '')
     ))) {
-      problems.push(`Table coherence.${tbl} has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with iam.effective_wide_org_ids and must not use iam.effective_any_org_ids)`);
+      problems.push(`Table coherence.${tbl} has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with wide/scoped IAM helpers and must not use iam.effective_any_org_ids)`);
     }
 
     const npnChkRes = await pool.query(
@@ -925,13 +951,13 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`RLS policy ${p.policyname} on coherence.${p.tablename} uses unscoped iam.has_right()`);
     }
     if (fkTableSet.has(p.tablename)) {
-      if (/\beffective_any_org_ids\b/i.test(qual) || /\beffective_any_org_ids\b/i.test(p.with_check || '')) {
+      if (forbiddenKeyedAnyRe.test(qual) || forbiddenKeyedAnyRe.test(p.with_check || '')) {
         problems.push(`RLS policy ${p.policyname} on keyed table coherence.${p.tablename} must not use iam.effective_any_org_ids()`);
       }
-      if (!/effective_wide_org_ids/.test(qual)) {
-        problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must reference iam.effective_wide_org_ids)`);
+      if (!keyedHelperRe.test(qual)) {
+        problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must reference wide/scoped IAM read helpers)`);
       }
-    } else if (!/effective_(wide|any)_org_ids/.test(qual)) {
+    } else if (!/(effective_(wide|any)_org_ids|app_views\._read_)/.test(qual)) {
       problems.push(`Table coherence.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname} (must scope with IAM org helpers)`);
     }
   }
@@ -1106,37 +1132,73 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
 
-  // Internal coherence._resolve_* and coherence._cmd_* helpers (escaped '_' in LIKE)
-  // must pin SET search_path = pg_catalog and be callable strictly by their respective owning platform roles.
+  // Internal coherence._resolve_* / coherence._cmd_* helpers and app_views._read_* shared rights checks
+  // must pin SET search_path = pg_catalog and be owned/callable strictly by their respective platform roles.
   const internalCohFnRes = await pool.query(
-    `SELECT p.oid, p.proname, p.proconfig, r.rolname AS owner_name
+    `SELECT p.oid, n.nspname AS schema_name, p.proname, p.proconfig, p.prosecdef, r.rolname AS owner_name,
+            pg_catalog.pg_get_functiondef(p.oid) AS fn_def
      FROM pg_catalog.pg_proc p
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
      JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
-     WHERE n.nspname = 'coherence'
-       AND (
-         p.proname LIKE '\\_resolve\\_%' ESCAPE '\\'
-         OR p.proname LIKE '\\_cmd\\_%' ESCAPE '\\'
-       )`,
+     WHERE (n.nspname = 'coherence' AND (
+              p.proname LIKE '\\_resolve\\_%' ESCAPE '\\'
+              OR p.proname LIKE '\\_cmd\\_%' ESCAPE '\\'
+            ))
+        OR (n.nspname = 'app_views' AND p.proname LIKE '\\_read\\_%' ESCAPE '\\')`,
   );
-  const resolveFns = internalCohFnRes.rows.filter((f) => f.proname.startsWith('_resolve_'));
-  const cmdFns = internalCohFnRes.rows.filter((f) => f.proname.startsWith('_cmd_'));
+  const resolveFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'coherence' && f.proname.startsWith('_resolve_'));
+  const cmdFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'coherence' && f.proname.startsWith('_cmd_'));
+  const readFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'app_views' && f.proname.startsWith('_read_'));
   if (resolveFns.length === 0) {
     problems.push('Expected internal coherence._resolve_* helper functions were not found in pg_proc');
   }
   if (cmdFns.length === 0) {
     problems.push('Expected internal coherence._cmd_* helper functions were not found in pg_proc');
   }
+  if (readFns.length === 0) {
+    problems.push('Expected shared app_views._read_* rights helper functions were not found in pg_proc');
+  }
+  const readWideOnlyFns = new Set([
+    '_read_tenant_right',
+    '_read_has_full_tenant_right',
+    '_read_bob_wide_orgs',
+    '_read_bob_narrow_pairs',
+    '_read_agency_statement_wide_orgs',
+    '_read_agency_statement_narrow_pairs',
+    '_read_statement_cash_wide_orgs',
+    '_read_statement_cash_narrow_pairs',
+    '_read_unpublished_wide_orgs',
+    '_read_unpublished_narrow_pairs',
+    '_read_upline_cash_orgs',
+    '_read_upline_statement_orgs',
+    '_read_ledger_orgs',
+    '_read_reconciliation_orgs',
+    '_read_has_full_entity_finance',
+  ]);
   for (const ifn of internalCohFnRes.rows) {
-    const isResolve = ifn.proname.startsWith('_resolve_');
-    const expectedOwner = isResolve ? 'platform_versioner' : 'platform_writer';
-    const allowedRoles = new Set(isResolve ? ['platform_versioner', 'platform_writer'] : ['platform_writer']);
+    const isResolve = ifn.schema_name === 'coherence' && ifn.proname.startsWith('_resolve_');
+    const isRead = ifn.schema_name === 'app_views' && ifn.proname.startsWith('_read_');
+    const expectedOwner = isResolve ? 'platform_versioner' : (isRead ? 'platform_view_owner' : 'platform_writer');
+    const allowedRoles = new Set(
+      isResolve
+        ? ['platform_versioner', 'platform_writer']
+        : (isRead
+          ? ['platform_view_owner', 'platform_app', 'platform_readonly']
+          : ['platform_writer']),
+    );
+    const fqFn = `${ifn.schema_name}.${ifn.proname}`;
     const cfg = Array.isArray(ifn.proconfig) ? ifn.proconfig : [];
     if (!cfg.includes('search_path=pg_catalog')) {
-      problems.push(`Internal function coherence.${ifn.proname} must pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
+      problems.push(`Internal function ${fqFn} must pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
     }
     if (ifn.owner_name !== expectedOwner) {
-      problems.push(`Internal function coherence.${ifn.proname} must be owned by ${expectedOwner} (got ${ifn.owner_name})`);
+      problems.push(`Internal function ${fqFn} must be owned by ${expectedOwner} (got ${ifn.owner_name})`);
+    }
+    if (isRead && !ifn.prosecdef) {
+      problems.push(`Shared read helper ${fqFn} must be SECURITY DEFINER owned by platform_view_owner`);
+    }
+    if (isRead && readWideOnlyFns.has(ifn.proname) && forbiddenKeyedAnyRe.test(ifn.fn_def || '')) {
+      problems.push(`Wide/scoped read helper ${fqFn} must not use iam.effective_any_org_ids()`);
     }
     for (const principal of ['public', ...PLATFORM_ROLES]) {
       if (allowedRoles.has(principal)) continue;
@@ -1145,7 +1207,7 @@ export async function verifyIamConfigInvariants(pool) {
         [principal, ifn.oid],
       );
       if (exRes.rows[0].hp) {
-        problems.push(`${principal} holds forbidden EXECUTE privilege on internal function coherence.${ifn.proname}`);
+        problems.push(`${principal} holds forbidden EXECUTE privilege on internal function ${fqFn}`);
       }
     }
   }

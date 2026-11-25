@@ -179,7 +179,26 @@ export function createDatabaseCoherenceReader({
       );
       run = res.rows[0] || null;
     } else {
-      run = await findLatestPublishedRunTx(tx, { asOfSeq });
+      const limitSeq = asOfSeq != null ? String(asOfSeq) : MAX_BIGINT;
+      const res = await tx.query(
+        `SELECT r.id, r.statement_date, r.stamp, r.folder_number, r.origin, r.input_version_id,
+                r.emit_mode, r.emit_display, r.emit_attempt_event_id, r.emit_journal_seq,
+                r.journal_seq, r.sent, r.default_emit_display, r.display_name
+         FROM app_views.coherence_published_runs r
+         WHERE r.journal_seq <= $1::bigint AND r.emit_journal_seq <= $1::bigint
+           AND (
+             r.sent
+             OR EXISTS (
+               SELECT 1
+               FROM app_views.coherence_entity_bundle_artifacts a
+               WHERE a.run_id = r.id AND a.is_viewer_config = true
+             )
+           )
+         ORDER BY r.statement_date DESC, r.folder_number DESC, r.journal_seq DESC
+         LIMIT 1`,
+        [limitSeq],
+      );
+      run = res.rows[0] || null;
     }
     if (!run) return null;
 

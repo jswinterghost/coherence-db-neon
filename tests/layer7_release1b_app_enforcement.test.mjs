@@ -22,7 +22,7 @@ import {
   readCurrentPolicyPeriods,
   readEntityStatementLines,
 } from '../src/readers/downstream-reader.mjs';
-import { sha256Hex } from '../src/util/crypto.mjs';
+import { fingerprintBytes, sha256Hex } from '../src/util/crypto.mjs';
 import { createWebHandlers } from '../src/web/handlers.mjs';
 import { createCoherenceRouter } from '../src/web/router.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
@@ -37,6 +37,7 @@ import {
   SYNTHETIC_RUN_COLUMNS,
 } from './helpers/fixtures.mjs';
 import {
+  appendIamAuditEntry,
   createRoleScopedTestPool,
   flipToolSwitch,
 } from './helpers/iam-harness.mjs';
@@ -404,10 +405,10 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
     report: { ok: true },
   });
 
-  // Verify Migration 010 live catalog audit passes across all 38 app_views.* and 33 app_cmd.*!
+  // Verify Migration 010 live catalog audit passes across all 39 app_views.* and 33 app_cmd.*!
   const catalogAudit = await withClusterCatalogLock(() => verifyIamConfigInvariants(env.pool));
   assert.equal(catalogAudit.passed, true, `verifyIamConfigInvariants failed:\n${catalogAudit.problems.join('\n')}`);
-  assert.equal(catalogAudit.checkedAppViews, 38);
+  assert.equal(catalogAudit.checkedAppViews, 39);
   assert.equal(catalogAudit.checkedAppCmdFunctions, 33);
 
   const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
@@ -1238,4 +1239,642 @@ test('Layer 7C [Worker app_cmd Path & Privileged-Write Deletion]: privileged wri
   });
   assert.equal(workerMat.result.agencyLineCount, 1);
   assert.equal(workerMat.result.uplineLineCount, 1);
+});
+
+test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store-Kind Boundary Guard (9c)]', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
+  t.after(() => env.cleanup());
+
+  const iam = env.iam;
+  const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
+  const workerPool = createRoleScopedTestPool(env.pool, 'platform_worker');
+  const appCommands = createAppCommands({ pool: appPool, stores: env.stores });
+  const workerCommands = createAppCommands({ pool: workerPool, stores: env.stores });
+  const { engineVersionId } = await seedEngineCopyVersion(env);
+  await seedStandingInput(env, { commandKey: 'c1-standing-init' });
+
+  // Seed two runs that BOTH carry an Entity Manager viewer bundle:
+  //   1) sentRunId   (2026-10-15, SENT)
+  //   2) unsentRunId (2026-11-15, UNSENT)
+  async function seedBundleRun({ date, keyPrefix, markSent }) {
+    const dataset = buildCanaryEmitCsvs({ statementDate: date });
+    const viewerHtml = Buffer.from(
+      `<!doctype html><head><script>window.__VIEWER_CONFIG__=${JSON.stringify({
+        name: 'Entity Manager', title: 'Acme', statementDate: date, role: 'ENTITY_MANAGER',
+        features: { CANONICAL_BOB: { canonical_bob: 'data/canonical_bob.csv' }, COHERENT_LEDGER: { coherent_ledger: 'data/coherent_ledger.csv' } },
+      })};</script></head>`,
+      'utf8',
+    );
+    const viewer = await env.stores.promoteArtifact('emits/bundles/entity-managers/Acme/viewer.html', viewerHtml, { checksPassed: true });
+    const bob = await env.stores.promoteArtifact('emits/bundles/entity-managers/Acme/data/canonical_bob.csv', Buffer.from(dataset.bobCsv, 'utf8'), { checksPassed: true });
+    const led = await env.stores.promoteArtifact('emits/bundles/entity-managers/Acme/data/coherent_ledger.csv', Buffer.from(dataset.ledgerCsv, 'utf8'), { checksPassed: true });
+    const stmt = await env.stores.promoteArtifact(`emits/statements_${date.replace(/-/g, '')}.csv`, Buffer.from(dataset.statementsCsv, 'utf8'), { checksPassed: true });
+    const inp = await env.dataStore.promoteBytes(Buffer.from(`k\n${date}\n`, 'utf8'), { relPath: `imp_${date}.csv`, checksPassed: true });
+    const imp = await env.commands.importHistoricalRun({
+      dbToken: env.ownerToken,
+      commandKey: `${keyPrefix}-import`,
+      run: { origin: 'company_import', statementDate: date, sourceFolder: `company-workspaces/acme/${date}/runs/${date}`, emitMode: 'coherence' },
+      inputVersion: { reason: `${keyPrefix} import` },
+      inputEntries: [{ relPath: `imp_${date}.csv`, fileSha256: inp.sha256 }],
+      stepAttempts: [{
+        step: 'emit',
+        attemptNo: 1,
+        artifacts: [viewer, bob, led, stmt].map((f) => ({
+          relPath: f.relPath, artifactKind: f.artifactKind, storeKind: f.storeKind, fileSha256: f.sha256,
+        })),
+      }],
+      storedFiles: [inp, viewer, bob, led, stmt],
+    });
+    const runId = imp.result.runId;
+    const emitEv = (await env.pool.query("SELECT coherence.current_finished_attempt($1::uuid, 'emit') AS ev", [runId])).rows[0].ev;
+    await env.commands.materializeEmit({
+      dbToken: env.workerToken,
+      commandKey: `${keyPrefix}-mat`,
+      runId,
+      attemptEventId: emitEv,
+      statementDate: date,
+      canonicalBobCsv: dataset.bobCsv,
+      coherentLedgerCsv: dataset.ledgerCsv,
+      statementsCsv: dataset.statementsCsv,
+    });
+    if (markSent) {
+      await env.commands.carrySent({ dbToken: env.ownerToken, commandKey: `${keyPrefix}-sent`, runId, typedPhrase: `sent ${date}` });
+    }
+    return runId;
+  }
+
+  const sentRunId = await seedBundleRun({ date: '2026-10-15', keyPrefix: 'c1-sent', markSent: true });
+  const unsentRunId = await seedBundleRun({ date: '2026-11-15', keyPrefix: 'c1-unsent', markSent: false });
+
+  // Seed custom test principals in one transaction
+  const customPeople = {
+    missingStmtCash: randomUUID(),
+    missingStmtsRead: randomUUID(),
+    missingUplineRead: randomUUID(),
+    allSixSentOnly: randomUUID(),
+    disjointUnpub: randomUUID(),
+    sentEmSubOrgUnpub: randomUUID(),
+    runsReadOnly: randomUUID(),
+    outputsReadOnly: randomUUID(),
+    decisionsReadOnly: randomUUID(),
+  };
+
+  {
+    const c = await env.pool.connect();
+    try {
+      await c.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      const j = await appendIamAuditEntry(c, {
+        environment: iam.environment,
+        commandKind: 'iam.c1_custom_roles',
+        commandKey: 'c1-custom-roles',
+        targetOrgId: iam.ids.companyOrg,
+      });
+      const seq = j.seq;
+      const seedCustomPerson = async (personId, slug, grants) => {
+        await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [personId, seq]);
+        await c.query(
+          "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)",
+          [randomUUID(), personId, slug, `${slug}@acme.example`, seq],
+        );
+        const memberOrgs = [...new Set(grants.map((g) => g.orgId))];
+        for (const orgId of memberOrgs) {
+          await c.query(
+            "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+            [randomUUID(), personId, orgId, seq],
+          );
+        }
+        let idx = 0;
+        for (const g of grants) {
+          idx += 1;
+          const roleId = randomUUID();
+          await c.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleId, `${slug}_r${idx}`, seq]);
+          await c.query(
+            "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,$3,false,false,true,'active',$4)",
+            [randomUUID(), roleId, `${slug} role ${idx}`, seq],
+          );
+          for (const rightId of g.rights) {
+            await c.query(
+              "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
+              [randomUUID(), roleId, rightId, seq],
+            );
+          }
+          await c.query(
+            "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+            [randomUUID(), personId, roleId, g.orgId, seq],
+          );
+        }
+      };
+
+      const sixEmRights = [
+        'act:coherence.bob.read',
+        'act:coherence.ledger.read',
+        'act:coherence.statements.read',
+        'act:coherence.upline.read',
+        'col:coherence.statement_cash',
+        'col:coherence.upline_cash',
+      ];
+      await seedCustomPerson(customPeople.missingStmtCash, 'c1_missing_stmt_cash', [{
+        orgId: iam.ids.companyOrg,
+        rights: [...sixEmRights.filter((r) => r !== 'col:coherence.statement_cash'), 'act:coherence.unpublished.read'],
+      }]);
+      await seedCustomPerson(customPeople.missingStmtsRead, 'c1_missing_stmts_read', [{
+        orgId: iam.ids.companyOrg,
+        rights: [...sixEmRights.filter((r) => r !== 'act:coherence.statements.read'), 'act:coherence.unpublished.read'],
+      }]);
+      await seedCustomPerson(customPeople.missingUplineRead, 'c1_missing_upline_read', [{
+        orgId: iam.ids.companyOrg,
+        rights: [...sixEmRights.filter((r) => r !== 'act:coherence.upline.read'), 'act:coherence.unpublished.read'],
+      }]);
+      await seedCustomPerson(customPeople.allSixSentOnly, 'c1_all_six_sent', [{
+        orgId: iam.ids.companyOrg,
+        rights: sixEmRights,
+      }]);
+      await seedCustomPerson(customPeople.disjointUnpub, 'c1_disjoint_unpub', [
+        { orgId: iam.ids.beaconOrg, rights: ['act:coherence.bob.read'] },
+        { orgId: iam.ids.harborOrg, rights: ['act:coherence.unpublished.read'] },
+      ]);
+      await seedCustomPerson(customPeople.sentEmSubOrgUnpub, 'c1_sent_em_sub_unpub', [
+        { orgId: iam.ids.companyOrg, rights: sixEmRights },
+        { orgId: iam.ids.beaconOrg, rights: ['act:coherence.unpublished.read'] },
+      ]);
+      await seedCustomPerson(customPeople.runsReadOnly, 'c1_runs_only', [
+        { orgId: iam.ids.companyOrg, rights: ['act:coherence.runs.read'] },
+      ]);
+      await seedCustomPerson(customPeople.outputsReadOnly, 'c1_outputs_only', [
+        { orgId: iam.ids.companyOrg, rights: ['act:coherence.bob.read', 'act:coherence.outputs.read'] },
+      ]);
+      await seedCustomPerson(customPeople.decisionsReadOnly, 'c1_decisions_only', [
+        { orgId: iam.ids.companyOrg, rights: ['act:coherence.bob.read', 'act:coherence.decisions.read'] },
+      ]);
+      await c.query('COMMIT');
+    } catch (err) {
+      await c.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      c.release();
+    }
+  }
+
+  const reader = createDatabaseCoherenceReader({ pool: appPool, stores: env.stores, entity: 'Acme' });
+
+  await t.test('Item 1 (9a): custom role missing statement_cash, statements.read, or upline.read gets nothing from coherence_entity_bundle_artifacts, artifacts_iam_read, and stored_files_iam_read', async () => {
+    for (const [label, personId] of [
+      ['missing col:coherence.statement_cash', customPeople.missingStmtCash],
+      ['missing act:coherence.statements.read', customPeople.missingStmtsRead],
+      ['missing act:coherence.upline.read', customPeople.missingUplineRead],
+    ]) {
+      const tok = iam.tokenFor(personId);
+      const bundleRows = await withRequestTx(appPool, tok, async (tx) => (
+        await tx.query('SELECT run_id, rel_path FROM app_views.coherence_entity_bundle_artifacts')
+      ).rows);
+      assert.deepEqual(bundleRows, [], `${label} must get 0 rows from app_views.coherence_entity_bundle_artifacts`);
+
+      const sumSent = await reader.summary(tok, { runId: sentRunId });
+      assert.equal(sumSent.available, false, `${label} must get available=false from reader.summary on sent run`);
+      const sumLatest = await reader.summary(tok);
+      assert.equal(sumLatest.available, false, `${label} must get available=false from reader.summary on latest run`);
+
+      // Direct platform_view_owner check confirms artifacts_iam_read and stored_files_iam_read also refuse the EM branch.
+      const voClient = await env.pool.connect();
+      try {
+        await voClient.query('BEGIN TRANSACTION READ ONLY');
+        await voClient.query('SET LOCAL ROLE platform_view_owner');
+        await voClient.query("SELECT pg_catalog.set_config('app.session_token', $1, true)", [tok]);
+        const artCnt = (await voClient.query('SELECT COUNT(*)::int AS n FROM coherence.artifacts')).rows[0].n;
+        const sfCnt = (await voClient.query('SELECT COUNT(*)::int AS n FROM coherence.stored_files')).rows[0].n;
+        await voClient.query('COMMIT');
+        assert.equal(artCnt, 0, `${label} must see 0 rows via artifacts_iam_read`);
+        assert.equal(sfCnt, 0, `${label} must see 0 rows via stored_files_iam_read`);
+      } finally {
+        await voClient.query('ROLLBACK').catch(() => {});
+        voClient.release();
+      }
+    }
+
+    // Control: role with all six rights reads sentRunId entity bundle cleanly.
+    const allSixTok = iam.tokenFor(customPeople.allSixSentOnly);
+    const controlRows = await withRequestTx(appPool, allSixTok, async (tx) => (
+      await tx.query('SELECT run_id, rel_path FROM app_views.coherence_entity_bundle_artifacts')
+    ).rows);
+    assert.ok(controlRows.length >= 3 && controlRows.every((r) => r.run_id === sentRunId), 'control role holding all six rights must read sentRunId bundle artifacts');
+    const controlSum = await reader.summary(allSixTok);
+    assert.equal(controlSum.available, true);
+    assert.equal(controlSum.runId, sentRunId);
+  });
+
+  await t.test('Item 1 (9b + downstream reader): disjoint bob.read and unpublished.read agencies see no unsent run, and downstream reader picks newest run it can open', async () => {
+    const disjointTok = iam.tokenFor(customPeople.disjointUnpub);
+    const pubRuns = await withRequestTx(appPool, disjointTok, async (tx) => (
+      await tx.query('SELECT id, sent FROM app_views.coherence_published_runs ORDER BY statement_date DESC')
+    ).rows);
+    assert.deepEqual(pubRuns.map((r) => r.id), [sentRunId], 'caller with bob.read on Beacon and unpublished.read on Harbor must see no unsent run in coherence_published_runs');
+    assert.equal(pubRuns[0].sent, true);
+
+    const latestDisjoint = await findLatestPublishedRun(appPool, disjointTok);
+    assert.equal(latestDisjoint?.id, sentRunId, 'findLatestPublishedRun must pick sentRunId when bob.read and unpublished.read are disjoint');
+
+    const periodsDisjoint = await readCurrentPolicyPeriods(appPool, disjointTok);
+    assert.ok(periodsDisjoint.length > 0 && periodsDisjoint.every((r) => r.run_id === sentRunId), 'policy periods must stay on sentRunId');
+
+    // Downstream reader: caller with all-6 sent EM rights on Acme + unpublished.read ONLY on Beacon
+    // can see unsentRunId in coherence_published_runs (for Beacon rows), cannot open unsentRunId's
+    // Entity Manager bundle, and must open sentRunId (newest run it can open) instead of failing closed!
+    const subUnpubTok = iam.tokenFor(customPeople.sentEmSubOrgUnpub);
+    const subSummary = await reader.summary(subUnpubTok);
+    assert.equal(subSummary.available, true, 'downstream reader must pick newest run it can open instead of failing closed on unreadable newer unsent run');
+    assert.equal(subSummary.runId, sentRunId);
+    assert.equal(subSummary.sent, true);
+    const subFile = await reader.file(subUnpubTok, 'data/canonical_bob.csv');
+    assert.ok(subFile.body.toString('utf8').includes('987654.32'));
+
+    // Control: owner (tenant-wide unpublished.read) opens newer unsentRunId.
+    const ownerSummary = await reader.summary(iam.tokens.owner);
+    assert.equal(ownerSummary.available, true);
+    assert.equal(ownerSummary.runId, unsentRunId);
+    assert.equal(ownerSummary.sent, false);
+
+    // Dedicated journal gate view exists and enforces journal.read separately from review drift gate.
+    const ownerGate = await withRequestTx(appPool, iam.tokens.owner, async (tx) => (
+      await tx.query('SELECT authorized FROM app_views.coherence_journal_gate LIMIT 1')
+    ).rows);
+    assert.equal(ownerGate.length, 1);
+    assert.equal(ownerGate[0].authorized, true);
+    const adminGate = await withRequestTx(appPool, iam.tokens.companyAdmin, async (tx) => (
+      await tx.query('SELECT authorized FROM app_views.coherence_journal_gate LIMIT 1')
+    ).rows);
+    assert.deepEqual(adminGate, []);
+  });
+
+  await t.test('Item 2 (9c + sibling commands): wrong store_kind is refused across data commands as operator/owner/worker and code command as owner', async () => {
+    const fakeCodeBytes = Buffer.from('console.log("not allowed in data command");\n', 'utf8');
+    const fakeCodeFp = fingerprintBytes(fakeCodeBytes);
+    const fakeCodeFile = {
+      storeKind: 'nusear_code',
+      sha256: fakeCodeFp.sha256,
+      byteSize: fakeCodeFp.byteSize,
+      md5B64: fakeCodeFp.md5B64,
+      crc32cB64: fakeCodeFp.crc32cB64,
+      objectName: `objects/${fakeCodeFp.sha256}`,
+    };
+
+    // Preserve current standing entries so publishInputVersion would succeed without the store_kind guard!
+    const curStandingId = (await env.pool.query('SELECT coherence.standing_input_version_as_of(NULL) AS id')).rows[0].id;
+    const curStandingEntries = (await env.pool.query(
+      'SELECT rel_path, file_sha256 FROM coherence.input_entries WHERE input_version_id = $1::uuid ORDER BY rel_path COLLATE "C"',
+      [curStandingId],
+    )).rows.map((r) => ({ relPath: r.rel_path, fileSha256: r.file_sha256 }));
+
+    // 1. Operator calling publishInputVersion with a nusear_code stored file is refused (9c).
+    await assert.rejects(
+      () => appCommands.publishInputVersion({
+        dbToken: iam.tokens.operator,
+        commandKey: 'c1-op-bad-store-publish',
+        lineKind: 'standing',
+        sourceKind: 'upload',
+        reason: 'attempt wrong store_kind',
+        entries: curStandingEntries,
+        storedFiles: [fakeCodeFile],
+      }),
+      (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+      'operator publishInputVersion with nusear_code stored_file must be refused with 403 INVALID_STORE',
+    );
+    const leakedAfterPublish = (await env.pool.query(
+      'SELECT COUNT(*)::int AS n FROM coherence.stored_files WHERE sha256 = $1',
+      [fakeCodeFp.sha256],
+    )).rows[0].n;
+    assert.equal(leakedAfterPublish, 0, 'refused publishInputVersion must insert 0 stored_files rows');
+
+    // Also refused even when the nusear_code sha256 ALREADY exists in coherence.stored_files!
+    const existingCode = (await env.pool.query(
+      "SELECT store_kind, sha256, byte_size, md5_b64, crc32c_b64, object_name FROM coherence.stored_files WHERE store_kind = 'nusear_code' LIMIT 1",
+    )).rows[0];
+    await assert.rejects(
+      () => appCommands.publishInputVersion({
+        dbToken: iam.tokens.operator,
+        commandKey: 'c1-op-existing-code-publish',
+        lineKind: 'standing',
+        sourceKind: 'upload',
+        reason: 'attempt existing nusear_code row',
+        entries: curStandingEntries,
+        storedFiles: [{
+          storeKind: existingCode.store_kind,
+          sha256: existingCode.sha256,
+          byteSize: Number(existingCode.byte_size),
+          md5B64: existingCode.md5_b64,
+          crc32cB64: existingCode.crc32c_b64,
+          objectName: existingCode.object_name,
+        }],
+      }),
+      (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+      'operator publishInputVersion must also refuse an already-existing nusear_code stored file',
+    );
+
+    // 2. Operator calling registerApprovalsFile with nusear_code is refused.
+    await assert.rejects(
+      () => appCommands.registerApprovalsFile({
+        dbToken: iam.tokens.operator,
+        commandKey: 'c1-op-bad-store-approvals',
+        storedFile: fakeCodeFile,
+        headerKind: 'v2',
+        rowCount: 0,
+        addedRows: [],
+      }),
+      (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+      'operator registerApprovalsFile with nusear_code stored_file must be refused with 403 INVALID_STORE',
+    );
+
+    // 3. Owner calling recordStatementBatch with nusear_code sourceFile is refused.
+    await assert.rejects(
+      () => appCommands.recordStatementBatch({
+        dbToken: iam.tokens.owner,
+        commandKey: 'c1-owner-bad-store-stmt-batch',
+        batchKind: 'historical_sent',
+        statementDate: '2026-07-10',
+        sourceFileName: 'bad.csv',
+        sourceFile: fakeCodeFile,
+        reason: 'wrong store_kind on statement batch',
+        agencyLines: [{
+          entity: 'Beacon', writingNpn: '11111111', writingAgent: 'Sam Seller',
+          recordId: 'carrier_a~direct~BAD~10.00~2026-07', sourceFile: 'bad.csv', sourceRowNo: 1,
+          grossComm: '10.00', amount: '10.00',
+        }],
+        uplineLines: [],
+      }),
+      (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+      'recordStatementBatch with nusear_code sourceFile must be refused with 403 INVALID_STORE',
+    );
+
+    // 4. Owner calling registerEngineVersion with company_data stored file is refused (requires nusear_code).
+    const fakeDataBytes = Buffer.from('a,b\n1,2\n', 'utf8');
+    const fakeDataFp = fingerprintBytes(fakeDataBytes);
+    const fakeDataFile = {
+      storeKind: 'company_data',
+      sha256: fakeDataFp.sha256,
+      byteSize: fakeDataFp.byteSize,
+      md5B64: fakeDataFp.md5B64,
+      crc32cB64: fakeDataFp.crc32cB64,
+      objectName: `objects/${fakeDataFp.sha256}`,
+    };
+    await assert.rejects(
+      () => appCommands.registerEngineVersion({
+        dbToken: iam.tokens.owner,
+        commandKey: 'c1-owner-bad-store-engine',
+        label: 'bad-store-engine',
+        coherenceCommit: 'abc1234',
+        engineKind: 'engine_copy',
+        gitBundleSha256: existingCode.sha256,
+        codeManifestSha256: existingCode.sha256,
+        pythonLockSha256: existingCode.sha256,
+        pythonWheelsSha256: existingCode.sha256,
+        wrapperBundleSha256: existingCode.sha256,
+        nusearCommit: 'def5678',
+        companyEmitSha256: existingCode.sha256,
+        overlayCheckSha256: existingCode.sha256,
+        toolchain: { python: '3.12' },
+        containerDigest: 'sha256:' + 'a'.repeat(64),
+        storedFiles: [fakeDataFile],
+      }),
+      (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+      'registerEngineVersion with company_data stored_file must be refused with 403 INVALID_STORE',
+    );
+    const leakedData = (await env.pool.query(
+      'SELECT COUNT(*)::int AS n FROM coherence.stored_files WHERE sha256 = $1',
+      [fakeDataFp.sha256],
+    )).rows[0].n;
+    assert.equal(leakedData, 0, 'refused registerEngineVersion must insert 0 stored_files rows');
+
+    // 5. Worker data commands (failAttempt, cancelAttempt) refuse nusear_code stored files.
+    const launch = await appCommands.launchRun({
+      dbToken: iam.tokens.operator,
+      commandKey: 'c1-worker-bad-store-launch',
+      statementDate: '2026-12-05',
+      origin: 'trial',
+      engineVersionId,
+    });
+    const runId = launch.result.runId;
+    await assert.rejects(
+      () => workerCommands.failStepAttempt({
+        dbToken: iam.tokens.worker,
+        commandKey: 'c1-worker-bad-store-fail',
+        runId,
+        step: 'assign',
+        attemptNo: 1,
+        errorSummary: 'bad store kind',
+        logFile: fakeCodeFile,
+        storedFiles: [fakeCodeFile],
+      }),
+      (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+      'worker failStepAttempt with nusear_code stored file must be refused with 403 INVALID_STORE',
+    );
+    await assert.rejects(
+      () => workerCommands.cancelStepAttempt({
+        dbToken: iam.tokens.worker,
+        commandKey: 'c1-worker-bad-store-cancel',
+        runId,
+        step: 'assign',
+        attemptNo: 1,
+        cancelRequestId: randomUUID(),
+        logFile: fakeCodeFile,
+        storedFiles: [fakeCodeFile],
+      }),
+      (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+      'worker cancelStepAttempt with nusear_code stored file must be refused with 403 INVALID_STORE',
+    );
+    await assert.rejects(
+      () => appCommands.recordGeneratedOverlay({
+        dbToken: iam.tokens.owner,
+        commandKey: 'c1-owner-bad-store-overlay',
+        decisionCommitId: randomUUID(),
+        runId,
+        purpose: 'assign_input',
+        headerContract: 'v2',
+        rowCount: 0,
+        storedFile: fakeCodeFile,
+      }),
+      (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+      'recordGeneratedOverlay with nusear_code stored file must be refused with 403 INVALID_STORE',
+    );
+
+    // 6. Worker finishStepAttempt log file & acceptReviewSubmission refuse nusear_code stored files (Fix 1 Item 6).
+    const slotClient = await workerPool.connect();
+    try {
+      const slotLock = await slotClient.query('SELECT pg_catalog.pg_try_advisory_lock(coherence.slot_class_id(), coherence.slot_obj_id()) AS ok');
+      assert.equal(slotLock.rows[0].ok, true);
+      await workerCommands.startStepAttempt({
+        client: slotClient,
+        dbToken: iam.tokens.worker,
+        commandKey: 'c1-worker-bad-store-start-assign',
+        runId,
+        step: 'assign',
+        stepRequestId: launch.result.stepRequestId,
+      });
+      await assert.rejects(
+        () => workerCommands.finishStepAttempt({
+          client: slotClient,
+          dbToken: iam.tokens.worker,
+          commandKey: 'c1-worker-bad-store-finish-log',
+          runId,
+          step: 'assign',
+          attemptNo: 1,
+          logFile: fakeCodeFile,
+        }),
+        (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+        'worker finishStepAttempt with nusear_code logFile must be refused with 403 INVALID_STORE',
+      );
+      const leakedAfterFinish = (await env.pool.query(
+        'SELECT COUNT(*)::int AS n FROM coherence.stored_files WHERE sha256 = $1',
+        [fakeCodeFp.sha256],
+      )).rows[0].n;
+      assert.equal(leakedAfterFinish, 0, 'refused finishStepAttempt must insert 0 stored_files rows');
+
+      // Advance run through assign -> attribute -> bible so acceptReviewSubmission reaches the store_kind guard.
+      const finAssign = await workerCommands.finishStepAttempt({
+        client: slotClient, dbToken: iam.tokens.worker, commandKey: 'c1-worker-fin-assign',
+        runId, step: 'assign', attemptNo: 1, continueToNextStep: true,
+      });
+      await workerCommands.startStepAttempt({
+        client: slotClient, dbToken: iam.tokens.worker, commandKey: 'c1-worker-start-attr',
+        runId, step: 'attribute', stepRequestId: finAssign.result.nextRequestId,
+      });
+      const finAttr = await workerCommands.finishStepAttempt({
+        client: slotClient, dbToken: iam.tokens.worker, commandKey: 'c1-worker-fin-attr',
+        runId, step: 'attribute', attemptNo: 1, continueToNextStep: true,
+      });
+      await workerCommands.startStepAttempt({
+        client: slotClient, dbToken: iam.tokens.worker, commandKey: 'c1-worker-start-bible',
+        runId, step: 'bible', stepRequestId: finAttr.result.nextRequestId,
+      });
+      await workerCommands.finishStepAttempt({
+        client: slotClient, dbToken: iam.tokens.worker, commandKey: 'c1-worker-fin-bible',
+        runId, step: 'bible', attemptNo: 1, continueToNextStep: false,
+      });
+
+      const runSeq = (await env.pool.query(
+        'SELECT latest_journal_seq FROM app_views.coherence_runs WHERE id = $1::uuid',
+        [runId],
+      )).rows[0]?.latest_journal_seq
+        ?? (await env.pool.query('SELECT MAX(journal_seq) AS s FROM coherence.step_attempt_events WHERE run_id = $1::uuid', [runId])).rows[0].s;
+
+      const sub = await appCommands.submitReview({
+        dbToken: iam.tokens.operator,
+        commandKey: 'c1-op-submit-bad-store-review',
+        expectedJournalSeq: Number(runSeq),
+        runId,
+        surface: 'bible',
+        csvBytes: fakeCodeBytes,
+      });
+      await assert.rejects(
+        () => workerCommands.acceptReviewSubmission({
+          client: slotClient,
+          dbToken: iam.tokens.worker,
+          commandKey: 'c1-worker-bad-store-accept-review',
+          submissionId: sub.submissionId,
+          storedFile: fakeCodeFile,
+          headerKind: 'v2',
+          rowCount: 0,
+          addedRows: [],
+        }),
+        (err) => err?.status === 403 && err?.code === 'INVALID_STORE',
+        'worker acceptReviewSubmission with nusear_code storedFile must be refused with 403 INVALID_STORE',
+      );
+      const subStatus = (await env.pool.query(
+        'SELECT status FROM coherence.review_submissions WHERE id = $1::uuid',
+        [sub.submissionId],
+      )).rows[0].status;
+      assert.equal(subStatus, 'pending', 'refused acceptReviewSubmission must leave submission pending');
+      const leakedAfterAccept = (await env.pool.query(
+        'SELECT COUNT(*)::int AS n FROM coherence.stored_files WHERE sha256 = $1',
+        [fakeCodeFp.sha256],
+      )).rows[0].n;
+      assert.equal(leakedAfterAccept, 0, 'refused acceptReviewSubmission must insert 0 stored_files rows');
+    } finally {
+      await slotClient.query('SELECT pg_catalog.pg_advisory_unlock(coherence.slot_class_id(), coherence.slot_obj_id())').catch(() => {});
+      slotClient.release();
+    }
+  });
+
+  await t.test('Fix1 Item 4: app_views._read_current_finished_attempt scopes steps by right (runs.read any, outputs.read emit only, decisions.read bible/adjust only)', async () => {
+    const inp = await env.dataStore.promoteBytes(Buffer.from('k\nsteps\n', 'utf8'), { relPath: 'imp_steps.csv', checksPassed: true });
+    const stepImp = await env.commands.importHistoricalRun({
+      dbToken: env.ownerToken,
+      commandKey: 'c1-fix1-item4-import',
+      run: { origin: 'company_import', statementDate: '2026-09-15', sourceFolder: 'company-workspaces/acme/2026-09-15/runs/2026-09-15', emitMode: 'coherence' },
+      inputVersion: { reason: 'step scoping test' },
+      inputEntries: [{ relPath: 'imp_steps.csv', fileSha256: inp.sha256 }],
+      stepAttempts: ['assign', 'attribute', 'bible', 'adjust', 'emit'].map((step) => ({
+        step, attemptNo: 1, artifacts: [],
+      })),
+      storedFiles: [inp],
+    });
+    const stepRunId = stepImp.result.runId;
+    const allSteps = ['assign', 'attribute', 'bible', 'adjust', 'emit'];
+    const querySteps = async (token) => withRequestTx(appPool, token, async (tx) => {
+      const out = {};
+      for (const step of allSteps) {
+        const res = await tx.query('SELECT app_views._read_current_finished_attempt($1::uuid, $2) AS id', [stepRunId, step]);
+        out[step] = res.rows[0].id;
+      }
+      return out;
+    });
+
+    const runsRes = await querySteps(iam.tokenFor(customPeople.runsReadOnly));
+    for (const s of allSteps) assert.notEqual(runsRes[s], null, `runs.read must see step ${s}`);
+
+    const outputsRes = await querySteps(iam.tokenFor(customPeople.outputsReadOnly));
+    assert.notEqual(outputsRes.emit, null, 'outputs.read must see emit');
+    for (const s of ['assign', 'attribute', 'bible', 'adjust']) {
+      assert.equal(outputsRes[s], null, `outputs.read must NOT see step ${s}`);
+    }
+
+    const decisionsRes = await querySteps(iam.tokenFor(customPeople.decisionsReadOnly));
+    assert.notEqual(decisionsRes.bible, null, 'decisions.read must see bible');
+    assert.notEqual(decisionsRes.adjust, null, 'decisions.read must see adjust');
+    for (const s of ['assign', 'attribute', 'emit']) {
+      assert.equal(decisionsRes[s], null, `decisions.read must NOT see step ${s}`);
+    }
+
+    const noneRes = await querySteps(iam.tokenFor(customPeople.allSixSentOnly));
+    for (const s of allSteps) assert.equal(noneRes[s], null, `caller without runs/outputs/decisions.read must get NULL for step ${s}`);
+  });
+
+  await t.test('Fix1 Item 5: downstream reader answers unavailable when newest SENT run has no entity-manager bundle instead of falling back to an older sent run', async () => {
+    const date = '2026-12-20';
+    const dataset = buildCanaryEmitCsvs({ statementDate: date });
+    const stmt = await env.stores.promoteArtifact(`emits/statements_${date.replace(/-/g, '')}.csv`, Buffer.from(dataset.statementsCsv, 'utf8'), { checksPassed: true });
+    const inp = await env.dataStore.promoteBytes(Buffer.from(`k\n${date}\n`, 'utf8'), { relPath: `imp_${date}.csv`, checksPassed: true });
+    const imp = await env.commands.importHistoricalRun({
+      dbToken: env.ownerToken,
+      commandKey: 'c1-fix1-item5-nobundle-import',
+      run: { origin: 'company_import', statementDate: date, sourceFolder: `company-workspaces/acme/${date}/runs/${date}`, emitMode: 'coherence' },
+      inputVersion: { reason: 'newest sent run without bundle' },
+      inputEntries: [{ relPath: `imp_${date}.csv`, fileSha256: inp.sha256 }],
+      stepAttempts: [{
+        step: 'emit',
+        attemptNo: 1,
+        artifacts: [{ relPath: stmt.relPath, artifactKind: stmt.artifactKind, storeKind: stmt.storeKind, fileSha256: stmt.sha256 }],
+      }],
+      storedFiles: [inp, stmt],
+    });
+    const newestSentNoBundleId = imp.result.runId;
+    await env.commands.carrySent({ dbToken: env.ownerToken, commandKey: 'c1-fix1-item5-nobundle-sent', runId: newestSentNoBundleId, typedPhrase: `sent ${date}` });
+
+    for (const [label, tok] of [
+      ['owner', iam.tokens.owner],
+      ['allSixSentOnly', iam.tokenFor(customPeople.allSixSentOnly)],
+      ['sentEmSubOrgUnpub', iam.tokenFor(customPeople.sentEmSubOrgUnpub)],
+    ]) {
+      const sum = await reader.summary(tok);
+      assert.equal(sum.available, false, `${label}: newest sent run without bundle must answer available=false instead of falling back to older run ${sentRunId} (got ${JSON.stringify(sum)})`);
+      await assert.rejects(
+        () => reader.file(tok, 'data/canonical_bob.csv'),
+        (err) => err?.status === 404 && err?.code === 'NO_RUN',
+        `${label}: reader.file must return 404 NO_RUN when newest sent run has no bundle`,
+      );
+    }
+
+    // Explicit runId for the older sent run still opens cleanly.
+    const explicitOld = await reader.summary(iam.tokenFor(customPeople.allSixSentOnly), { runId: sentRunId });
+    assert.equal(explicitOld.available, true);
+    assert.equal(explicitOld.runId, sentRunId);
+  });
 });

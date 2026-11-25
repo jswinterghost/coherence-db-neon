@@ -30,6 +30,9 @@ export function mapPgError(error) {
     if (prefix === 'HUMAN_ONLY') {
       return new AppError('The worker service identity cannot execute human decision commands.', 403, 'HUMAN_ONLY');
     }
+    if (prefix === 'INVALID_STORE') {
+      return new AppError(msg, 403, 'INVALID_STORE');
+    }
     return new AppError('Insufficient database privilege for this operation.', 403, 'FORBIDDEN');
   }
   if (pgCode === '25006') {

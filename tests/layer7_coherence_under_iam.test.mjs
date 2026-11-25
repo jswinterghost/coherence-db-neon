@@ -1902,31 +1902,156 @@ test('Layer 7B [app_cmd.coherence_* Commands, View-As Refusal & Worker Boundary]
   assert.equal(comm.passed, true, `verifyCommitments failed: ${comm.problems.join('; ')}`);
 });
 
-test('Layer 7B [InitPlan Performance Guard]: EXPLAIN on app_views.coherence_bob and v_current_policy_periods evaluates IAM scope helpers as statement-level InitPlans', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7B [InitPlan Performance Guard]: EXPLAIN on keyed app_views evaluates _read_* helpers once per statement (InitPlan / hashed SubPlan, zero per-row SubPlans) on sent and unsent runs', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createCoherenceIamTestEnv();
   t.after(() => env.cleanup());
 
   const { ids, keyId, secretBytes, environment } = await seedCoherenceIamWorld(env.pool);
-  await seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'plan-r1', markSent: true });
+  const rSent = await seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'plan-r1', markSent: true });
+  const rUnsent = await seedPublishedRun(env, { statementDate: '2026-11-15', keyPrefix: 'plan-r2', markSent: false });
   await env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys()');
 
+  // Give agentA narrow self unpublished.read + statement_cash so narrow pairs run on both sent and unsent runs.
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.plan_guard_seed', commandKey: 'plan-guard-seed' });
+    const roleId = randomUUID();
+    await c.query("INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,'plan_narrow_unpub',NULL,$2)", [roleId, j.seq]);
+    await c.query(
+      "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Plan Narrow Unpub',false,false,false,'active',$3)",
+      [randomUUID(), roleId, j.seq],
+    );
+    for (const rightId of ['act:coherence.bob.read', 'act:coherence.statements.read', 'col:coherence.statement_cash', 'act:coherence.unpublished.read']) {
+      await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)", [randomUUID(), roleId, rightId, j.seq]);
+    }
+    await c.query(
+      "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'self','[2020-01-01,)'::daterange,'active',$5)",
+      [randomUUID(), ids.agentA, roleId, ids.beaconOrg, j.seq],
+    );
+  });
+
+  const collectPlanRefStrings = (node, out = []) => {
+    for (const [k, v] of Object.entries(node)) {
+      if (k === 'Plans' || k === 'Subplan Name') continue;
+      if (typeof v === 'string') out.push(v);
+      else if (Array.isArray(v)) {
+        for (const item of v) if (typeof item === 'string') out.push(item);
+      }
+    }
+    for (const child of node.Plans || []) collectPlanRefStrings(child, out);
+    return out;
+  };
+
+  const inspectReadNodes = (planRoot) => {
+    const allRefStrings = collectPlanRefStrings(planRoot).join('\n');
+    const readInitPlans = [];
+    const readHashedSubPlans = [];
+    const readPerRowSubPlans = [];
+    const readHighLoopNodes = [];
+
+    const walk = (node, enclosingSubplan = null, enclosingRel = null) => {
+      const ownSubplan = node['Subplan Name'] || enclosingSubplan;
+      const ownRel = node['Subplan Name'] ? (node['Parent Relationship'] || enclosingRel) : enclosingRel;
+      const fnName = node['Function Name'] || '';
+      const fnSchema = node.Schema || '';
+      const ownStrings = Object.entries(node)
+        .filter(([k]) => k !== 'Plans')
+        .flatMap(([, v]) => (Array.isArray(v) ? v : [v]))
+        .filter((v) => typeof v === 'string')
+        .join(' ');
+      const isReadFnScan = node['Node Type'] === 'Function Scan' && fnSchema === 'app_views' && fnName.startsWith('_read_');
+      const hasReadExpr = /app_views\._read_\w+/.test(ownStrings);
+      if (isReadFnScan || hasReadExpr) {
+        const label = isReadFnScan ? `app_views.${fnName}` : (ownStrings.match(/app_views\._read_\w+/) || ['app_views._read_'])[0];
+        const loops = Number(node['Actual Loops'] ?? 0);
+        if (loops > 1) {
+          readHighLoopNodes.push(`${label} in ${ownSubplan || 'main'} (Actual Loops=${loops})`);
+        }
+        if (ownRel === 'InitPlan' || (ownSubplan && ownSubplan.startsWith('InitPlan '))) {
+          readInitPlans.push(`${ownSubplan}:${label}`);
+        } else if (ownSubplan && ownSubplan.startsWith('SubPlan ')) {
+          const spNum = ownSubplan.match(/^SubPlan (\d+)/)?.[1];
+          const unhashedRe = new RegExp(`(?<!hashed )SubPlan ${spNum}\\b`);
+          const hashedRe = new RegExp(`hashed SubPlan ${spNum}\\b`);
+          const isHashedOnly = spNum && hashedRe.test(allRefStrings) && !unhashedRe.test(allRefStrings);
+          if (isHashedOnly) {
+            readHashedSubPlans.push(`${ownSubplan}:${label}`);
+          } else {
+            readPerRowSubPlans.push(`${ownSubplan}:${label} (loops=${loops})`);
+          }
+        }
+      }
+      for (const child of node.Plans || []) walk(child, ownSubplan, ownRel);
+    };
+    walk(planRoot);
+    return { readInitPlans, readHashedSubPlans, readPerRowSubPlans, readHighLoopNodes };
+  };
+
   const agentTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.agentA });
-  for (const viewName of ['coherence_bob', 'v_current_policy_periods', 'coherence_statement_agency_lines']) {
-    const planText = await runAsPlatformApp(env.pool, { token: agentTok, readOnly: true }, async (c) => {
-      const res = await c.query(`EXPLAIN (VERBOSE) SELECT * FROM app_views.${viewName}`);
-      return res.rows.map((r) => r['QUERY PLAN']).join('\n');
+  const emTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.acmeEntityMgr });
+  const beaconMgrTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.beaconManager });
+
+  const checks = [
+    // Narrow self caller with both sent and unsent runs (exercises wide InitPlans + narrow hashed SubPlans on both runs).
+    { label: 'agentA (sent+unsent)', token: agentTok, viewName: 'coherence_bob', expectBothRuns: true, expectHashedNarrow: true },
+    { label: 'agentA (sent+unsent)', token: agentTok, viewName: 'v_current_policy_periods', expectBothRuns: false, expectHashedNarrow: true },
+    { label: 'agentA (sent+unsent)', token: agentTok, viewName: 'coherence_statement_agency_lines', expectBothRuns: true, expectHashedNarrow: true },
+    // Sent-only wide agency manager (exercises sent-only path without unsent rights).
+    { label: 'beaconMgr (sent-only)', token: beaconMgrTok, viewName: 'coherence_bob', expectBothRuns: false, expectHashedNarrow: false },
+    { label: 'beaconMgr (sent-only)', token: beaconMgrTok, viewName: 'coherence_statement_agency_lines', expectBothRuns: false, expectHashedNarrow: false },
+    // Wide EM caller across all keyed tables, batches, and current ledger on both sent and unsent runs.
+    { label: 'acmeEM (sent+unsent)', token: emTok, viewName: 'coherence_bob', expectBothRuns: true, expectHashedNarrow: false },
+    { label: 'acmeEM (sent+unsent)', token: emTok, viewName: 'coherence_statement_batches', expectBothRuns: true, expectHashedNarrow: false },
+    { label: 'acmeEM (sent+unsent)', token: emTok, viewName: 'coherence_statement_agency_lines', expectBothRuns: true, expectHashedNarrow: false },
+    { label: 'acmeEM (sent+unsent)', token: emTok, viewName: 'coherence_statement_upline_lines', expectBothRuns: true, expectHashedNarrow: false },
+    { label: 'acmeEM (sent+unsent)', token: emTok, viewName: 'coherence_ledger', expectBothRuns: true, expectHashedNarrow: false },
+    { label: 'acmeEM (sent+unsent)', token: emTok, viewName: 'v_current_commission_ledger', expectBothRuns: false, expectHashedNarrow: false },
+  ];
+
+  for (const chk of checks) {
+    const { planRoot, rowCount, runDates } = await runAsPlatformApp(env.pool, { token: chk.token, readOnly: true }, async (c) => {
+      const planRes = await c.query(`EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) SELECT * FROM app_views.${chk.viewName}`);
+      const root = planRes.rows[0]['QUERY PLAN'][0].Plan;
+      let dates = [];
+      if (chk.expectBothRuns) {
+        if (chk.viewName === 'coherence_bob' || chk.viewName === 'coherence_ledger') {
+          dates = (await c.query(`SELECT DISTINCT run_id FROM app_views.${chk.viewName}`)).rows.map((r) => r.run_id);
+        } else {
+          dates = (await c.query(`SELECT DISTINCT pg_catalog.to_char(statement_date, 'YYYY-MM-DD') AS d FROM app_views.${chk.viewName}`)).rows.map((r) => r.d);
+        }
+      }
+      return { planRoot: root, rowCount: Number(root['Actual Rows'] ?? 0), runDates: dates };
     });
-    assert.ok(/InitPlan/i.test(planText), `expected InitPlan in EXPLAIN for app_views.${viewName}:\n${planText}`);
-    // effective_wide_org_ids / effective_narrow_person_ids / effective_any_org_ids must be evaluated inside InitPlans (never correlated per-row SubPlans),
-    // and effective_narrow_pairs must be referenced via hashed SubPlan (evaluated once into a hash table).
-    const narrowPairSubPlans = [...planText.matchAll(/SubPlan (\d+)\n[^\n]*Function Scan on iam\.effective_narrow_pairs/g)].map((m) => m[1]);
-    for (const spId of narrowPairSubPlans) {
+
+    assert.ok(rowCount > 0, `${chk.label} on app_views.${chk.viewName} must return non-zero rows so plan check is non-vacuous`);
+    if (chk.expectBothRuns) {
+      if (chk.viewName === 'coherence_bob' || chk.viewName === 'coherence_ledger') {
+        assert.ok(runDates.includes(rSent.runId) && runDates.includes(rUnsent.runId), `${chk.label} on app_views.${chk.viewName} must match both sent and unsent runs (got ${JSON.stringify(runDates)})`);
+      } else {
+        assert.ok(runDates.includes('2026-10-31') && runDates.includes('2026-11-15'), `${chk.label} on app_views.${chk.viewName} must match both sent and unsent statement dates (got ${JSON.stringify(runDates)})`);
+      }
+    }
+
+    const { readInitPlans, readHashedSubPlans, readPerRowSubPlans, readHighLoopNodes } = inspectReadNodes(planRoot);
+    assert.ok(
+      readInitPlans.length > 0,
+      `${chk.label} on app_views.${chk.viewName} must match non-zero app_views._read_* InitPlans:\n${JSON.stringify(planRoot, null, 2)}`,
+    );
+    if (chk.expectHashedNarrow) {
       assert.ok(
-        planText.includes(`hashed SubPlan ${spId}`),
-        `SubPlan ${spId} on iam.effective_narrow_pairs must be a once-per-statement hashed SubPlan in app_views.${viewName}:\n${planText}`,
+        readHashedSubPlans.length > 0,
+        `${chk.label} on app_views.${chk.viewName} must match non-zero app_views._read_* hashed SubPlans:\n${JSON.stringify(planRoot, null, 2)}`,
       );
     }
-    assert.ok(!/SubPlan \d+\n[^\n]*effective_(wide|any|narrow_person)_/i.test(planText), `unexpected SubPlan on array helper in app_views.${viewName}:\n${planText}`);
+    assert.deepEqual(
+      readPerRowSubPlans,
+      [],
+      `${chk.label} on app_views.${chk.viewName} must have ZERO per-row SubPlans on app_views._read_* (found ${JSON.stringify(readPerRowSubPlans)})`,
+    );
+    assert.deepEqual(
+      readHighLoopNodes,
+      [],
+      `${chk.label} on app_views.${chk.viewName} must evaluate every app_views._read_* node at most once per statement (found ${JSON.stringify(readHighLoopNodes)})`,
+    );
   }
 });
 
@@ -5151,6 +5276,27 @@ test('Layer 7B [Fix4 - Narrow unpublished.read Stays Narrow Across Keyed Tables 
         bad.problems.some((p) => /coherence_entity_statement_reconciliation/i.test(p) && /effective_any_org_ids/i.test(p)),
         `unexpected problems: ${bad.problems.join('; ')}`,
       );
+
+      await probeClient.query(
+        `CREATE OR REPLACE VIEW app_views.coherence_entity_statement_reconciliation
+         WITH (security_barrier = true) AS
+         SELECT NULL::uuid AS run_id,
+                NULL::uuid AS attempt_event_id,
+                NULL::date AS statement_date,
+                NULL::text AS statement_entity,
+                NULL::text AS account_kind,
+                NULL::numeric(14,2) AS statement_total,
+                NULL::numeric(14,2) AS ledger_total,
+                NULL::numeric(14,2) AS variance,
+                NULL::boolean AS reconciled
+         WHERE (SELECT app_views._read_has_run_meta_access())`,
+      );
+      const badMeta = await policyChecks.verifyIamConfigInvariants(probeClient);
+      assert.equal(badMeta.passed, false, 'reconciliation view referencing metadata-only _read_has_run_meta_access must fail audit');
+      assert.ok(
+        badMeta.problems.some((p) => /coherence_entity_statement_reconciliation/i.test(p)),
+        `unexpected problems: ${badMeta.problems.join('; ')}`,
+      );
     } finally {
       await probeClient.query('ROLLBACK').catch(() => {});
       probeClient.release();
@@ -5166,5 +5312,494 @@ test('Layer 7B [Fix4 - Narrow unpublished.read Stays Narrow Across Keyed Tables 
     } finally {
       await env.pool.query('DROP POLICY IF EXISTS audit_journal_has_right_probe ON platform.audit_journal');
     }
+  });
+});
+
+test('Layer 7B [Release C1 Item 8 - Time-Consistent Chains in iam.v_organization_closure]: post-move team under moved agency is absent from old company tree and its people see nothing there; pre-move old team is absent from new upline tree; v_organization_closure_live stays today tree', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createCoherenceIamTestEnv();
+  t.after(() => env.cleanup());
+
+  const { ids, keyId, secretBytes, environment } = await seedCoherenceIamWorld(env.pool);
+  const tok = (personId, viewAsPersonId = null) => mintSignedToken({
+    keyId, secretBytes, environment, actorPersonId: personId, viewAsPersonId,
+  });
+
+  const movedAgency = randomUUID();
+  const oldPreMoveTeam = randomUUID();
+  const movedActiveTeam = randomUUID();
+  const newPostMoveTeam = randomUUID();
+  const rejoinAgency = randomUUID();
+  const rejoinPreLeaveTeam = randomUUID();
+  const rejoinAwayTeam = randomUUID();
+  const rejoinStayTeam = randomUUID();
+  const rejoinPostTeam = randomUUID();
+
+  const movedAgencyMgr = randomUUID();
+  const movedActiveTeamMgr = randomUUID();
+  const newTeamMgr = randomUUID();
+  const newTeamAgent = randomUUID();
+  const northstarEM = randomUUID();
+  const nsOnlyMemberMovedGrant = randomUUID();
+  const acmeMemberMovedGrant = randomUUID();
+  const rejoinAgencyMgr = randomUUID();
+  const nsOnlyMemberRejoinGrant = randomUUID();
+  const acmeMemberRejoinGrant = randomUUID();
+
+  await inSerializableTx(env.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c1_item8_setup', commandKey: 'c1-item8-setup' });
+    const seq = j.seq;
+
+    // 1. Moved Agency: under Acme during [2020-01-01, 2025-06-01), then under Northstar during [2025-06-01, ).
+    await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'agency',$2)", [movedAgency, seq]);
+    await c.query(
+      "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'moved_agency','Moved Agency','active',$3)",
+      [randomUUID(), movedAgency, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2025-06-01)'::daterange,'active',$4)",
+      [randomUUID(), movedAgency, ids.acmeOrg, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2025-06-01,)'::daterange,'active',$4)",
+      [randomUUID(), movedAgency, ids.northstarOrg, seq],
+    );
+
+    // 2. Old Pre-Move Team: existed under Moved Agency ONLY before the move [2020-01-01, 2025-01-01) and archived.
+    await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'team',$2)", [oldPreMoveTeam, seq]);
+    await c.query(
+      "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'old_pre_move_team','Old Pre Move Team','archived',$3)",
+      [randomUUID(), oldPreMoveTeam, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2025-01-01)'::daterange,'active',$4)",
+      [randomUUID(), oldPreMoveTeam, movedAgency, seq],
+    );
+
+    // 2b. Moved Active Team: active team under Moved Agency since [2020-01-01, ) that moved WITH Moved Agency.
+    await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'team',$2)", [movedActiveTeam, seq]);
+    await c.query(
+      "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'moved_active_team','Moved Active Team','active',$3)",
+      [randomUUID(), movedActiveTeam, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4)",
+      [randomUUID(), movedActiveTeam, movedAgency, seq],
+    );
+
+    // 3. New Post-Move Team: added under Moved Agency ONLY after the move [2025-07-01, ), active.
+    await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'team',$2)", [newPostMoveTeam, seq]);
+    await c.query(
+      "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'new_post_move_team','New Post Move Team','active',$3)",
+      [randomUUID(), newPostMoveTeam, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2025-07-01,)'::daterange,'active',$4)",
+      [randomUUID(), newPostMoveTeam, movedAgency, seq],
+    );
+
+    // 4. Rejoin Agency: left Acme [2020-01-01, 2024-01-01) -> Northstar [2024-01-01, 2025-06-01) -> re-joined Acme [2025-06-01, ).
+    await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'agency',$2)", [rejoinAgency, seq]);
+    await c.query(
+      "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'rejoin_agency','Rejoin Agency','active',$3)",
+      [randomUUID(), rejoinAgency, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2024-01-01)'::daterange,'active',$4)",
+      [randomUUID(), rejoinAgency, ids.acmeOrg, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2024-01-01,2025-06-01)'::daterange,'active',$4)",
+      [randomUUID(), rejoinAgency, ids.northstarOrg, seq],
+    );
+    await c.query(
+      "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2025-06-01,)'::daterange,'active',$4)",
+      [randomUUID(), rejoinAgency, ids.acmeOrg, seq],
+    );
+
+    // 4a-d. Teams under Rejoin Agency across its three periods.
+    for (const [oid, slug, name, status, rng] of [
+      [rejoinPreLeaveTeam, 'rejoin_pre_leave_team', 'Rejoin Pre Leave Team', 'archived', '[2020-01-01,2023-06-01)'],
+      [rejoinAwayTeam, 'rejoin_away_team', 'Rejoin Away Team', 'archived', '[2024-06-01,2025-01-01)'],
+      [rejoinStayTeam, 'rejoin_stay_team', 'Rejoin Stay Team', 'active', '[2020-01-01,)'],
+      [rejoinPostTeam, 'rejoin_post_team', 'Rejoin Post Team', 'active', '[2025-07-01,)'],
+    ]) {
+      await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'team',$2)", [oid, seq]);
+      await c.query(
+        "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6)",
+        [randomUUID(), oid, slug, name, status, seq],
+      );
+      await c.query(
+        "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4::daterange,'active',$5)",
+        [randomUUID(), oid, rejoinAgency, rng, seq],
+      );
+    }
+
+    // Seed people across moved, active-moved, post-move, and rejoined scenarios.
+    for (const [pid, name, email, npn] of [
+      [movedAgencyMgr, 'Moved Agency Mgr', 'moved.ag.mgr@example.test', null],
+      [movedActiveTeamMgr, 'Moved Active Team Mgr', 'moved.act.mgr@example.test', null],
+      [newTeamMgr, 'New Team Mgr', 'new.team.mgr@example.test', null],
+      [newTeamAgent, 'New Team Agent', 'new.team.agent@example.test', '88888888'],
+      [northstarEM, 'Northstar EM', 'ns.em.item8@example.test', null],
+      [nsOnlyMemberMovedGrant, 'NS Member Moved Grant', 'ns.mem.moved@example.test', null],
+      [acmeMemberMovedGrant, 'Acme Member Moved Grant', 'acme.mem.moved@example.test', null],
+      [rejoinAgencyMgr, 'Rejoin Agency Mgr', 'rejoin.ag.mgr@example.test', null],
+      [nsOnlyMemberRejoinGrant, 'NS Member Rejoin Grant', 'ns.mem.rejoin@example.test', null],
+      [acmeMemberRejoinGrant, 'Acme Member Rejoin Grant', 'acme.mem.rejoin@example.test', null],
+    ]) {
+      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
+      await c.query(
+        "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, journal_seq) VALUES ($1,$2,$3,$3,$4,$5,'active',$6)",
+        [randomUUID(), pid, name, email, npn, seq],
+      );
+    }
+    for (const [pid, orgId, cap] of [
+      [movedAgencyMgr, movedAgency, 'employee'],
+      [movedActiveTeamMgr, movedActiveTeam, 'employee'],
+      [newTeamMgr, newPostMoveTeam, 'employee'],
+      [northstarEM, ids.northstarOrg, 'owner'],
+      [nsOnlyMemberMovedGrant, ids.northstarOrg, 'employee'],
+      [acmeMemberMovedGrant, ids.acmeOrg, 'employee'],
+      [rejoinAgencyMgr, rejoinAgency, 'employee'],
+      [nsOnlyMemberRejoinGrant, ids.northstarOrg, 'employee'],
+      [acmeMemberRejoinGrant, ids.acmeOrg, 'employee'],
+    ]) {
+      await c.query(
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
+        [randomUUID(), pid, orgId, cap, seq],
+      );
+    }
+    await c.query(
+      "INSERT INTO iam.agent_affiliations (id, person_id, npn, agency_org_id, split_bps, agent_file_name, valid_range, status, journal_seq) VALUES ($1,$2,'88888888',$3,8000,'New Team Agent','[2025-07-01,)'::daterange,'active',$4)",
+      [randomUUID(), newTeamAgent, newPostMoveTeam, seq],
+    );
+    for (const [pid, roleId, orgId, incDesc, pMode] of [
+      [movedAgencyMgr, ids.roleAgencyManager, movedAgency, true, 'org_subtree'],
+      [movedActiveTeamMgr, ids.roleAgencyManager, movedActiveTeam, true, 'org_subtree'],
+      [newTeamMgr, ids.roleAgencyManager, newPostMoveTeam, true, 'org_subtree'],
+      [newTeamAgent, ids.roleSellingAgent, newPostMoveTeam, false, 'self'],
+      [northstarEM, ids.roleEntityManager, ids.northstarOrg, true, 'org_subtree'],
+      [nsOnlyMemberMovedGrant, ids.roleAgencyManager, movedAgency, true, 'org_subtree'],
+      [acmeMemberMovedGrant, ids.roleAgencyManager, movedAgency, true, 'org_subtree'],
+      [rejoinAgencyMgr, ids.roleAgencyManager, rejoinAgency, true, 'org_subtree'],
+      [nsOnlyMemberRejoinGrant, ids.roleAgencyManager, rejoinAgency, true, 'org_subtree'],
+      [acmeMemberRejoinGrant, ids.roleAgencyManager, rejoinAgency, true, 'org_subtree'],
+    ]) {
+      await c.query(
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6,'[2020-01-01,)'::daterange,'active',$7)",
+        [randomUUID(), pid, roleId, orgId, incDesc, pMode, seq],
+      );
+    }
+  });
+
+  // Seed historical sent statement batch in Acme DB for Moved Agency, Old Pre-Move Team, Moved Active Team, and Rejoin orgs.
+  await env.commands.recordStatementBatch({
+    dbToken: env.ownerToken,
+    commandKey: 'c1-item8-hist-batch',
+    batchKind: 'historical_sent',
+    statementDate: '2024-12-31',
+    reason: 'Historical rows for Moved Agency, Old Pre-Move Team, Moved Active Team, and Rejoin orgs',
+    agencyLines: [
+      {
+        entity: 'Moved Agency', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~MOVEDAG~100.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 1,
+        grossComm: '100.00', amount: '80.00',
+      },
+      {
+        entity: 'Old Pre Move Team', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~OLDPRE~50.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 2,
+        grossComm: '50.00', amount: '40.00',
+      },
+      {
+        entity: 'Moved Active Team', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~MOVEDACT~60.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 3,
+        grossComm: '60.00', amount: '48.00',
+      },
+      {
+        entity: 'Rejoin Agency', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~REJOIN~70.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 4,
+        grossComm: '70.00', amount: '56.00',
+      },
+      {
+        entity: 'Rejoin Pre Leave Team', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~REJOINPRE~30.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 5,
+        grossComm: '30.00', amount: '24.00',
+      },
+      {
+        entity: 'Rejoin Stay Team', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~REJOINSTAY~40.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 6,
+        grossComm: '40.00', amount: '32.00',
+      },
+      {
+        entity: 'Rejoin Post Team', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~REJOINPOST~20.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 7,
+        grossComm: '20.00', amount: '16.00',
+      },
+    ],
+    uplineLines: [
+      {
+        sourceEntity: 'Moved Agency', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~MOVEDAG~100.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 1,
+        grossComm: '100.00', amount: '20.00',
+      },
+      {
+        sourceEntity: 'Old Pre Move Team', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~OLDPRE~50.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 2,
+        grossComm: '50.00', amount: '10.00',
+      },
+      {
+        sourceEntity: 'Moved Active Team', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~MOVEDACT~60.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 3,
+        grossComm: '60.00', amount: '12.00',
+      },
+      {
+        sourceEntity: 'Rejoin Agency', writingNpn: null, writingAgent: null,
+        recordId: 'carrier_a~direct~REJOIN~70.00~2024-12', sourceFile: 'hist.csv', sourceRowNo: 4,
+        grossComm: '70.00', amount: '14.00',
+      },
+    ],
+  });
+  await seedPublishedRun(env, { statementDate: '2026-10-31', keyPrefix: 'c1-item8-r1', markSent: true });
+
+  await t.test('C1-8a: post-move New Post-Move Team is absent from old company (Acme) closure & tenant tree and its people see nothing in Acme DB', async () => {
+    const acmeClosure = (await env.pool.query(
+      'SELECT DISTINCT descendant_org_id FROM iam.v_organization_closure WHERE ancestor_org_id = $1::uuid',
+      [ids.acmeOrg],
+    )).rows.map((r) => r.descendant_org_id);
+    assert.ok(acmeClosure.includes(movedAgency), 'Moved Agency history must remain in Acme closure');
+    assert.ok(acmeClosure.includes(oldPreMoveTeam), 'Old Pre-Move Team history must remain in Acme closure');
+    assert.ok(acmeClosure.includes(movedActiveTeam), 'Moved Active Team that moved with Moved Agency must remain in Acme closure');
+    assert.ok(!acmeClosure.includes(newPostMoveTeam), 'New Post-Move Team added after move MUST be absent from Acme closure');
+    assert.ok(acmeClosure.includes(rejoinAgency) && acmeClosure.includes(rejoinPreLeaveTeam) && acmeClosure.includes(rejoinStayTeam) && acmeClosure.includes(rejoinPostTeam));
+    assert.ok(!acmeClosure.includes(rejoinAwayTeam), 'Rejoin Away Team from Northstar period MUST be absent from Acme closure');
+
+    const tenantTree = (await env.pool.query(
+      'SELECT coherence._resolve_tenant_tree_org_ids() AS orgs',
+    )).rows[0].orgs;
+    assert.ok(tenantTree.includes(movedAgency), 'Moved Agency must remain in Acme tenant tree');
+    assert.ok(tenantTree.includes(oldPreMoveTeam), 'Old Pre-Move Team must remain in Acme tenant tree');
+    assert.ok(tenantTree.includes(movedActiveTeam), 'Moved Active Team must remain in Acme tenant tree');
+    assert.ok(!tenantTree.includes(newPostMoveTeam), 'New Post-Move Team MUST be absent from Acme tenant tree');
+    assert.ok(!tenantTree.includes(rejoinAwayTeam), 'Rejoin Away Team MUST be absent from Acme tenant tree');
+
+    // Live write for New Post-Move Team in Acme DB must be refused as UNMAPPED_ENTITY.
+    await assert.rejects(
+      () => env.commands.recordStatementBatch({
+        dbToken: env.ownerToken,
+        commandKey: 'c1-item8-reject-new-team',
+        batchKind: 'historical_sent',
+        statementDate: '2026-07-15',
+        reason: 'new post-move team must not resolve in old company DB',
+        agencyLines: [{
+          entity: 'New Post Move Team', writingNpn: null, writingAgent: null,
+          recordId: 'carrier_a~direct~NEWPOST~10.00~2026-07', sourceFile: 'new.csv', sourceRowNo: 1,
+          grossComm: '10.00', amount: '10.00',
+        }],
+        uplineLines: [],
+      }),
+      /UNMAPPED_ENTITY/i,
+      'New Post-Move Team must be refused in old company DB',
+    );
+
+    // New Post-Move Team people and new-upline-only members with grants on Moved Agency or Rejoin Agency see ZERO everywhere in Acme DB.
+    for (const [label, token] of [
+      ['newTeamMgr', tok(newTeamMgr)],
+      ['View-as newTeamMgr', tok(ids.nusearOwner, newTeamMgr)],
+      ['newTeamAgent', tok(newTeamAgent)],
+      ['View-as newTeamAgent', tok(ids.nusearOwner, newTeamAgent)],
+      ['northstarEM', tok(northstarEM)],
+      ['nsOnlyMemberMovedGrant', tok(nsOnlyMemberMovedGrant)],
+      ['View-as nsOnlyMemberMovedGrant', tok(ids.nusearOwner, nsOnlyMemberMovedGrant)],
+      ['nsOnlyMemberRejoinGrant', tok(nsOnlyMemberRejoinGrant)],
+      ['View-as nsOnlyMemberRejoinGrant', tok(ids.nusearOwner, nsOnlyMemberRejoinGrant)],
+    ]) {
+      await runAsPlatformApp(env.pool, { token, readOnly: true }, async (c) => {
+        const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v;
+        const anyOrgs = (await c.query("SELECT iam.effective_any_org_ids('act:coherence.bob.read') AS v")).rows[0].v;
+        assert.deepEqual(wide, [], `${label} must have 0 effective wide orgs in Acme DB`);
+        assert.deepEqual(anyOrgs, [], `${label} must have 0 effective any orgs in Acme DB`);
+        for (const viewName of [
+          'coherence_bob',
+          'v_current_policy_periods',
+          'coherence_statement_agency_lines',
+          'coherence_statement_upline_lines',
+          'coherence_entity_statement_lines',
+          'coherence_ledger',
+          'coherence_published_runs',
+        ]) {
+          const n = (await c.query(`SELECT COUNT(*)::int AS n FROM app_views.${viewName}`)).rows[0].n;
+          assert.equal(n, 0, `${label} must see 0 rows in app_views.${viewName}`);
+        }
+      });
+    }
+
+    // Acme Entity Manager and Nusear Owner retain Moved Agency, Old Pre-Move Team, Moved Active Team, and Rejoin orgs.
+    const expectedAllHist = [
+      'Moved Active Team', 'Moved Agency', 'Old Pre Move Team',
+      'Rejoin Agency', 'Rejoin Post Team', 'Rejoin Pre Leave Team', 'Rejoin Stay Team',
+    ];
+    for (const [label, pid] of [['acmeEntityMgr', ids.acmeEntityMgr], ['nusearOwner', ids.nusearOwner]]) {
+      await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+        const entities = (await c.query(
+          "SELECT DISTINCT entity FROM app_views.coherence_statement_agency_lines WHERE statement_date = DATE '2024-12-31' ORDER BY entity",
+        )).rows.map((r) => r.entity);
+        assert.deepEqual(entities, expectedAllHist, `${label} must keep historical rows for Moved Agency, Old Pre-Move Team, Moved Active Team, and Rejoin orgs`);
+      });
+    }
+
+    // Moved Agency own manager AND old-company (Acme) member with a grant on Moved Agency both see Moved Agency, Old Pre-Move Team, and Moved Active Team.
+    for (const [label, pid] of [
+      ['movedAgencyMgr', movedAgencyMgr],
+      ['acmeMemberMovedGrant', acmeMemberMovedGrant],
+    ]) {
+      await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+        const entities = (await c.query(
+          "SELECT DISTINCT entity FROM app_views.coherence_statement_agency_lines WHERE statement_date = DATE '2024-12-31' ORDER BY entity",
+        )).rows.map((r) => r.entity);
+        assert.deepEqual(entities, ['Moved Active Team', 'Moved Agency', 'Old Pre Move Team'], `${label} must see Moved Agency, Moved Active Team, and archived Old Pre-Move Team in Acme DB`);
+      });
+    }
+
+    // Active team that moved with Moved Agency: its own manager sees Moved Active Team in Acme DB.
+    await runAsPlatformApp(env.pool, { token: tok(movedActiveTeamMgr), readOnly: true }, async (c) => {
+      const entities = (await c.query(
+        "SELECT DISTINCT entity FROM app_views.coherence_statement_agency_lines WHERE statement_date = DATE '2024-12-31' ORDER BY entity",
+      )).rows.map((r) => r.entity);
+      assert.deepEqual(entities, ['Moved Active Team'], 'Moved Active Team own manager must see Moved Active Team in Acme DB');
+    });
+
+    // Rejoin Agency own manager and Acme member with grant on Rejoin Agency see Rejoin Agency, Pre Leave, Stay, and Post teams (never Away).
+    for (const [label, pid] of [
+      ['rejoinAgencyMgr', rejoinAgencyMgr],
+      ['acmeMemberRejoinGrant', acmeMemberRejoinGrant],
+    ]) {
+      await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+        const entities = (await c.query(
+          "SELECT DISTINCT entity FROM app_views.coherence_statement_agency_lines WHERE statement_date = DATE '2024-12-31' ORDER BY entity",
+        )).rows.map((r) => r.entity);
+        assert.deepEqual(
+          entities,
+          ['Rejoin Agency', 'Rejoin Post Team', 'Rejoin Pre Leave Team', 'Rejoin Stay Team'],
+          `${label} must see all Acme-period teams under Rejoin Agency`,
+        );
+      });
+    }
+  });
+
+  await t.test('C1-8b: pre-move Old Pre-Move Team is absent from new upline (Northstar) closure, and v_organization_closure_live stays today tree', async () => {
+    const northstarClosure = (await env.pool.query(
+      'SELECT DISTINCT descendant_org_id FROM iam.v_organization_closure WHERE ancestor_org_id = $1::uuid',
+      [ids.northstarOrg],
+    )).rows.map((r) => r.descendant_org_id);
+    assert.ok(northstarClosure.includes(movedAgency), 'Moved Agency must be in Northstar closure');
+    assert.ok(northstarClosure.includes(movedActiveTeam), 'Moved Active Team must be in Northstar closure');
+    assert.ok(northstarClosure.includes(newPostMoveTeam), 'New Post-Move Team must be in Northstar closure');
+    assert.ok(!northstarClosure.includes(oldPreMoveTeam), 'Old Pre-Move Team from before the move MUST be absent from Northstar closure');
+    assert.ok(northstarClosure.includes(rejoinAgency) && northstarClosure.includes(rejoinAwayTeam) && northstarClosure.includes(rejoinStayTeam));
+    assert.ok(!northstarClosure.includes(rejoinPreLeaveTeam) && !northstarClosure.includes(rejoinPostTeam));
+
+    // v_organization_closure_live stays today's live tree only!
+    const acmeLive = (await env.pool.query(
+      'SELECT DISTINCT descendant_org_id FROM iam.v_organization_closure_live WHERE ancestor_org_id = $1::uuid',
+      [ids.acmeOrg],
+    )).rows.map((r) => r.descendant_org_id);
+    assert.ok(acmeLive.includes(ids.acmeOrg) && acmeLive.includes(ids.beaconOrg) && acmeLive.includes(ids.harborOrg));
+    assert.ok(acmeLive.includes(rejoinAgency) && acmeLive.includes(rejoinStayTeam) && acmeLive.includes(rejoinPostTeam));
+    assert.ok(!acmeLive.includes(movedAgency), 'Moved Agency (moved away) must not be in Acme today live tree');
+    assert.ok(!acmeLive.includes(movedActiveTeam), 'Moved Active Team (moved away) must not be in Acme today live tree');
+    assert.ok(!acmeLive.includes(oldPreMoveTeam), 'archived Old Pre-Move Team must not be in Acme today live tree');
+    assert.ok(!acmeLive.includes(newPostMoveTeam), 'New Post-Move Team must not be in Acme today live tree');
+
+    const northstarLive = (await env.pool.query(
+      'SELECT DISTINCT descendant_org_id FROM iam.v_organization_closure_live WHERE ancestor_org_id = $1::uuid',
+      [ids.northstarOrg],
+    )).rows.map((r) => r.descendant_org_id);
+    assert.ok(northstarLive.includes(ids.northstarOrg), 'Northstar must be in Northstar today live tree');
+    assert.ok(northstarLive.includes(movedAgency), 'Moved Agency must be in Northstar today live tree');
+    assert.ok(northstarLive.includes(movedActiveTeam), 'Moved Active Team must be in Northstar today live tree');
+    assert.ok(northstarLive.includes(newPostMoveTeam), 'New Post-Move Team must be in Northstar today live tree');
+    assert.ok(!northstarLive.includes(oldPreMoveTeam), 'Old Pre-Move Team must not be in Northstar today live tree');
+    assert.ok(!northstarLive.includes(rejoinAgency), 'Rejoin Agency (back in Acme today) must not be in Northstar today live tree');
+  });
+
+  await t.test('C1-8c: tool switch set by new upline (Northstar) never affects Acme DB; switching Moved Agency itself off nulls company totals in coherence_statement_batches for non-internal callers', async () => {
+    // 1. Northstar switches coherence OFF (and HELD): must have ZERO effect on Acme DB!
+    for (const [state, holdReason, keySuffix] of [
+      ['off', null, 'ns-off'],
+      ['held', 'new upline hold', 'ns-held'],
+    ]) {
+      await inSerializableTx(env.pool, async (c) => {
+        const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c1_ns_switch', commandKey: `c1-${keySuffix}` });
+        const prev = (await c.query(
+          "SELECT id FROM iam.organization_tool_switches WHERE organization_id = $1 AND tool_id = 'coherence' AND superseded_by_id IS NULL",
+          [ids.northstarOrg],
+        )).rows[0]?.id ?? null;
+        await c.query(
+          "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, hold_reason, status, replaces_id, journal_seq) VALUES ($1,$2,'coherence',$3,$4,'active',$5,$6)",
+          [randomUUID(), ids.northstarOrg, state, holdReason, prev, j.seq],
+        );
+      });
+
+      for (const [label, pid, expected] of [
+        ['movedAgencyMgr', movedAgencyMgr, ['Moved Active Team', 'Moved Agency', 'Old Pre Move Team']],
+        ['acmeMemberMovedGrant', acmeMemberMovedGrant, ['Moved Active Team', 'Moved Agency', 'Old Pre Move Team']],
+        ['movedActiveTeamMgr', movedActiveTeamMgr, ['Moved Active Team']],
+        ['rejoinAgencyMgr', rejoinAgencyMgr, ['Rejoin Agency', 'Rejoin Post Team', 'Rejoin Pre Leave Team', 'Rejoin Stay Team']],
+      ]) {
+        await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
+          const entities = (await c.query(
+            "SELECT DISTINCT entity FROM app_views.coherence_statement_agency_lines WHERE statement_date = DATE '2024-12-31' ORDER BY entity",
+          )).rows.map((r) => r.entity);
+          assert.deepEqual(entities, expected, `Northstar switch=${state} must NEVER affect ${label} in Acme DB`);
+        });
+      }
+
+      // Acme EM still keeps full company totals in coherence_statement_batches!
+      await runAsPlatformApp(env.pool, { token: tok(ids.acmeEntityMgr), readOnly: true }, async (c) => {
+        const batch = (await c.query(
+          "SELECT agency_line_count, agency_net_total, upline_net_total FROM app_views.coherence_statement_batches WHERE statement_date = DATE '2024-12-31'",
+        )).rows[0];
+        assert.notEqual(batch?.agency_net_total, null, `Northstar switch=${state} must not null Acme EM batch totals`);
+        assert.notEqual(batch?.upline_net_total, null, `Northstar switch=${state} must not null Acme EM upline totals`);
+      });
+    }
+
+    // 2. Switch Moved Agency ITSELF off (Item 3): Moved Agency is outside Acme's live tree today, yet its lines
+    //    appear in Acme's batches, so company totals in coherence_statement_batches MUST become NULL for Acme EM
+    //    while staying populated for Nusear Owner (who bypasses tool switches).
+    await inSerializableTx(env.pool, async (c) => {
+      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c1_moved_off', commandKey: 'c1-moved-off' });
+      await c.query(
+        "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','off','active',$3)",
+        [randomUUID(), movedAgency, j.seq],
+      );
+    });
+
+    await runAsPlatformApp(env.pool, { token: tok(ids.acmeEntityMgr), readOnly: true }, async (c) => {
+      const movedLines = (await c.query(
+        "SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines WHERE entity IN ('Moved Agency', 'Old Pre Move Team', 'Moved Active Team')",
+      )).rows[0].n;
+      assert.equal(movedLines, 0, 'Acme EM must see 0 lines for switched-off Moved Agency and its teams');
+      const batches = (await c.query(
+        `SELECT statement_date, agency_line_count, agency_lines_sha256, agency_net_total,
+                upline_line_count, upline_lines_sha256, upline_net_total
+         FROM app_views.coherence_statement_batches`,
+      )).rows;
+      assert.ok(batches.length >= 2);
+      for (const b of batches) {
+        for (const col of ['agency_line_count', 'agency_lines_sha256', 'agency_net_total', 'upline_line_count', 'upline_lines_sha256', 'upline_net_total']) {
+          assert.equal(b[col], null, `Acme EM must get NULL ${col} in coherence_statement_batches when moved agency is switched off`);
+        }
+      }
+    });
+
+    await runAsPlatformApp(env.pool, { token: tok(ids.nusearOwner), readOnly: true }, async (c) => {
+      const histBatch = (await c.query(
+        "SELECT agency_line_count, agency_net_total, upline_net_total FROM app_views.coherence_statement_batches WHERE statement_date = DATE '2024-12-31'",
+      )).rows[0];
+      assert.equal(Number(histBatch.agency_line_count), 7);
+      assert.notEqual(histBatch.agency_net_total, null, 'Nusear Owner bypasses tool switches and keeps batch totals');
+      assert.notEqual(histBatch.upline_net_total, null);
+    });
   });
 });

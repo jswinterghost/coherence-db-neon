@@ -1818,3 +1818,111 @@ test('Layer 7 [Release 1A Journal Hash Parity]: platform.compute_journal_hash us
   })}`);
   assert.equal(row.h, expectedHash, 'platform.compute_journal_hash must match Release 1A canonical_json serialization byte-for-byte');
 });
+
+test('Layer 7 [Control DB Closure]: iam.person_effective_grants reads today live tree in control database (moved agency follows new upline; old company member and archived orgs excluded)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const db = await createEmptyMigratedTestDb();
+  t.after(() => db.cleanup());
+
+  const keyId = 'k_ctrl_2026';
+  const secretBytes = randomBytes(32);
+  const environment = 'local';
+  const rootOrg = randomUUID();
+  const acmeOrg = randomUUID();
+  const northstarOrg = randomUUID();
+  const movedAgency = randomUUID();
+  const archivedTeam = randomUUID();
+  const acmeMember = randomUUID();
+  const nsMember = randomUUID();
+  const roleMgr = randomUUID();
+
+  await inSerializableTx(db.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment, commandKind: 'iam.ctrl_seed', commandKey: 'ctrl-seed' });
+    const seq = j.seq;
+    for (const [id, kind] of [
+      [rootOrg, 'platform_root'], [acmeOrg, 'company'], [northstarOrg, 'company'],
+      [movedAgency, 'agency'], [archivedTeam, 'team'],
+    ]) {
+      await c.query('INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,$2,$3)', [id, kind, seq]);
+    }
+    await c.query(
+      `INSERT INTO iam.database_context (singleton, environment, db_role_kind, tenant_org_id, company_slug, support_external_label, journal_seq)
+       VALUES (true, $1, 'control', NULL, NULL, 'Nusear support', $2)`,
+      [environment, seq],
+    );
+    await c.query(
+      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from, active_until)
+       VALUES ($1, $2, $3, pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
+      [keyId, secretBytes, environment],
+    );
+    await c.query("INSERT INTO iam.tools (id, display_name, is_nusear_only, is_customer_switchable, journal_seq) VALUES ('coherence','Coherence',false,true,$1)", [seq]);
+    await c.query(
+      "INSERT INTO iam.rights (id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power, description, journal_seq) VALUES ('act:coherence.bob.read','action','coherence','both','ordinary',true,'Read BoB',$1)",
+      [seq],
+    );
+    for (const [oid, slug, name, status] of [
+      [rootOrg, 'nusear', 'Nusear', 'active'],
+      [acmeOrg, 'acme', 'Acme', 'active'],
+      [northstarOrg, 'northstar', 'Northstar', 'active'],
+      [movedAgency, 'moved', 'Moved', 'active'],
+      [archivedTeam, 'arch_team', 'Archived Team', 'archived'],
+    ]) {
+      await c.query(
+        'INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,$3,$4,$5,$6)',
+        [randomUUID(), oid, slug, name, status, seq],
+      );
+    }
+    for (const [child, parent, rng] of [
+      [acmeOrg, rootOrg, '[2020-01-01,)'],
+      [northstarOrg, rootOrg, '[2020-01-01,)'],
+      [movedAgency, acmeOrg, '[2020-01-01,2025-06-01)'],
+      [movedAgency, northstarOrg, '[2025-06-01,)'],
+      [archivedTeam, northstarOrg, '[2020-01-01,2026-01-01)'],
+    ]) {
+      await c.query(
+        "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4::daterange,'active',$5)",
+        [randomUUID(), child, parent, rng, seq],
+      );
+    }
+    for (const oid of [acmeOrg, northstarOrg]) {
+      await c.query(
+        "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','on','active',$3)",
+        [randomUUID(), oid, seq],
+      );
+    }
+    await c.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleMgr, 'ctrl_mgr', seq]);
+    await c.query(
+      "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Ctrl Mgr',false,false,true,'active',$3)",
+      [randomUUID(), roleMgr, seq],
+    );
+    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), roleMgr, seq]);
+    for (const [pid, name, email, memOrg, grantOrg] of [
+      [acmeMember, 'Acme Mem', 'acme.ctrl@example.test', acmeOrg, movedAgency],
+      [nsMember, 'NS Mem', 'ns.ctrl@example.test', northstarOrg, northstarOrg],
+    ]) {
+      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
+      await c.query(
+        "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)",
+        [randomUUID(), pid, name, email, seq],
+      );
+      await c.query(
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        [randomUUID(), pid, memOrg, seq],
+      );
+      await c.query(
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+        [randomUUID(), pid, roleMgr, grantOrg, seq],
+      );
+    }
+  });
+
+  const tok = (pid) => mintSignedToken({ keyId, secretBytes, environment, actorPersonId: pid });
+  const acmeWide = await runAsPlatformApp(db.pool, { token: tok(acmeMember), readOnly: true }, async (c) => (
+    (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v
+  ));
+  assert.deepEqual(acmeWide, [], 'control DB uses today live tree: old company member with grant on moved agency gets 0 orgs');
+
+  const nsWide = await runAsPlatformApp(db.pool, { token: tok(nsMember), readOnly: true }, async (c) => (
+    (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v
+  ));
+  assert.deepEqual([...nsWide].sort(), [movedAgency, northstarOrg].sort(), 'control DB uses today live tree: new upline sees moved agency and excludes archived team');
+});

@@ -57,7 +57,7 @@ export function createWebHandlers({
     if (asOf) {
       const parsed = new Date(asOf);
       if (Number.isNaN(parsed.getTime())) throw new AppError('asOf must be a valid ISO-8601 timestamp.', 400, 'INVALID_AS_OF');
-      const gateRes = await tx.query('SELECT authorized FROM app_views.coherence_review_drift_gate LIMIT 1');
+      const gateRes = await tx.query('SELECT authorized FROM app_views.coherence_journal_gate LIMIT 1');
       if (gateRes.rows.length === 0 || gateRes.rows[0].authorized !== true) {
         throw new AppError('Resolving an asOf timestamp requires journal read access.', 403, 'FORBIDDEN');
       }

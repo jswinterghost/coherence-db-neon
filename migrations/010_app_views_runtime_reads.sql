@@ -6,98 +6,59 @@
 -- All functions pin SET search_path = pg_catalog and schema-qualify all references.
 
 -- 1. IAM-scoped platform_view_owner FOR SELECT RLS policies on the remaining Coherence tables
---    required by runtime web handlers and downstream readers (every policy scoped against iam.database_context).
+--    required by runtime web handlers and downstream readers (sharing app_views._read_* checks).
 CREATE POLICY stored_files_iam_read ON coherence.stored_files
   FOR SELECT TO platform_view_owner
   USING (
     (
       store_kind = 'company_data'
       AND (
-        (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.inputs.read')))::uuid[])
-        OR (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.runs.read')))::uuid[])
-        OR (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.outputs.read')))::uuid[])
-        OR (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[])
-        OR (
-          (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
-          AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
-          AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
-        )
+        (SELECT app_views._read_tenant_right('act:coherence.inputs.read'))
+        OR (SELECT app_views._read_tenant_right('act:coherence.runs.read'))
+        OR (SELECT app_views._read_tenant_right('act:coherence.outputs.read'))
+        OR (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
+        OR (SELECT app_views._read_has_full_entity_finance())
       )
     )
     OR (
       store_kind = 'nusear_code'
       AND (
-        (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[])
-        OR (
-          (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
-          AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
-          AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
-        )
+        (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
+        OR (SELECT app_views._read_has_full_entity_finance())
       )
     )
   );
 
 CREATE POLICY input_changes_iam_read ON coherence.input_changes
   FOR SELECT TO platform_view_owner
-  USING (
-    (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-      = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.inputs.read')))::uuid[])
-  );
+  USING ((SELECT app_views._read_tenant_right('act:coherence.inputs.read')));
 
 CREATE POLICY imported_files_iam_read ON coherence.imported_files
   FOR SELECT TO platform_view_owner
-  USING (
-    (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-      = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.inputs.read')))::uuid[])
-  );
+  USING ((SELECT app_views._read_tenant_right('act:coherence.inputs.read')));
 
 CREATE POLICY engine_versions_iam_read ON coherence.engine_versions
   FOR SELECT TO platform_view_owner
-  USING (
-    (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-      = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.runs.read')))::uuid[])
-  );
+  USING ((SELECT app_views._read_tenant_right('act:coherence.runs.read')));
 
 CREATE POLICY approvals_files_iam_read ON coherence.approvals_files
   FOR SELECT TO platform_view_owner
   USING (
-    (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-      = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[])
-    OR (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-      = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.runs.read')))::uuid[])
+    (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
+    OR (SELECT app_views._read_tenant_right('act:coherence.runs.read'))
   );
 
 CREATE POLICY approval_rows_iam_read ON coherence.approval_rows
   FOR SELECT TO platform_view_owner
-  USING (
-    (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-      = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[])
-  );
+  USING ((SELECT app_views._read_tenant_right('act:coherence.decisions.read')));
 
 CREATE POLICY review_submissions_iam_read ON coherence.review_submissions
   FOR SELECT TO platform_view_owner
-  USING (
-    (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-      = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[])
-  );
+  USING ((SELECT app_views._read_tenant_right('act:coherence.decisions.read')));
 
 CREATE POLICY review_drafts_iam_read ON coherence.review_drafts
   FOR SELECT TO platform_view_owner
-  USING (
-    (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-      = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[])
-  );
+  USING ((SELECT app_views._read_tenant_right('act:coherence.decisions.read')));
 
 CREATE POLICY artifacts_iam_read ON coherence.artifacts
   FOR SELECT TO platform_view_owner
@@ -106,33 +67,18 @@ CREATE POLICY artifacts_iam_read ON coherence.artifacts
       artifact_kind = 'data'
       AND store_kind = 'company_data'
       AND (
-        (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.outputs.read')))::uuid[])
-        OR (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-          = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[])
-        OR (
-          (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
-          AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
-          AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
-        )
+        (SELECT app_views._read_tenant_right('act:coherence.outputs.read'))
+        OR (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
+        OR (SELECT app_views._read_has_full_entity_finance())
       )
     )
     OR (
       rel_path IN ('bible.json', 'bible.html', 'adjust.json', 'adjust.html')
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[])
+      AND (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
     )
     OR (
       rel_path LIKE 'emits/bundles/entity-managers/%/viewer.html'
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
+      AND (SELECT app_views._read_has_full_entity_finance())
     )
   );
 
@@ -179,8 +125,7 @@ JOIN coherence.stored_files sf
   ON sf.store_kind = ie.store_kind
  AND sf.sha256 = ie.file_sha256
 WHERE ie.store_kind = 'company_data'
-  AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.inputs.read')))::uuid[]);
+  AND (SELECT app_views._read_tenant_right('act:coherence.inputs.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_staging_files
 WITH (security_barrier = true) AS
@@ -240,8 +185,7 @@ FROM coherence.step_attempt_events e
 LEFT JOIN coherence.stored_files sf
   ON sf.store_kind = 'company_data'
  AND sf.sha256 = e.log_file_sha256
-WHERE (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.runs.read')))::uuid[]);
+WHERE (SELECT app_views._read_tenant_right('act:coherence.runs.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_step_requests
 WITH (security_barrier = true) AS
@@ -310,8 +254,7 @@ SELECT
   c.typed_phrase,
   c.journal_seq
 FROM coherence.carries c
-WHERE (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.runs.read')))::uuid[]);
+WHERE (SELECT app_views._read_tenant_right('act:coherence.runs.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_abandonments
 WITH (security_barrier = true) AS
@@ -322,8 +265,7 @@ SELECT
   a.reason,
   a.journal_seq
 FROM coherence.abandonments a
-WHERE (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.runs.read')))::uuid[]);
+WHERE (SELECT app_views._read_tenant_right('act:coherence.runs.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_review_submissions
 WITH (security_barrier = true) AS
@@ -395,28 +337,16 @@ SELECT
   sf.md5_b64,
   sf.crc32c_b64
 FROM coherence.runs r
-JOIN LATERAL (
-  SELECT DISTINCT ON (s.step)
-    s.id, s.step, s.attempt_no
-  FROM coherence.step_attempt_events s
-  WHERE s.run_id = r.id
-    AND s.step IN ('bible', 'adjust')
-    AND s.event_kind = 'finished'
-    AND NOT EXISTS (
-      SELECT 1 FROM coherence.step_attempt_events sup
-      WHERE sup.run_id = s.run_id AND sup.step = s.step AND sup.attempt_no = s.attempt_no
-        AND sup.event_kind = 'superseded'
-    )
-  ORDER BY s.step, s.attempt_no DESC
-) e ON true
+CROSS JOIN (VALUES ('bible'::text), ('adjust'::text)) AS surf(step)
+JOIN coherence.step_attempt_events e
+  ON e.id = app_views._read_current_finished_attempt(r.id, surf.step)
 JOIN coherence.artifacts a
   ON a.attempt_event_id = e.id
  AND a.rel_path IN (e.step || '.json', e.step || '.html')
 JOIN coherence.stored_files sf
   ON sf.store_kind = a.store_kind
  AND sf.sha256 = a.file_sha256
-WHERE (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.decisions.read')))::uuid[]);
+WHERE (SELECT app_views._read_tenant_right('act:coherence.decisions.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_run_outputs
 WITH (security_barrier = true) AS
@@ -431,20 +361,10 @@ SELECT
   sf.md5_b64,
   sf.crc32c_b64
 FROM coherence.runs r
-JOIN LATERAL (
-  SELECT s.id
-  FROM coherence.step_attempt_events s
-  WHERE s.run_id = r.id
-    AND s.step = 'emit'
-    AND s.event_kind = 'finished'
-    AND NOT EXISTS (
-      SELECT 1 FROM coherence.step_attempt_events sup
-      WHERE sup.run_id = s.run_id AND sup.step = s.step AND sup.attempt_no = s.attempt_no
-        AND sup.event_kind = 'superseded'
-    )
-  ORDER BY s.attempt_no DESC
-  LIMIT 1
-) e ON true
+JOIN coherence.step_attempt_events e
+  ON e.id = app_views._read_current_finished_attempt(r.id, 'emit')
+LEFT JOIN app_views._read_published_emit_attempts() pe
+  ON pe.attempt_event_id = e.id
 JOIN coherence.artifacts a
   ON a.attempt_event_id = e.id
  AND a.artifact_kind = 'data'
@@ -452,31 +372,13 @@ JOIN coherence.artifacts a
 JOIN coherence.stored_files sf
   ON sf.store_kind = 'company_data'
  AND sf.sha256 = a.file_sha256
-WHERE (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.outputs.read')))::uuid[])
+WHERE (SELECT app_views._read_tenant_right('act:coherence.outputs.read'))
   AND (
     a.rel_path IN ('run.json', 'company_manifest.json')
     OR (
-      r.origin IN ('app', 'company_import')
-      AND (r.source_folder IS NULL OR r.source_folder NOT LIKE 'company-abandoned/%')
-      AND NOT EXISTS (SELECT 1 FROM coherence.abandonments ab WHERE ab.run_id = r.id)
-      AND (
-        EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent')
-        OR (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-             = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
-      )
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.statement_cash')))::uuid[])
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.statements.read')))::uuid[])
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.upline.read')))::uuid[])
-      AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-            = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
+      pe.attempt_event_id IS NOT NULL
+      AND (pe.is_sent OR (SELECT app_views._read_has_full_tenant_right('act:coherence.unpublished.read')))
+      AND (SELECT app_views._read_has_full_entity_finance())
     )
   );
 
@@ -491,56 +393,24 @@ SELECT
   r.input_version_id,
   r.emit_mode,
   r.emit_display,
-  ev.id AS emit_attempt_event_id,
-  ev.journal_seq AS emit_journal_seq,
+  pe.attempt_event_id AS emit_attempt_event_id,
+  pe.attempt_journal_seq AS emit_journal_seq,
   r.journal_seq,
-  sent_info.is_sent AS sent,
+  pe.is_sent AS sent,
   cm.default_emit_display,
   cm.display_name
 FROM coherence.runs r
-JOIN LATERAL (
-  SELECT e.id, e.journal_seq
-  FROM coherence.step_attempt_events e
-  WHERE e.run_id = r.id
-    AND e.step = 'emit'
-    AND e.event_kind = 'finished'
-    AND NOT EXISTS (
-      SELECT 1 FROM coherence.step_attempt_events sup
-      WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no
-        AND sup.event_kind = 'superseded'
-    )
-  ORDER BY e.attempt_no DESC
-  LIMIT 1
-) ev ON true
+JOIN app_views._read_published_emit_attempts() pe
+  ON pe.run_id = r.id
 LEFT JOIN coherence.company_meta cm ON cm.singleton = true
-CROSS JOIN LATERAL (
-  SELECT EXISTS (
-    SELECT 1 FROM coherence.carries c
-    WHERE c.run_id = r.id AND c.carry_kind = 'sent'
-  ) AS is_sent
-) sent_info
-WHERE r.origin IN ('app', 'company_import')
-  AND (r.source_folder IS NULL OR r.source_folder NOT LIKE 'company-abandoned/%')
-  AND NOT EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = r.id)
-  AND pg_catalog.cardinality(
-    ((SELECT iam.effective_any_org_ids('act:coherence.bob.read')))::uuid[]
-    || ((SELECT iam.effective_any_org_ids('act:coherence.statements.read')))::uuid[]
-    || ((SELECT iam.effective_any_org_ids('act:coherence.upline.read')))::uuid[]
-    || ((SELECT iam.effective_any_org_ids('act:coherence.ledger.read')))::uuid[]
-    || ((SELECT iam.effective_any_org_ids('act:coherence.runs.read')))::uuid[]
-  ) > 0
-  AND (
-    sent_info.is_sent
-    OR pg_catalog.cardinality(
-      ((SELECT iam.effective_any_org_ids('act:coherence.unpublished.read')))::uuid[]
-    ) > 0
-  );
+WHERE (SELECT app_views._read_has_run_meta_access())
+  AND (pe.is_sent OR (SELECT app_views._read_can_see_unsent_run_meta()));
 
 CREATE OR REPLACE VIEW app_views.coherence_entity_bundle_artifacts
 WITH (security_barrier = true) AS
 SELECT
   r.id AS run_id,
-  ev.id AS attempt_event_id,
+  pe.attempt_event_id,
   a.rel_path,
   a.artifact_kind,
   a.store_kind,
@@ -550,22 +420,10 @@ SELECT
   sf.crc32c_b64,
   (a.rel_path LIKE 'emits/bundles/entity-managers/%/viewer.html') AS is_viewer_config
 FROM coherence.runs r
-JOIN LATERAL (
-  SELECT e.id
-  FROM coherence.step_attempt_events e
-  WHERE e.run_id = r.id
-    AND e.step = 'emit'
-    AND e.event_kind = 'finished'
-    AND NOT EXISTS (
-      SELECT 1 FROM coherence.step_attempt_events sup
-      WHERE sup.run_id = e.run_id AND sup.step = e.step AND sup.attempt_no = e.attempt_no
-        AND sup.event_kind = 'superseded'
-    )
-  ORDER BY e.attempt_no DESC
-  LIMIT 1
-) ev ON true
+JOIN app_views._read_published_emit_attempts() pe
+  ON pe.run_id = r.id
 JOIN coherence.artifacts a
-  ON a.attempt_event_id = ev.id
+  ON a.attempt_event_id = pe.attempt_event_id
  AND (
    a.rel_path LIKE 'emits/bundles/entity-managers/%/viewer.html'
    OR (
@@ -577,20 +435,8 @@ JOIN coherence.artifacts a
 JOIN coherence.stored_files sf
   ON sf.store_kind = a.store_kind
  AND sf.sha256 = a.file_sha256
-WHERE r.origin IN ('app', 'company_import')
-  AND (r.source_folder IS NULL OR r.source_folder NOT LIKE 'company-abandoned/%')
-  AND NOT EXISTS (SELECT 1 FROM coherence.abandonments ab WHERE ab.run_id = r.id)
-  AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.bob.read')))::uuid[])
-  AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.ledger.read')))::uuid[])
-  AND (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-        = ANY(((SELECT iam.effective_wide_org_ids('col:coherence.upline_cash')))::uuid[])
-  AND (
-    EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent')
-    OR (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-         = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.unpublished.read')))::uuid[])
-  );
+WHERE (SELECT app_views._read_has_full_entity_finance())
+  AND (pe.is_sent OR (SELECT app_views._read_has_full_tenant_right('act:coherence.unpublished.read')));
 
 CREATE OR REPLACE VIEW app_views.coherence_review_drift_gate
 WITH (security_barrier = true) AS
@@ -599,7 +445,16 @@ SELECT
   true AS authorized
 FROM iam.database_context dc
 WHERE dc.singleton = true
-  AND dc.tenant_org_id = ANY(((SELECT iam.effective_wide_org_ids('act:coherence.journal.read')))::uuid[]);
+  AND (SELECT app_views._read_tenant_right('act:coherence.journal.read'));
+
+CREATE OR REPLACE VIEW app_views.coherence_journal_gate
+WITH (security_barrier = true) AS
+SELECT
+  dc.company_slug,
+  true AS authorized
+FROM iam.database_context dc
+WHERE dc.singleton = true
+  AND (SELECT app_views._read_tenant_right('act:coherence.journal.read'));
 
 DO $$
 DECLARE
@@ -624,7 +479,8 @@ BEGIN
     'coherence_run_outputs',
     'coherence_published_runs',
     'coherence_entity_bundle_artifacts',
-    'coherence_review_drift_gate'
+    'coherence_review_drift_gate',
+    'coherence_journal_gate'
   ] LOOP
     EXECUTE pg_catalog.format('ALTER VIEW app_views.%I OWNER TO platform_view_owner', v_view);
     EXECUTE pg_catalog.format('REVOKE ALL ON app_views.%I FROM PUBLIC', v_view);
