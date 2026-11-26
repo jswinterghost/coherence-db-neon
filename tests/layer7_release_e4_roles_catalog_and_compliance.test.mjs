@@ -849,8 +849,8 @@ test('Layer 7G [E4 Test 2]: agent and retention-agent roles refuse company reven
 test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harness and scripts/prove-history.mjs, all 15 built-in roles exact rights & flags, investor role empty, and new role empty', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const catalogMod = await import('../src/iam/catalog.mjs');
   const { CANONICAL_TOOLS, CANONICAL_RIGHTS, CANONICAL_ROLES, seedIamCatalog } = catalogMod;
-  assert.equal(CANONICAL_TOOLS.length, 8);
-  assert.equal(CANONICAL_RIGHTS.length, 57);
+  assert.equal(CANONICAL_TOOLS.length, 9);
+  assert.equal(CANONICAL_RIGHTS.length, 63);
   assert.equal(CANONICAL_ROLES.length, 15);
   assert.equal(typeof seedIamCatalog, 'function');
 
@@ -1039,6 +1039,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
       'act:coherence.unpublished.read',
       'act:coherence.upline.read',
       'act:hr.records.read',
+      'act:iam.read',
       'act:leads.costs.read',
       'act:leads.vendor_bills.read',
       'act:payroll.agent_pay.read',
@@ -1070,6 +1071,11 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
       'act:coherence.run.launch',
       'act:coherence.run.retry',
       'act:hr.records.write',
+      'act:iam.entities.write',
+      'act:iam.grants.write',
+      'act:iam.people.write',
+      'act:iam.roles.write',
+      'act:iam.switches.write',
     ].sort();
     const expectedNusearOwner = [
       ...expectedNusearSupport,
@@ -1103,6 +1109,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
       'act:coherence.upline.read',
       'act:hr.records.read',
       'act:hr.records.write',
+      'act:iam.read',
       'act:leads.costs.read',
       'act:payroll.agent_pay.read',
       'act:payroll.runs.read',
@@ -1122,6 +1129,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
     const expectedAgentRights = [
       'act:coherence.bob.read',
       'act:hr.records.read',
+      'act:iam.read',
       'act:payroll.agent_pay.read',
       'act:referrals.read',
       'col:coherence.member_contact',
@@ -1175,6 +1183,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
           'act:coherence.unpublished.read',
           'act:hr.records.read',
           'act:hr.records.write',
+          'act:iam.read',
           'act:platform.audit_journal.read',
           'col:coherence.member_contact',
           'col:coherence.member_phi',
@@ -1186,6 +1195,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         rights: [
           'act:coherence.bob.read',
           'act:coherence.statements.read',
+          'act:iam.read',
           'col:coherence.member_contact',
           'col:coherence.member_phi',
           'col:coherence.statement_cash',
@@ -1195,6 +1205,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: true,
         rights: [
           'act:coherence.bob.read',
+          'act:iam.read',
           'act:leads.costs.read',
           'col:coherence.member_contact',
           'col:coherence.member_phi',
@@ -1205,6 +1216,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: true,
         rights: [
           'act:coherence.bob.read',
+          'act:iam.read',
           'act:leads.costs.read',
           'act:referrals.read',
           'col:coherence.member_contact',
@@ -1220,6 +1232,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
           'act:coherence.ledger.read',
           'act:coherence.statements.read',
           'act:coherence.upline.read',
+          'act:iam.read',
           'act:leads.costs.read',
           'act:payroll.agent_pay.read',
           'act:payroll.runs.read',
@@ -1238,6 +1251,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         rights: [
           'act:coherence.bob.read',
           'act:coherence.statements.read',
+          'act:iam.read',
           'col:coherence.member_contact',
           'col:coherence.member_phi',
         ],

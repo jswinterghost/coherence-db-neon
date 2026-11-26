@@ -266,11 +266,12 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
         commandKey: `e1-personas-${randomUUID()}`,
       })).seq;
 
-      const seedPersona = async (personId, slug, display, { npn = null, memberships = [], affiliations = [], grants = [] }) => {
-        await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [personId, seq]);
+      const seedPersona = async (personId, slug, display, { npn = null, isNusearStaff = false, memberships = [], affiliations = [], grants = [] }) => {
+        const origin = isNusearStaff ? 'nusear_staff' : 'company_local';
+        await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human',$2,$3)", [personId, origin, seq]);
         await c.query(
-          "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, journal_seq) VALUES ($1,$2,$3,$3,$4,$5,'active',$6)",
-          [randomUUID(), personId, display, `${slug}@acme.example`, npn, seq],
+          "INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, npn, status, journal_seq) VALUES ($1,$2,$3,$4,$4,$5,$6,'active',$7)",
+          [randomUUID(), personId, origin, display, `${slug}@acme.example`, npn, seq],
         );
         for (const orgId of memberships) {
           await c.query(
@@ -290,8 +291,8 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
           const roleId = randomUUID();
           await c.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleId, `${slug}_r${idx}`, seq]);
           await c.query(
-            "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,$3,false,false,$4,'active',$5)",
-            [randomUUID(), roleId, `${slug} r${idx}`, g.mode === 'org_subtree', seq],
+            "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,$3,false,$4,$5,'active',$6)",
+            [randomUUID(), roleId, `${slug} r${idx}`, isNusearStaff, g.mode === 'org_subtree', seq],
           );
           for (const rightId of g.rights) {
             await c.query(
@@ -478,7 +479,8 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
         ],
       });
       await seedPersona(personas.checkRunnerNoPhi, 'check_runner_no_phi', 'Check Runner No PHI', {
-        memberships: [iam.ids.companyOrg],
+        isNusearStaff: true,
+        memberships: [iam.ids.rootOrg],
         grants: [{
           orgId: iam.ids.companyOrg,
           mode: 'org_subtree',
@@ -486,7 +488,8 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
         }],
       });
       await seedPersona(personas.checkRunnerSubOrgPhi, 'check_runner_suborg_phi', 'Check Runner SubOrg PHI', {
-        memberships: [iam.ids.companyOrg],
+        isNusearStaff: true,
+        memberships: [iam.ids.rootOrg],
         grants: [
           {
             orgId: iam.ids.companyOrg,
@@ -497,7 +500,8 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
         ],
       });
       await seedPersona(personas.checkRunnerNoRead, 'check_runner_no_read', 'Check Runner No Read', {
-        memberships: [iam.ids.companyOrg],
+        isNusearStaff: true,
+        memberships: [iam.ids.rootOrg],
         grants: [{ orgId: iam.ids.companyOrg, mode: 'org_subtree', rights: ['act:coherence.checks.record'] }],
       });
       await seedPersona(personas.journalNoPhi, 'journal_no_phi', 'Journal No PHI', {
@@ -1998,7 +2002,7 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
         ['checkRunnerSubOrgPhi', personas.checkRunnerSubOrgPhi, true],
         ['checkRunnerNoRead', personas.checkRunnerNoRead, false],
       ]) {
-        const tok = iam.tokenFor(pid);
+        const tok = iam.tokenFor(pid, null, { keyScope: 'nusear_staff' });
         for (const checkKind of ['objects', 'chain']) {
           const postRes = await httpJson(tok, '/api/coherence/acme/checks/run', {
             method: 'POST',
@@ -2040,7 +2044,7 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
       assert.deepEqual(ownerPost.body.report, ownerDetail.body.report, 'owner POST /checks/run report must match GET /checks/:id');
 
       // Idempotent replay of POST /checks/run keeps the exact same masking for both blocked and permitted callers.
-      const replayNoPhi = await httpJson(iam.tokenFor(personas.checkRunnerNoPhi), '/api/coherence/acme/checks/run', {
+      const replayNoPhi = await httpJson(iam.tokenFor(personas.checkRunnerNoPhi, null, { keyScope: 'nusear_staff' }), '/api/coherence/acme/checks/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ commandKey: 'f3-post-chk-checkRunnerNoPhi-objects', checkKind: 'objects' }),

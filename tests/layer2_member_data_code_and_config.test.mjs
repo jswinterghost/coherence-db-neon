@@ -610,8 +610,8 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
   const dbCfg = await verifyDatabaseConfigInvariants(env.pool);
   assert.equal(dbCfg.passed, true, `Database config audit failed:\n${dbCfg.problems.join('\n')}`);
   assert.equal(dbCfg.checkedBusinessTables, 31);
-  assert.equal(dbCfg.checkedAppViews, 39);
-  assert.equal(dbCfg.checkedAppCmdFunctions, 33);
+  assert.equal(dbCfg.checkedAppViews, 50);
+  assert.equal(dbCfg.checkedAppCmdFunctions, 48);
   assert.ok(dbCfg.checkedFunctions >= 40);
 
   const iamCfg = await verifyIamConfigInvariants(env.pool);

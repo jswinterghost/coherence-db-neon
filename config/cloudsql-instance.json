@@ -37,7 +37,9 @@
       "businessTables": ["SELECT", "INSERT"],
       "reviewSubmissions": ["SELECT", "INSERT", "UPDATE"],
       "reviewDrafts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-      "auditJournal": ["SELECT", "INSERT"]
+      "auditJournal": ["SELECT", "INSERT"],
+      "iamTables": ["SELECT", "INSERT"],
+      "iamAuthIdentities": []
     },
     "platform_readonly": {
       "businessTables": ["SELECT"],

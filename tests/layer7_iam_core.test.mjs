@@ -174,8 +174,8 @@ async function seedStandardIamWorld(pool, { environment = 'local' } = {}) {
       ['act:transmittals.read', 'action', 'transmittals', 'both', 'ordinary', true, null, null, null, 'Read transmittals'],
       ['act:transmittals.approve', 'action', 'transmittals', 'both', 'ordinary', true, null, null, null, 'Approve transmittals'],
       ['act:vault.archive.retrieve', 'action', 'vault', 'both', 'ordinary', true, null, null, null, 'Retrieve archive files'],
-      ['act:control_center.read', 'action', 'control_center', 'both', 'platform_internal', true, null, null, null, 'Read Control Center'],
-      ['act:coherence.dev_debug', 'action', 'coherence', 'dev_only', 'platform_internal', true, null, null, null, 'Dev-only diagnostics'],
+      ['act:control_center.read', 'action', 'control_center', 'both', 'ordinary', true, null, null, null, 'Read Control Center'],
+      ['act:coherence.dev_debug', 'action', 'coherence', 'dev_only', 'ordinary', true, null, null, null, 'Dev-only diagnostics'],
       ['act:coherence.prod_send', 'action', 'coherence', 'prod_only', 'ordinary', true, null, null, null, 'Prod-only send'],
     ];
     for (const r of rights) {

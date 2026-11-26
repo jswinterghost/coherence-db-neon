@@ -220,6 +220,9 @@ export function mapPgError(error) {
   if (pgCode === '23505') {
     return new AppError(msg, 409, prefix || 'UNIQUE_VIOLATION');
   }
+  if (pgCode === '23P01') {
+    return new AppError(msg, 409, prefix || 'EXCLUSION_VIOLATION');
+  }
   if (pgCode === '22023') {
     const isInputErr = prefix && (prefix.startsWith('MISSING_') || prefix.startsWith('INVALID_'));
     return new AppError(msg, isInputErr ? 400 : 409, prefix || 'INVARIANT_VIOLATION');

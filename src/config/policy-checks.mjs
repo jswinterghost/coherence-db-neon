@@ -82,6 +82,58 @@ export const IAM_VERSIONED_TABLES = Object.freeze([
   'organization_tool_switches',
 ]);
 
+export const IAM_WRITER_INSERT_TABLES = Object.freeze([
+  'organizations',
+  'organization_versions',
+  'organization_edges',
+  'people',
+  'person_versions',
+  'organization_memberships',
+  'agent_affiliations',
+  'roles',
+  'role_versions',
+  'role_rights',
+  'role_grants',
+  'role_grant_people',
+  'organization_tool_switches',
+]);
+
+export const IAM_WRITER_SELECT_ONLY_TABLES = Object.freeze([
+  'database_context',
+  'tools',
+  'rights',
+  'right_retirements',
+]);
+
+export const IAM_RO_LOOKUP_HELPERS = Object.freeze([
+  '_tenant_tree_org_ids',
+  '_external_upline_org_ids',
+  '_real_vendor_org_ids',
+  '_strip_masked_vendors',
+  '_visible_detail_org_ids',
+  '_visible_person_ids',
+  '_visible_role_ids',
+  '_visible_grant_ids',
+]);
+
+export const IAM_CMD_HELPERS = Object.freeze([
+  '_cmd_require_nusear_staff',
+  '_cmd_resolve_context',
+  '_cmd_check_idempotency',
+  '_cmd_append_audit',
+  '_cmd_validate_role_right',
+]);
+
+export const APP_VIEWS_IAM_READ_HELPERS = Object.freeze([
+  '_read_iam_has_read',
+  '_read_iam_visible_org_ids',
+  '_read_iam_detail_org_ids',
+  '_read_iam_real_vendor_org_ids',
+  '_read_iam_visible_person_ids',
+  '_read_iam_visible_role_ids',
+  '_read_iam_visible_grant_ids',
+]);
+
 export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
   'iam.business_today(timestamp with time zone)',
   'iam.session_context()',
@@ -95,6 +147,7 @@ export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
   'app_views.coherence_effective_statement_batches(uuid)',
   'app_views.coherence_run_stage(uuid, bigint)',
   'app_views.coherence_run_stages()',
+  'app_views._read_audit_journal_orgs()',
   'app_views._read_has_full_tenant_right(text)',
   'app_views._read_workshop_right(text)',
   'app_views._read_bob_wide_orgs()',
@@ -120,6 +173,13 @@ export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
   'app_views._read_can_see_unsent_batch_meta()',
   'app_views._read_published_emit_attempts()',
   'app_views._read_published_emit_attempt_ids(boolean)',
+  'app_views._read_iam_has_read()',
+  'app_views._read_iam_visible_org_ids()',
+  'app_views._read_iam_detail_org_ids()',
+  'app_views._read_iam_real_vendor_org_ids()',
+  'app_views._read_iam_visible_person_ids()',
+  'app_views._read_iam_visible_role_ids()',
+  'app_views._read_iam_visible_grant_ids()',
 ]);
 
 export const PLATFORM_APP_CMD_WHITELIST = Object.freeze([
@@ -148,6 +208,21 @@ export const PLATFORM_APP_CMD_WHITELIST = Object.freeze([
   'app_cmd.coherence_record_generated_overlay(text, text, uuid, uuid, text, text, integer, jsonb, uuid, uuid)',
   'app_cmd.coherence_materialize_emit(text, text, jsonb)',
   'app_cmd.coherence_authorize_check_run()',
+  'app_cmd.iam_create_organization(text, text, text, text, text, uuid, date, text, text, uuid)',
+  'app_cmd.iam_update_organization(text, text, uuid, text, text, text, text, text)',
+  'app_cmd.iam_set_organization_edge(text, text, uuid, uuid, daterange, uuid, text, uuid, daterange)',
+  'app_cmd.iam_create_person(text, text, uuid, text, text, text, text, text, text, uuid, uuid, daterange, text, text)',
+  'app_cmd.iam_set_person_status(text, text, uuid, text, uuid)',
+  'app_cmd.iam_set_membership(text, text, uuid, uuid, daterange, text, text, uuid, text)',
+  'app_cmd.iam_set_agent_affiliation(text, text, uuid, text, uuid, integer, text, daterange, uuid, uuid, text)',
+  'app_cmd.iam_create_role(text, text, uuid, text, text, boolean, boolean, uuid)',
+  'app_cmd.iam_copy_role(text, text, uuid, uuid, text, text, text[], text[], uuid)',
+  'app_cmd.iam_update_role(text, text, uuid, text, text)',
+  'app_cmd.iam_set_role_right(text, text, uuid, text, text)',
+  'app_cmd.iam_grant_role(text, text, uuid, uuid, uuid, text, daterange, boolean, daterange, uuid, uuid[])',
+  'app_cmd.iam_revoke_role_grant(text, text, uuid)',
+  'app_cmd.iam_set_role_grant_person(text, text, uuid, uuid, text)',
+  'app_cmd.iam_set_tool_switch(text, text, uuid, text, text, text, text)',
 ]);
 
 export const APP_CMD_WORKER_OR_OWNER_FUNCTIONS = Object.freeze([
@@ -219,6 +294,17 @@ export const APP_VIEWS_EXPECTED = Object.freeze([
   'coherence_checks',
   'coherence_journal',
   'audit_journal',
+  'iam_my_context',
+  'iam_organizations',
+  'iam_organization_edges',
+  'iam_people',
+  'iam_memberships',
+  'iam_agent_affiliations',
+  'iam_roles',
+  'iam_role_rights',
+  'iam_role_grants',
+  'iam_role_grant_people',
+  'iam_tool_switches',
 ]);
 
 export const COHERENCE_IAM_FK_TABLES = Object.freeze([
@@ -447,6 +533,12 @@ export function validateCloudSqlConfig(config) {
   if (!hasExactPrivileges(roles.platform_writer?.businessTables, ['SELECT', 'INSERT'])) {
     problems.push('roles.platform_writer.businessTables must be strictly ["SELECT", "INSERT"]');
   }
+  if (!hasExactPrivileges(roles.platform_writer?.iamTables, ['SELECT', 'INSERT'])) {
+    problems.push('roles.platform_writer.iamTables must be strictly ["SELECT", "INSERT"]');
+  }
+  if (!hasExactPrivileges(roles.platform_writer?.iamAuthIdentities, [])) {
+    problems.push('roles.platform_writer.iamAuthIdentities must be strictly [] (zero access)');
+  }
   if (!hasExactPrivileges(roles.platform_readonly?.businessTables, ['SELECT'])) {
     problems.push('roles.platform_readonly.businessTables must be strictly ["SELECT"]');
   }
@@ -647,11 +739,12 @@ export async function verifyIamConfigInvariants(pool) {
   }
 
   const baseTblOids = tblRes.rows.map((r) => r.table_oid);
+  const iamBaseTbls = tblRes.rows.filter((r) => r.table_schema === 'iam');
   const tblInfoByOid = new Map(tblRes.rows.map((r) => [Number(r.table_oid), r]));
   const lockedPrincipals = ['platform_app', 'platform_auth_lookup', 'public', ...existingRetiredRoles];
   const baseRelPrincipals = [...lockedPrincipals, 'platform_worker', 'platform_writer', 'platform_readonly', 'platform_iam_sync'];
 
-  const [baseRelPrivRes, baseColPrivRes, pvSelRes] = await Promise.all([
+  const [baseRelPrivRes, baseColPrivRes, pvSelRes, pvIamPrivRes] = await Promise.all([
     pool.query(
       `SELECT t.table_oid, p.principal, pr.priv
        FROM pg_catalog.unnest($1::oid[]) AS t(table_oid)
@@ -674,12 +767,28 @@ export async function verifyIamConfigInvariants(pool) {
        WHERE pg_catalog.has_table_privilege('platform_view_owner', t.table_oid, 'SELECT')`,
       [cohBaseTbls.map((r) => r.table_oid)],
     ),
+    pool.query(
+      `SELECT t.table_oid, pr.priv
+       FROM pg_catalog.unnest($1::oid[]) AS t(table_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS pr(priv)
+       WHERE pg_catalog.has_table_privilege('platform_view_owner', t.table_oid, pr.priv)`,
+      [iamBaseTbls.map((r) => r.table_oid), ALL_RELATION_PRIVS],
+    ),
   ]);
 
   const lockedPrincipalSet = new Set(lockedPrincipals);
   const workerForbiddenPrivs = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
   const writerForbiddenBizPrivs = new Set(['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
   const roForbiddenBizPrivs = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
+  const writerIamInsertSet = new Set(IAM_WRITER_INSERT_TABLES);
+  const writerIamSelectOnlySet = new Set(IAM_WRITER_SELECT_ONLY_TABLES);
+
+  const writerAllowedPrivForIamTable = (tableName) => {
+    if (tableName === 'person_auth_identities') return new Set();
+    if (writerIamInsertSet.has(tableName)) return new Set(['SELECT', 'INSERT']);
+    if (writerIamSelectOnlySet.has(tableName)) return new Set(['SELECT']);
+    return new Set();
+  };
 
   const syncAllowedPrivForBaseTable = (schema, fq) => {
     if (schema === 'coherence') return new Set();
@@ -714,7 +823,7 @@ export async function verifyIamConfigInvariants(pool) {
         }
       } else if (fq === 'platform.audit_journal' && workerForbiddenPrivs.has(row.priv)) {
         problems.push(`platform_worker must not hold ${row.priv} on platform.audit_journal`);
-      } else if (fq === 'iam.person_auth_identities' || tbl.table_schema === 'iam_secret') {
+      } else if (fq === 'iam.person_auth_identities' || tbl.table_schema === 'iam_secret' || (tbl.table_schema === 'iam' && workerForbiddenPrivs.has(row.priv))) {
         problems.push(`platform_worker must not hold ${row.priv} on ${fq}`);
       }
     } else if (row.principal === 'platform_iam_sync') {
@@ -727,6 +836,11 @@ export async function verifyIamConfigInvariants(pool) {
         problems.push(`platform_writer has forbidden privilege ${row.priv} on ${fq}`);
       } else if (tbl.table_name === 'review_submissions' && ['DELETE', 'TRUNCATE'].includes(row.priv)) {
         problems.push(`platform_writer must not have ${row.priv} on coherence.review_submissions`);
+      }
+    } else if (row.principal === 'platform_writer' && tbl.table_schema === 'iam') {
+      const allowed = writerAllowedPrivForIamTable(tbl.table_name);
+      if (!allowed.has(row.priv)) {
+        problems.push(`platform_writer must not hold ${row.priv} on base table ${fq}`);
       }
     } else if (row.principal === 'platform_readonly' && tbl.table_schema === 'coherence') {
       if (businessTblSet.has(tbl.table_name) && roForbiddenBizPrivs.has(row.priv)) {
@@ -750,6 +864,30 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`platform_worker missing SELECT on ${fq}`);
     }
   }
+  for (const tbl of IAM_WRITER_INSERT_TABLES) {
+    const fq = `iam.${tbl}`;
+    const writerSet = roleTablePrivs.get(`platform_writer:${fq}`);
+    if (!writerSet?.has('SELECT') || !writerSet?.has('INSERT')) {
+      problems.push(`platform_writer missing SELECT or INSERT on ${fq}`);
+    }
+  }
+  for (const tbl of IAM_WRITER_SELECT_ONLY_TABLES) {
+    const fq = `iam.${tbl}`;
+    if (!roleTablePrivs.get(`platform_writer:${fq}`)?.has('SELECT')) {
+      problems.push(`platform_writer missing SELECT on ${fq}`);
+    }
+  }
+
+  const pvIamReadableOids = new Set();
+  for (const row of pvIamPrivRes.rows) {
+    const tbl = tblInfoByOid.get(Number(row.table_oid));
+    const fq = `${tbl.table_schema}.${tbl.table_name}`;
+    if (tbl.table_name === 'person_auth_identities' || row.priv !== 'SELECT') {
+      problems.push(`platform_view_owner must not hold ${row.priv} on base table ${fq}`);
+    } else {
+      pvIamReadableOids.add(Number(row.table_oid));
+    }
+  }
 
   for (const row of baseColPrivRes.rows) {
     const tbl = tblInfoByOid.get(Number(row.table_oid));
@@ -763,13 +901,18 @@ export async function verifyIamConfigInvariants(pool) {
         }
       } else if (fq === 'platform.audit_journal' && row.priv !== 'SELECT') {
         problems.push(`platform_worker must not hold column-level ${row.priv} on base table ${fq}`);
-      } else if (fq === 'iam.person_auth_identities' || tbl.table_schema === 'iam_secret') {
+      } else if (fq === 'iam.person_auth_identities' || tbl.table_schema === 'iam_secret' || (tbl.table_schema === 'iam' && row.priv !== 'SELECT')) {
         problems.push(`platform_worker must not hold column-level ${row.priv} on base table ${fq}`);
       }
     } else if (row.principal === 'platform_iam_sync') {
       const allowed = syncAllowedPrivForBaseTable(tbl.table_schema, fq);
       if (!allowed.has(row.priv)) {
         problems.push(`platform_iam_sync must not hold column-level ${row.priv} on base table ${fq}`);
+      }
+    } else if (row.principal === 'platform_writer' && tbl.table_schema === 'iam') {
+      const allowed = writerAllowedPrivForIamTable(tbl.table_name);
+      if (!allowed.has(row.priv)) {
+        problems.push(`platform_writer must not hold column-level ${row.priv} on base table ${fq}`);
       }
     } else if ((row.principal === 'platform_writer' || row.principal === 'platform_readonly') && tbl.table_schema === 'iam_secret') {
       problems.push(`${row.principal} must not hold column-level ${row.priv} on base table ${fq}`);
@@ -938,6 +1081,7 @@ export async function verifyIamConfigInvariants(pool) {
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
        WHERE (n.nspname = 'coherence' AND c.relkind IN ('r', 'p') AND c.relname <> 'schema_migrations')
+          OR (n.nspname = 'iam' AND c.relkind IN ('r', 'p'))
           OR (n.nspname = 'platform' AND c.relname = 'audit_journal')
           OR (n.nspname = 'iam_secret' AND c.relname = 'signing_keys')`,
     ),
@@ -1029,6 +1173,7 @@ export async function verifyIamConfigInvariants(pool) {
   const fkTableSet = new Set(COHERENCE_IAM_FK_TABLES);
   const retiredRoleSet = new Set(RETIRED_COHERENCE_ROLES);
   const cohViewPolTables = new Set();
+  const iamViewPolTables = new Set();
   const auditViewPols = [];
   const signingKeySyncCmds = new Set();
   const syncSigningKeyScopeRe = /^\(*key_scope\s*=\s*ANY\s*\(\s*ARRAY\[\s*(?:'nusear_staff'::text\s*,\s*'service'::text|'service'::text\s*,\s*'nusear_staff'::text)\s*\]\s*\)\)*$/;
@@ -1049,8 +1194,30 @@ export async function verifyIamConfigInvariants(pool) {
     if (p.schemaname === 'coherence' && legacyGucRe.test(qual)) {
       problems.push(`Retired Migration 006 policy still active on ${p.schemaname}.${p.tablename}: ${p.policyname}`);
     }
-    if ((p.schemaname === 'coherence' || p.schemaname === 'platform') && roleList.includes('platform_worker') && p.cmd !== 'SELECT') {
+    if ((p.schemaname === 'coherence' || p.schemaname === 'platform' || p.schemaname === 'iam') && roleList.includes('platform_worker') && p.cmd !== 'SELECT') {
       problems.push(`RLS policy ${p.policyname} on ${p.schemaname}.${p.tablename} grants platform_worker ${p.cmd} (must be SELECT only)`);
+    }
+    if (p.schemaname === 'iam' && p.tablename === 'person_auth_identities') {
+      for (const badRole of ['platform_view_owner', 'platform_writer', 'platform_worker', 'platform_iam_sync']) {
+        if (roleList.includes(badRole)) {
+          problems.push(`RLS policy ${p.policyname} on iam.person_auth_identities grants forbidden role ${badRole}`);
+        }
+      }
+    }
+    if (p.schemaname === 'iam' && roleList.includes('platform_view_owner')) {
+      iamViewPolTables.add(p.tablename);
+      if (p.cmd !== 'SELECT') {
+        problems.push(`RLS policy ${p.policyname} on iam.${p.tablename} grants platform_view_owner ${p.cmd} (must be SELECT only)`);
+      }
+      if (!/(app_views\._read_iam_|iam\.session_context\s*\()/.test(qual)) {
+        problems.push(`Table iam.${p.tablename} has an unscoped platform_view_owner RLS policy ${p.policyname}`);
+      }
+    }
+    if (p.schemaname === 'iam' && roleList.includes('platform_writer')) {
+      const allowed = writerAllowedPrivForIamTable(p.tablename);
+      if (!allowed.has(p.cmd)) {
+        problems.push(`RLS policy ${p.policyname} on iam.${p.tablename} grants platform_writer forbidden command ${p.cmd}`);
+      }
     }
     if (p.schemaname === 'coherence' && roleList.includes('platform_view_owner')) {
       cohViewPolTables.add(p.tablename);
@@ -1130,15 +1297,25 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`Table coherence.${row.table_name} grants SELECT to platform_view_owner without a platform_view_owner RLS policy`);
     }
   }
+  for (const row of iamBaseTbls) {
+    if (row.table_name === 'person_auth_identities') continue;
+    if (!pvIamReadableOids.has(Number(row.table_oid))) {
+      problems.push(`Table iam.${row.table_name} is missing SELECT grant to platform_view_owner`);
+    }
+    if (!iamViewPolTables.has(row.table_name)) {
+      problems.push(`Table iam.${row.table_name} is missing platform_view_owner RLS policy`);
+    }
+  }
 
   if (auditViewPols.length === 0) {
     problems.push('Table platform.audit_journal is missing platform_view_owner RLS policy');
   } else if (!auditViewPols.every((p) => (
     p.cmd === 'SELECT'
     && !/\bhas_right\s*\(/i.test(p.qual || '')
-    && /effective_wide_org_ids/.test(p.qual || '')
+    && !/\beffective_wide_org_ids\s*\(/i.test(p.qual || '')
+    && /\bapp_views\._read_audit_journal_orgs\s*\(/.test(p.qual || '')
   ))) {
-    problems.push('Table platform.audit_journal has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped with iam.effective_wide_org_ids)');
+    problems.push('Table platform.audit_journal has an unscoped platform_view_owner RLS policy (every policy must be FOR SELECT scoped strictly with app_views._read_audit_journal_orgs())');
   }
 
   // Confirm removed privileged write bypass objects and Migration 006 helper functions do not exist.
@@ -1196,19 +1373,19 @@ export async function verifyIamConfigInvariants(pool) {
                 OR p.proname LIKE '\\_cmd\\_%' ESCAPE '\\'
                 OR p.proname = '_ro_run_stage'
               ))
+          OR (n.nspname = 'iam' AND p.proname LIKE '\\_%' ESCAPE '\\')
           OR (n.nspname = 'app_views' AND (
                 p.proname LIKE '\\_read\\_%' ESCAPE '\\'
                 OR p.proname IN ('coherence_run_stage', 'coherence_run_stages')
               ))`,
     ),
     pool.query(
-      `SELECT c.oid, c.relname AS view_name, r.rolname AS owner_name, c.reloptions
+      `SELECT c.oid, n.nspname AS schema_name, c.relname AS view_name, r.rolname AS owner_name, c.reloptions
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
-       WHERE n.nspname = 'coherence'
-         AND c.relname IN ('v_run_latest_journal_seq', 'v_current_finished_attempts')
-         AND c.relkind = 'v'`,
+       WHERE (n.nspname = 'coherence' AND c.relname IN ('v_run_latest_journal_seq', 'v_current_finished_attempts') AND c.relkind = 'v')
+          OR (n.nspname = 'iam' AND c.relname = 'v_actor_display_lookup' AND c.relkind = 'v')`,
     ),
   ]);
 
@@ -1259,13 +1436,47 @@ export async function verifyIamConfigInvariants(pool) {
   const readFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'app_views' && f.proname.startsWith('_read_'));
   const roStageFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'coherence' && f.proname === '_ro_run_stage');
   const appStageFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'app_views' && (f.proname === 'coherence_run_stage' || f.proname === 'coherence_run_stages'));
+  const iamRoLookupFns = new Set(IAM_RO_LOOKUP_HELPERS);
+  const iamCmdHelperFns = new Set(IAM_CMD_HELPERS);
+  const appViewsIamReadHelperFns = new Set(APP_VIEWS_IAM_READ_HELPERS);
+  const iamSessionMetaFound = internalCohFnRes.rows.filter((f) => f.schema_name === 'iam' && f.proname === '_session_lookup_meta');
+  const iamRoLookupFound = internalCohFnRes.rows.filter((f) => f.schema_name === 'iam' && iamRoLookupFns.has(f.proname));
+  const iamCmdFound = internalCohFnRes.rows.filter((f) => f.schema_name === 'iam' && iamCmdHelperFns.has(f.proname));
+  const appViewsIamReadFound = internalCohFnRes.rows.filter((f) => f.schema_name === 'app_views' && appViewsIamReadHelperFns.has(f.proname));
+
   if (resolveFns.length === 0) problems.push('Expected internal coherence._resolve_* helper functions were not found in pg_proc');
   if (cmdFns.length === 0) problems.push('Expected internal coherence._cmd_* helper functions were not found in pg_proc');
   if (readFns.length === 0) problems.push('Expected shared app_views._read_* rights helper functions were not found in pg_proc');
   if (roStageFns.length !== 1) problems.push('Expected narrow definer helper function coherence._ro_run_stage is missing');
   if (appStageFns.length !== 2) problems.push('Expected app_views.coherence_run_stage and app_views.coherence_run_stages wrapper functions');
+  if (iamSessionMetaFound.length !== 1) problems.push(`Expected 1 iam._session_lookup_meta helper (found ${iamSessionMetaFound.length})`);
+  if (iamRoLookupFound.length !== IAM_RO_LOOKUP_HELPERS.length) {
+    problems.push(`Expected ${IAM_RO_LOOKUP_HELPERS.length} platform_readonly iam._* lookup helpers (found ${iamRoLookupFound.length})`);
+  }
+  for (const name of IAM_RO_LOOKUP_HELPERS) {
+    if (!iamRoLookupFound.some((f) => f.proname === name)) {
+      problems.push(`Missing expected platform_readonly helper iam.${name}`);
+    }
+  }
+  if (iamCmdFound.length !== IAM_CMD_HELPERS.length) {
+    problems.push(`Expected ${IAM_CMD_HELPERS.length} platform_writer iam._cmd_* helpers (found ${iamCmdFound.length})`);
+  }
+  for (const name of IAM_CMD_HELPERS) {
+    if (!iamCmdFound.some((f) => f.proname === name)) {
+      problems.push(`Missing expected platform_writer helper iam.${name}`);
+    }
+  }
+  if (appViewsIamReadFound.length !== APP_VIEWS_IAM_READ_HELPERS.length) {
+    problems.push(`Expected ${APP_VIEWS_IAM_READ_HELPERS.length} platform_view_owner app_views._read_iam_* helpers (found ${appViewsIamReadFound.length})`);
+  }
+  for (const name of APP_VIEWS_IAM_READ_HELPERS) {
+    if (!appViewsIamReadFound.some((f) => f.proname === name)) {
+      problems.push(`Missing expected platform_view_owner helper app_views.${name}`);
+    }
+  }
 
   const readWideOnlyFns = new Set([
+    '_read_audit_journal_orgs',
     '_read_has_full_tenant_right',
     '_read_workshop_right',
     '_read_bob_wide_orgs',
@@ -1293,23 +1504,37 @@ export async function verifyIamConfigInvariants(pool) {
     '_read_can_see_unsent_batch_meta',
     '_read_published_emit_attempts',
     '_read_published_emit_attempt_ids',
+    ...APP_VIEWS_IAM_READ_HELPERS,
   ]);
   for (const ifn of internalCohFnRes.rows) {
     const isResolve = ifn.schema_name === 'coherence' && ifn.proname.startsWith('_resolve_');
     const isRoStage = ifn.schema_name === 'coherence' && ifn.proname === '_ro_run_stage';
+    const isIamSessionMeta = ifn.schema_name === 'iam' && ifn.proname === '_session_lookup_meta';
+    const isIamRoLookup = ifn.schema_name === 'iam' && iamRoLookupFns.has(ifn.proname);
+    const isIamCmd = ifn.schema_name === 'iam' && iamCmdHelperFns.has(ifn.proname);
     const isRead = ifn.schema_name === 'app_views' && ifn.proname.startsWith('_read_');
     const isAppStage = ifn.schema_name === 'app_views' && !isRead;
-    const expectedOwner = isResolve ? 'platform_versioner' : (isRoStage ? 'platform_readonly' : ((isRead || isAppStage) ? 'platform_view_owner' : 'platform_writer'));
+    const fqFn = `${ifn.schema_name}.${ifn.proname}`;
+    if (ifn.schema_name === 'iam' && !isIamSessionMeta && !isIamRoLookup && !isIamCmd) {
+      problems.push(`Unclassified internal IAM helper function ${fqFn}`);
+      continue;
+    }
+    const expectedOwner = isResolve
+      ? 'platform_versioner'
+      : ((isRoStage || isIamSessionMeta || isIamRoLookup)
+        ? 'platform_readonly'
+        : ((isRead || isAppStage) ? 'platform_view_owner' : 'platform_writer'));
     const allowedRoles = new Set(
       isResolve
         ? ['platform_versioner', 'platform_writer']
-        : (isRoStage
+        : (isRoStage || isIamRoLookup
           ? ['platform_readonly', 'platform_view_owner']
-          : ((isRead || isAppStage)
-            ? ['platform_view_owner', 'platform_app', 'platform_readonly']
-            : ['platform_writer'])),
+          : (isIamSessionMeta
+            ? ['platform_readonly', 'platform_migrator']
+            : ((isRead || isAppStage)
+              ? ['platform_view_owner', 'platform_app', 'platform_readonly']
+              : ['platform_writer']))),
     );
-    const fqFn = `${ifn.schema_name}.${ifn.proname}`;
     const cfg = Array.isArray(ifn.proconfig) ? ifn.proconfig : [];
     if (!cfg.includes('search_path=pg_catalog')) {
       problems.push(`Internal function ${fqFn} must pin SET search_path = pg_catalog (proconfig: ${JSON.stringify(cfg)})`);
@@ -1317,8 +1542,11 @@ export async function verifyIamConfigInvariants(pool) {
     if (ifn.owner_name !== expectedOwner) {
       problems.push(`Internal function ${fqFn} must be owned by ${expectedOwner} (got ${ifn.owner_name})`);
     }
-    if ((isRead || isRoStage || isAppStage) && !ifn.prosecdef) {
+    if ((isRead || isRoStage || isAppStage || isIamSessionMeta || isIamRoLookup) && !ifn.prosecdef) {
       problems.push(`Helper ${fqFn} must be SECURITY DEFINER owned by ${expectedOwner}`);
+    }
+    if (isIamCmd && ifn.prosecdef) {
+      problems.push(`Internal command helper ${fqFn} must be SECURITY INVOKER owned by platform_writer`);
     }
     if (isRead && !readWideOnlyFns.has(ifn.proname) && !readMetaFns.has(ifn.proname)) {
       problems.push(`Unclassified shared read helper ${fqFn} must be listed in readWideOnlyFns or readMetaFns`);
@@ -1350,27 +1578,30 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
 
-  // Narrow helper views coherence.v_run_latest_journal_seq (platform_readonly) and
-  // coherence.v_current_finished_attempts (platform_view_owner) must set security_barrier=true.
-  const internalViewByName = new Map(internalViewRes.rows.map((r) => [r.view_name, r]));
-  for (const [viewName, expectedOwner, restrictSelect] of [
-    ['v_run_latest_journal_seq', 'platform_readonly', true],
-    ['v_current_finished_attempts', 'platform_view_owner', true],
+  // Narrow helper views coherence.v_run_latest_journal_seq (platform_readonly),
+  // coherence.v_current_finished_attempts (platform_view_owner), and
+  // iam.v_actor_display_lookup (platform_readonly) must set security_barrier=true.
+  const internalViewByKey = new Map(internalViewRes.rows.map((r) => [`${r.schema_name}.${r.view_name}`, r]));
+  for (const [schemaName, viewName, expectedOwner, restrictSelect] of [
+    ['coherence', 'v_run_latest_journal_seq', 'platform_readonly', true],
+    ['coherence', 'v_current_finished_attempts', 'platform_view_owner', true],
+    ['iam', 'v_actor_display_lookup', 'platform_readonly', true],
   ]) {
-    const iv = internalViewByName.get(viewName);
+    const fqView = `${schemaName}.${viewName}`;
+    const iv = internalViewByKey.get(fqView);
     if (!iv) {
-      problems.push(`Expected narrow helper view coherence.${viewName} is missing`);
+      problems.push(`Expected narrow helper view ${fqView} is missing`);
       continue;
     }
     const opts = Array.isArray(iv.reloptions) ? iv.reloptions : [];
     if (iv.owner_name !== expectedOwner) {
-      problems.push(`View coherence.${viewName} must be owned by ${expectedOwner} (got ${iv.owner_name})`);
+      problems.push(`View ${fqView} must be owned by ${expectedOwner} (got ${iv.owner_name})`);
     }
     if (!opts.includes('security_barrier=true')) {
-      problems.push(`View coherence.${viewName} must set security_barrier=true (reloptions: ${JSON.stringify(opts)})`);
+      problems.push(`View ${fqView} must set security_barrier=true (reloptions: ${JSON.stringify(opts)})`);
     }
     if (opts.includes('security_invoker=true')) {
-      problems.push(`View coherence.${viewName} must not set security_invoker=true`);
+      problems.push(`View ${fqView} must not set security_invoker=true`);
     }
     if (restrictSelect) {
       const tipPrivRes = await pool.query(
@@ -1383,9 +1614,9 @@ export async function verifyIamConfigInvariants(pool) {
       const allowedTipReaders = new Set(['platform_readonly', 'platform_view_owner']);
       for (const principal of allAuditPrincipals) {
         if (allowedTipReaders.has(principal)) {
-          if (!tipHolders.has(principal)) problems.push(`${principal} is missing SELECT on coherence.${viewName}`);
+          if (!tipHolders.has(principal)) problems.push(`${principal} is missing SELECT on ${fqView}`);
         } else if (tipHolders.has(principal)) {
-          problems.push(`${principal} holds forbidden SELECT privilege on coherence.${viewName}`);
+          problems.push(`${principal} holds forbidden SELECT privilege on ${fqView}`);
         }
       }
     }
@@ -1463,6 +1694,7 @@ export async function verifyIamConfigInvariants(pool) {
   }
   for (const [fq, trName] of [
     ['iam.organization_versions', 'trg_00b_verify_org_version'],
+    ['iam.organization_edges', 'trg_00b_verify_org_edge'],
     ['iam.people', 'trg_00b_verify_origin'],
     ['iam.person_versions', 'trg_00b_verify_origin'],
     ['iam.person_auth_identities', 'trg_00b_verify_origin'],
@@ -1472,6 +1704,7 @@ export async function verifyIamConfigInvariants(pool) {
     ['iam.role_versions', 'trg_00b_verify_sync'],
     ['iam.role_rights', 'trg_00b_verify_sync'],
     ['iam.role_grants', 'trg_00b_verify_sync'],
+    ['iam.role_grants', 'trg_02_carry_explicit_people'],
     ['iam.role_grant_people', 'trg_00b_verify_sync'],
     ['iam.people', 'trg_people_verify_db_origin'],
     ['iam.database_context', 'trg_database_context_verify_db_origin'],
@@ -1678,6 +1911,9 @@ export async function verifyIamConfigInvariants(pool) {
     checkedFunctions: fnRes.rows.length,
     checkedAppCmdFunctions: appCmdFns.length,
     checkedInternalCoherenceFunctions: internalCohFnRes.rows.length,
+    checkedIamCmdHelpers: iamCmdFound.length,
+    checkedIamRoLookupHelpers: iamRoLookupFound.length,
+    checkedAppViewsIamReadHelpers: appViewsIamReadFound.length,
     forbiddenBusinessPrivileges: FORBIDDEN_BUSINESS_PRIVS,
     problems,
   };

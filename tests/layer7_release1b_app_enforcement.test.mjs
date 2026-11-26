@@ -405,11 +405,11 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
     report: { ok: true },
   });
 
-  // Verify Migration 010 live catalog audit passes across all 39 app_views.* and 33 app_cmd.*!
+  // Verify Migration 010 live catalog audit passes across all 50 app_views.* and 48 app_cmd.*!
   const catalogAudit = await withClusterCatalogLock(() => verifyIamConfigInvariants(env.pool));
   assert.equal(catalogAudit.passed, true, `verifyIamConfigInvariants failed:\n${catalogAudit.problems.join('\n')}`);
-  assert.equal(catalogAudit.checkedAppViews, 39);
-  assert.equal(catalogAudit.checkedAppCmdFunctions, 33);
+  assert.equal(catalogAudit.checkedAppViews, 50);
+  assert.equal(catalogAudit.checkedAppCmdFunctions, 48);
 
   const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
   const readonlyPool = createRoleScopedTestPool(env.pool, 'platform_readonly');

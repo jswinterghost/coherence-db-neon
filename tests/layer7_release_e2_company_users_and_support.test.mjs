@@ -1062,7 +1062,7 @@ test('Layer 7E [E2 Test 7]: assert_can_write records writes deterministically (s
       [randomUUID(), samePersonStaffId, randomUUID(), samePersonLocalId, ids.rootOrg, ids.companyOrg, seq, randomUUID(), companyJournalReaderId],
     );
 
-    // Company-local write role (inputs + decision baseline) and customer reader role (journal + decisions + audit, NO nusear_actor).
+    // Company-local write role (inputs + review save) and customer reader role (journal + decisions + audit, NO nusear_actor).
     await c.query("INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,'local_writer_e2',$3,$4),($2,'cust_jd_reader_e2',$3,$4)", [roleLocalWriter, roleCustJournalDecReader, ids.companyOrg, seq]);
     await c.query(
       `INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq)
@@ -1070,7 +1070,7 @@ test('Layer 7E [E2 Test 7]: assert_can_write records writes deterministically (s
               ($3,$4,'Customer JD Reader',false,false,true,'active',$5)`,
       [randomUUID(), roleLocalWriter, randomUUID(), roleCustJournalDecReader, seq],
     );
-    for (const rightId of ['act:coherence.inputs.publish', 'act:coherence.owner.record_baseline']) {
+    for (const rightId of ['act:coherence.inputs.publish', 'act:coherence.review.save']) {
       await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)", [randomUUID(), roleLocalWriter, rightId, seq]);
     }
     for (const rightId of [
@@ -1142,22 +1142,11 @@ test('Layer 7E [E2 Test 7]: assert_can_write records writes deterministically (s
       policy: 'POL-1', book: 'MA', month: '2026-10', status: 'ACTIVE', note: 'support action',
     }],
   });
-  const locRes = await appCommands.recordDecisionBaseline({
-    dbToken: localTok,
-    commandKey: 'e2-local-baseline',
-    headerContract: 'v2',
-    parentCommitId: supRes.result.decisionCommitId,
-    imported: true,
-    decisions: [{
-      recordId: localRecId, disposition: 'CONFIRM', agent: 'Sam Seller', agency: 'Beacon',
-      policy: 'POL-2', book: 'MA', month: '2026-10', status: 'ACTIVE', note: 'company owner action',
-    }],
-  });
   const impRes = await appCommands.recordDecisionBaseline({
-    dbToken: localTok,
+    dbToken: staffTok,
     commandKey: 'e2-imported-baseline',
     headerContract: 'v2',
-    parentCommitId: locRes.result.decisionCommitId,
+    parentCommitId: supRes.result.decisionCommitId,
     imported: true,
     decisions: [{
       recordId: importedRecId, disposition: 'CONFIRM', agent: 'Sam Seller', agency: 'Beacon',
@@ -1215,7 +1204,7 @@ test('Layer 7E [E2 Test 7]: assert_can_write records writes deterministically (s
   const liveWorker = env.registerWorker(createEngineWorker({
     pool: env.pool, pgConfig: env.pgConfig, companySlug: env.companySlug,
     stores: env.stores, commands: env.commands, workerToken: env.workerToken,
-    materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: null }),
+    materializeEngine: createDataOnlyMockEngineMaterializer({ adjustReconfirmRecordId: localRecId }),
     tempBaseDir: env.tempDir,
   }));
   const liveLaunched = await env.commands.launchRun({
@@ -1244,6 +1233,26 @@ test('Layer 7E [E2 Test 7]: assert_can_write records writes deterministically (s
       disposition: 'CONFIRM',
       decidedBy: samePersonLocalId,
       actingFor: 'self',
+    })),
+  });
+  assert.equal((await liveWorker.runOnce()).action, 'step_finished');
+  const adjustSeq = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [liveLaunched.result.runId])).rows[0].latest_journal_seq);
+  const adjustEvId = (await env.pool.query("SELECT coherence.current_finished_attempt($1::uuid, 'adjust') AS ev", [liveLaunched.result.runId])).rows[0].ev;
+  const adjustQueueKeys = (await env.pool.query(
+    'SELECT record_id FROM coherence.review_queue_items WHERE attempt_event_id = $1::uuid ORDER BY record_id',
+    [adjustEvId],
+  )).rows.map((r) => r.record_id);
+  assert.ok(adjustQueueKeys.includes(localRecId), 'adjust attempt must include localRecId');
+  await appCommands.saveReviewDecisions({
+    dbToken: localTok,
+    commandKey: 'e2-local-review',
+    expectedJournalSeq: adjustSeq,
+    runId: liveLaunched.result.runId,
+    surface: 'adjust',
+    decisions: adjustQueueKeys.map((recordId) => ({
+      recordId,
+      disposition: 'CONFIRM',
+      note: 'company owner action',
     })),
   });
 
@@ -1288,14 +1297,14 @@ test('Layer 7E [E2 Test 7]: assert_can_write records writes deterministically (s
   // company-local writes show the company-local user's ID and name.
   await withRequestTx(appPool, custReaderTok, async (tx) => {
     const jRows = (await tx.query(
-      "SELECT command_key, actor, actor_display, acting_for FROM app_views.coherence_journal WHERE command_key IN ('e2-support-baseline', 'e2-local-baseline') ORDER BY seq",
+      "SELECT command_key, actor, actor_display, acting_for FROM app_views.coherence_journal WHERE command_key IN ('e2-support-baseline', 'e2-local-review') ORDER BY seq",
     )).rows;
     assert.equal(jRows.length, 2);
     assert.equal(jRows[0].command_key, 'e2-support-baseline');
     assert.equal(jRows[0].actor, 'Nusear support', 'customer coherence_journal.actor must mask Nusear support UUID');
     assert.equal(jRows[0].actor_display, 'Nusear support', 'customer coherence_journal.actor_display must mask Nusear person name');
     assert.equal(jRows[0].acting_for, 'nusear_support');
-    assert.equal(jRows[1].command_key, 'e2-local-baseline');
+    assert.equal(jRows[1].command_key, 'e2-local-review');
     assert.equal(jRows[1].actor, samePersonLocalId, 'customer coherence_journal.actor keeps company-local UUID');
     assert.equal(jRows[1].actor_display, 'Pat Company Owner', 'customer coherence_journal.actor_display shows company-local name');
     assert.equal(jRows[1].acting_for, null);
@@ -1330,9 +1339,9 @@ test('Layer 7E [E2 Test 7]: assert_can_write records writes deterministically (s
     assert.equal(dByRec.get(liveSupportRecId).decided_by_display, 'Nusear support');
 
     const aRows = (await tx.query(
-      "SELECT command_kind, recorded_as, recorded_by_display, actor_person_id FROM app_views.audit_journal WHERE command_kind = 'coherence.record_decision_baseline' ORDER BY seq",
+      "SELECT command_kind, recorded_as, recorded_by_display, actor_person_id FROM app_views.audit_journal WHERE command_kind = 'coherence.save_review_decisions' ORDER BY seq",
     )).rows;
-    assert.ok(aRows.length >= 2);
+    assert.equal(aRows.length, 2);
     assert.equal(aRows[0].recorded_as, 'nusear_support');
     assert.equal(aRows[0].recorded_by_display, 'Nusear support');
     assert.equal(aRows[0].actor_person_id, null);

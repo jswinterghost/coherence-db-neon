@@ -4,11 +4,13 @@
 // so each tool can enforce them as soon as its tables join PostgreSQL (no agent-pay data tables
 // exist in the database yet).
 import { randomUUID } from 'node:crypto';
+import { isPgPool, withSerializableTx } from '../db/pg-client.mjs';
 import { sha256Hex } from '../util/crypto.mjs';
 
 export const CANONICAL_TOOLS = Object.freeze([
   Object.freeze({ id: 'coherence', displayName: 'Coherence', isNusearOnly: false, isCustomerSwitchable: true }),
   Object.freeze({ id: 'platform_audit', displayName: 'Platform Audit', isNusearOnly: false, isCustomerSwitchable: true }),
+  Object.freeze({ id: 'iam', displayName: 'IAM', isNusearOnly: false, isCustomerSwitchable: false }),
   Object.freeze({ id: 'vendors', displayName: 'Vendors', isNusearOnly: false, isCustomerSwitchable: true }),
   Object.freeze({ id: 'concurrence', displayName: 'Concurrence', isNusearOnly: false, isCustomerSwitchable: true }),
   Object.freeze({ id: 'payroll', displayName: 'Payroll', isNusearOnly: false, isCustomerSwitchable: true }),
@@ -70,8 +72,14 @@ export const CANONICAL_RIGHTS = Object.freeze([
   actionRight('act:coherence.checks.read', 'coherence', 'ordinary', 'Read check reports'),
   actionRight('act:coherence.journal.read', 'coherence', 'ordinary', 'Read Coherence journal'),
 
-  // Platform audit read right.
+  // Platform audit & IAM governance rights.
   actionRight('act:platform.audit_journal.read', 'platform_audit', 'ordinary', 'Read platform audit journal'),
+  actionRight('act:iam.read', 'iam', 'ordinary', 'Read IAM entities, people, works-for lines, roles, grants, and tool switches'),
+  actionRight('act:iam.entities.write', 'iam', 'ordinary', 'Create and update IAM organizations and dated parent edges'),
+  actionRight('act:iam.people.write', 'iam', 'ordinary', 'Create and update IAM people, statuses, works-for lines, and agent affiliations'),
+  actionRight('act:iam.roles.write', 'iam', 'ordinary', 'Create, copy, update, and adjust IAM roles and their rights'),
+  actionRight('act:iam.grants.write', 'iam', 'ordinary', 'Grant, update, and revoke IAM role grants and explicit-people subjects'),
+  actionRight('act:iam.switches.write', 'iam', 'ordinary', 'Set and revoke per-organization tool switches'),
 
   // Coherence & platform audit column rights.
   columnRight('col:coherence.statement_cash', 'coherence', 'money_statement', 'coherence', 'bob_policy_financials', 'amount', 'View agency statement cash'),
@@ -89,20 +97,20 @@ export const CANONICAL_RIGHTS = Object.freeze([
   actionRight('act:coherence.review.draft', 'coherence', 'ordinary', 'Save review draft'),
   actionRight('act:coherence.inputs.publish', 'coherence', 'ordinary', 'Publish input version'),
   actionRight('act:coherence.approvals.register', 'coherence', 'ordinary', 'Register approvals file'),
-  actionRight('act:coherence.owner.confirm_emit', 'coherence', 'ordinary', 'Confirm Emit'),
-  actionRight('act:coherence.owner.carry_sent', 'coherence', 'ordinary', 'Carry sent statements'),
-  actionRight('act:coherence.owner.carry_approvals', 'coherence', 'ordinary', 'Carry approvals file'),
-  actionRight('act:coherence.owner.carry_decisions', 'coherence', 'ordinary', 'Carry decisions'),
-  actionRight('act:coherence.owner.abandon_run', 'coherence', 'ordinary', 'Abandon run'),
-  actionRight('act:coherence.owner.init_company', 'coherence', 'ordinary', 'Initialize company metadata'),
-  actionRight('act:coherence.owner.register_engine', 'coherence', 'ordinary', 'Register engine version'),
-  actionRight('act:coherence.owner.record_baseline', 'coherence', 'ordinary', 'Record decision baseline'),
-  actionRight('act:coherence.owner.record_statement_batch', 'coherence', 'ordinary', 'Record standalone statement batch'),
-  actionRight('act:coherence.owner.import_history', 'coherence', 'ordinary', 'Import historical runs and files'),
-  actionRight('act:coherence.checks.record', 'coherence', 'ordinary', 'Record check report'),
-  actionRight('act:coherence.files.register', 'coherence', 'ordinary', 'Register stored files'),
-  actionRight('act:coherence.overlays.record', 'coherence', 'ordinary', 'Record generated overlay'),
-  actionRight('act:coherence.emit.materialize', 'coherence', 'ordinary', 'Materialize Emit outputs'),
+  actionRight('act:coherence.owner.confirm_emit', 'coherence', 'ordinary', 'Confirm Emit', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.carry_sent', 'coherence', 'ordinary', 'Carry sent statements', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.carry_approvals', 'coherence', 'ordinary', 'Carry approvals file', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.carry_decisions', 'coherence', 'ordinary', 'Carry decisions', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.abandon_run', 'coherence', 'ordinary', 'Abandon run', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.init_company', 'coherence', 'ordinary', 'Initialize company metadata', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.register_engine', 'coherence', 'ordinary', 'Register engine version', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.record_baseline', 'coherence', 'ordinary', 'Record decision baseline', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.record_statement_batch', 'coherence', 'ordinary', 'Record standalone statement batch', { isDelegablePower: false }),
+  actionRight('act:coherence.owner.import_history', 'coherence', 'ordinary', 'Import historical runs and files', { isDelegablePower: false }),
+  actionRight('act:coherence.checks.record', 'coherence', 'ordinary', 'Record check report', { isDelegablePower: false }),
+  actionRight('act:coherence.files.register', 'coherence', 'ordinary', 'Register stored files', { isDelegablePower: false }),
+  actionRight('act:coherence.overlays.record', 'coherence', 'ordinary', 'Record generated overlay', { isDelegablePower: false }),
+  actionRight('act:coherence.emit.materialize', 'coherence', 'ordinary', 'Materialize Emit outputs', { isDelegablePower: false }),
   actionRight('act:coherence.worker.attempt', 'coherence', 'platform_internal', 'Worker step attempt lifecycle', { isDelegablePower: false }),
   actionRight('act:coherence.worker.review', 'coherence', 'platform_internal', 'Worker review submission resolution', { isDelegablePower: false }),
 
@@ -150,6 +158,7 @@ const NUSEAR_ALL_READ_RIGHTS = Object.freeze([
   'act:coherence.checks.read',
   'act:coherence.journal.read',
   'act:platform.audit_journal.read',
+  'act:iam.read',
   'col:coherence.statement_cash',
   'col:coherence.upline_cash',
   'col:coherence.member_phi',
@@ -182,10 +191,16 @@ const NUSEAR_OPERATOR_WRITE_RIGHTS = Object.freeze([
   'act:coherence.inputs.publish',
   'act:coherence.approvals.register',
   'act:hr.records.write',
+  'act:iam.entities.write',
+  'act:iam.people.write',
+  'act:iam.roles.write',
+  'act:iam.grants.write',
+  'act:iam.switches.write',
 ]);
 
 const AGENT_RIGHTS = Object.freeze([
   'act:coherence.bob.read',
+  'act:iam.read',
   'col:coherence.member_phi',
   'col:coherence.member_contact',
   'act:payroll.agent_pay.read',
@@ -208,6 +223,7 @@ const ENTITY_MANAGER_RIGHTS = Object.freeze([
   'act:coherence.checks.read',
   'act:coherence.journal.read',
   'act:platform.audit_journal.read',
+  'act:iam.read',
   'col:coherence.statement_cash',
   'col:coherence.upline_cash',
   'col:coherence.member_phi',
@@ -235,6 +251,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: true,
     isNusearInternal: true,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: ALL_NON_WORKER_RIGHTS,
   }),
@@ -244,6 +261,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: true,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: Object.freeze([...NUSEAR_ALL_READ_RIGHTS, ...NUSEAR_OPERATOR_WRITE_RIGHTS]),
   }),
@@ -253,6 +271,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: true,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: NUSEAR_ALL_READ_RIGHTS,
   }),
@@ -262,6 +281,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: true,
     isNusearInternal: true,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: Object.freeze([
       'act:coherence.worker.attempt',
@@ -280,6 +300,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: ENTITY_MANAGER_RIGHTS,
   }),
@@ -289,6 +310,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: ENTITY_MANAGER_RIGHTS,
   }),
@@ -298,6 +320,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: Object.freeze([
       'act:coherence.runs.read',
@@ -311,6 +334,7 @@ export const CANONICAL_ROLES = Object.freeze([
       'col:coherence.member_phi',
       'col:coherence.member_contact',
       'act:platform.audit_journal.read',
+      'act:iam.read',
       'col:vendors.real_name',
       'act:hr.records.read',
       'act:hr.records.write',
@@ -322,10 +346,12 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: Object.freeze([
       'act:coherence.bob.read',
       'act:coherence.statements.read',
+      'act:iam.read',
       'col:coherence.statement_cash',
       'col:coherence.member_phi',
       'col:coherence.member_contact',
@@ -337,9 +363,11 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: true,
     rights: Object.freeze([
       'act:coherence.bob.read',
+      'act:iam.read',
       'col:coherence.member_phi',
       'col:coherence.member_contact',
       'act:leads.costs.read',
@@ -352,9 +380,11 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: true,
     rights: Object.freeze([
       'act:coherence.bob.read',
+      'act:iam.read',
       'col:coherence.member_phi',
       'col:coherence.member_contact',
       'act:leads.costs.read',
@@ -368,12 +398,14 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: Object.freeze([
       'act:coherence.bob.read',
       'act:coherence.statements.read',
       'act:coherence.upline.read',
       'act:coherence.ledger.read',
+      'act:iam.read',
       'col:coherence.statement_cash',
       'col:coherence.upline_cash',
       'act:payroll.agent_pay.read',
@@ -394,10 +426,12 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: false,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: true,
     rights: Object.freeze([
       'act:coherence.bob.read',
       'act:coherence.statements.read',
+      'act:iam.read',
       'col:coherence.member_phi',
       'col:coherence.member_contact',
     ]),
@@ -408,6 +442,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: false,
+    requiresSelfScope: true,
     forbidsCompanyRevenueRights: true,
     rights: AGENT_RIGHTS,
   }),
@@ -417,6 +452,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: false,
+    requiresSelfScope: true,
     forbidsCompanyRevenueRights: true,
     rights: AGENT_RIGHTS,
   }),
@@ -426,6 +462,7 @@ export const CANONICAL_ROLES = Object.freeze([
     isPinned: false,
     isNusearInternal: false,
     allowsOrgWideScope: true,
+    requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
     rights: Object.freeze([]),
   }),
@@ -551,6 +588,7 @@ async function seedCatalogOnClient(client, { environment = null, journalSeq = nu
         isPinned: r.isPinned,
         isNusearInternal: r.isNusearInternal,
         allowsOrgWideScope: r.allowsOrgWideScope,
+        requiresSelfScope: r.requiresSelfScope,
         forbidsCompanyRevenueRights: r.forbidsCompanyRevenueRights,
       })),
       roleRights: delta.missingRoleRights.map((rr) => `${rr.slug}:${rr.rightId}`),
@@ -599,11 +637,11 @@ async function seedCatalogOnClient(client, { environment = null, journalSeq = nu
     await client.query(
       `INSERT INTO iam.role_versions (
          id, role_id, display_name, is_pinned, is_nusear_internal,
-         allows_org_wide_scope, forbids_company_revenue_rights, status, journal_seq
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8)`,
+         allows_org_wide_scope, requires_self_scope, forbids_company_revenue_rights, status, journal_seq
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)`,
       [
         randomUUID(), roleId, role.displayName, role.isPinned, role.isNusearInternal,
-        role.allowsOrgWideScope, role.forbidsCompanyRevenueRights, seq,
+        role.allowsOrgWideScope, role.requiresSelfScope, role.forbidsCompanyRevenueRights, seq,
       ],
     );
   }
@@ -634,20 +672,8 @@ async function seedCatalogOnClient(client, { environment = null, journalSeq = nu
  * (optionally reusing an open audit_journal seq).
  */
 export async function seedIamCatalog(poolOrClient, opts = {}) {
-  const isPool = typeof poolOrClient?.connect === 'function' && typeof poolOrClient?.release !== 'function';
-  if (!isPool) {
+  if (!isPgPool(poolOrClient)) {
     return seedCatalogOnClient(poolOrClient, opts);
   }
-  const client = await poolOrClient.connect();
-  try {
-    await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-    const res = await seedCatalogOnClient(client, opts);
-    await client.query('COMMIT');
-    return res;
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw err;
-  } finally {
-    client.release();
-  }
+  return withSerializableTx(poolOrClient, (client) => seedCatalogOnClient(client, opts));
 }

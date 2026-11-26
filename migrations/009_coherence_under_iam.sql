@@ -598,36 +598,26 @@ CREATE POLICY audit_journal_service_all ON platform.audit_journal
   USING (true) WITH CHECK (true);
 CREATE POLICY audit_journal_readonly_sel ON platform.audit_journal
   FOR SELECT TO platform_readonly, platform_worker USING (true);
-CREATE POLICY audit_journal_iam_read ON platform.audit_journal
-  FOR SELECT TO platform_view_owner
-  USING (
-    target_org_id = ANY(((SELECT iam.effective_wide_org_ids('act:platform.audit_journal.read')))::uuid[])
-  );
 
 -- Shared platform_view_owner read-rights and published-emit helpers (one check per data kind).
 -- All functions live in app_views.*, are SECURITY DEFINER owned by NOBYPASSRLS platform_view_owner
 -- (so FORCE RLS still applies and platform_app keeps zero privileges on schema coherence),
 -- and pin SET search_path = pg_catalog.
+CREATE OR REPLACE FUNCTION app_views._read_audit_journal_orgs()
+RETURNS UUID[]
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT iam._strip_masked_vendors(iam.effective_wide_org_ids('act:platform.audit_journal.read'));
+$$;
+
 CREATE OR REPLACE FUNCTION app_views._read_has_full_tenant_right(p_right_id TEXT)
 RETURNS BOOLEAN
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
   WITH tenant_orgs AS (
-    SELECT COALESCE((
-      SELECT pg_catalog.array_agg(DISTINCT c.descendant_org_id)
-      FROM iam.database_context dc
-      JOIN iam.organizations root_o
-        ON root_o.id = dc.tenant_org_id
-       AND root_o.org_kind IN ('company', 'agency', 'team')
-      JOIN iam.v_organization_closure c
-        ON c.ancestor_org_id = dc.tenant_org_id
-      JOIN iam.organizations co
-        ON co.id = c.descendant_org_id
-       AND co.org_kind IN ('company', 'agency', 'team')
-      WHERE dc.singleton = true
-        AND dc.tenant_org_id IS NOT NULL
-    ), ARRAY[]::uuid[]) AS orgs
+    SELECT iam._tenant_tree_org_ids(ARRAY['company', 'agency', 'team']) AS orgs
   )
   SELECT pg_catalog.cardinality(t.orgs) > 0
     AND t.orgs <@ ((SELECT iam.effective_wide_org_ids(p_right_id)))::uuid[]
@@ -991,6 +981,7 @@ DECLARE
 BEGIN
   -- Shared per-data-kind read predicates used in app_views.* views and platform_view_owner RLS policies.
   FOREACH v_sig IN ARRAY ARRAY[
+    'app_views._read_audit_journal_orgs()',
     'app_views._read_has_full_tenant_right(text)',
     'app_views._read_workshop_right(text)',
     'app_views._read_bob_wide_orgs()',
@@ -1026,8 +1017,14 @@ BEGIN
 END;
 $$;
 
--- IAM-backed row rules for platform_view_owner on leaf metadata tables (strict DAG: zero cross-table
--- references inside leaf policies; every iam.effective_* helper is already tenant-bounded in 008).
+-- IAM-backed row rules for platform_view_owner on platform.audit_journal and leaf metadata tables
+-- (strict DAG: zero cross-table references inside leaf policies; every iam.effective_* helper is already tenant-bounded in 008).
+CREATE POLICY audit_journal_iam_read ON platform.audit_journal
+  FOR SELECT TO platform_view_owner
+  USING (
+    target_org_id = ANY(((SELECT app_views._read_audit_journal_orgs()))::uuid[])
+  );
+
 CREATE POLICY company_meta_iam_read ON coherence.company_meta
   FOR SELECT TO platform_view_owner
   USING ((SELECT app_views._read_has_run_meta_access()));
@@ -2154,7 +2151,7 @@ SELECT
   d.imported,
   d.journal_seq
 FROM coherence.decisions d
-LEFT JOIN iam.person_versions pv
+LEFT JOIN iam.v_actor_display_lookup pv
   ON pv.person_id = (
     CASE
       WHEN d.decided_by ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -2162,7 +2159,6 @@ LEFT JOIN iam.person_versions pv
       ELSE NULL
     END
   )
- AND pv.superseded_by_id IS NULL
 CROSS JOIN scopes s;
 
 CREATE OR REPLACE VIEW app_views.coherence_checks
@@ -2217,7 +2213,7 @@ SELECT
   je.prev_hash,
   je.entry_hash
 FROM coherence.journal_entries je
-LEFT JOIN iam.person_versions pv
+LEFT JOIN iam.v_actor_display_lookup pv
   ON pv.person_id = (
     CASE
       WHEN je.actor ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -2225,7 +2221,6 @@ LEFT JOIN iam.person_versions pv
       ELSE NULL
     END
   )
- AND pv.superseded_by_id IS NULL
 CROSS JOIN scopes s;
 
 -- Platform audit journal view (from DESIGN.md section 2.5): masks Nusear staff identity for customers.
@@ -2255,8 +2250,8 @@ SELECT
     ELSE NULL
   END AS actor_person_id
 FROM platform.audit_journal j
-LEFT JOIN iam.person_versions pv
-  ON pv.person_id = j.actor_person_id AND pv.superseded_by_id IS NULL
+LEFT JOIN iam.v_actor_display_lookup pv
+  ON pv.person_id = j.actor_person_id
 CROSS JOIN scopes s;
 
 -- Assign ownership of every app_views.* view to platform_view_owner and grant SELECT strictly to
