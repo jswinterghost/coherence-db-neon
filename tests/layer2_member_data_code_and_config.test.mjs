@@ -459,6 +459,7 @@ test('Layer 2 [Negative Invariant]: View-As never writes, worker-only exclusivit
 
   const customerTokens = [
     ['company_admin', iam.tokens.companyAdmin],
+    ['company_admin_runs_only', iam.tokens.companyAdminRunsOnly],
     ['selling_agent', iam.tokens.agentA],
   ];
 
@@ -479,14 +480,16 @@ test('Layer 2 [Negative Invariant]: View-As never writes, worker-only exclusivit
     assert.equal((await fetch(`${baseUrl}/api/coherence/acme/bundles/config?output=selling-agents/Acme/jane-agent`)).status, 404);
     assert.equal((await fetch(`${baseUrl}/api/coherence/acme/bundles/file?output=selling-agents/Acme/jane-agent&path=viewer.html`)).status, 404);
 
-    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/review/bible/config`)).status, 404, `${label} must receive 0 rows (404) on review/bible/config`);
-    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/review/adjust/config`)).status, 404, `${label} must receive 0 rows (404) on review/adjust/config`);
-    assert.equal((await fetch(`${baseUrl}/api/coherence/acme/review-drift`)).status, 403, `${label} must be refused on review-drift`);
-    assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/journal`)).json()).entries, [], `${label} must see 0 journal entries`);
-    assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/checks`)).json()).checks, [], `${label} must see 0 checks`);
-    assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/approvals/history`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ recordId: 'policy:carrier_a:P10001#effective:2026-01-01' }),
-    })).json()).history, [], `${label} must see 0 approval history rows`);
+    if (label !== 'company_admin') {
+      assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/review/bible/config`)).status, 404, `${label} must receive 0 rows (404) on review/bible/config`);
+      assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/review/adjust/config`)).status, 404, `${label} must receive 0 rows (404) on review/adjust/config`);
+      assert.equal((await fetch(`${baseUrl}/api/coherence/acme/review-drift`)).status, 403, `${label} must be refused on review-drift`);
+      assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/journal`)).json()).entries, [], `${label} must see 0 journal entries`);
+      assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/checks`)).json()).checks, [], `${label} must see 0 checks`);
+      assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/approvals/history`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ recordId: 'policy:carrier_a:P10001#effective:2026-01-01' }),
+      })).json()).history, [], `${label} must see 0 approval history rows`);
+    }
 
     assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -714,6 +717,7 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
   assert.deepEqual(csql.config.roles.platform_writer.businessTables, ['SELECT', 'INSERT']);
   assert.deepEqual(csql.config.roles.platform_readonly.businessTables, ['SELECT']);
   assert.deepEqual(csql.config.roles.platform_iam_sync.agentAffiliations, ['SELECT']);
+  assert.deepEqual(csql.config.roles.platform_iam_sync.roleGrantPeople, ['SELECT']);
   assert.deepEqual(csql.config.roles.platform_iam_sync.personAuthIdentities, []);
   assert.deepEqual(csql.config.roles.platform_iam_sync.signingKeyScopes, ['nusear_staff', 'service']);
   for (const retired of ['coherence_app', 'coherence_worker', 'coherence_readonly']) {
@@ -844,6 +848,7 @@ test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline
     assert.equal(totals[0].net_amount, '200.00');
     assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_upline_lines')).rows[0].n, 0);
     assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger')).rows[0].n, 0);
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_journal')).rows[0].n, 0);
 
     // Side-channel security_barrier check: Harbor rows must never reach user WHERE expression
     const sideChannel = (await c.query(
@@ -873,7 +878,7 @@ test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline
     );
   }
 
-  // 2. Selling Agent (NPN 11111111): strictly own NPN (distinguishes same-name 11111111 vs 22222222) and zero dollars
+  // 2. Selling Agent (NPN 11111111): strictly own NPN (distinguishes same-name 11111111 vs 22222222), zero BoB dollars, and zero Coherence statements
   await runAsApp(iam.tokens.agentA, async (c) => {
     const bob = (await c.query('SELECT policy_id, writing_npn, writing_agent, amount, upline_amount FROM app_views.coherence_bob')).rows;
     assert.equal(bob.length, 1);
@@ -881,36 +886,35 @@ test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline
     assert.equal(bob[0].amount, null);
     assert.equal(bob[0].upline_amount, null);
     const act = (await c.query('SELECT entity, writing_npn, amount, gross_comm, record_id FROM app_views.coherence_statement_agency_lines')).rows;
-    assert.equal(act.length, 1);
-    assert.equal(act[0].writing_npn, '11111111');
-    assert.equal(act[0].amount, null);
-    assert.equal(act[0].gross_comm, null);
-    assert.equal(act[0].record_id, null);
+    assert.equal(act.length, 0);
   });
 
-  // 3. Retention Agent: scoped to Harbor, zero dollar access
-  await runAsApp(iam.tokens.retentionAgent, async (c) => {
+  // 3. Agency-wide zero-dollar reader (test-only custom role scoped to Harbor) sees Harbor with zero dollars;
+  //    built-in retention_agent (self-only) sees zero rows of another Harbor agent's policies.
+  await runAsApp(iam.tokens.harborZeroDollarReader, async (c) => {
     const bob = (await c.query('SELECT entity, amount, upline_amount FROM app_views.coherence_bob')).rows;
     assert.equal(bob.length, 1);
     assert.equal(bob[0].entity, 'Harbor');
     assert.equal(bob[0].amount, null);
     assert.equal(bob[0].upline_amount, null);
   });
+  await runAsApp(iam.tokens.retentionAgent, async (c) => {
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n, 0);
+  });
 
-  // 4. Entity Manager: full BoB, ledger, all entities + Acme Upline, reconciliation view, zero journal access
+  // 4. Entity Manager: full BoB, ledger, all entities + Acme Upline, reconciliation view, and full workshop (journal included)
   await runAsApp(iam.tokens.entityMgr, async (c) => {
     const bob = (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n;
     assert.equal(bob, 3);
     const recon = (await c.query('SELECT * FROM app_views.coherence_entity_statement_reconciliation WHERE run_id = $1::uuid', [run1Id])).rows;
     assert.equal(recon.length, 4);
     assert.ok(recon.every((r) => r.reconciled && r.variance === '0.00'));
-    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_journal')).rows[0].n, 0);
+    assert.ok((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_journal')).rows[0].n > 0);
   });
 
-  // 5. Investor: BoB only, zero ledger or statement access
+  // 5. Investor: empty role (zero rights by default), zero rows across all Coherence views
   await runAsApp(iam.tokens.investor, async (c) => {
-    const bob = (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n;
-    assert.equal(bob, 3);
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n, 0);
     assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger')).rows[0].n, 0);
     assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n, 0);
     assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_upline_lines')).rows[0].n, 0);

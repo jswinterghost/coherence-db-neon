@@ -1,6 +1,7 @@
-// Test-only IAM seeding, signed token minting, and role-scoped pool harness for Release 1B proofs.
+// Test-only IAM seeding, signed token minting, and role-scoped pool harness for Release 1B+ proofs.
 // Never imported by runtime code under src/.
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { CANONICAL_TOOLS, seedIamCatalog } from '../../src/iam/catalog.mjs';
 import { sha256Hex } from '../../src/util/crypto.mjs';
 
 export function mintSignedToken({
@@ -129,25 +130,16 @@ export async function seedCoherenceIamFixture(pool, {
     leadManager: randomUUID(),
     teamManager: randomUUID(),
     harborRetention: randomUUID(),
+    harborZeroDollarReader: randomUUID(),
     agentA: randomUUID(),
     agentB: randomUUID(),
     agentEast: randomUUID(),
     agentHarbor: randomUUID(),
     suspendedAgent: randomUUID(),
 
-    roleNusearOwner: randomUUID(),
-    roleNusearAdmin: randomUUID(),
-    roleCoherenceOperator: randomUUID(),
-    roleWorkerService: randomUUID(),
-    roleEntityManager: randomUUID(),
-    roleCompanyAdmin: randomUUID(),
     roleCompanyAdminRunsOnly: randomUUID(),
     roleCompanyAdminNoGrants: randomUUID(),
-    roleInvestor: randomUUID(),
-    roleAgencyManager: randomUUID(),
-    roleTeamManager: randomUUID(),
-    roleSellingAgent: randomUUID(),
-    roleRetentionAgent: randomUUID(),
+    roleAgencyZeroDollarReader: randomUUID(),
   };
 
   const client = await pool.connect();
@@ -190,163 +182,44 @@ export async function seedCoherenceIamFixture(pool, {
       [keyId, secretBytes, staffKeyId, staffSecretBytes, serviceKeyId, serviceSecretBytes, environment],
     );
 
-    for (const [id, display] of [['coherence', 'Coherence'], ['platform_audit', 'Platform Audit']]) {
-      await client.query(
-        'INSERT INTO iam.tools (id, display_name, is_nusear_only, is_customer_switchable, journal_seq) VALUES ($1,$2,false,true,$3)',
-        [id, display, seq],
-      );
-    }
+    const { rolesBySlug } = await seedIamCatalog(client, { environment, journalSeq: seq });
+    ids.roleNusearOwner = rolesBySlug.get('nusear_owner');
+    ids.roleNusearAdmin = rolesBySlug.get('nusear_admin');
+    ids.roleNusearSupport = rolesBySlug.get('nusear_support');
+    ids.roleCoherenceOperator = rolesBySlug.get('nusear_support');
+    ids.roleWorkerService = rolesBySlug.get('coherence_worker_svc');
+    ids.roleOwner = rolesBySlug.get('owner');
+    ids.roleEntityManager = rolesBySlug.get('entity_manager');
+    ids.roleCompanyAdmin = rolesBySlug.get('company_admin');
+    ids.roleInvestor = rolesBySlug.get('investor');
+    ids.roleAgencyManager = rolesBySlug.get('agency_manager');
+    ids.roleDirectorOfSales = rolesBySlug.get('director_of_sales');
+    ids.roleDirectorOfOperations = rolesBySlug.get('director_of_operations');
+    ids.roleAccounting = rolesBySlug.get('accounting');
+    ids.roleCompliance = rolesBySlug.get('compliance');
+    ids.roleSellingAgent = rolesBySlug.get('selling_agent');
+    ids.roleRetentionAgent = rolesBySlug.get('retention_agent');
 
-    const rights = [
-      ['act:coherence.bob.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read Book of Business'],
-      ['act:coherence.statements.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read agency statements'],
-      ['act:coherence.upline.read', 'action', 'coherence', 'both', 'money_upline', true, null, null, null, 'Read upline statements'],
-      ['act:coherence.ledger.read', 'action', 'coherence', 'both', 'money_upline', true, null, null, null, 'Read Coherent Ledger'],
-      ['act:coherence.unpublished.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read published unsent runs'],
-      ['act:coherence.runs.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read run metadata'],
-      ['act:coherence.inputs.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read input versions'],
-      ['act:coherence.outputs.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read data-only run outputs'],
-      ['act:coherence.decisions.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read decision records and review configs'],
-      ['act:coherence.checks.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read check reports'],
-      ['act:coherence.journal.read', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Read Coherence journal'],
-      ['act:platform.audit_journal.read', 'action', 'platform_audit', 'both', 'ordinary', true, null, null, null, 'Read platform audit journal'],
-      ['col:coherence.statement_cash', 'column', 'coherence', 'both', 'money_statement', true, 'coherence', 'bob_policy_financials', 'amount', 'View agency statement cash'],
-      ['col:coherence.upline_cash', 'column', 'coherence', 'both', 'money_upline', true, 'coherence', 'bob_policy_financials', 'upline_amount', 'View upline and gross cash'],
-      ['col:coherence.member_phi', 'column', 'coherence', 'both', 'member_phi', true, 'coherence', 'bob_policies', 'mbi', 'View member PHI (name, MBI, DOB, member record IDs)'],
-      ['col:coherence.member_contact', 'column', 'coherence', 'both', 'member_contact', true, 'coherence', 'bob_policies', 'phone', 'View member contact details (phone, email, address, county)'],
-      ['col:platform.audit_journal.nusear_actor', 'column', 'platform_audit', 'both', 'platform_internal', true, 'platform', 'audit_journal', 'actor_person_id', 'View Nusear actor identity'],
-      ['act:coherence.run.launch', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Launch Coherence run'],
-      ['act:coherence.run.retry', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Retry Coherence step'],
-      ['act:coherence.run.cancel', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Cancel Coherence step'],
-      ['act:coherence.review.submit', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Submit staged review CSV'],
-      ['act:coherence.review.save', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Save review decisions'],
-      ['act:coherence.review.draft', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Save review draft'],
-      ['act:coherence.inputs.publish', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Publish input version'],
-      ['act:coherence.approvals.register', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Register approvals file'],
-      ['act:coherence.owner.confirm_emit', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Confirm Emit'],
-      ['act:coherence.owner.carry_sent', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Carry sent statements'],
-      ['act:coherence.owner.carry_approvals', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Carry approvals file'],
-      ['act:coherence.owner.carry_decisions', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Carry decisions'],
-      ['act:coherence.owner.abandon_run', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Abandon run'],
-      ['act:coherence.owner.init_company', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Initialize company metadata'],
-      ['act:coherence.owner.register_engine', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Register engine version'],
-      ['act:coherence.owner.record_baseline', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Record decision baseline'],
-      ['act:coherence.owner.record_statement_batch', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Record standalone statement batch'],
-      ['act:coherence.owner.import_history', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Import historical runs and files'],
-      ['act:coherence.checks.record', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Record check report'],
-      ['act:coherence.files.register', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Register stored files'],
-      ['act:coherence.overlays.record', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Record generated overlay'],
-      ['act:coherence.emit.materialize', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Materialize Emit outputs'],
-      ['act:coherence.worker.attempt', 'action', 'coherence', 'both', 'platform_internal', false, null, null, null, 'Worker step attempt lifecycle'],
-      ['act:coherence.worker.review', 'action', 'coherence', 'both', 'platform_internal', false, null, null, null, 'Worker review submission resolution'],
+    // Test-only custom company roles for verifying partial workshop grants and agency-wide zero-dollar reads.
+    const customRoleSpecs = [
+      [ids.roleCompanyAdminRunsOnly, 'company_admin_runs_only', 'Company Admin Runs Only', ['act:coherence.runs.read', 'act:coherence.unpublished.read']],
+      [ids.roleCompanyAdminNoGrants, 'company_admin_none', 'Company Admin No Grants', ['act:platform.audit_journal.read']],
+      [ids.roleAgencyZeroDollarReader, 'agency_zero_dollar_reader', 'Agency Zero Dollar Reader', ['act:coherence.bob.read', 'col:coherence.member_phi', 'col:coherence.member_contact']],
     ];
-    for (const r of rights) {
-      await client.query(
-        `INSERT INTO iam.rights (
-           id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power,
-           target_schema, target_table, target_column, description, journal_seq
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-        [...r, seq],
-      );
-    }
-
-    const roleSpecs = [
-      [ids.roleNusearOwner, 'nusear_owner', 'Nusear Owner', true, true, true],
-      [ids.roleNusearAdmin, 'nusear_admin', 'Nusear Admin', false, true, true],
-      [ids.roleCoherenceOperator, 'coherence_operator', 'Coherence Operator', false, true, true],
-      [ids.roleWorkerService, 'coherence_worker_svc', 'Coherence Worker', true, true, true],
-      [ids.roleEntityManager, 'entity_manager', 'Entity Manager', false, false, true],
-      [ids.roleCompanyAdmin, 'company_admin', 'Company Admin', false, false, true],
-      [ids.roleCompanyAdminRunsOnly, 'company_admin_runs_only', 'Company Admin Runs Only', false, false, true],
-      [ids.roleCompanyAdminNoGrants, 'company_admin_none', 'Company Admin No Grants', false, false, true],
-      [ids.roleInvestor, 'investor', 'Investor', false, false, true],
-      [ids.roleAgencyManager, 'agency_manager', 'Agency Manager', false, false, true],
-      [ids.roleTeamManager, 'team_manager', 'Team Manager', false, false, false],
-      [ids.roleSellingAgent, 'selling_agent', 'Selling Agent', false, false, false],
-      [ids.roleRetentionAgent, 'retention_agent', 'Retention Agent', false, false, true],
-    ];
-    for (const [id, slug, display, pinned, internal, wide] of roleSpecs) {
-      await client.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [id, slug, seq]);
+    for (const [id, slug, display, rightList] of customRoleSpecs) {
+      await client.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,$3,$4)', [id, slug, ids.companyOrg, seq]);
       await client.query(
         `INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq)
-         VALUES ($1,$2,$3,$4,$5,$6,'active',$7)`,
-        [randomUUID(), id, display, pinned, internal, wide, seq],
+         VALUES ($1,$2,$3,false,false,true,'active',$4)`,
+        [randomUUID(), id, display, seq],
       );
-    }
-
-    const addRoleRights = async (roleId, list) => {
-      for (const rightId of list) {
+      for (const rightId of rightList) {
         await client.query(
           "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-          [randomUUID(), roleId, rightId, seq],
+          [randomUUID(), id, rightId, seq],
         );
       }
-    };
-
-    const allNonWorkerRights = rights.map((r) => r[0]).filter((id) => !id.startsWith('act:coherence.worker.'));
-    await addRoleRights(ids.roleNusearOwner, allNonWorkerRights);
-    await addRoleRights(ids.roleNusearAdmin, [
-      'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
-      'act:coherence.ledger.read', 'act:coherence.unpublished.read', 'act:coherence.runs.read',
-      'act:coherence.inputs.read', 'act:coherence.outputs.read', 'act:coherence.decisions.read',
-      'act:coherence.checks.read', 'act:coherence.journal.read', 'act:platform.audit_journal.read',
-      'col:coherence.statement_cash', 'col:coherence.upline_cash',
-      'col:coherence.member_phi', 'col:coherence.member_contact',
-      'col:platform.audit_journal.nusear_actor',
-    ]);
-    await addRoleRights(ids.roleCoherenceOperator, [
-      'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
-      'act:coherence.ledger.read', 'act:coherence.unpublished.read', 'act:coherence.runs.read',
-      'act:coherence.inputs.read', 'act:coherence.outputs.read', 'act:coherence.decisions.read',
-      'act:coherence.checks.read', 'act:coherence.journal.read', 'act:platform.audit_journal.read',
-      'col:coherence.statement_cash', 'col:coherence.upline_cash',
-      'col:coherence.member_phi', 'col:coherence.member_contact',
-      'col:platform.audit_journal.nusear_actor',
-      'act:coherence.run.launch', 'act:coherence.run.retry', 'act:coherence.run.cancel',
-      'act:coherence.review.submit', 'act:coherence.review.save', 'act:coherence.review.draft',
-      'act:coherence.inputs.publish', 'act:coherence.approvals.register',
-    ]);
-    await addRoleRights(ids.roleWorkerService, [
-      'act:coherence.worker.attempt', 'act:coherence.worker.review',
-      'act:coherence.checks.record', 'act:coherence.files.register',
-      'act:coherence.overlays.record', 'act:coherence.emit.materialize',
-    ]);
-    await addRoleRights(ids.roleEntityManager, [
-      'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
-      'act:coherence.ledger.read', 'act:coherence.unpublished.read',
-      'act:coherence.runs.read', 'act:coherence.inputs.read', 'act:coherence.outputs.read',
-      'act:platform.audit_journal.read',
-      'col:coherence.statement_cash', 'col:coherence.upline_cash',
-      'col:coherence.member_phi', 'col:coherence.member_contact',
-    ]);
-    await addRoleRights(ids.roleCompanyAdmin, [
-      'act:coherence.runs.read', 'act:coherence.inputs.read', 'act:coherence.outputs.read',
-      'act:coherence.unpublished.read',
-      'act:platform.audit_journal.read',
-    ]);
-    await addRoleRights(ids.roleCompanyAdminRunsOnly, [
-      'act:coherence.runs.read', 'act:coherence.unpublished.read',
-    ]);
-    await addRoleRights(ids.roleCompanyAdminNoGrants, ['act:platform.audit_journal.read']);
-    await addRoleRights(ids.roleInvestor, [
-      'act:coherence.bob.read', 'col:coherence.statement_cash', 'col:coherence.upline_cash',
-    ]);
-    await addRoleRights(ids.roleAgencyManager, [
-      'act:coherence.bob.read', 'act:coherence.statements.read', 'col:coherence.statement_cash',
-      'col:coherence.member_phi', 'col:coherence.member_contact',
-    ]);
-    await addRoleRights(ids.roleTeamManager, [
-      'act:coherence.bob.read', 'act:coherence.statements.read',
-      'col:coherence.member_phi', 'col:coherence.member_contact',
-    ]);
-    await addRoleRights(ids.roleSellingAgent, [
-      'act:coherence.bob.read', 'act:coherence.statements.read',
-      'col:coherence.member_phi', 'col:coherence.member_contact',
-    ]);
-    await addRoleRights(ids.roleRetentionAgent, [
-      'act:coherence.bob.read', 'act:coherence.statements.read',
-      'col:coherence.member_phi', 'col:coherence.member_contact',
-    ]);
+    }
 
     for (const [orgId, , slug, name, parentId] of orgList) {
       await client.query(
@@ -363,21 +236,17 @@ export async function seedCoherenceIamFixture(pool, {
       }
     }
 
-    await client.query(
-      `INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq)
-       VALUES ($1,$2,'coherence','on','active',$3)`,
-      [ids.switchAcmeCoherenceId, ids.companyOrg, seq],
-    );
-    await client.query(
-      `INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq)
-       VALUES ($1,$2,'platform_audit','on','active',$3)`,
-      [randomUUID(), ids.companyOrg, seq],
-    );
-    for (const toolId of ['coherence', 'platform_audit']) {
+    for (const tool of CANONICAL_TOOLS) {
+      const switchId = tool.id === 'coherence' ? ids.switchAcmeCoherenceId : randomUUID();
       await client.query(
         `INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq)
          VALUES ($1,$2,$3,'on','active',$4)`,
-        [randomUUID(), ids.northstarOrg, toolId, seq],
+        [switchId, ids.companyOrg, tool.id, seq],
+      );
+      await client.query(
+        `INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq)
+         VALUES ($1,$2,$3,'on','active',$4)`,
+        [randomUUID(), ids.northstarOrg, tool.id, seq],
       );
     }
 
@@ -394,7 +263,8 @@ export async function seedCoherenceIamFixture(pool, {
       [ids.beaconManager, 'company_local', 'Taylor Beacon', 'taylor.bm@acme.example', null, 'active'],
       [ids.leadManager, 'company_local', 'Lee Lead', 'lee.lm@acme.example', null, 'active'],
       [ids.teamManager, 'company_local', 'Riley Team', 'riley.tm@acme.example', null, 'active'],
-      [ids.harborRetention, 'company_local', 'Jordan Retain', 'jordan.ret@acme.example', null, 'active'],
+      [ids.harborRetention, 'company_local', 'Jordan Retain', 'jordan.ret@acme.example', '31313131', 'active'],
+      [ids.harborZeroDollarReader, 'company_local', 'Morgan Harbor', 'morgan.hv@acme.example', null, 'active'],
       [ids.agentA, 'company_local', 'Sam Seller', 'sam.a@acme.example', '11111111', 'active'],
       [ids.agentB, 'company_local', 'Sam Seller', 'sam.b@acme.example', '22222222', 'active'],
       [ids.agentEast, 'company_local', 'Jamie East', 'jamie.east@acme.example', '44444444', 'active'],
@@ -421,16 +291,17 @@ export async function seedCoherenceIamFixture(pool, {
       [ids.nusearAdminNoCoh, ids.rootOrg, 'employee'],
       [ids.nusearOperator, ids.rootOrg, 'employee'],
       [ids.northstarOperator, ids.rootOrg, 'employee'],
-      [ids.workerService, ids.rootOrg, 'employee'],
+      [ids.workerService, ids.rootOrg, null],
       [ids.entityMgr, ids.companyOrg, 'employee'],
       [ids.companyAdmin, ids.companyOrg, 'employee'],
       [ids.companyAdminRunsOnly, ids.companyOrg, 'employee'],
       [ids.companyAdminNoGrants, ids.companyOrg, 'employee'],
-      [ids.investor, ids.companyOrg, 'employee'],
+      [ids.investor, ids.companyOrg, null],
       [ids.beaconManager, ids.beaconOrg, 'employee'],
       [ids.leadManager, ids.beaconOrg, 'employee'],
       [ids.teamManager, ids.beaconOrg, 'employee'],
       [ids.harborRetention, ids.harborOrg, 'employee'],
+      [ids.harborZeroDollarReader, ids.harborOrg, 'employee'],
     ]) {
       await client.query(
         `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq)
@@ -444,6 +315,7 @@ export async function seedCoherenceIamFixture(pool, {
       [ids.agentB, '22222222', ids.beaconOrg, 'Sam Seller 2'],
       [ids.agentEast, '44444444', ids.eastTeamOrg, 'Jamie East'],
       [ids.agentHarbor, '33333333', ids.harborOrg, 'Robin Harbor'],
+      [ids.harborRetention, '31313131', ids.harborOrg, 'Jordan Retain'],
       [ids.suspendedAgent, '55555555', ids.beaconOrg, 'Chris Suspended'],
     ];
     for (const ag of extraAgents) {
@@ -482,7 +354,8 @@ export async function seedCoherenceIamFixture(pool, {
       [ids.companyAdminNoGrants, ids.roleCompanyAdminNoGrants, ids.companyOrg, 'org_subtree'],
       [ids.investor, ids.roleInvestor, ids.companyOrg, 'org_subtree'],
       [ids.beaconManager, ids.roleAgencyManager, ids.beaconOrg, 'org_subtree'],
-      [ids.harborRetention, ids.roleRetentionAgent, ids.harborOrg, 'org_subtree'],
+      [ids.harborRetention, ids.roleRetentionAgent, ids.harborOrg, 'self'],
+      [ids.harborZeroDollarReader, ids.roleAgencyZeroDollarReader, ids.harborOrg, 'org_subtree'],
       [ids.agentA, ids.roleSellingAgent, ids.beaconOrg, 'self'],
       [ids.agentB, ids.roleSellingAgent, ids.beaconOrg, 'self'],
       [ids.agentEast, ids.roleSellingAgent, ids.eastTeamOrg, 'self'],
@@ -559,6 +432,7 @@ export async function seedCoherenceIamFixture(pool, {
       leadMgr: tokenFor(ids.leadManager),
       teamMgr: tokenFor(ids.teamManager),
       retentionAgent: tokenFor(ids.harborRetention),
+      harborZeroDollarReader: tokenFor(ids.harborZeroDollarReader),
       agentA: tokenFor(ids.agentA),
       agentB: tokenFor(ids.agentB),
       agentEast: tokenFor(ids.agentEast),

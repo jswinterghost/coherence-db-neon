@@ -282,6 +282,8 @@ test('Layer 7F [E3 Test 1]: agency move to an external_upline keeps runoff Emit 
     ],
   });
 
+  const extSwitchOnId = randomUUID();
+
   // 2. Move the agency from Acme [2024-01-01, 2026-08-01) to an external_upline [2026-08-01, ).
   await inSerializableTx(env.pool, async (c) => {
     const seq = (await appendIamAuditEntry(c, {
@@ -346,10 +348,11 @@ test('Layer 7F [E3 Test 1]: agency move to an external_upline keeps runoff Emit 
       );
     }
 
-    // Switching coherence OFF on the external upline must never affect Acme's DB.
+    // Seed coherence switch 'on' on the external upline FIRST so zero-visibility checks are non-vacuous;
+    // later we supersede it to 'off' and re-check both Acme and external upline visibility.
     await c.query(
-      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','off','active',$3)",
-      [randomUUID(), extUplineOrg, seq],
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','on','active',$3)",
+      [extSwitchOnId, extUplineOrg, seq],
     );
   });
 
@@ -428,90 +431,114 @@ test('Layer 7F [E3 Test 1]: agency move to an external_upline keeps runoff Emit 
   }
 
   const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
-
-  // 4. Acme Entity Manager and Nusear Owner see $0.00 reconciliation across pre-move and runoff runs (and keep workshop access).
-  for (const [label, tok] of [['entityMgr', env.iam.tokens.entityMgr], ['nusearOwner', env.ownerToken]]) {
-    await withRequestTx(appPool, tok, async (tx) => {
-      for (const runId of [preMoveRun.runId, runoffRun.runId]) {
-        const recon = (await tx.query(
-          'SELECT statement_entity, variance, reconciled FROM app_views.coherence_entity_statement_reconciliation WHERE run_id = $1::uuid',
-          [runId],
-        )).rows;
-        assert.ok(recon.some((r) => r.statement_entity === 'Insure Agency'), `${label} must see Insure Agency in reconciliation`);
-        assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'), `${label} reconciliation must tie to $0.00`);
-      }
-      const runCnt = (await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs')).rows[0].n;
-      assert.ok(runCnt >= 2, `${label} must retain workshop run visibility after agency move`);
-    }, { readOnly: true });
-  }
-
-  // 5. Moved agency's manager (direct and View-as) reads Insure Agency BoB and both pre-move & runoff statements, and zero other agencies.
   const movedMgrTok = env.iam.tokenFor(movedAgencyMgr);
   const viewAsMovedMgrTok = env.iam.tokenFor(ids.nusearOwner, movedAgencyMgr);
-  for (const [label, tok] of [['movedAgencyMgr', movedMgrTok], ['View-as movedAgencyMgr', viewAsMovedMgrTok]]) {
-    await withRequestTx(appPool, tok, async (tx) => {
-      const bob = (await tx.query('SELECT entity, amount FROM app_views.v_current_policy_periods ORDER BY entity')).rows;
-      assert.deepEqual(bob, [{ entity: 'Insure Agency', amount: '120.00' }], `${label} must see Insure Agency runoff BoB only`);
-      const stmts = (await tx.query(
-        'SELECT statement_date::text AS d, entity, amount FROM app_views.coherence_statement_agency_lines ORDER BY statement_date',
-      )).rows;
-      assert.deepEqual(stmts, [
-        { d: '2026-07-15', entity: 'Insure Agency', amount: '80.00' },
-        { d: '2026-11-15', entity: 'Insure Agency', amount: '120.00' },
-      ], `${label} must see both pre-move and post-move runoff statements for Insure Agency only`);
-      assert.equal((await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_upline_lines')).rows[0].n, 0);
-      assert.equal((await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger')).rows[0].n, 0);
-    }, { readOnly: true });
-  }
 
-  // Selling agent at moved agency still reads own runoff policy with NULL dollar columns.
-  await withRequestTx(appPool, env.iam.tokenFor(movedAgent), async (tx) => {
-    const bob = (await tx.query('SELECT entity, writing_npn, amount, upline_amount FROM app_views.v_current_policy_periods')).rows;
-    assert.deepEqual(bob, [{ entity: 'Insure Agency', writing_npn: '71717171', amount: null, upline_amount: null }]);
-  }, { readOnly: true });
+  const assertVisibilityInvariant = async (phase) => {
+    // 4. Acme Entity Manager and Nusear Owner see $0.00 reconciliation across pre-move and runoff runs (and keep workshop access).
+    for (const [label, tok] of [['entityMgr', env.iam.tokens.entityMgr], ['nusearOwner', env.ownerToken]]) {
+      await withRequestTx(appPool, tok, async (tx) => {
+        for (const runId of [preMoveRun.runId, runoffRun.runId]) {
+          const recon = (await tx.query(
+            'SELECT statement_entity, variance, reconciled FROM app_views.coherence_entity_statement_reconciliation WHERE run_id = $1::uuid',
+            [runId],
+          )).rows;
+          assert.ok(recon.some((r) => r.statement_entity === 'Insure Agency'), `[${phase}] ${label} must see Insure Agency in reconciliation`);
+          assert.ok(recon.every((r) => r.reconciled === true && r.variance === '0.00'), `[${phase}] ${label} reconciliation must tie to $0.00`);
+        }
+        const runCnt = (await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs')).rows[0].n;
+        assert.ok(runCnt >= 2, `[${phase}] ${label} must retain workshop run visibility after agency move`);
+      }, { readOnly: true });
+    }
 
-  // 6. New external upline (and post-move team) see ZERO rows anywhere inside Acme's DB.
-  for (const [label, tok] of [
-    ['extUplineMgr', env.iam.tokenFor(extUplineMgr)],
-    ['View-as extUplineMgr', env.iam.tokenFor(ids.nusearOwner, extUplineMgr)],
-    ['extMemberMovedGrant', env.iam.tokenFor(extMemberMovedGrant)],
-    ['View-as extMemberMovedGrant', env.iam.tokenFor(ids.nusearOwner, extMemberMovedGrant)],
-    ['postMoveTeamMgr', env.iam.tokenFor(postMoveTeamMgr)],
-  ]) {
-    await withRequestTx(appPool, tok, async (tx) => {
-      assert.deepEqual((await tx.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], `${label} must have 0 wide orgs`);
-      assert.deepEqual((await tx.query("SELECT iam.effective_any_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], `${label} must have 0 any orgs`);
-      for (const viewName of [
-        'coherence_bob',
-        'v_current_policy_periods',
-        'coherence_statement_agency_lines',
-        'coherence_statement_upline_lines',
-        'coherence_entity_statement_lines',
-        'coherence_ledger',
-        'coherence_published_runs',
-        'coherence_runs',
-      ]) {
-        const n = (await tx.query(`SELECT COUNT(*)::int AS n FROM app_views.${viewName}`)).rows[0].n;
-        assert.equal(n, 0, `${label} must see 0 rows in app_views.${viewName}`);
-      }
+    // 5. Moved agency's manager (direct and View-as) reads Insure Agency BoB and both pre-move & runoff statements, and zero other agencies.
+    for (const [label, tok] of [['movedAgencyMgr', movedMgrTok], ['View-as movedAgencyMgr', viewAsMovedMgrTok]]) {
+      await withRequestTx(appPool, tok, async (tx) => {
+        const bob = (await tx.query('SELECT entity, amount FROM app_views.v_current_policy_periods ORDER BY entity')).rows;
+        assert.deepEqual(bob, [{ entity: 'Insure Agency', amount: '120.00' }], `[${phase}] ${label} must see Insure Agency runoff BoB only`);
+        const stmts = (await tx.query(
+          'SELECT statement_date::text AS d, entity, amount FROM app_views.coherence_statement_agency_lines ORDER BY statement_date',
+        )).rows;
+        assert.deepEqual(stmts, [
+          { d: '2026-07-15', entity: 'Insure Agency', amount: '80.00' },
+          { d: '2026-11-15', entity: 'Insure Agency', amount: '120.00' },
+        ], `[${phase}] ${label} must see both pre-move and post-move runoff statements for Insure Agency only`);
+        assert.equal((await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_upline_lines')).rows[0].n, 0);
+        assert.equal((await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger')).rows[0].n, 0);
+      }, { readOnly: true });
+    }
+
+    // Selling agent at moved agency still reads own runoff policy with NULL dollar columns.
+    await withRequestTx(appPool, env.iam.tokenFor(movedAgent), async (tx) => {
+      const bob = (await tx.query('SELECT entity, writing_npn, amount, upline_amount FROM app_views.v_current_policy_periods')).rows;
+      assert.deepEqual(bob, [{ entity: 'Insure Agency', writing_npn: '71717171', amount: null, upline_amount: null }]);
     }, { readOnly: true });
-  }
+
+    // 6. New external upline (and post-move team) see ZERO rows anywhere inside Acme's DB.
+    for (const [label, tok] of [
+      ['extUplineMgr', env.iam.tokenFor(extUplineMgr)],
+      ['View-as extUplineMgr', env.iam.tokenFor(ids.nusearOwner, extUplineMgr)],
+      ['extMemberMovedGrant', env.iam.tokenFor(extMemberMovedGrant)],
+      ['View-as extMemberMovedGrant', env.iam.tokenFor(ids.nusearOwner, extMemberMovedGrant)],
+      ['postMoveTeamMgr', env.iam.tokenFor(postMoveTeamMgr)],
+    ]) {
+      await withRequestTx(appPool, tok, async (tx) => {
+        assert.deepEqual((await tx.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], `[${phase}] ${label} must have 0 wide orgs`);
+        assert.deepEqual((await tx.query("SELECT iam.effective_any_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], `[${phase}] ${label} must have 0 any orgs`);
+        for (const viewName of [
+          'coherence_bob',
+          'v_current_policy_periods',
+          'coherence_statement_agency_lines',
+          'coherence_statement_upline_lines',
+          'coherence_entity_statement_lines',
+          'coherence_ledger',
+          'coherence_published_runs',
+          'coherence_runs',
+        ]) {
+          const n = (await tx.query(`SELECT COUNT(*)::int AS n FROM app_views.${viewName}`)).rows[0].n;
+          assert.equal(n, 0, `[${phase}] ${label} must see 0 rows in app_views.${viewName}`);
+        }
+      }, { readOnly: true });
+    }
+  };
+
+  // Phase A: external upline coherence switch is 'on' (proves zero visibility comes from tenant bounding, not a switched-off tool).
+  await assertVisibilityInvariant('ext_upline switch=on');
+
+  // Phase B: supersede external upline coherence switch to 'off' and re-check both Acme's reads and external upline's zero visibility.
+  await inSerializableTx(env.pool, async (c) => {
+    const seq = (await appendIamAuditEntry(c, {
+      environment,
+      targetOrgId: extUplineOrg,
+      commandKind: 'iam.e3_ext_switch_off',
+      commandKey: `e3-ext-switch-off-${randomUUID()}`,
+    })).seq;
+    await c.query(
+      "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, replaces_id, journal_seq) VALUES ($1,$2,'coherence','off','active',$3,$4)",
+      [randomUUID(), extUplineOrg, extSwitchOnId, seq],
+    );
+  });
+  await assertVisibilityInvariant('ext_upline switch=off');
 });
 
-test('Layer 7F [E3 Test 2]: dated works-for lines carry work_arrangement and tax_classification, satisfy governing membership, and refuse overlapping active lines', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7F [E3 Test 2]: dated works-for lines carry nullable work_arrangement (no employee default) and tax_classification, satisfy governing membership, and refuse overlapping active lines', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
   t.after(() => env.cleanup());
   const { ids, environment } = env.iam;
 
-  // Verify capacity column is removed and work_arrangement + tax_classification exist on iam.organization_memberships.
-  const cols = (await env.pool.query(
-    `SELECT column_name
+  // Verify capacity column is removed and work_arrangement (nullable, no default) + tax_classification exist on iam.organization_memberships.
+  const colRows = (await env.pool.query(
+    `SELECT column_name, is_nullable, column_default
      FROM information_schema.columns
      WHERE table_schema = 'iam' AND table_name = 'organization_memberships'
      ORDER BY ordinal_position`,
-  )).rows.map((r) => r.column_name);
+  )).rows;
+  const cols = colRows.map((r) => r.column_name);
+  const waCol = colRows.find((r) => r.column_name === 'work_arrangement');
   assert.ok(!cols.includes('capacity'), 'iam.organization_memberships must no longer have capacity column');
-  assert.ok(cols.includes('work_arrangement'), 'iam.organization_memberships must have work_arrangement column');
+  assert.ok(waCol, 'iam.organization_memberships must have work_arrangement column');
+  assert.equal(waCol.is_nullable, 'YES', 'iam.organization_memberships.work_arrangement must be nullable (service principals and passive investors store NULL)');
+  assert.equal(waCol.column_default, null, 'iam.organization_memberships.work_arrangement must have no default');
   assert.ok(cols.includes('tax_classification'), 'iam.organization_memberships must have tax_classification column');
 
   const viewCols = (await env.pool.query(
@@ -524,7 +551,8 @@ test('Layer 7F [E3 Test 2]: dated works-for lines carry work_arrangement and tax
   const empPerson = randomUUID();
   const selfIntPerson = randomUUID();
   const selfExtPerson = randomUUID();
-  const defaultPerson = randomUUID();
+  const omittedArrangementPerson = randomUUID();
+  const passiveInvestorPerson = randomUUID();
   const selfExtMemId = randomUUID();
 
   await inSerializableTx(env.pool, async (c) => {
@@ -539,7 +567,8 @@ test('Layer 7F [E3 Test 2]: dated works-for lines carry work_arrangement and tax
       [empPerson, 'Employee Worker', 'emp.wf@acme.example'],
       [selfIntPerson, 'Self Internal Worker', 'self.int@acme.example'],
       [selfExtPerson, 'Self External Worker', 'self.ext@acme.example'],
-      [defaultPerson, 'Default Arrangement Worker', 'default.wf@acme.example'],
+      [omittedArrangementPerson, 'Omitted Arrangement Member', 'omitted.wf@acme.example'],
+      [passiveInvestorPerson, 'Passive Investor Member', 'passive.inv@acme.example'],
     ]) {
       await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','company_local',$2)", [pid, seq]);
       await c.query(
@@ -552,7 +581,7 @@ test('Layer 7F [E3 Test 2]: dated works-for lines carry work_arrangement and tax
       );
     }
 
-    // Insert all three work arrangements + nullable tax_classification + default work_arrangement.
+    // Insert all three work arrangements + omitted work_arrangement (stores NULL) + explicit NULL (passive investor / service principal).
     await c.query(
       `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, tax_classification, valid_range, status, journal_seq)
        VALUES ($1,$2,$7,'employee','w2','[2020-01-01,)'::daterange,'active',$8),
@@ -563,24 +592,38 @@ test('Layer 7F [E3 Test 2]: dated works-for lines carry work_arrangement and tax
     await c.query(
       `INSERT INTO iam.organization_memberships (id, person_id, organization_id, valid_range, status, journal_seq)
        VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4)`,
-      [randomUUID(), defaultPerson, ids.beaconOrg, seq],
+      [randomUUID(), omittedArrangementPerson, ids.beaconOrg, seq],
+    );
+    await c.query(
+      `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, tax_classification, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,NULL,NULL,'[2020-01-01,)'::daterange,'active',$4)`,
+      [randomUUID(), passiveInvestorPerson, ids.beaconOrg, seq],
     );
   });
 
-  // Verify default row stored work_arrangement='employee' and tax_classification=NULL.
-  const defRow = (await env.pool.query(
-    'SELECT work_arrangement, tax_classification FROM iam.organization_memberships WHERE person_id = $1 AND superseded_by_id IS NULL',
-    [defaultPerson],
-  )).rows[0];
-  assert.deepEqual(defRow, { work_arrangement: 'employee', tax_classification: null });
+  // Verify omitted and explicit-NULL rows stored work_arrangement=NULL (never defaulted to 'employee'),
+  // and harness service principal + investor memberships also store work_arrangement=NULL.
+  for (const [label, pid] of [
+    ['omitted arrangement', omittedArrangementPerson],
+    ['explicit NULL passive investor', passiveInvestorPerson],
+    ['harness workerService', ids.workerService],
+    ['harness investor', ids.investor],
+  ]) {
+    const row = (await env.pool.query(
+      'SELECT work_arrangement, tax_classification FROM iam.organization_memberships WHERE person_id = $1 AND superseded_by_id IS NULL',
+      [pid],
+    )).rows[0];
+    assert.deepEqual(row, { work_arrangement: null, tax_classification: null }, `${label} must store work_arrangement=NULL`);
+  }
 
-  // All three arrangements satisfy governing membership identically in iam.person_effective_grants().
+  // All three arrangements AND NULL work_arrangement satisfy governing membership identically in iam.person_effective_grants().
   const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
   for (const [label, pid] of [
     ['employee', empPerson],
     ['self_employed_internal', selfIntPerson],
     ['self_employed_external', selfExtPerson],
-    ['default', defaultPerson],
+    ['omitted (NULL)', omittedArrangementPerson],
+    ['explicit NULL', passiveInvestorPerson],
   ]) {
     await withRequestTx(appPool, env.iam.tokenFor(pid), async (tx) => {
       const orgs = (await tx.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v;
@@ -588,12 +631,12 @@ test('Layer 7F [E3 Test 2]: dated works-for lines carry work_arrangement and tax
     }, { readOnly: true });
   }
 
-  // Invalid work_arrangement, NULL work_arrangement, and invalid tax_classification must fail.
+  // Invalid non-NULL work_arrangement and invalid tax_classification must still fail 23514.
   for (const [label, arr, tax, expectedCode] of [
     ['legacy capacity owner', 'owner', null, '23514'],
     ['legacy capacity consultant', 'consultant', '1099', '23514'],
     ['legacy capacity investor', 'investor', null, '23514'],
-    ['null work_arrangement', null, 'w2', '23502'],
+    ['blank work_arrangement', '', null, '23514'],
     ['invalid tax_classification', 'employee', 'w9', '23514'],
   ]) {
     await assert.rejects(

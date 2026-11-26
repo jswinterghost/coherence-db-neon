@@ -1,13 +1,14 @@
--- Migration 008: Database-only IAM core (Release 1A + Release E2 + Release E3).
+-- Migration 008: Database-only IAM core (Release 1A + Release E2 + Release E3 + Release E4).
 -- Installs bootstrap least-privilege roles (including platform_auth_lookup), hash-chained platform.audit_journal,
 -- BEFORE INSERT platform_versioner supersession triggers and ENABLE ALWAYS immutability triggers,
 -- scoped iam_secret.signing_keys, core iam identity/org/role/right/scope/switch/auth-identity tables
--- (including external_upline organizations, per-company lead_vendor masked_display_name, and dated works-for
--- memberships with work_arrangement and nullable tax_classification),
--- origin/role/control-DB/platform_iam_sync/org-version isolation triggers, America/New_York business_today(),
--- HMAC-SHA256 scope-checked session_context(), narrow resolve_auth_identity(), unified org closure and
--- tenant-bounded grant evaluator (no cross-company holding-company grant flow), set-theoretic scope helpers,
--- and deterministic iam.assert_can_write().
+-- (including external_upline organizations, per-company lead_vendor masked_display_name, dated works-for
+-- memberships with nullable work_arrangement and nullable tax_classification, hr_record sensitivity class,
+-- forbids_company_revenue_rights role guard, and explicit_people scoping via iam.role_grant_people),
+-- origin/role/control-DB/platform_iam_sync/org-version/revenue-guard/explicit-people triggers,
+-- America/New_York business_today(), HMAC-SHA256 scope-checked session_context(), narrow resolve_auth_identity(),
+-- unified org closure and tenant-bounded grant evaluator (no cross-company holding-company grant flow),
+-- set-theoretic InitPlan scope helpers (org_subtree, self, explicit_people), and deterministic iam.assert_can_write().
 -- All functions pin SET search_path = pg_catalog and schema-qualify all references.
 
 CREATE EXTENSION IF NOT EXISTS btree_gist;
@@ -482,7 +483,7 @@ BEGIN
 END;
 $$;
 
--- 4. Core IAM tables (all 17 tables in schema iam are strictly append-only).
+-- 4. Core IAM tables (all 18 tables in schema iam are strictly append-only).
 
 -- Immutable one-row identity of this database instance (env never supplied by app code).
 CREATE TABLE iam.database_context (
@@ -630,11 +631,12 @@ CREATE INDEX person_auth_identities_person_live_idx
   WHERE superseded_by_id IS NULL AND status = 'active';
 
 -- Dated works-for lines (grants nothing by itself; selling-agent affiliation lives in agent_affiliations).
+-- work_arrangement is nullable with no default (service principals and passive investors store NULL).
 CREATE TABLE iam.organization_memberships (
   id UUID PRIMARY KEY,
   person_id UUID NOT NULL REFERENCES iam.people(id),
   organization_id UUID NOT NULL REFERENCES iam.organizations(id),
-  work_arrangement TEXT NOT NULL DEFAULT 'employee' CHECK (work_arrangement IN (
+  work_arrangement TEXT CHECK (work_arrangement IN (
     'employee', 'self_employed_internal', 'self_employed_external'
   )),
   tax_classification TEXT CHECK (tax_classification IN ('w2', '1099')),
@@ -695,7 +697,7 @@ CREATE TABLE iam.rights (
   sensitivity_class TEXT NOT NULL CHECK (sensitivity_class IN (
     'ordinary', 'vendor_identity', 'internal_id',
     'money_lead', 'money_pay', 'money_statement', 'money_upline', 'money_operating',
-    'recording', 'caller_phone', 'member_contact', 'member_phi', 'staff_free_text', 'platform_internal'
+    'recording', 'caller_phone', 'member_contact', 'member_phi', 'staff_free_text', 'hr_record', 'platform_internal'
   )),
   is_delegable_power BOOLEAN NOT NULL DEFAULT true,
   target_schema TEXT,
@@ -733,6 +735,7 @@ CREATE TABLE iam.role_versions (
   is_pinned BOOLEAN NOT NULL DEFAULT false,
   is_nusear_internal BOOLEAN NOT NULL DEFAULT false,
   allows_org_wide_scope BOOLEAN NOT NULL DEFAULT false,
+  forbids_company_revenue_rights BOOLEAN NOT NULL DEFAULT false,
   status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
   replaces_id UUID UNIQUE REFERENCES iam.role_versions(id),
   superseded_by_id UUID UNIQUE,
@@ -774,7 +777,7 @@ CREATE TABLE iam.role_grants (
   role_id UUID NOT NULL REFERENCES iam.roles(id),
   organization_id UUID NOT NULL REFERENCES iam.organizations(id),
   include_descendants BOOLEAN NOT NULL DEFAULT true,
-  person_scope_mode TEXT NOT NULL CHECK (person_scope_mode IN ('org_subtree', 'self')),
+  person_scope_mode TEXT NOT NULL CHECK (person_scope_mode IN ('org_subtree', 'self', 'explicit_people')),
   data_date_range DATERANGE,
   valid_range DATERANGE NOT NULL CHECK (NOT pg_catalog.isempty(valid_range) AND pg_catalog.lower_inc(valid_range) AND NOT pg_catalog.upper_inc(valid_range)),
   status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
@@ -793,6 +796,30 @@ CREATE TABLE iam.role_grants (
     WHERE (superseded_by_id IS NULL AND status = 'active')
 );
 CREATE INDEX role_grants_person_live_idx ON iam.role_grants (person_id, organization_id)
+  WHERE superseded_by_id IS NULL AND status = 'active';
+
+-- Explicit-people scope rows: binds permitted company_local subjects (e.g., compliance permitted NPNs)
+-- strictly to a live active role_grant with person_scope_mode = 'explicit_people'.
+CREATE TABLE iam.role_grant_people (
+  id UUID PRIMARY KEY,
+  role_grant_id UUID NOT NULL REFERENCES iam.role_grants(id),
+  subject_person_id UUID NOT NULL REFERENCES iam.people(id),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+  replaces_id UUID UNIQUE REFERENCES iam.role_grant_people(id),
+  superseded_by_id UUID UNIQUE,
+  superseded_journal_seq BIGINT REFERENCES platform.audit_journal(seq),
+  journal_seq BIGINT NOT NULL REFERENCES platform.audit_journal(seq),
+  UNIQUE (id, replaces_id),
+  FOREIGN KEY (superseded_by_id, id) REFERENCES iam.role_grant_people(id, replaces_id) DEFERRABLE INITIALLY DEFERRED,
+  CHECK (replaces_id IS NULL OR replaces_id <> id),
+  CHECK (superseded_by_id IS NULL OR superseded_by_id <> id),
+  CHECK ((superseded_by_id IS NULL) = (superseded_journal_seq IS NULL))
+);
+CREATE UNIQUE INDEX role_grant_people_live_uniq
+  ON iam.role_grant_people (role_grant_id, subject_person_id)
+  WHERE superseded_by_id IS NULL AND status = 'active';
+CREATE INDEX role_grant_people_grant_live_idx
+  ON iam.role_grant_people (role_grant_id)
   WHERE superseded_by_id IS NULL AND status = 'active';
 
 -- Per-organization tool switches (versioned, append-only).
@@ -847,7 +874,7 @@ BEGIN
     EXECUTE pg_catalog.format('ALTER TABLE iam.%I ENABLE ALWAYS TRIGGER trg_immutable', v_tbl);
   END LOOP;
 
-  -- Versioned append-only iam tables (10 tables): table name + comma-separated anchor columns.
+  -- Versioned append-only iam tables (11 tables): table name + comma-separated anchor columns.
   FOREACH v_spec SLICE 1 IN ARRAY ARRAY[
     ARRAY['organization_versions', '''organization_id'''],
     ARRAY['organization_edges', '''child_org_id'''],
@@ -858,6 +885,7 @@ BEGIN
     ARRAY['role_versions', '''role_id'''],
     ARRAY['role_rights', '''role_id'', ''right_id'''],
     ARRAY['role_grants', '''person_id'''],
+    ARRAY['role_grant_people', '''role_grant_id'', ''subject_person_id'''],
     ARRAY['organization_tool_switches', '''organization_id'', ''tool_id''']
   ] LOOP
     v_tbl := v_spec[1];
@@ -1087,6 +1115,9 @@ BEGIN
       RAISE EXCEPTION 'SYNC_FORBIDDEN_ORIGIN: platform_iam_sync cannot write role grants for company_local people.'
         USING ERRCODE = '42501';
     END IF;
+  ELSIF TG_TABLE_NAME = 'role_grant_people' THEN
+    RAISE EXCEPTION 'SYNC_FORBIDDEN_TABLE: platform_iam_sync cannot write iam.role_grant_people.'
+      USING ERRCODE = '42501';
   END IF;
   RETURN NEW;
 END;
@@ -1103,6 +1134,9 @@ CREATE TRIGGER trg_00b_verify_sync
   FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_sync_role_boundary();
 CREATE TRIGGER trg_00b_verify_sync
   BEFORE INSERT ON iam.role_grants
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_sync_role_boundary();
+CREATE TRIGGER trg_00b_verify_sync
+  BEFORE INSERT ON iam.role_grant_people
   FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_sync_role_boundary();
 
 CREATE OR REPLACE FUNCTION iam.trg_check_org_edge_no_cycle()
@@ -1253,6 +1287,19 @@ BEGIN
       NEW.role_id, NEW.is_nusear_internal USING ERRCODE = '23514';
   END IF;
 
+  IF NEW.status = 'active' AND NEW.forbids_company_revenue_rights = true AND EXISTS (
+    SELECT 1
+    FROM iam.role_rights rr
+    JOIN iam.rights r ON r.id = rr.right_id
+    WHERE rr.role_id = NEW.role_id
+      AND rr.superseded_by_id IS NULL
+      AND rr.status = 'active'
+      AND r.sensitivity_class IN ('money_statement', 'money_upline')
+  ) THEN
+    RAISE EXCEPTION 'COMPANY_REVENUE_RIGHT_FORBIDDEN: role % still has live company-revenue rights.',
+      NEW.role_id USING ERRCODE = '23514';
+  END IF;
+
   RETURN NULL;
 END;
 $$;
@@ -1261,6 +1308,98 @@ CREATE CONSTRAINT TRIGGER trg_role_versions_verify_invariants
   AFTER INSERT ON iam.role_versions
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_role_version_invariants();
+
+-- Enforce forbids_company_revenue_rights (blocks money_statement and money_upline while allowing agent own-pay money_pay).
+CREATE OR REPLACE FUNCTION iam.trg_verify_role_rights_invariants()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_sens_class TEXT;
+  v_forbids_rev BOOLEAN;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM iam.role_rights cur
+    WHERE cur.id = NEW.id AND cur.superseded_by_id IS NULL AND cur.status = 'active'
+  ) THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT r.sensitivity_class INTO v_sens_class
+  FROM iam.rights r
+  WHERE r.id = NEW.right_id;
+
+  IF v_sens_class IN ('money_statement', 'money_upline') THEN
+    SELECT rv.forbids_company_revenue_rights INTO v_forbids_rev
+    FROM iam.role_versions rv
+    WHERE rv.role_id = NEW.role_id
+      AND rv.superseded_by_id IS NULL;
+
+    IF COALESCE(v_forbids_rev, false) = true THEN
+      RAISE EXCEPTION 'COMPANY_REVENUE_RIGHT_FORBIDDEN: role % forbids company-revenue right % (sensitivity_class = %).',
+        NEW.role_id, NEW.right_id, v_sens_class USING ERRCODE = '23514';
+    END IF;
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER trg_role_rights_verify_invariants
+  AFTER INSERT ON iam.role_rights
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_role_rights_invariants();
+
+-- Enforce explicit_people grant mode, live active parent grant, and company_local subjects on iam.role_grant_people.
+CREATE OR REPLACE FUNCTION iam.trg_verify_role_grant_people()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_grant RECORD;
+  v_subject_origin TEXT;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM iam.role_grant_people cur
+    WHERE cur.id = NEW.id AND cur.superseded_by_id IS NULL AND cur.status = 'active'
+  ) THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT g.person_scope_mode, g.superseded_by_id, g.status
+  INTO v_grant
+  FROM iam.role_grants g
+  WHERE g.id = NEW.role_grant_id;
+
+  IF v_grant.person_scope_mode <> 'explicit_people' THEN
+    RAISE EXCEPTION 'EXPLICIT_PEOPLE_SCOPE_REQUIRED: role_grant % has person_scope_mode = % (expected explicit_people).',
+      NEW.role_grant_id, v_grant.person_scope_mode USING ERRCODE = '23514';
+  END IF;
+
+  IF v_grant.superseded_by_id IS NOT NULL OR v_grant.status <> 'active' THEN
+    RAISE EXCEPTION 'EXPLICIT_PEOPLE_GRANT_INACTIVE: role_grant % must be live and active to attach role_grant_people.',
+      NEW.role_grant_id USING ERRCODE = '23514';
+  END IF;
+
+  SELECT p.principal_origin INTO v_subject_origin
+  FROM iam.people p
+  WHERE p.id = NEW.subject_person_id;
+
+  IF v_subject_origin IS DISTINCT FROM 'company_local' THEN
+    RAISE EXCEPTION 'EXPLICIT_PEOPLE_ORIGIN_MISMATCH: role_grant_people subject_person_id must be company_local (got %).',
+      v_subject_origin USING ERRCODE = '23514';
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER trg_role_grant_people_verify
+  AFTER INSERT ON iam.role_grant_people
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_role_grant_people();
 
 -- 7. Core IAM functions: Eastern business day, signed token verification, unified org closure,
 --    set-theoretic InitPlan scope helpers, and central write guard.
@@ -1699,6 +1838,15 @@ AS $$
       ))
     )
     AND (
+      g.person_scope_mode <> 'explicit_people'
+      OR EXISTS (
+        SELECT 1 FROM iam.role_grant_people rgp
+        WHERE rgp.role_grant_id = g.id
+          AND rgp.superseded_by_id IS NULL
+          AND rgp.status = 'active'
+      )
+    )
+    AND (
       rv.is_nusear_internal
       OR (
         (
@@ -1726,27 +1874,6 @@ AS $$
     );
 $$;
 
--- Token-bound helper: does effective caller hold a right in an overlapping org (intersected on View-as)?
-CREATE OR REPLACE FUNCTION iam.has_right(p_right_id TEXT, p_data_date DATE DEFAULT NULL)
-RETURNS BOOLEAN
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-  WITH ctx AS (SELECT * FROM iam.session_context())
-  SELECT CASE
-    WHEN (SELECT actor_person_id FROM ctx) IS NULL THEN false
-    WHEN (SELECT view_as_person_id FROM ctx) IS NULL THEN
-      EXISTS (SELECT 1 FROM iam.person_effective_grants((SELECT actor_person_id FROM ctx), p_right_id, p_data_date))
-    ELSE
-      EXISTS (
-        SELECT 1
-        FROM iam.person_effective_grants((SELECT actor_person_id FROM ctx), p_right_id, p_data_date) a
-        JOIN iam.person_effective_grants((SELECT view_as_person_id FROM ctx), p_right_id, p_data_date) t
-          ON t.target_org_id = a.target_org_id
-      )
-  END;
-$$;
-
 -- Set-theoretic InitPlan helper 1: org IDs where caller sees ALL rows (intersected on View-as).
 CREATE OR REPLACE FUNCTION iam.effective_wide_org_ids(p_right_id TEXT, p_data_date DATE DEFAULT NULL)
 RETURNS UUID[]
@@ -1772,66 +1899,66 @@ AS $$
      OR a.target_org_id IN (SELECT target_org_id FROM target_orgs);
 $$;
 
--- Set-theoretic InitPlan helper 2: org IDs reachable under ANY person_scope_mode (intersected on View-as).
-CREATE OR REPLACE FUNCTION iam.effective_any_org_ids(p_right_id TEXT, p_data_date DATE DEFAULT NULL)
-RETURNS UUID[]
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-  WITH ctx AS (SELECT * FROM iam.session_context()),
-  actor_orgs AS (
-    SELECT DISTINCT g.target_org_id
-    FROM ctx
-    JOIN LATERAL iam.person_effective_grants(ctx.actor_person_id, p_right_id, p_data_date) g ON true
-    WHERE ctx.actor_person_id IS NOT NULL
-  ),
-  target_orgs AS (
-    SELECT DISTINCT g.target_org_id
-    FROM ctx
-    JOIN LATERAL iam.person_effective_grants(ctx.view_as_person_id, p_right_id, p_data_date) g ON true
-    WHERE ctx.view_as_person_id IS NOT NULL
-  )
-  SELECT COALESCE(pg_catalog.array_agg(a.target_org_id), ARRAY[]::uuid[])
-  FROM actor_orgs a
-  WHERE (SELECT view_as_person_id FROM ctx) IS NULL
-     OR a.target_org_id IN (SELECT target_org_id FROM target_orgs);
-$$;
-
--- Set-theoretic InitPlan helper 3: effective narrow (org_id, person_id) pairs for self mode under View-as intersection.
+-- Set-theoretic InitPlan helper 2: effective narrow (org_id, person_id) pairs for self and explicit_people
+-- modes under View-as intersection (each person's grants materialized once per statement).
 CREATE OR REPLACE FUNCTION iam.effective_narrow_pairs(p_right_id TEXT, p_data_date DATE DEFAULT NULL)
 RETURNS TABLE (org_id UUID, person_id UUID)
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
   WITH ctx AS (SELECT * FROM iam.session_context()),
-  a_wide AS (
-    SELECT DISTINCT g.target_org_id AS org_id
-    FROM ctx JOIN LATERAL iam.person_effective_grants(ctx.actor_person_id, p_right_id, p_data_date) g ON true
-    WHERE ctx.actor_person_id IS NOT NULL AND g.person_scope_mode = 'org_subtree'
+  a_grants AS MATERIALIZED (
+    SELECT g.grant_id, g.target_org_id AS org_id, g.person_scope_mode
+    FROM ctx
+    JOIN LATERAL iam.person_effective_grants(ctx.actor_person_id, p_right_id, p_data_date) g ON true
+    WHERE ctx.actor_person_id IS NOT NULL
   ),
-  a_self AS (
-    SELECT DISTINCT g.target_org_id AS org_id, ctx.actor_person_id AS person_id
-    FROM ctx JOIN LATERAL iam.person_effective_grants(ctx.actor_person_id, p_right_id, p_data_date) g ON true
-    WHERE ctx.actor_person_id IS NOT NULL AND g.person_scope_mode = 'self'
+  t_grants AS MATERIALIZED (
+    SELECT g.grant_id, g.target_org_id AS org_id, g.person_scope_mode
+    FROM ctx
+    JOIN LATERAL iam.person_effective_grants(ctx.view_as_person_id, p_right_id, p_data_date) g ON true
+    WHERE ctx.view_as_person_id IS NOT NULL
+  ),
+  a_wide AS (
+    SELECT DISTINCT org_id FROM a_grants WHERE person_scope_mode = 'org_subtree'
+  ),
+  a_narrow AS (
+    SELECT DISTINCT g.org_id, (SELECT actor_person_id FROM ctx) AS person_id
+    FROM a_grants g
+    WHERE g.person_scope_mode = 'self'
+    UNION
+    SELECT DISTINCT g.org_id, rgp.subject_person_id AS person_id
+    FROM a_grants g
+    JOIN iam.role_grant_people rgp
+      ON rgp.role_grant_id = g.grant_id
+     AND rgp.superseded_by_id IS NULL
+     AND rgp.status = 'active'
+    WHERE g.person_scope_mode = 'explicit_people'
   ),
   t_wide AS (
-    SELECT DISTINCT g.target_org_id AS org_id
-    FROM ctx JOIN LATERAL iam.person_effective_grants(ctx.view_as_person_id, p_right_id, p_data_date) g ON true
-    WHERE ctx.view_as_person_id IS NOT NULL AND g.person_scope_mode = 'org_subtree'
+    SELECT DISTINCT org_id FROM t_grants WHERE person_scope_mode = 'org_subtree'
   ),
-  t_self AS (
-    SELECT DISTINCT g.target_org_id AS org_id, ctx.view_as_person_id AS person_id
-    FROM ctx JOIN LATERAL iam.person_effective_grants(ctx.view_as_person_id, p_right_id, p_data_date) g ON true
-    WHERE ctx.view_as_person_id IS NOT NULL AND g.person_scope_mode = 'self'
+  t_narrow AS (
+    SELECT DISTINCT g.org_id, (SELECT view_as_person_id FROM ctx) AS person_id
+    FROM t_grants g
+    WHERE g.person_scope_mode = 'self'
+    UNION
+    SELECT DISTINCT g.org_id, rgp.subject_person_id AS person_id
+    FROM t_grants g
+    JOIN iam.role_grant_people rgp
+      ON rgp.role_grant_id = g.grant_id
+     AND rgp.superseded_by_id IS NULL
+     AND rgp.status = 'active'
+    WHERE g.person_scope_mode = 'explicit_people'
   )
   SELECT a.org_id, a.person_id
-  FROM a_self a
+  FROM a_narrow a
   WHERE (SELECT view_as_person_id FROM ctx) IS NULL
      OR a.org_id IN (SELECT org_id FROM t_wide)
-     OR EXISTS (SELECT 1 FROM t_self t WHERE t.org_id = a.org_id AND t.person_id = a.person_id)
+     OR EXISTS (SELECT 1 FROM t_narrow t WHERE t.org_id = a.org_id AND t.person_id = a.person_id)
   UNION
   SELECT t.org_id, t.person_id
-  FROM t_self t
+  FROM t_narrow t
   WHERE (SELECT view_as_person_id FROM ctx) IS NOT NULL
     AND t.org_id IN (SELECT org_id FROM a_wide);
 $$;
@@ -1843,6 +1970,29 @@ SET search_path = pg_catalog
 AS $$
   SELECT COALESCE(pg_catalog.array_agg(DISTINCT person_id), ARRAY[]::uuid[])
   FROM iam.effective_narrow_pairs(p_right_id, p_data_date);
+$$;
+
+-- Set-theoretic InitPlan helper 3: org IDs reachable under ANY person_scope_mode (strictly intersected on View-as).
+CREATE OR REPLACE FUNCTION iam.effective_any_org_ids(p_right_id TEXT, p_data_date DATE DEFAULT NULL)
+RETURNS UUID[]
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT COALESCE(pg_catalog.array_agg(DISTINCT u.org_id), ARRAY[]::uuid[])
+  FROM (
+    SELECT org_id FROM pg_catalog.unnest(iam.effective_wide_org_ids(p_right_id, p_data_date)) AS org_id
+    UNION
+    SELECT np.org_id FROM iam.effective_narrow_pairs(p_right_id, p_data_date) np
+  ) u;
+$$;
+
+-- Token-bound helper: does effective caller hold a right in any non-empty overlapping scope (intersected on View-as)?
+CREATE OR REPLACE FUNCTION iam.has_right(p_right_id TEXT, p_data_date DATE DEFAULT NULL)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT pg_catalog.cardinality(iam.effective_any_org_ids(p_right_id, p_data_date)) > 0;
 $$;
 
 -- Central write authorization guard called by every app_cmd.* function.
@@ -1892,6 +2042,18 @@ BEGIN
       AND (
         g.person_scope_mode = 'org_subtree'
         OR (g.person_scope_mode = 'self' AND p_subject_person_id = v_ctx.actor_person_id)
+        OR (
+          g.person_scope_mode = 'explicit_people'
+          AND p_subject_person_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM iam.role_grant_people rgp
+            WHERE rgp.role_grant_id = g.grant_id
+              AND rgp.subject_person_id = p_subject_person_id
+              AND rgp.superseded_by_id IS NULL
+              AND rgp.status = 'active'
+          )
+        )
       )
   ) INTO v_has_write;
 
@@ -1935,7 +2097,7 @@ BEGIN
     FOREACH v_tbl IN ARRAY ARRAY[
       'organization_versions', 'organization_edges', 'person_versions', 'person_auth_identities',
       'organization_memberships', 'agent_affiliations',
-      'role_versions', 'role_rights', 'role_grants', 'organization_tool_switches'
+      'role_versions', 'role_rights', 'role_grants', 'role_grant_people', 'organization_tool_switches'
     ] LOOP
       EXECUTE pg_catalog.format(
         'GRANT SELECT, UPDATE (superseded_by_id, superseded_journal_seq) ON iam.%I TO platform_versioner',
@@ -2006,8 +2168,9 @@ BEGIN
   END IF;
 
   -- platform_iam_sync: mirrors strictly Nusear people, entity tree, platform catalog, tool switches,
-  -- and Nusear/service signing keys (zero INSERT on agent_affiliations; zero privileges on person_auth_identities;
-  -- triggers enforce refusal of company_local people/memberships/grants, company custom roles, and company_local signing keys).
+  -- and Nusear/service signing keys (zero INSERT on agent_affiliations and role_grant_people; zero privileges on
+  -- person_auth_identities; triggers enforce refusal of company_local people/memberships/grants, role_grant_people,
+  -- company custom roles, and company_local signing keys).
   IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'platform_iam_sync') THEN
     GRANT USAGE ON SCHEMA platform, iam, iam_secret TO platform_iam_sync;
     GRANT SELECT, INSERT ON platform.audit_journal TO platform_iam_sync;

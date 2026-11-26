@@ -54,6 +54,7 @@
     "platform_iam_sync": {
       "iamTables": ["SELECT", "INSERT"],
       "agentAffiliations": ["SELECT"],
+      "roleGrantPeople": ["SELECT"],
       "personAuthIdentities": [],
       "signingKeys": ["SELECT", "INSERT", "UPDATE"],
       "signingKeyScopes": ["nusear_staff", "service"],

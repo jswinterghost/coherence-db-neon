@@ -491,18 +491,20 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   assert.equal((await reader.summary(iam.tokens.agentA)).available, false);
   assert.equal((await feed.houseSummary(iam.tokens.agentA)).available, false);
 
-  // 3. Retention Agent (Harbor agency wide row scope + zero dollar rights): sees Harbor only, ZERO dollars, ZERO Beacon rows
-  const retBook = await feed.agentBook(iam.tokens.retentionAgent);
+  // 3. Agency-wide zero-dollar reader (test-only custom role on Harbor): sees Harbor only, ZERO dollars, ZERO Beacon rows;
+  //    built-in Retention Agent (self-only) sees 0 rows of Robin Harbor's policies.
+  const retBook = await feed.agentBook(iam.tokens.harborZeroDollarReader);
   assert.equal(retBook.eligible, true);
   assert.equal(retBook.rows, 1);
   assert.equal(retBook.policies[0].entity, 'Harbor');
   assert.equal(retBook.policies[0].amount, null);
   assert.equal(retBook.policies[0].upline_amount, null);
   for (const canary of ['44444.44', '5555.56', '987654.32', 'Beacon', 'Pat Canary']) {
-    assert.ok(!retBook.csv.includes(canary), `Retention Agent CSV leaked canary ${canary}`);
+    assert.ok(!retBook.csv.includes(canary), `Harbor zero-dollar reader CSV leaked canary ${canary}`);
   }
+  assert.equal((await feed.agentBook(iam.tokens.retentionAgent)).eligible, false);
 
-  // 4. Agency Manager (Beacon subtree = Beacon + East Team): sees agency amount, ZERO upline_amount, ZERO Harbor, ZERO ledger, ZERO house bundle
+  // 4. Agency Manager (Beacon subtree = Beacon + East Team): sees agency amount, ZERO upline_amount, ZERO Harbor, ZERO ledger, ZERO house bundle, ZERO workshop (journal / review-drift)
   const mgrPeriods = await readCurrentPolicyPeriods(appPool, iam.tokens.agencyMgr);
   assert.equal(mgrPeriods.length, 3);
   assert.ok(mgrPeriods.every((r) => ['Beacon', 'East Team'].includes(r.entity) && r.amount !== null && r.upline_amount === null));
@@ -511,24 +513,28 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   assert.ok(mgrStmts.every((r) => r.account_kind === 'agency' && r.gross_comm === null));
   assert.deepEqual(await readCurrentCommissionLedger(appPool, iam.tokens.agencyMgr), []);
   assert.equal((await reader.summary(iam.tokens.agencyMgr)).available, false);
+  assert.deepEqual((await callHttp(iam.tokens.agencyMgr, `/api/coherence/acme/runs/${unsentRunId}/journal`)).json.entries, []);
+  assert.equal((await callHttp(iam.tokens.agencyMgr, '/api/coherence/acme/review-drift')).status, 403);
 
-  // 5. Investor: BoB with money, ZERO statements, ZERO ledger, ZERO house bundle
-  const invPeriods = await readCurrentPolicyPeriods(appPool, iam.tokens.investor);
-  assert.equal(invPeriods.length, 4);
-  assert.ok(invPeriods.some((r) => r.amount === '987654.32' && r.upline_amount === '111111.11'));
+  // 5. Investor: empty role (zero rights by default) -> ZERO BoB, ZERO statements, ZERO ledger, ZERO house bundle
+  assert.deepEqual(await readCurrentPolicyPeriods(appPool, iam.tokens.investor), []);
   assert.deepEqual(await readCurrentCommissionLedger(appPool, iam.tokens.investor), []);
   assert.deepEqual(await readEntityStatementLines(appPool, iam.tokens.investor), []);
   assert.equal((await reader.summary(iam.tokens.investor)).available, false);
 
-  // 7. Entity Manager: full BoB + Ledger + Entity Statements + Entity Manager bundle (can read sent 2026-10-15 bundle directly), 0 journal/decisions, 403 on all writes
+  // 7. Entity Manager: full BoB + Ledger + Entity Statements + Entity Manager bundle + full Coherence workshop (journal & review-drift included), 403 on all writes
   const emSum = await reader.summary(iam.tokens.entityMgr, { runId: sentRunId });
   assert.equal(emSum.available, true);
   assert.equal(emSum.sent, true);
   const emBobFile = await reader.file(iam.tokens.entityMgr, 'data/canonical_bob.csv', false, { runId: sentRunId });
   assert.ok(emBobFile.body.toString('utf8').includes('987654.32'));
   assert.equal((await readCurrentCommissionLedger(appPool, iam.tokens.entityMgr)).length > 0, true);
-  assert.deepEqual((await callHttp(iam.tokens.entityMgr, `/api/coherence/acme/runs/${unsentRunId}/journal`)).json.entries, []);
-  assert.equal((await callHttp(iam.tokens.entityMgr, '/api/coherence/acme/review-drift')).status, 403);
+  assert.ok((await callHttp(iam.tokens.entityMgr, `/api/coherence/acme/runs/${unsentRunId}/journal`)).json.entries.length > 0);
+  assert.equal((await callHttp(iam.tokens.entityMgr, '/api/coherence/acme/review-drift')).status, 200);
+  assert.equal((await callHttp(iam.tokens.entityMgr, '/api/coherence/acme/runs', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ commandKey: 'em-launch-deny', statementDate: '2026-12-01', engineVersionId }),
+  })).status, 403);
 
   // 8. Northstar Operator (wrong company): 0 rows everywhere, 403 on every write
   assert.equal(await findLatestPublishedRun(appPool, iam.tokens.wrongCoOperator), null);
@@ -959,13 +965,16 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
     `/api/coherence/acme/runs/${unsentRunId}?asOf=${asOfIso}`,
     `/api/coherence/acme/history/as-of?asOf=${asOfIso}`,
   ]) {
-    const denied = await callHttp(iam.tokens.companyAdmin, path);
-    assert.equal(denied.status, 403, `companyAdmin without journal.read must get 403 on ${path} (got ${denied.status}: ${denied.text})`);
-    assert.equal(denied.json?.code, 'FORBIDDEN', `companyAdmin ?asOf= error code must be FORBIDDEN on ${path}`);
+    const denied = await callHttp(iam.tokens.companyAdminRunsOnly, path);
+    assert.equal(denied.status, 403, `companyAdminRunsOnly without journal.read must get 403 on ${path} (got ${denied.status}: ${denied.text})`);
+    assert.equal(denied.json?.code, 'FORBIDDEN', `companyAdminRunsOnly ?asOf= error code must be FORBIDDEN on ${path}`);
   }
   const ownerAsOf = await callHttp(iam.tokens.owner, `/api/coherence/acme/runs?asOf=${asOfIso}`);
   assert.equal(ownerAsOf.status, 200, 'owner with journal.read must succeed on ?asOf=');
   assert.ok(ownerAsOf.json.runs.length >= 2);
+  const adminAsOf = await callHttp(iam.tokens.companyAdmin, `/api/coherence/acme/runs?asOf=${asOfIso}`);
+  assert.equal(adminAsOf.status, 200, 'administrator with full Coherence workshop must succeed on ?asOf=');
+  assert.ok(adminAsOf.json.runs.length >= 2);
 });
 
 test('Layer 7C [Worker app_cmd Path & Privileged-Write Deletion]: privileged write path is completely gone, worker/reconciler mandate workerToken, and platform_worker runs full pipeline strictly via app_cmd.* with non-NULL organization_id', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
@@ -1507,7 +1516,12 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     const adminGate = await withRequestTx(appPool, iam.tokens.companyAdmin, async (tx) => (
       await tx.query('SELECT authorized FROM app_views.coherence_journal_gate LIMIT 1')
     ).rows);
-    assert.deepEqual(adminGate, []);
+    assert.equal(adminGate.length, 1);
+    assert.equal(adminGate[0].authorized, true);
+    const runsOnlyGate = await withRequestTx(appPool, iam.tokens.companyAdminRunsOnly, async (tx) => (
+      await tx.query('SELECT authorized FROM app_views.coherence_journal_gate LIMIT 1')
+    ).rows);
+    assert.deepEqual(runsOnlyGate, []);
   });
 
   await t.test('Item 2 (9c + sibling commands): wrong store_kind is refused across data commands as operator/owner/worker and code command as owner', async () => {

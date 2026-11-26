@@ -78,6 +78,7 @@ export const IAM_VERSIONED_TABLES = Object.freeze([
   'role_versions',
   'role_rights',
   'role_grants',
+  'role_grant_people',
   'organization_tool_switches',
 ]);
 
@@ -458,6 +459,9 @@ export function validateCloudSqlConfig(config) {
   if (!hasExactPrivileges(roles.platform_iam_sync?.agentAffiliations, ['SELECT'])) {
     problems.push('roles.platform_iam_sync.agentAffiliations must be strictly ["SELECT"]');
   }
+  if (!hasExactPrivileges(roles.platform_iam_sync?.roleGrantPeople, ['SELECT'])) {
+    problems.push('roles.platform_iam_sync.roleGrantPeople must be strictly ["SELECT"]');
+  }
   if (!hasExactPrivileges(roles.platform_iam_sync?.personAuthIdentities, [])) {
     problems.push('roles.platform_iam_sync.personAuthIdentities must be strictly [] (zero access)');
   }
@@ -683,7 +687,7 @@ export async function verifyIamConfigInvariants(pool) {
     if (schema === 'iam_secret') return fq === 'iam_secret.signing_keys' ? new Set(['SELECT', 'INSERT', 'UPDATE']) : new Set();
     if (schema === 'iam') {
       if (fq === 'iam.person_auth_identities') return new Set();
-      if (fq === 'iam.agent_affiliations') return new Set(['SELECT']);
+      if (fq === 'iam.agent_affiliations' || fq === 'iam.role_grant_people') return new Set(['SELECT']);
       return new Set(['SELECT', 'INSERT']);
     }
     return new Set();
@@ -1468,11 +1472,14 @@ export async function verifyIamConfigInvariants(pool) {
     ['iam.role_versions', 'trg_00b_verify_sync'],
     ['iam.role_rights', 'trg_00b_verify_sync'],
     ['iam.role_grants', 'trg_00b_verify_sync'],
+    ['iam.role_grant_people', 'trg_00b_verify_sync'],
     ['iam.people', 'trg_people_verify_db_origin'],
     ['iam.database_context', 'trg_database_context_verify_db_origin'],
     ['iam.person_auth_identities', 'trg_person_auth_identities_verify_db_origin'],
     ['iam.role_grants', 'trg_role_grants_verify_scope'],
     ['iam.role_versions', 'trg_role_versions_verify_invariants'],
+    ['iam.role_rights', 'trg_role_rights_verify_invariants'],
+    ['iam.role_grant_people', 'trg_role_grant_people_verify'],
     ['iam_secret.signing_keys', 'trg_00_verify_signing_key_sync'],
   ]) {
     const tr = trigByKey.get(`${fq}:${trName}`);

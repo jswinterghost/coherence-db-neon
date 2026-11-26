@@ -20,6 +20,7 @@ import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstructi
 import { compareDbRuns, compareRunFolders } from '../src/compare/run-comparator.mjs';
 import { runMigrations } from '../src/db/migrate.mjs';
 import { createClient, createPool, resolveLocalUser } from '../src/db/pg-client.mjs';
+import { CANONICAL_TOOLS, seedIamCatalog } from '../src/iam/catalog.mjs';
 import {
   executeHistoryImport,
   loadImportManifestFile,
@@ -224,12 +225,11 @@ function mintProofToken({ keyId, secretBytes, environment = 'local', actorPerson
   return `${payload}|${sig}`;
 }
 
-async function seedProofIamOwner(pool, { companySlug, displayName, environment = 'local' }) {
+export async function seedProofIamOwner(pool, { companySlug, displayName, environment = 'local' }) {
   const keyId = `k_proof_${randomBytes(4).toString('hex')}`;
   const secretBytes = randomBytes(32);
   const rootOrgId = randomUUID();
   const companyOrgId = randomUUID();
-  const roleOwnerId = randomUUID();
   const ownerPersonId = randomUUID();
 
   const client = await pool.connect();
@@ -269,82 +269,18 @@ async function seedProofIamOwner(pool, { companySlug, displayName, environment =
        VALUES ($1, $2, $3, 'nusear_staff', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
       [keyId, secretBytes, environment],
     );
-    await client.query(
-      "INSERT INTO iam.tools (id, display_name, is_nusear_only, is_customer_switchable, journal_seq) VALUES ('coherence','Coherence',false,true,$1),('platform_audit','Platform Audit',false,true,$1)",
-      [seq],
-    );
-    await client.query(
-      `INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq)
-       VALUES ($1,$2,'coherence','on','active',$4),($3,$2,'platform_audit','on','active',$4)`,
-      [randomUUID(), companyOrgId, randomUUID(), seq],
-    );
 
-    const ownerRights = [
-      'act:coherence.owner.init_company',
-      'act:coherence.owner.register_engine',
-      'act:coherence.owner.import_history',
-      'act:coherence.owner.record_baseline',
-      'act:coherence.owner.record_statement_batch',
-      'act:coherence.owner.carry_sent',
-      'act:coherence.owner.carry_approvals',
-      'act:coherence.owner.carry_decisions',
-      'act:coherence.owner.confirm_emit',
-      'act:coherence.owner.abandon_run',
-      'act:coherence.inputs.publish',
-      'act:coherence.approvals.register',
-      'act:coherence.files.register',
-      'act:coherence.overlays.record',
-      'act:coherence.checks.record',
-      'act:coherence.emit.materialize',
-      'act:coherence.run.launch',
-      'act:coherence.runs.read',
-      'act:coherence.inputs.read',
-      'act:coherence.outputs.read',
-      'act:coherence.decisions.read',
-      'act:coherence.checks.read',
-      'act:coherence.journal.read',
-      'act:coherence.bob.read',
-      'act:coherence.statements.read',
-      'act:coherence.upline.read',
-      'act:coherence.ledger.read',
-      'act:coherence.unpublished.read',
-      'act:platform.audit_journal.read',
-    ];
-    const ownerColumnRights = [
-      ['col:coherence.statement_cash', 'coherence', 'money_statement', 'coherence', 'bob_policy_financials', 'amount', 'View agency statement cash'],
-      ['col:coherence.upline_cash', 'coherence', 'money_upline', 'coherence', 'bob_policy_financials', 'upline_amount', 'View upline and gross cash'],
-      ['col:coherence.member_phi', 'coherence', 'member_phi', 'coherence', 'bob_policies', 'mbi', 'View member PHI'],
-      ['col:coherence.member_contact', 'coherence', 'member_contact', 'coherence', 'bob_policies', 'phone', 'View member contact details'],
-      ['col:platform.audit_journal.nusear_actor', 'platform_audit', 'platform_internal', 'platform', 'audit_journal', 'actor_person_id', 'View Nusear actor identity'],
-    ];
-    for (const rightId of ownerRights) {
-      const toolId = rightId.startsWith('act:platform.') ? 'platform_audit' : 'coherence';
+    const { rolesBySlug } = await seedIamCatalog(client, { environment, journalSeq: seq });
+    const roleOwnerId = rolesBySlug.get('nusear_owner');
+
+    for (const tool of CANONICAL_TOOLS) {
       await client.query(
-        `INSERT INTO iam.rights (id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power, description, journal_seq)
-         VALUES ($1,'action',$2,'both','ordinary',true,$1,$3)`,
-        [rightId, toolId, seq],
+        `INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq)
+         VALUES ($1,$2,$3,'on','active',$4)`,
+        [randomUUID(), companyOrgId, tool.id, seq],
       );
     }
-    for (const [rightId, toolId, sensClass, tgtSchema, tgtTable, tgtCol, desc] of ownerColumnRights) {
-      await client.query(
-        `INSERT INTO iam.rights (
-           id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power,
-           target_schema, target_table, target_column, description, journal_seq
-         ) VALUES ($1,'column',$2,'both',$3,true,$4,$5,$6,$7,$8)`,
-        [rightId, toolId, sensClass, tgtSchema, tgtTable, tgtCol, desc, seq],
-      );
-    }
-    await client.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleOwnerId, 'nusear_owner', seq]);
-    await client.query(
-      "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Nusear Owner',true,true,true,'active',$3)",
-      [randomUUID(), roleOwnerId, seq],
-    );
-    for (const rightId of [...ownerRights, ...ownerColumnRights.map((r) => r[0])]) {
-      await client.query(
-        "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-        [randomUUID(), roleOwnerId, rightId, seq],
-      );
-    }
+
     await client.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','nusear_staff',$2)", [ownerPersonId, seq]);
     await client.query(
       "INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'nusear_staff','Proof Importer','Proof Importer','proof.importer@nusear.example','active',$3)",

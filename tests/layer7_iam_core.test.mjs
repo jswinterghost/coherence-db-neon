@@ -389,7 +389,7 @@ test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 
   const iamTables = tblRes.rows.filter((r) => r.table_schema === 'iam');
   const secretTables = tblRes.rows.filter((r) => r.table_schema === 'iam_secret');
   const platformTables = tblRes.rows.filter((r) => r.table_schema === 'platform');
-  assert.equal(iamTables.length, 17, `expected 17 iam base tables, found ${iamTables.length}`);
+  assert.equal(iamTables.length, 18, `expected 18 iam base tables, found ${iamTables.length}`);
   assert.ok(secretTables.some((r) => r.table_name === 'signing_keys'), 'expected iam_secret.signing_keys');
   assert.ok(platformTables.some((r) => r.table_name === 'audit_journal'), 'expected platform.audit_journal');
 
@@ -675,6 +675,22 @@ test('Layer 7 [Immutability & Supersession]: UPDATE, DELETE, and TRUNCATE fail o
     'iam tables must refuse attaching rows to already-committed journal_seq',
   );
 
+  // Seed one live explicit_people grant + iam.role_grant_people row so FOR EACH ROW immutability
+  // checks run non-vacuously on iam.role_grant_people in both normal and replica mode.
+  await inSerializableTx(db.pool, async (c) => {
+    const j = await appendAuditEntry(c, { environment: 'local', commandKind: 'iam.seed_imm_rgp', commandKey: 'seed-imm-rgp-1' });
+    const expGrantId = randomUUID();
+    await c.query(
+      `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
+       VALUES ($1,$2,$3,$4,true,'explicit_people','[2020-01-01,)'::daterange,'active',$5)`,
+      [expGrantId, ids.teamManager, ids.roleExplicitReader, ids.beaconOrg, j.seq],
+    );
+    await c.query(
+      "INSERT INTO iam.role_grant_people (id, role_grant_id, subject_person_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
+      [randomUUID(), expGrantId, ids.agentA, j.seq],
+    );
+  });
+
   // 2. UPDATE, DELETE, and TRUNCATE fail with SQLSTATE 55000 on EVERY iam table and platform.audit_journal (normal + replica mode)
   const iamTablesRes = await db.pool.query(
     `SELECT table_schema, table_name
@@ -682,7 +698,7 @@ test('Layer 7 [Immutability & Supersession]: UPDATE, DELETE, and TRUNCATE fail o
      WHERE table_schema IN ('iam', 'platform') AND table_type = 'BASE TABLE'
      ORDER BY table_schema, table_name`,
   );
-  assert.equal(iamTablesRes.rows.length, 18);
+  assert.equal(iamTablesRes.rows.length, 19);
 
   for (const replicaMode of [false, true]) {
     for (const row of iamTablesRes.rows) {

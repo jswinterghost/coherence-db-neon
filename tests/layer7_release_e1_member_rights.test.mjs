@@ -1568,17 +1568,23 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
       const curBob = await readCurrentPolicyPeriods(appPool, tok);
       assert.ok(curBob.length > 0 && curBob.every((r) => r.run_id === sentRunId), `${label}: readCurrentPolicyPeriods must stay on sentRunId`);
       const stmts = await readEntityStatementLines(appPool, tok);
-      assert.ok(stmts.length > 0 && stmts.every((r) => toIsoDate(r.statement_date) <= '2026-10-15'), `${label}: readEntityStatementLines must see sent dates only (got ${JSON.stringify(stmts.map((r) => toIsoDate(r.statement_date)))})`);
+      if (label === 'agentA') {
+        assert.deepEqual(stmts, [], 'agentA (built-in selling_agent) sees 0 Coherence statement lines');
+      } else {
+        assert.ok(stmts.length > 0 && stmts.every((r) => toIsoDate(r.statement_date) <= '2026-10-15'), `${label}: readEntityStatementLines must see sent dates only (got ${JSON.stringify(stmts.map((r) => toIsoDate(r.statement_date)))})`);
+      }
       assert.equal((await reader.summary(tok)).available, false, `${label}: entity bundle reader.summary must stay unavailable`);
     }
+    const stmtCashSentLines = await readEntityStatementLines(appPool, iam.tokenFor(personas.stmtCashNoPhi));
+    assert.ok(stmtCashSentLines.length > 0 && stmtCashSentLines.every((r) => toIsoDate(r.statement_date) <= '2026-10-15'), 'stmtCashNoPhi: readEntityStatementLines must see sent dates only');
     const emSentSum = await reader.summary(iam.tokenFor(personas.emSentOnlyOutputs));
     assert.equal(emSentSum.available, true);
     assert.equal(emSentSum.runId, sentBundleRunId, 'sent-only EM must open sent bundle run only');
     assert.equal(emSentSum.sent, true);
 
-    // 6. Default Company Administrator holds the customer workshop (unpublished.read included) and sees EVERY run,
-    //    unfinished included, plus snapshot input versions and unsent run.json/company_manifest.json (while staying
-    //    out of Nusear-only decisions/checks/journal and emits/*).
+    // 6. Default Company Administrator holds the whole Coherence workshop (unpublished.read, runs, inputs,
+    //    outputs, decisions, checks, and journal) and sees EVERY run, unfinished included, plus snapshot input
+    //    versions and unsent run.json/company_manifest.json (while staying out of revenue-gated emits/* outputs).
     const adminRuns = new Set((await qApp(iam.tokens.companyAdmin, 'SELECT id FROM app_views.coherence_runs')).rows.map((r) => r.id));
     for (const id of allRunIds) {
       assert.equal(adminRuns.has(id), true, `default companyAdmin must see run ${id} (unfinished included)`);
@@ -1910,7 +1916,7 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
     for (const [label, tok] of [
       ['agencyMgr', iam.tokens.agencyMgr],
       ['agentA', iam.tokens.agentA],
-      ['investor', iam.tokens.investor],
+      ['moneyOnlyNoMember', iam.tokenFor(personas.moneyOnlyNoMember)],
       ['stmtCashNoPhi', iam.tokenFor(personas.stmtCashNoPhi)],
       ['emSentOnlyOutputs', iam.tokenFor(personas.emSentOnlyOutputs)],
     ]) {
@@ -1921,6 +1927,8 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
       const unsentIds = (await qApp(tok, 'SELECT app_views._read_published_emit_attempt_ids(false) AS ids')).rows[0].ids;
       assert.deepEqual(unsentIds, [], `finished-goods reader ${label} without unpublished.read must get 0 unsent attempt IDs`);
     }
+    // Investor holds no rights by default -> 0 rows in coherence_published_runs.
+    assert.deepEqual((await qApp(iam.tokens.investor, 'SELECT id FROM app_views.coherence_published_runs')).rows, []);
   });
 
   await t.test('Fix3 Item 2a: app_views.coherence_journal.body requires member_phi (and full entity finance for carry_sent)', async () => {
