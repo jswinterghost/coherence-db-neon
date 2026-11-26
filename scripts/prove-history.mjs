@@ -309,6 +309,12 @@ async function seedProofIamOwner(pool, { companySlug, displayName, environment =
       'act:coherence.ledger.read',
       'act:coherence.unpublished.read',
     ];
+    const ownerColumnRights = [
+      ['col:coherence.statement_cash', 'money_statement', 'coherence', 'bob_policy_financials', 'amount', 'View agency statement cash'],
+      ['col:coherence.upline_cash', 'money_upline', 'coherence', 'bob_policy_financials', 'upline_amount', 'View upline and gross cash'],
+      ['col:coherence.member_phi', 'member_phi', 'coherence', 'bob_policies', 'mbi', 'View member PHI'],
+      ['col:coherence.member_contact', 'member_contact', 'coherence', 'bob_policies', 'phone', 'View member contact details'],
+    ];
     for (const rightId of ownerRights) {
       await client.query(
         `INSERT INTO iam.rights (id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power, description, journal_seq)
@@ -316,12 +322,21 @@ async function seedProofIamOwner(pool, { companySlug, displayName, environment =
         [rightId, seq],
       );
     }
+    for (const [rightId, sensClass, tgtSchema, tgtTable, tgtCol, desc] of ownerColumnRights) {
+      await client.query(
+        `INSERT INTO iam.rights (
+           id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power,
+           target_schema, target_table, target_column, description, journal_seq
+         ) VALUES ($1,'column','coherence','both',$2,true,$3,$4,$5,$6,$7)`,
+        [rightId, sensClass, tgtSchema, tgtTable, tgtCol, desc, seq],
+      );
+    }
     await client.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleOwnerId, 'nusear_owner', seq]);
     await client.query(
       "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Nusear Owner',true,true,true,'active',$3)",
       [randomUUID(), roleOwnerId, seq],
     );
-    for (const rightId of ownerRights) {
+    for (const rightId of [...ownerRights, ...ownerColumnRights.map((r) => r[0])]) {
       await client.query(
         "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
         [randomUUID(), roleOwnerId, rightId, seq],

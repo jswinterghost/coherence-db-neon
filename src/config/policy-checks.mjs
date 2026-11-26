@@ -92,14 +92,19 @@ export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
   'iam.assert_can_write(text, uuid, uuid, date)',
   'app_views.coherence_effective_statement_batches(uuid)',
   'app_views.coherence_run_stage(uuid, bigint)',
-  'app_views._read_tenant_right(text)',
+  'app_views.coherence_run_stages()',
   'app_views._read_has_full_tenant_right(text)',
+  'app_views._read_workshop_right(text)',
   'app_views._read_bob_wide_orgs()',
   'app_views._read_bob_narrow_pairs()',
   'app_views._read_agency_statement_wide_orgs()',
   'app_views._read_agency_statement_narrow_pairs()',
   'app_views._read_statement_cash_wide_orgs()',
   'app_views._read_statement_cash_narrow_pairs()',
+  'app_views._read_member_phi_wide_orgs()',
+  'app_views._read_member_phi_narrow_pairs()',
+  'app_views._read_member_contact_wide_orgs()',
+  'app_views._read_member_contact_narrow_pairs()',
   'app_views._read_unpublished_wide_orgs()',
   'app_views._read_unpublished_narrow_pairs()',
   'app_views._read_upline_cash_orgs()',
@@ -113,7 +118,6 @@ export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
   'app_views._read_can_see_unsent_batch_meta()',
   'app_views._read_published_emit_attempts()',
   'app_views._read_published_emit_attempt_ids(boolean)',
-  'app_views._read_current_finished_attempt(uuid, text)',
 ]);
 
 export const PLATFORM_APP_CMD_WHITELIST = Object.freeze([
@@ -1043,9 +1047,10 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
 
-  // Audit coherence.backfill_iam_foreign_keys, internal coherence._resolve_* / _cmd_*, and app_views._read_*.
+  // Audit coherence.backfill_iam_foreign_keys, internal coherence._resolve_* / _cmd_* / _ro_run_stage,
+  // narrow helper views (v_run_latest_journal_seq, v_current_finished_attempts), and app_views._read_* / run_stage*.
   const allAuditPrincipals = ['public', ...PLATFORM_ROLES, ...existingRetiredRoles];
-  const [bfFnRes, internalCohFnRes, tipViewRes] = await Promise.all([
+  const [bfFnRes, internalCohFnRes, internalViewRes] = await Promise.all([
     pool.query(
       `SELECT p.oid, p.prosecdef, r.rolname AS owner_name, p.proconfig
        FROM pg_catalog.pg_proc p
@@ -1062,15 +1067,21 @@ export async function verifyIamConfigInvariants(pool) {
        WHERE (n.nspname = 'coherence' AND (
                 p.proname LIKE '\\_resolve\\_%' ESCAPE '\\'
                 OR p.proname LIKE '\\_cmd\\_%' ESCAPE '\\'
+                OR p.proname = '_ro_run_stage'
               ))
-          OR (n.nspname = 'app_views' AND p.proname LIKE '\\_read\\_%' ESCAPE '\\')`,
+          OR (n.nspname = 'app_views' AND (
+                p.proname LIKE '\\_read\\_%' ESCAPE '\\'
+                OR p.proname IN ('coherence_run_stage', 'coherence_run_stages')
+              ))`,
     ),
     pool.query(
-      `SELECT c.oid, r.rolname AS owner_name, c.reloptions
+      `SELECT c.oid, c.relname AS view_name, r.rolname AS owner_name, c.reloptions
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
-       WHERE n.nspname = 'coherence' AND c.relname = 'v_run_latest_journal_seq' AND c.relkind = 'v'`,
+       WHERE n.nspname = 'coherence'
+         AND c.relname IN ('v_run_latest_journal_seq', 'v_current_finished_attempts')
+         AND c.relkind = 'v'`,
     ),
   ]);
 
@@ -1119,19 +1130,27 @@ export async function verifyIamConfigInvariants(pool) {
   const resolveFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'coherence' && f.proname.startsWith('_resolve_'));
   const cmdFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'coherence' && f.proname.startsWith('_cmd_'));
   const readFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'app_views' && f.proname.startsWith('_read_'));
+  const roStageFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'coherence' && f.proname === '_ro_run_stage');
+  const appStageFns = internalCohFnRes.rows.filter((f) => f.schema_name === 'app_views' && (f.proname === 'coherence_run_stage' || f.proname === 'coherence_run_stages'));
   if (resolveFns.length === 0) problems.push('Expected internal coherence._resolve_* helper functions were not found in pg_proc');
   if (cmdFns.length === 0) problems.push('Expected internal coherence._cmd_* helper functions were not found in pg_proc');
   if (readFns.length === 0) problems.push('Expected shared app_views._read_* rights helper functions were not found in pg_proc');
+  if (roStageFns.length !== 1) problems.push('Expected narrow definer helper function coherence._ro_run_stage is missing');
+  if (appStageFns.length !== 2) problems.push('Expected app_views.coherence_run_stage and app_views.coherence_run_stages wrapper functions');
 
   const readWideOnlyFns = new Set([
-    '_read_tenant_right',
     '_read_has_full_tenant_right',
+    '_read_workshop_right',
     '_read_bob_wide_orgs',
     '_read_bob_narrow_pairs',
     '_read_agency_statement_wide_orgs',
     '_read_agency_statement_narrow_pairs',
     '_read_statement_cash_wide_orgs',
     '_read_statement_cash_narrow_pairs',
+    '_read_member_phi_wide_orgs',
+    '_read_member_phi_narrow_pairs',
+    '_read_member_contact_wide_orgs',
+    '_read_member_contact_narrow_pairs',
     '_read_unpublished_wide_orgs',
     '_read_unpublished_narrow_pairs',
     '_read_upline_cash_orgs',
@@ -1140,16 +1159,28 @@ export async function verifyIamConfigInvariants(pool) {
     '_read_reconciliation_orgs',
     '_read_has_full_entity_finance',
   ]);
+  const readMetaFns = new Set([
+    '_read_has_run_meta_access',
+    '_read_can_see_unsent_run_meta',
+    '_read_has_statement_batch_access',
+    '_read_can_see_unsent_batch_meta',
+    '_read_published_emit_attempts',
+    '_read_published_emit_attempt_ids',
+  ]);
   for (const ifn of internalCohFnRes.rows) {
     const isResolve = ifn.schema_name === 'coherence' && ifn.proname.startsWith('_resolve_');
+    const isRoStage = ifn.schema_name === 'coherence' && ifn.proname === '_ro_run_stage';
     const isRead = ifn.schema_name === 'app_views' && ifn.proname.startsWith('_read_');
-    const expectedOwner = isResolve ? 'platform_versioner' : (isRead ? 'platform_view_owner' : 'platform_writer');
+    const isAppStage = ifn.schema_name === 'app_views' && !isRead;
+    const expectedOwner = isResolve ? 'platform_versioner' : (isRoStage ? 'platform_readonly' : ((isRead || isAppStage) ? 'platform_view_owner' : 'platform_writer'));
     const allowedRoles = new Set(
       isResolve
         ? ['platform_versioner', 'platform_writer']
-        : (isRead
-          ? ['platform_view_owner', 'platform_app', 'platform_readonly']
-          : ['platform_writer']),
+        : (isRoStage
+          ? ['platform_readonly', 'platform_view_owner']
+          : ((isRead || isAppStage)
+            ? ['platform_view_owner', 'platform_app', 'platform_readonly']
+            : ['platform_writer'])),
     );
     const fqFn = `${ifn.schema_name}.${ifn.proname}`;
     const cfg = Array.isArray(ifn.proconfig) ? ifn.proconfig : [];
@@ -1159,11 +1190,25 @@ export async function verifyIamConfigInvariants(pool) {
     if (ifn.owner_name !== expectedOwner) {
       problems.push(`Internal function ${fqFn} must be owned by ${expectedOwner} (got ${ifn.owner_name})`);
     }
-    if (isRead && !ifn.prosecdef) {
-      problems.push(`Shared read helper ${fqFn} must be SECURITY DEFINER owned by platform_view_owner`);
+    if ((isRead || isRoStage || isAppStage) && !ifn.prosecdef) {
+      problems.push(`Helper ${fqFn} must be SECURITY DEFINER owned by ${expectedOwner}`);
+    }
+    if (isRead && !readWideOnlyFns.has(ifn.proname) && !readMetaFns.has(ifn.proname)) {
+      problems.push(`Unclassified shared read helper ${fqFn} must be listed in readWideOnlyFns or readMetaFns`);
     }
     if (isRead && readWideOnlyFns.has(ifn.proname) && forbiddenKeyedAnyRe.test(ifn.fn_def || '')) {
       problems.push(`Wide/scoped read helper ${fqFn} must not use iam.effective_any_org_ids()`);
+    }
+    if (isRoStage && /\b(app_views|iam)\./i.test(ifn.fn_def || '')) {
+      problems.push('coherence._ro_run_stage must not reference app_views.* or iam.* (must delegate purely to coherence.run_stage)');
+    }
+    if (isAppStage) {
+      if (!/\bcoherence\._ro_run_stage\s*\(/.test(ifn.fn_def || '') || /\bcoherence\.run_stage\s*\(/.test(ifn.fn_def || '')) {
+        problems.push(`${fqFn} must delegate to coherence._ro_run_stage (never coherence.run_stage directly)`);
+      }
+      if (!/\bapp_views\._read_workshop_right\s*\(/.test(ifn.fn_def || '')) {
+        problems.push(`${fqFn} must enforce app_views._read_workshop_right`);
+      }
     }
     const holders = execByFnOid.get(Number(ifn.oid)) || new Set();
     for (const reqRole of allowedRoles) {
@@ -1178,35 +1223,43 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
 
-  // Narrow definer helper view coherence.v_run_latest_journal_seq must be owned by platform_readonly,
-  // carry security_barrier=true, and grant SELECT strictly to platform_readonly and platform_view_owner.
-  if (tipViewRes.rows.length !== 1) {
-    problems.push('Expected narrow definer helper view coherence.v_run_latest_journal_seq is missing');
-  } else {
-    const tv = tipViewRes.rows[0];
-    const opts = Array.isArray(tv.reloptions) ? tv.reloptions : [];
-    if (tv.owner_name !== 'platform_readonly') {
-      problems.push(`View coherence.v_run_latest_journal_seq must be owned by platform_readonly (got ${tv.owner_name})`);
+  // Narrow helper views coherence.v_run_latest_journal_seq (platform_readonly) and
+  // coherence.v_current_finished_attempts (platform_view_owner) must set security_barrier=true.
+  const internalViewByName = new Map(internalViewRes.rows.map((r) => [r.view_name, r]));
+  for (const [viewName, expectedOwner, restrictSelect] of [
+    ['v_run_latest_journal_seq', 'platform_readonly', true],
+    ['v_current_finished_attempts', 'platform_view_owner', true],
+  ]) {
+    const iv = internalViewByName.get(viewName);
+    if (!iv) {
+      problems.push(`Expected narrow helper view coherence.${viewName} is missing`);
+      continue;
+    }
+    const opts = Array.isArray(iv.reloptions) ? iv.reloptions : [];
+    if (iv.owner_name !== expectedOwner) {
+      problems.push(`View coherence.${viewName} must be owned by ${expectedOwner} (got ${iv.owner_name})`);
     }
     if (!opts.includes('security_barrier=true')) {
-      problems.push(`View coherence.v_run_latest_journal_seq must set security_barrier=true (reloptions: ${JSON.stringify(opts)})`);
+      problems.push(`View coherence.${viewName} must set security_barrier=true (reloptions: ${JSON.stringify(opts)})`);
     }
     if (opts.includes('security_invoker=true')) {
-      problems.push('View coherence.v_run_latest_journal_seq must not set security_invoker=true');
+      problems.push(`View coherence.${viewName} must not set security_invoker=true`);
     }
-    const tipPrivRes = await pool.query(
-      `SELECT p.principal
-       FROM pg_catalog.unnest($1::text[]) AS p(principal)
-       WHERE pg_catalog.has_table_privilege(p.principal, $2::oid, 'SELECT')`,
-      [allAuditPrincipals, tv.oid],
-    );
-    const tipHolders = new Set(tipPrivRes.rows.map((r) => r.principal));
-    const allowedTipReaders = new Set(['platform_readonly', 'platform_view_owner']);
-    for (const principal of allAuditPrincipals) {
-      if (allowedTipReaders.has(principal)) {
-        if (!tipHolders.has(principal)) problems.push(`${principal} is missing SELECT on coherence.v_run_latest_journal_seq`);
-      } else if (tipHolders.has(principal)) {
-        problems.push(`${principal} holds forbidden SELECT privilege on coherence.v_run_latest_journal_seq`);
+    if (restrictSelect) {
+      const tipPrivRes = await pool.query(
+        `SELECT p.principal
+         FROM pg_catalog.unnest($1::text[]) AS p(principal)
+         WHERE pg_catalog.has_table_privilege(p.principal, $2::oid, 'SELECT')`,
+        [allAuditPrincipals, iv.oid],
+      );
+      const tipHolders = new Set(tipPrivRes.rows.map((r) => r.principal));
+      const allowedTipReaders = new Set(['platform_readonly', 'platform_view_owner']);
+      for (const principal of allAuditPrincipals) {
+        if (allowedTipReaders.has(principal)) {
+          if (!tipHolders.has(principal)) problems.push(`${principal} is missing SELECT on coherence.${viewName}`);
+        } else if (tipHolders.has(principal)) {
+          problems.push(`${principal} holds forbidden SELECT privilege on coherence.${viewName}`);
+        }
       }
     }
   }

@@ -584,15 +584,6 @@ CREATE POLICY audit_journal_iam_read ON platform.audit_journal
 -- All functions live in app_views.*, are SECURITY DEFINER owned by NOBYPASSRLS platform_view_owner
 -- (so FORCE RLS still applies and platform_app keeps zero privileges on schema coherence),
 -- and pin SET search_path = pg_catalog.
-CREATE OR REPLACE FUNCTION app_views._read_tenant_right(p_right_id TEXT)
-RETURNS BOOLEAN
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-  SELECT (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true)
-    = ANY(((SELECT iam.effective_wide_org_ids(p_right_id)))::uuid[]);
-$$;
-
 CREATE OR REPLACE FUNCTION app_views._read_has_full_tenant_right(p_right_id TEXT)
 RETURNS BOOLEAN
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -617,6 +608,17 @@ AS $$
   SELECT pg_catalog.cardinality(t.orgs) > 0
     AND t.orgs <@ ((SELECT iam.effective_wide_org_ids(p_right_id)))::uuid[]
   FROM tenant_orgs t;
+$$;
+
+-- Single workshop gate: Coherence's run workshop (runs, inputs, decisions, checks, journal, and unsent
+-- outputs) is all-or-nothing, requiring both the workshop right and full-tenant unpublished.read.
+CREATE OR REPLACE FUNCTION app_views._read_workshop_right(p_right_id TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT app_views._read_has_full_tenant_right(p_right_id)
+    AND app_views._read_has_full_tenant_right('act:coherence.unpublished.read');
 $$;
 
 -- Uncorrelated wide-org array and narrow (org_id, person_id) set helpers per data kind so
@@ -668,6 +670,40 @@ LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
   SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.statement_cash');
+$$;
+
+-- Member PHI (mbi, member, dob, and member-identifying record_id / reversal_of / corrects_record_id).
+CREATE OR REPLACE FUNCTION app_views._read_member_phi_wide_orgs()
+RETURNS UUID[]
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT iam.effective_wide_org_ids('col:coherence.member_phi');
+$$;
+
+CREATE OR REPLACE FUNCTION app_views._read_member_phi_narrow_pairs()
+RETURNS TABLE (org_id UUID, person_id UUID)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.member_phi');
+$$;
+
+-- Member contact details (phone, email, address, county).
+CREATE OR REPLACE FUNCTION app_views._read_member_contact_wide_orgs()
+RETURNS UUID[]
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT iam.effective_wide_org_ids('col:coherence.member_contact');
+$$;
+
+CREATE OR REPLACE FUNCTION app_views._read_member_contact_narrow_pairs()
+RETURNS TABLE (org_id UUID, person_id UUID)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT org_id, person_id FROM iam.effective_narrow_pairs('col:coherence.member_contact');
 $$;
 
 -- Unsent runs (wide orgs for all tables + narrow pairs for BoB and agency statement lines).
@@ -780,7 +816,8 @@ AS $$
   FROM s;
 $$;
 
--- Full Entity Manager / Emit outputs & bundle access (all six tenant-wide finance rights).
+-- Full Entity Manager / Emit outputs & bundle access (all eight tenant-wide rights:
+-- BoB, ledger, statements, upline, statement cash, upline cash, member PHI, and member contact).
 CREATE OR REPLACE FUNCTION app_views._read_has_full_entity_finance()
 RETURNS BOOLEAN
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -791,17 +828,19 @@ AS $$
     AND app_views._read_has_full_tenant_right('act:coherence.statements.read')
     AND app_views._read_has_full_tenant_right('act:coherence.upline.read')
     AND app_views._read_has_full_tenant_right('col:coherence.statement_cash')
-    AND app_views._read_has_full_tenant_right('col:coherence.upline_cash');
+    AND app_views._read_has_full_tenant_right('col:coherence.upline_cash')
+    AND app_views._read_has_full_tenant_right('col:coherence.member_phi')
+    AND app_views._read_has_full_tenant_right('col:coherence.member_contact');
 $$;
 
--- Run/metadata read rights (5-right union) and overlapping unsent-run visibility (short-circuiting).
+-- Run/metadata read rights (4 finished-goods rights + workshop runs.read) and overlapping unsent-run visibility (short-circuiting).
 CREATE OR REPLACE FUNCTION app_views._read_has_run_meta_access()
 RETURNS BOOLEAN
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
   SELECT pg_catalog.cardinality(iam.effective_any_org_ids('act:coherence.bob.read')) > 0
-    OR pg_catalog.cardinality(iam.effective_any_org_ids('act:coherence.runs.read')) > 0
+    OR app_views._read_workshop_right('act:coherence.runs.read')
     OR pg_catalog.cardinality(iam.effective_any_org_ids('act:coherence.statements.read')) > 0
     OR pg_catalog.cardinality(iam.effective_any_org_ids('act:coherence.upline.read')) > 0
     OR pg_catalog.cardinality(iam.effective_any_org_ids('act:coherence.ledger.read')) > 0;
@@ -818,7 +857,7 @@ AS $$
   SELECT pg_catalog.cardinality(u.orgs) > 0
     AND (
       u.orgs && iam.effective_any_org_ids('act:coherence.bob.read')
-      OR u.orgs && iam.effective_any_org_ids('act:coherence.runs.read')
+      OR app_views._read_workshop_right('act:coherence.runs.read')
       OR u.orgs && iam.effective_any_org_ids('act:coherence.statements.read')
       OR u.orgs && iam.effective_any_org_ids('act:coherence.upline.read')
       OR u.orgs && iam.effective_any_org_ids('act:coherence.ledger.read')
@@ -854,6 +893,31 @@ AS $$
   FROM unpub u;
 $$;
 
+-- Single shared finished, unsuperseded attempt selector across app_views.*
+-- (owned by NOBYPASSRLS platform_view_owner so FORCE RLS on step_attempt_events still applies).
+CREATE OR REPLACE VIEW coherence.v_current_finished_attempts
+WITH (security_barrier = true) AS
+SELECT DISTINCT ON (e.run_id, e.step)
+  e.id AS attempt_event_id,
+  e.run_id,
+  e.step,
+  e.attempt_no,
+  e.journal_seq
+FROM coherence.step_attempt_events e
+WHERE e.event_kind = 'finished'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM coherence.step_attempt_events sup
+    WHERE sup.run_id = e.run_id
+      AND sup.step = e.step
+      AND sup.attempt_no = e.attempt_no
+      AND sup.event_kind = 'superseded'
+  )
+ORDER BY e.run_id, e.step, e.attempt_no DESC;
+
+ALTER VIEW coherence.v_current_finished_attempts OWNER TO platform_view_owner;
+REVOKE ALL ON coherence.v_current_finished_attempts FROM PUBLIC, platform_app;
+
 -- Single shared published-emit attempt definition (replaces all repeated finished/unsuperseded emit subqueries).
 -- Runs as NOBYPASSRLS platform_view_owner and gates unsent runs on overlapping unpublished.read.
 CREATE OR REPLACE FUNCTION app_views._read_published_emit_attempts()
@@ -867,27 +931,14 @@ LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
   SELECT
-    ev.id AS attempt_event_id,
+    ev.attempt_event_id,
     r.id AS run_id,
     ev.journal_seq AS attempt_journal_seq,
     sent_info.is_sent
   FROM coherence.runs r
-  JOIN LATERAL (
-    SELECT e.id, e.journal_seq
-    FROM coherence.step_attempt_events e
-    WHERE e.run_id = r.id
-      AND e.step = 'emit'
-      AND e.event_kind = 'finished'
-      AND NOT EXISTS (
-        SELECT 1 FROM coherence.step_attempt_events sup
-        WHERE sup.run_id = e.run_id
-          AND sup.step = e.step
-          AND sup.attempt_no = e.attempt_no
-          AND sup.event_kind = 'superseded'
-      )
-    ORDER BY e.attempt_no DESC
-    LIMIT 1
-  ) ev ON true
+  JOIN coherence.v_current_finished_attempts ev
+    ON ev.run_id = r.id
+   AND ev.step = 'emit'
   CROSS JOIN LATERAL (
     SELECT EXISTS (
       SELECT 1 FROM coherence.carries c
@@ -910,35 +961,24 @@ AS $$
   WHERE pe.is_sent = p_is_sent;
 $$;
 
--- IAM-gated view-owner wrapper over coherence.current_finished_attempt(UUID, TEXT) for review configs and run outputs.
-CREATE OR REPLACE FUNCTION app_views._read_current_finished_attempt(p_run_id UUID, p_step TEXT)
-RETURNS UUID
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-  SELECT CASE
-    WHEN app_views._read_tenant_right('act:coherence.runs.read')
-      OR (p_step = 'emit' AND app_views._read_tenant_right('act:coherence.outputs.read'))
-      OR (p_step IN ('bible', 'adjust') AND app_views._read_tenant_right('act:coherence.decisions.read'))
-    THEN coherence.current_finished_attempt(p_run_id, p_step)
-    ELSE NULL
-  END;
-$$;
-
 DO $$
 DECLARE
   v_sig TEXT;
 BEGIN
   -- Shared per-data-kind read predicates used in app_views.* views and platform_view_owner RLS policies.
   FOREACH v_sig IN ARRAY ARRAY[
-    'app_views._read_tenant_right(text)',
     'app_views._read_has_full_tenant_right(text)',
+    'app_views._read_workshop_right(text)',
     'app_views._read_bob_wide_orgs()',
     'app_views._read_bob_narrow_pairs()',
     'app_views._read_agency_statement_wide_orgs()',
     'app_views._read_agency_statement_narrow_pairs()',
     'app_views._read_statement_cash_wide_orgs()',
     'app_views._read_statement_cash_narrow_pairs()',
+    'app_views._read_member_phi_wide_orgs()',
+    'app_views._read_member_phi_narrow_pairs()',
+    'app_views._read_member_contact_wide_orgs()',
+    'app_views._read_member_contact_narrow_pairs()',
     'app_views._read_unpublished_wide_orgs()',
     'app_views._read_unpublished_narrow_pairs()',
     'app_views._read_upline_cash_orgs()',
@@ -951,8 +991,7 @@ BEGIN
     'app_views._read_has_statement_batch_access()',
     'app_views._read_can_see_unsent_batch_meta()',
     'app_views._read_published_emit_attempts()',
-    'app_views._read_published_emit_attempt_ids(boolean)',
-    'app_views._read_current_finished_attempt(uuid, text)'
+    'app_views._read_published_emit_attempt_ids(boolean)'
   ] LOOP
     EXECUTE 'ALTER FUNCTION ' || v_sig || ' OWNER TO platform_view_owner';
     EXECUTE 'REVOKE ALL ON FUNCTION ' || v_sig || ' FROM PUBLIC';
@@ -971,70 +1010,90 @@ CREATE POLICY company_meta_iam_read ON coherence.company_meta
 
 CREATE POLICY runs_iam_read ON coherence.runs
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_has_run_meta_access()));
+  USING (
+    (SELECT app_views._read_has_run_meta_access())
+    OR (SELECT app_views._read_has_full_tenant_right('act:coherence.outputs.read'))
+    OR (
+      (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+      AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'))
+    )
+  );
 
 CREATE POLICY step_attempt_events_iam_read ON coherence.step_attempt_events
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_has_run_meta_access()));
+  USING (
+    (SELECT app_views._read_has_run_meta_access())
+    OR (SELECT app_views._read_has_full_tenant_right('act:coherence.outputs.read'))
+    OR (
+      (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+      AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'))
+    )
+  );
 
 CREATE POLICY carries_iam_read ON coherence.carries
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_has_run_meta_access()));
+  USING (
+    (SELECT app_views._read_has_run_meta_access())
+    OR (SELECT app_views._read_has_full_tenant_right('act:coherence.outputs.read'))
+  );
 
 CREATE POLICY abandonments_iam_read ON coherence.abandonments
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_has_run_meta_access()));
+  USING (
+    (SELECT app_views._read_has_run_meta_access())
+    OR (SELECT app_views._read_has_full_tenant_right('act:coherence.outputs.read'))
+  );
 
 CREATE POLICY input_entries_iam_read ON coherence.input_entries
   FOR SELECT TO platform_view_owner
-  USING (
-    (SELECT app_views._read_tenant_right('act:coherence.ledger.read'))
-    OR (SELECT app_views._read_tenant_right('act:coherence.inputs.read'))
-  );
+  USING ((SELECT app_views._read_workshop_right('act:coherence.inputs.read')));
 
 CREATE POLICY input_versions_iam_read ON coherence.input_versions
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.inputs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.inputs.read')));
 
 CREATE POLICY decision_commits_iam_read ON coherence.decision_commits
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.decisions.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.decisions.read')));
 
 CREATE POLICY decisions_iam_read ON coherence.decisions
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.decisions.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.decisions.read')));
 
 CREATE POLICY checks_iam_read ON coherence.checks
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.checks.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.checks.read')));
 
 CREATE POLICY journal_entries_iam_read ON coherence.journal_entries
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.journal.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.journal.read')));
 
 CREATE POLICY step_requests_iam_read ON coherence.step_requests
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.runs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.runs.read')));
 
 CREATE POLICY cancel_requests_iam_read ON coherence.cancel_requests
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.runs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.runs.read')));
 
 CREATE POLICY review_saves_iam_read ON coherence.review_saves
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.runs.read')));
+  USING (
+    (SELECT app_views._read_workshop_right('act:coherence.runs.read'))
+    OR (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+  );
 
 CREATE POLICY review_queue_items_iam_read ON coherence.review_queue_items
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.runs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.runs.read')));
 
 CREATE POLICY generated_overlays_iam_read ON coherence.generated_overlays
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.runs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.runs.read')));
 
 CREATE POLICY emit_confirmations_iam_read ON coherence.emit_confirmations
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.runs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.runs.read')));
 
 -- Level-1 IAM-backed row rules on statement_batches and run_materializations (reference leaf tables only).
 CREATE POLICY statement_batches_iam_read ON coherence.statement_batches
@@ -1231,9 +1290,6 @@ GRANT SELECT ON
   iam.person_versions
 TO platform_view_owner;
 GRANT EXECUTE ON FUNCTION
-  coherence.current_finished_attempt(UUID, TEXT),
-  coherence.run_stage(UUID, BIGINT),
-  coherence.step_rank(TEXT),
   coherence.run_effective_statement_batches(UUID)
 TO platform_view_owner;
 
@@ -1244,7 +1300,9 @@ WITH (security_barrier = true) AS
 WITH scopes AS MATERIALIZED (
   SELECT
     app_views._read_upline_cash_orgs() AS ucash,
-    app_views._read_statement_cash_wide_orgs() AS scash
+    app_views._read_statement_cash_wide_orgs() AS scash,
+    app_views._read_member_phi_wide_orgs() AS mphi,
+    app_views._read_member_contact_wide_orgs() AS mcontact
 )
 SELECT
   bp.attempt_event_id,
@@ -1260,13 +1318,13 @@ SELECT
   bp.plan_type,
   bp.plan_name,
   bp.simple_plan_type,
-  bp.mbi,
-  bp.member,
-  bp.dob,
-  bp.phone,
-  bp.email,
-  bp.address,
-  bp.county,
+  CASE WHEN gate.show_member_phi THEN bp.mbi ELSE NULL END AS mbi,
+  CASE WHEN gate.show_member_phi THEN bp.member ELSE NULL END AS member,
+  CASE WHEN gate.show_member_phi THEN bp.dob ELSE NULL END AS dob,
+  CASE WHEN gate.show_member_contact THEN bp.phone ELSE NULL END AS phone,
+  CASE WHEN gate.show_member_contact THEN bp.email ELSE NULL END AS email,
+  CASE WHEN gate.show_member_contact THEN bp.address ELSE NULL END AS address,
+  CASE WHEN gate.show_member_contact THEN bp.county ELSE NULL END AS county,
   bp.state,
   bp.submission_date,
   bp.origin_effective,
@@ -1282,7 +1340,7 @@ SELECT
   CASE WHEN gate.show_upline THEN bpf.agency_id ELSE NULL END AS agency_id,
   bp.status,
   CASE WHEN gate.show_upline THEN bp.coherent_status ELSE NULL END AS coherent_status,
-  CASE WHEN gate.show_upline THEN bpf.conflicts ELSE NULL END AS conflicts,
+  CASE WHEN gate.show_upline AND gate.show_member_phi THEN bpf.conflicts ELSE NULL END AS conflicts,
   CASE WHEN gate.show_upline THEN bpf.spine_source ELSE NULL END AS spine_source,
   CASE WHEN gate.show_upline THEN bpf.confidence_level ELSE NULL END AS confidence_level,
   CASE WHEN gate.show_upline THEN bpf.coherent_trajectory ELSE NULL END AS coherent_trajectory,
@@ -1300,7 +1358,21 @@ CROSS JOIN LATERAL (
         SELECT np.org_id, np.person_id FROM app_views._read_statement_cash_narrow_pairs() np
       ),
       false
-    ) AS show_stmt
+    ) AS show_stmt,
+    COALESCE(
+      bp.organization_id = ANY(s.mphi)
+      OR (bp.organization_id, bp.writing_person_id) IN (
+        SELECT np.org_id, np.person_id FROM app_views._read_member_phi_narrow_pairs() np
+      ),
+      false
+    ) AS show_member_phi,
+    COALESCE(
+      bp.organization_id = ANY(s.mcontact)
+      OR (bp.organization_id, bp.writing_person_id) IN (
+        SELECT np.org_id, np.person_id FROM app_views._read_member_contact_narrow_pairs() np
+      ),
+      false
+    ) AS show_member_contact
 ) gate;
 
 -- Live view replacing any copied policy_periods table: every sent run stays eligible so a newest
@@ -1367,15 +1439,17 @@ CROSS JOIN LATERAL (
   ) AS show_company_totals
 ) gate;
 
--- Agency statement lines: record_id / reversal_of / corrects_record_id / tx_id / amount require
--- col:coherence.statement_cash (preventing dollar leaks via record_id strings); gross_comm requires
--- col:coherence.upline_cash (preventing agency managers from subtracting amount from gross_comm).
+-- Agency statement lines: tx_id and amount require col:coherence.statement_cash; mbi and member
+-- require col:coherence.member_phi; record_id / reversal_of / corrects_record_id embed both member
+-- names/MBIs and dollar values so they require both statement_cash and member_phi; gross_comm
+-- requires col:coherence.upline_cash (preventing agency managers from subtracting amount from gross_comm).
 CREATE OR REPLACE VIEW app_views.coherence_statement_agency_lines
 WITH (security_barrier = true) AS
 WITH scopes AS MATERIALIZED (
   SELECT
     app_views._read_upline_cash_orgs() AS ucash,
-    app_views._read_statement_cash_wide_orgs() AS scash
+    app_views._read_statement_cash_wide_orgs() AS scash,
+    app_views._read_member_phi_wide_orgs() AS mphi
 )
 SELECT
   sal.batch_id,
@@ -1388,16 +1462,16 @@ SELECT
   sal.entity,
   sal.writing_npn,
   sal.writing_agent,
-  CASE WHEN gate.show_stmt THEN sal.record_id ELSE NULL END AS record_id,
-  CASE WHEN gate.show_stmt THEN sal.reversal_of ELSE NULL END AS reversal_of,
-  CASE WHEN gate.show_stmt THEN sal.corrects_record_id ELSE NULL END AS corrects_record_id,
+  CASE WHEN gate.show_stmt AND gate.show_member_phi THEN sal.record_id ELSE NULL END AS record_id,
+  CASE WHEN gate.show_stmt AND gate.show_member_phi THEN sal.reversal_of ELSE NULL END AS reversal_of,
+  CASE WHEN gate.show_stmt AND gate.show_member_phi THEN sal.corrects_record_id ELSE NULL END AS corrects_record_id,
   sal.source_file,
   sal.sheet_name,
   sal.source_row_no,
   sal.src_type,
   sal.carrier,
-  sal.mbi,
-  sal.member,
+  CASE WHEN gate.show_member_phi THEN sal.mbi ELSE NULL END AS mbi,
+  CASE WHEN gate.show_member_phi THEN sal.member ELSE NULL END AS member,
   sal.external_policy_id,
   sal.policy_id,
   CASE WHEN gate.show_stmt THEN sal.tx_id ELSE NULL END AS tx_id,
@@ -1414,8 +1488,8 @@ SELECT
   sal.revenue_type,
   CASE WHEN gate.show_upline THEN sal.gross_comm ELSE NULL END AS gross_comm,
   CASE WHEN gate.show_stmt THEN sal.amount ELSE NULL END AS amount,
-  sal.reason,
-  sal.notes,
+  CASE WHEN gate.show_member_phi THEN sal.reason ELSE NULL END AS reason,
+  CASE WHEN gate.show_member_phi THEN sal.notes ELSE NULL END AS notes,
   sal.journal_seq
 FROM coherence.statement_agency_lines sal
 CROSS JOIN scopes s
@@ -1428,37 +1502,51 @@ CROSS JOIN LATERAL (
         SELECT np.org_id, np.person_id FROM app_views._read_statement_cash_narrow_pairs() np
       ),
       false
-    ) AS show_stmt
+    ) AS show_stmt,
+    COALESCE(
+      sal.organization_id = ANY(s.mphi)
+      OR (sal.organization_id, sal.writing_person_id) IN (
+        SELECT np.org_id, np.person_id FROM app_views._read_member_phi_narrow_pairs() np
+      ),
+      false
+    ) AS show_member_phi
 ) gate;
 
 -- Upline statement lines report organization_id at the tenant company organization (owning
--- '<Company> Upline') while preserving the originating agency in source_organization_id.
+-- '<Company> Upline') while preserving the originating agency in source_organization_id,
+-- and gate mbi, member, record_id, reversal_of, and corrects_record_id on wide col:coherence.member_phi.
 CREATE OR REPLACE VIEW app_views.coherence_statement_upline_lines
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT
+    (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true) AS tenant_org_id,
+    COALESCE((SELECT cm.display_name || ' Upline' FROM coherence.company_meta cm LIMIT 1), 'Upline') AS statement_entity,
+    app_views._read_member_phi_wide_orgs() AS mphi
+)
 SELECT
   sul.batch_id,
   sul.line_no,
   sul.statement_date,
   sul.entry_kind,
   sul.run_action,
-  (SELECT dc.tenant_org_id FROM iam.database_context dc WHERE dc.singleton = true) AS organization_id,
+  s.tenant_org_id AS organization_id,
   sul.organization_id AS source_organization_id,
   sul.writing_person_id,
-  COALESCE((SELECT cm.display_name || ' Upline' FROM coherence.company_meta cm LIMIT 1), 'Upline') AS statement_entity,
+  s.statement_entity,
   sul.source_entity,
   sul.marked_sent,
   sul.writing_npn,
   sul.writing_agent,
-  sul.record_id,
-  sul.reversal_of,
-  sul.corrects_record_id,
+  CASE WHEN gate.show_member_phi THEN sul.record_id ELSE NULL END AS record_id,
+  CASE WHEN gate.show_member_phi THEN sul.reversal_of ELSE NULL END AS reversal_of,
+  CASE WHEN gate.show_member_phi THEN sul.corrects_record_id ELSE NULL END AS corrects_record_id,
   sul.source_file,
   sul.sheet_name,
   sul.source_row_no,
   sul.src_type,
   sul.carrier,
-  sul.mbi,
-  sul.member,
+  CASE WHEN gate.show_member_phi THEN sul.mbi ELSE NULL END AS mbi,
+  CASE WHEN gate.show_member_phi THEN sul.member ELSE NULL END AS member,
   sul.external_policy_id,
   sul.policy_id,
   sul.tx_id,
@@ -1475,10 +1563,14 @@ SELECT
   sul.revenue_type,
   sul.gross_comm,
   sul.amount,
-  sul.reason,
-  sul.notes,
+  CASE WHEN gate.show_member_phi THEN sul.reason ELSE NULL END AS reason,
+  CASE WHEN gate.show_member_phi THEN sul.notes ELSE NULL END AS notes,
   sul.journal_seq
-FROM coherence.statement_upline_lines sul;
+FROM coherence.statement_upline_lines sul
+CROSS JOIN scopes s
+CROSS JOIN LATERAL (
+  SELECT (sul.organization_id = ANY(s.mphi)) AS show_member_phi
+) gate;
 
 CREATE OR REPLACE VIEW app_views.coherence_entity_statement_lines
 WITH (security_barrier = true) AS
@@ -1631,20 +1723,24 @@ GROUP BY policy_id, tx_id, record_id, statement_date, organization_id, statement
 
 CREATE OR REPLACE VIEW app_views.coherence_ledger
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT
+    app_views._read_member_phi_wide_orgs() AS mphi
+)
 SELECT
   clr.attempt_event_id,
   clr.tx_id,
   clr.run_id,
   clr.organization_id,
   clr.writing_person_id,
-  clr.record_id,
+  CASE WHEN gate.show_member_phi THEN clr.record_id ELSE NULL END AS record_id,
   clr.external_policy_id,
   clr.policy_id,
   clr.statement_name,
   clr.src_type,
   clr.carrier,
-  clr.mbi,
-  clr.member,
+  CASE WHEN gate.show_member_phi THEN clr.mbi ELSE NULL END AS mbi,
+  CASE WHEN gate.show_member_phi THEN clr.member ELSE NULL END AS member,
   clr.state,
   clr.plan_type,
   clr.simple_plan_type,
@@ -1675,12 +1771,16 @@ SELECT
   clr.cbob_c,
   clr.cbob_s,
   clr.sf,
-  clr.notes,
-  clr.coherent_notes,
+  CASE WHEN gate.show_member_phi THEN clr.notes ELSE NULL END AS notes,
+  CASE WHEN gate.show_member_phi THEN clr.coherent_notes ELSE NULL END AS coherent_notes,
   clr.sheet_name,
   clr.source_row_no,
   clr.journal_seq
-FROM coherence.coherent_ledger_rows clr;
+FROM coherence.coherent_ledger_rows clr
+CROSS JOIN scopes s
+CROSS JOIN LATERAL (
+  SELECT (clr.organization_id = ANY(s.mphi)) AS show_member_phi
+) gate;
 
 -- Live view replacing any copied commission_ledger_rows table: every sent run stays eligible so a
 -- newest sent run with zero rows for the caller never falls back to a stale older run, while unsent
@@ -1821,8 +1921,8 @@ JOIN LATERAL (
 
 -- Narrow definer-rights helper view owned by read-only platform_readonly (SELECT strictly for
 -- platform_view_owner; zero privileges for platform_app or PUBLIC) so app_views.coherence_runs
--- reports the true latest_journal_seq tip even for readers who hold act:coherence.runs.read
--- without decisions.read, statements.read, or unpublished.read.
+-- reports the true latest_journal_seq tip even for workshop readers who lack decisions.read or
+-- statements.read, with zero per-run RLS or rights work.
 CREATE OR REPLACE VIEW coherence.v_run_latest_journal_seq
 WITH (security_barrier = true) AS
 SELECT
@@ -1843,23 +1943,38 @@ SELECT
     COALESCE((SELECT pg_catalog.max(journal_seq) FROM coherence.abandonments WHERE run_id = r.id), 0)
   ) AS latest_journal_seq
 FROM coherence.runs r
-WHERE (SELECT app_views._read_tenant_right('act:coherence.runs.read'));
+WHERE (SELECT app_views._read_workshop_right('act:coherence.runs.read'));
 
 ALTER VIEW coherence.v_run_latest_journal_seq OWNER TO platform_readonly;
 REVOKE ALL ON coherence.v_run_latest_journal_seq FROM PUBLIC, platform_app;
 GRANT SELECT ON coherence.v_run_latest_journal_seq TO platform_view_owner;
 
--- IAM-gated view-owner wrapper over coherence.run_stage(UUID, BIGINT) so app_views.coherence_runs
--- and historical as-of queries share the single SQL run_stage function while platform_app holds
--- zero EXECUTE privileges in schema coherence.
+-- Narrow definer-rights wrapper over coherence.run_stage(UUID, BIGINT) owned by read-only
+-- platform_readonly (whose RLS policies are USING (true)), executable strictly by
+-- platform_view_owner after the view or wrapper's single workshop check. Keeps coherence.run_stage
+-- as the single source of truth while performing zero per-run rights or RLS work.
+CREATE OR REPLACE FUNCTION coherence._ro_run_stage(p_run_id UUID, p_as_of_seq BIGINT DEFAULT NULL)
+RETURNS TEXT
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT coherence.run_stage(p_run_id, p_as_of_seq);
+$$;
+
+ALTER FUNCTION coherence._ro_run_stage(UUID, BIGINT) OWNER TO platform_readonly;
+REVOKE ALL ON FUNCTION coherence._ro_run_stage(UUID, BIGINT) FROM PUBLIC, platform_app;
+GRANT EXECUTE ON FUNCTION coherence._ro_run_stage(UUID, BIGINT) TO platform_view_owner;
+
+-- IAM-gated view-owner wrapper over coherence._ro_run_stage(UUID, BIGINT) for historical as-of queries
+-- while platform_app holds zero EXECUTE privileges in schema coherence.
 CREATE OR REPLACE FUNCTION app_views.coherence_run_stage(p_run_id UUID, p_as_of_seq BIGINT DEFAULT NULL)
 RETURNS TEXT
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
   SELECT CASE
-    WHEN (SELECT app_views._read_tenant_right('act:coherence.runs.read'))
-      THEN coherence.run_stage(p_run_id, p_as_of_seq)
+    WHEN (SELECT app_views._read_workshop_right('act:coherence.runs.read'))
+      THEN coherence._ro_run_stage(p_run_id, p_as_of_seq)
     ELSE NULL
   END;
 $$;
@@ -1868,15 +1983,45 @@ ALTER FUNCTION app_views.coherence_run_stage(UUID, BIGINT) OWNER TO platform_vie
 REVOKE ALL ON FUNCTION app_views.coherence_run_stage(UUID, BIGINT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_views.coherence_run_stage(UUID, BIGINT) TO platform_app, platform_readonly;
 
+-- Single-evaluation workshop stage table for app_views.coherence_runs: runs the workshop gate ONCE as
+-- platform_view_owner and delegates stage computation to platform_readonly coherence._ro_run_stage
+-- (RLS USING (true), zero per-run rights or RLS work). Needed because PostgreSQL checks function
+-- EXECUTE inside views against current_user (platform_app), not the view owner (platform_view_owner).
+CREATE OR REPLACE FUNCTION app_views.coherence_run_stages()
+RETURNS TABLE (
+  run_id UUID,
+  stage TEXT
+)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT r.id AS run_id, coherence._ro_run_stage(r.id, NULL) AS stage
+  FROM coherence.runs r
+  WHERE (SELECT app_views._read_workshop_right('act:coherence.runs.read'));
+$$;
+
+ALTER FUNCTION app_views.coherence_run_stages() OWNER TO platform_view_owner;
+REVOKE ALL ON FUNCTION app_views.coherence_run_stages() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_views.coherence_run_stages() TO platform_app, platform_readonly;
+
 CREATE OR REPLACE VIEW app_views.coherence_runs
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT
+    app_views._read_workshop_right('act:coherence.runs.read') AS show_runs,
+    app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+),
+run_stages AS MATERIALIZED (
+  SELECT run_id, stage
+  FROM app_views.coherence_run_stages()
+)
 SELECT
   r.id,
   r.statement_date,
   r.folder_number,
   r.origin,
   r.input_version_id,
-  r.prior_approvals_sha256,
+  CASE WHEN s.show_member_phi THEN r.prior_approvals_sha256 ELSE NULL END AS prior_approvals_sha256,
   r.prior_decision_commit_id,
   r.engine_version_id,
   r.emit_mode,
@@ -1889,16 +2034,24 @@ SELECT
   r.source_folder,
   r.journal_seq AS created_journal_seq,
   tip.latest_journal_seq,
-  app_views.coherence_run_stage(r.id, NULL) AS stage,
+  rs.stage,
   EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'sent') AS sent_recorded,
   EXISTS (SELECT 1 FROM coherence.carries c WHERE c.run_id = r.id AND c.carry_kind = 'approvals') AS approvals_carried,
   EXISTS (SELECT 1 FROM coherence.abandonments a WHERE a.run_id = r.id) AS abandoned
 FROM coherence.runs r
+JOIN run_stages rs ON rs.run_id = r.id
 LEFT JOIN coherence.v_run_latest_journal_seq tip ON tip.run_id = r.id
-WHERE (SELECT app_views._read_tenant_right('act:coherence.runs.read'));
+CROSS JOIN scopes s
+WHERE s.show_runs;
 
 CREATE OR REPLACE VIEW app_views.coherence_input_versions
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT (
+    app_views._read_has_full_tenant_right('col:coherence.member_phi')
+    AND app_views._read_has_full_tenant_right('col:coherence.member_contact')
+  ) AS show_file_handle
+)
 SELECT
   iv.id,
   iv.line_kind,
@@ -1906,12 +2059,13 @@ SELECT
   iv.source_kind,
   iv.reason,
   iv.entry_count,
-  iv.entries_sha256,
-  iv.entries_list_file_sha256,
+  CASE WHEN s.show_file_handle THEN iv.entries_sha256 ELSE NULL END AS entries_sha256,
+  CASE WHEN s.show_file_handle THEN iv.entries_list_file_sha256 ELSE NULL END AS entries_list_file_sha256,
   iv.change_count,
   iv.changes_sha256,
   iv.journal_seq
-FROM coherence.input_versions iv;
+FROM coherence.input_versions iv
+CROSS JOIN scopes s;
 
 CREATE OR REPLACE VIEW app_views.coherence_decision_commits
 WITH (security_barrier = true) AS
@@ -1930,6 +2084,9 @@ FROM coherence.decision_commits dc;
 
 CREATE OR REPLACE VIEW app_views.coherence_decisions
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+)
 SELECT
   d.id,
   d.decision_commit_id,
@@ -1937,7 +2094,7 @@ SELECT
   d.run_id,
   d.review_save_id,
   d.surface,
-  d.record_id,
+  CASE WHEN s.show_member_phi THEN d.record_id ELSE NULL END AS record_id,
   d.replaces_decision_id,
   d.disposition,
   d.agent,
@@ -1946,7 +2103,7 @@ SELECT
   d.book,
   d.month,
   d.status,
-  d.note,
+  CASE WHEN s.show_member_phi THEN d.note ELSE NULL END AS note,
   d.approved_amount,
   d.approved_agency,
   d.approved_agent,
@@ -1958,22 +2115,32 @@ SELECT
   d.committed_at_raw,
   d.imported,
   d.journal_seq
-FROM coherence.decisions d;
+FROM coherence.decisions d
+CROSS JOIN scopes s;
 
 CREATE OR REPLACE VIEW app_views.coherence_checks
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+)
 SELECT
   ch.id,
   ch.check_kind,
   ch.run_id,
   ch.compared_run_id,
   ch.passed,
-  ch.report,
+  CASE WHEN s.show_member_phi THEN ch.report ELSE NULL END AS report,
   ch.journal_seq
-FROM coherence.checks ch;
+FROM coherence.checks ch
+CROSS JOIN scopes s;
 
 CREATE OR REPLACE VIEW app_views.coherence_journal
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT
+    app_views._read_has_full_entity_finance() AS show_full_entity_finance,
+    app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+)
 SELECT
   je.seq,
   je.recorded_at,
@@ -1982,10 +2149,15 @@ SELECT
   je.command_kind,
   je.command_key,
   je.request_sha256,
-  je.body,
+  CASE
+    WHEN je.command_kind = 'carry_sent' AND s.show_full_entity_finance THEN je.body
+    WHEN je.command_kind <> 'carry_sent' AND s.show_member_phi THEN je.body
+    ELSE NULL
+  END AS body,
   je.prev_hash,
   je.entry_hash
-FROM coherence.journal_entries je;
+FROM coherence.journal_entries je
+CROSS JOIN scopes s;
 
 -- Platform audit journal view (from DESIGN.md section 2.5): masks Nusear staff identity for customers.
 CREATE OR REPLACE VIEW app_views.audit_journal

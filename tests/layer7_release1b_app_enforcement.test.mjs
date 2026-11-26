@@ -763,16 +763,19 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
         'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
         'act:coherence.ledger.read', 'act:coherence.outputs.read', 'act:coherence.runs.read',
         'col:coherence.statement_cash', 'col:coherence.upline_cash',
+        'col:coherence.member_phi', 'col:coherence.member_contact',
       ]);
       await seedNarrowRole(noCashPersonId, 'no_cash_col', 'No Cash Col', [
         'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
         'act:coherence.ledger.read', 'act:coherence.outputs.read', 'act:coherence.runs.read',
         'act:coherence.unpublished.read', 'col:coherence.upline_cash',
+        'col:coherence.member_phi', 'col:coherence.member_contact',
       ]);
       await seedNarrowRole(subOrgUnpubPersonId, 'sub_org_unpub_finance', 'Sub Org Unpub Finance', [
         'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
         'act:coherence.ledger.read', 'act:coherence.runs.read',
         'col:coherence.statement_cash', 'col:coherence.upline_cash',
+        'col:coherence.member_phi', 'col:coherence.member_contact',
       ], {
         extraSubOrgGrant: { orgId: iam.ids.beaconOrg, rights: ['act:coherence.unpublished.read'] },
       });
@@ -1311,7 +1314,7 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     missingStmtCash: randomUUID(),
     missingStmtsRead: randomUUID(),
     missingUplineRead: randomUUID(),
-    allSixSentOnly: randomUUID(),
+    fullEmSentOnly: randomUUID(),
     disjointUnpub: randomUUID(),
     sentEmSubOrgUnpub: randomUUID(),
     runsReadOnly: randomUUID(),
@@ -1365,36 +1368,38 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
         }
       };
 
-      const sixEmRights = [
+      const fullEmRights = [
         'act:coherence.bob.read',
         'act:coherence.ledger.read',
         'act:coherence.statements.read',
         'act:coherence.upline.read',
         'col:coherence.statement_cash',
         'col:coherence.upline_cash',
+        'col:coherence.member_phi',
+        'col:coherence.member_contact',
       ];
       await seedCustomPerson(customPeople.missingStmtCash, 'c1_missing_stmt_cash', [{
         orgId: iam.ids.companyOrg,
-        rights: [...sixEmRights.filter((r) => r !== 'col:coherence.statement_cash'), 'act:coherence.unpublished.read'],
+        rights: [...fullEmRights.filter((r) => r !== 'col:coherence.statement_cash'), 'act:coherence.unpublished.read'],
       }]);
       await seedCustomPerson(customPeople.missingStmtsRead, 'c1_missing_stmts_read', [{
         orgId: iam.ids.companyOrg,
-        rights: [...sixEmRights.filter((r) => r !== 'act:coherence.statements.read'), 'act:coherence.unpublished.read'],
+        rights: [...fullEmRights.filter((r) => r !== 'act:coherence.statements.read'), 'act:coherence.unpublished.read'],
       }]);
       await seedCustomPerson(customPeople.missingUplineRead, 'c1_missing_upline_read', [{
         orgId: iam.ids.companyOrg,
-        rights: [...sixEmRights.filter((r) => r !== 'act:coherence.upline.read'), 'act:coherence.unpublished.read'],
+        rights: [...fullEmRights.filter((r) => r !== 'act:coherence.upline.read'), 'act:coherence.unpublished.read'],
       }]);
-      await seedCustomPerson(customPeople.allSixSentOnly, 'c1_all_six_sent', [{
+      await seedCustomPerson(customPeople.fullEmSentOnly, 'c1_full_em_sent', [{
         orgId: iam.ids.companyOrg,
-        rights: sixEmRights,
+        rights: fullEmRights,
       }]);
       await seedCustomPerson(customPeople.disjointUnpub, 'c1_disjoint_unpub', [
         { orgId: iam.ids.beaconOrg, rights: ['act:coherence.bob.read'] },
         { orgId: iam.ids.harborOrg, rights: ['act:coherence.unpublished.read'] },
       ]);
       await seedCustomPerson(customPeople.sentEmSubOrgUnpub, 'c1_sent_em_sub_unpub', [
-        { orgId: iam.ids.companyOrg, rights: sixEmRights },
+        { orgId: iam.ids.companyOrg, rights: fullEmRights },
         { orgId: iam.ids.beaconOrg, rights: ['act:coherence.unpublished.read'] },
       ]);
       await seedCustomPerson(customPeople.runsReadOnly, 'c1_runs_only', [
@@ -1451,13 +1456,13 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
       }
     }
 
-    // Control: role with all six rights reads sentRunId entity bundle cleanly.
-    const allSixTok = iam.tokenFor(customPeople.allSixSentOnly);
-    const controlRows = await withRequestTx(appPool, allSixTok, async (tx) => (
+    // Control: role with all eight entity-finance and member rights reads sentRunId entity bundle cleanly.
+    const fullEmTok = iam.tokenFor(customPeople.fullEmSentOnly);
+    const controlRows = await withRequestTx(appPool, fullEmTok, async (tx) => (
       await tx.query('SELECT run_id, rel_path FROM app_views.coherence_entity_bundle_artifacts')
     ).rows);
-    assert.ok(controlRows.length >= 3 && controlRows.every((r) => r.run_id === sentRunId), 'control role holding all six rights must read sentRunId bundle artifacts');
-    const controlSum = await reader.summary(allSixTok);
+    assert.ok(controlRows.length >= 3 && controlRows.every((r) => r.run_id === sentRunId), 'control role holding all eight entity-finance and member rights must read sentRunId bundle artifacts');
+    const controlSum = await reader.summary(fullEmTok);
     assert.equal(controlSum.available, true);
     assert.equal(controlSum.runId, sentRunId);
   });
@@ -1793,8 +1798,9 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     }
   });
 
-  await t.test('Fix1 Item 4: platform_readonly keeps working app_views SELECT (coherence_bob & coherence_runs) while app_views._read_current_finished_attempt denies platform_worker and scopes steps by right as platform_view_owner', async () => {
+  await t.test('Fix1 Item 4 / Fix2: platform_readonly keeps working app_views SELECT (coherence_bob & coherence_runs) while platform_worker & platform_app are refused on internal helpers (_read_*, _ro_run_stage, v_current_finished_attempts) and runs.read without unpublished.read sees 0 runs', async () => {
     const inp = await env.dataStore.promoteBytes(Buffer.from('k\nsteps\n', 'utf8'), { relPath: 'imp_steps.csv', checksPassed: true });
+    const stepStmt = await env.stores.promoteArtifact('emits/statements_20260915.csv', Buffer.from('record_id\nstep\n', 'utf8'), { checksPassed: true });
     const stepImp = await env.commands.importHistoricalRun({
       dbToken: env.ownerToken,
       commandKey: 'c1-fix1-item4-import',
@@ -1802,22 +1808,39 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
       inputVersion: { reason: 'step scoping test' },
       inputEntries: [{ relPath: 'imp_steps.csv', fileSha256: inp.sha256 }],
       stepAttempts: ['assign', 'attribute', 'bible', 'adjust', 'emit'].map((step) => ({
-        step, attemptNo: 1, artifacts: [],
+        step,
+        attemptNo: 1,
+        artifacts: step === 'emit'
+          ? [{ relPath: stepStmt.relPath, artifactKind: stepStmt.artifactKind, storeKind: stepStmt.storeKind, fileSha256: stepStmt.sha256 }]
+          : [],
       })),
-      storedFiles: [inp],
+      storedFiles: [inp, stepStmt],
     });
     const stepRunId = stepImp.result.runId;
-    const allSteps = ['assign', 'attribute', 'bible', 'adjust', 'emit'];
 
-    // platform_worker still gets 42501 on app_views._read_* helpers.
+    // platform_worker gets 42501 on app_views._read_* helpers, coherence._ro_run_stage, and coherence.v_current_finished_attempts.
     for (const sql of [
-      `SELECT app_views._read_current_finished_attempt('${stepRunId}'::uuid, 'emit')`,
+      "SELECT app_views._read_workshop_right('act:coherence.runs.read')",
       'SELECT app_views._read_bob_wide_orgs()',
+      `SELECT coherence._ro_run_stage('${stepRunId}'::uuid, NULL)`,
+      'SELECT * FROM coherence.v_current_finished_attempts LIMIT 1',
     ]) {
       await assert.rejects(
-        () => withRequestTx(workerPool, iam.tokenFor(customPeople.runsReadOnly), (tx) => tx.query(sql), { readOnly: true }),
+        () => withRequestTx(workerPool, iam.tokens.owner, (tx) => tx.query(sql), { readOnly: true }),
         (err) => err?.code === '42501',
         `platform_worker must get 42501 on internal helper: ${sql}`,
+      );
+    }
+
+    // platform_app gets 42501 on coherence._ro_run_stage and coherence.v_current_finished_attempts directly.
+    for (const sql of [
+      `SELECT coherence._ro_run_stage('${stepRunId}'::uuid, NULL)`,
+      'SELECT * FROM coherence.v_current_finished_attempts LIMIT 1',
+    ]) {
+      await assert.rejects(
+        () => withRequestTx(appPool, iam.tokens.owner, (tx) => tx.query(sql), { readOnly: true }),
+        (err) => err?.code === '42501',
+        `platform_app must get 42501 on internal helper: ${sql}`,
       );
     }
 
@@ -1825,11 +1848,11 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     const readonlyHelperPool = createRoleScopedTestPool(env.pool, 'platform_readonly');
     const roRuns = await withRequestTx(
       readonlyHelperPool,
-      iam.tokenFor(customPeople.runsReadOnly),
+      iam.tokens.companyAdmin,
       (tx) => tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs'),
       { readOnly: true },
     );
-    assert.ok(roRuns.rows[0].n > 0, 'platform_readonly must read app_views.coherence_runs with valid token');
+    assert.ok(roRuns.rows[0].n > 0, 'platform_readonly must read app_views.coherence_runs with valid workshop token');
     const roBob = await withRequestTx(
       readonlyHelperPool,
       iam.tokens.entityMgr,
@@ -1838,34 +1861,37 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     );
     assert.ok(roBob.rows[0].n > 0, 'platform_readonly must read app_views.coherence_bob with valid token');
 
-    const viewOwnerPool = createRoleScopedTestPool(env.pool, 'platform_view_owner');
-    const querySteps = async (token) => withRequestTx(viewOwnerPool, token, async (tx) => {
-      const out = {};
-      for (const step of allSteps) {
-        const res = await tx.query('SELECT app_views._read_current_finished_attempt($1::uuid, $2) AS id', [stepRunId, step]);
-        out[step] = res.rows[0].id;
-      }
-      return out;
-    }, { readOnly: true });
+    // All-or-nothing workshop: runs.read without unpublished.read sees 0 runs and NULL stage both before and after carrySent;
+    // workshop holders (companyAdmin, owner) see the run and its stage both before and after carrySent.
+    const runsOnlyTok = iam.tokenFor(customPeople.runsReadOnly);
+    assert.equal(
+      (await withRequestTx(appPool, runsOnlyTok, (tx) => tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs WHERE id = $1::uuid', [stepRunId]), { readOnly: true })).rows[0].n,
+      0,
+      'runs.read without unpublished.read must see 0 rows before carrySent',
+    );
+    assert.equal(
+      (await withRequestTx(appPool, runsOnlyTok, (tx) => tx.query('SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [stepRunId]), { readOnly: true })).rows[0].st,
+      null,
+      'runs.read without unpublished.read must get NULL stage before carrySent',
+    );
+    assert.equal(
+      (await withRequestTx(appPool, iam.tokens.companyAdmin, (tx) => tx.query('SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [stepRunId]), { readOnly: true })).rows[0].st,
+      'done',
+      'companyAdmin with workshop access must see unsent run stage',
+    );
 
-    const runsRes = await querySteps(iam.tokenFor(customPeople.runsReadOnly));
-    for (const s of allSteps) assert.notEqual(runsRes[s], null, `runs.read must see step ${s}`);
+    await env.commands.carrySent({ dbToken: env.ownerToken, commandKey: 'c1-fix1-item4-sent', runId: stepRunId, typedPhrase: 'sent 2026-09-15' });
 
-    const outputsRes = await querySteps(iam.tokenFor(customPeople.outputsReadOnly));
-    assert.notEqual(outputsRes.emit, null, 'outputs.read must see emit');
-    for (const s of ['assign', 'attribute', 'bible', 'adjust']) {
-      assert.equal(outputsRes[s], null, `outputs.read must NOT see step ${s}`);
-    }
-
-    const decisionsRes = await querySteps(iam.tokenFor(customPeople.decisionsReadOnly));
-    assert.notEqual(decisionsRes.bible, null, 'decisions.read must see bible');
-    assert.notEqual(decisionsRes.adjust, null, 'decisions.read must see adjust');
-    for (const s of ['assign', 'attribute', 'emit']) {
-      assert.equal(decisionsRes[s], null, `decisions.read must NOT see step ${s}`);
-    }
-
-    const noneRes = await querySteps(iam.tokenFor(customPeople.allSixSentOnly));
-    for (const s of allSteps) assert.equal(noneRes[s], null, `caller without runs/outputs/decisions.read must get NULL for step ${s}`);
+    assert.equal(
+      (await withRequestTx(appPool, runsOnlyTok, (tx) => tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs WHERE id = $1::uuid', [stepRunId]), { readOnly: true })).rows[0].n,
+      0,
+      'runs.read without unpublished.read must still see 0 rows in coherence_runs even after carrySent',
+    );
+    assert.equal(
+      (await withRequestTx(appPool, runsOnlyTok, (tx) => tx.query('SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [stepRunId]), { readOnly: true })).rows[0].st,
+      null,
+      'runs.read without unpublished.read must still get NULL stage even after carrySent',
+    );
   });
 
   await t.test('Fix1 Item 5: downstream reader answers unavailable when newest SENT run has no entity-manager bundle instead of falling back to an older sent run', async () => {
@@ -1891,7 +1917,7 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
 
     for (const [label, tok] of [
       ['owner', iam.tokens.owner],
-      ['allSixSentOnly', iam.tokenFor(customPeople.allSixSentOnly)],
+      ['fullEmSentOnly', iam.tokenFor(customPeople.fullEmSentOnly)],
       ['sentEmSubOrgUnpub', iam.tokenFor(customPeople.sentEmSubOrgUnpub)],
     ]) {
       const sum = await reader.summary(tok);
@@ -1904,7 +1930,7 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     }
 
     // Explicit runId for the older sent run still opens cleanly.
-    const explicitOld = await reader.summary(iam.tokenFor(customPeople.allSixSentOnly), { runId: sentRunId });
+    const explicitOld = await reader.summary(iam.tokenFor(customPeople.fullEmSentOnly), { runId: sentRunId });
     assert.equal(explicitOld.available, true);
     assert.equal(explicitOld.runId, sentRunId);
   });

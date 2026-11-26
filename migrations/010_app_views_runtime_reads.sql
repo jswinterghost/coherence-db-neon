@@ -13,17 +13,23 @@ CREATE POLICY stored_files_iam_read ON coherence.stored_files
     (
       store_kind = 'company_data'
       AND (
-        (SELECT app_views._read_tenant_right('act:coherence.inputs.read'))
-        OR (SELECT app_views._read_tenant_right('act:coherence.runs.read'))
-        OR (SELECT app_views._read_tenant_right('act:coherence.outputs.read'))
-        OR (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
+        (SELECT app_views._read_workshop_right('act:coherence.inputs.read'))
+        OR (SELECT app_views._read_workshop_right('act:coherence.runs.read'))
+        OR (SELECT app_views._read_has_full_tenant_right('act:coherence.outputs.read'))
+        OR (
+          (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+          AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'))
+        )
         OR (SELECT app_views._read_has_full_entity_finance())
       )
     )
     OR (
       store_kind = 'nusear_code'
       AND (
-        (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
+        (
+          (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+          AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'))
+        )
         OR (SELECT app_views._read_has_full_entity_finance())
       )
     )
@@ -31,34 +37,40 @@ CREATE POLICY stored_files_iam_read ON coherence.stored_files
 
 CREATE POLICY input_changes_iam_read ON coherence.input_changes
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.inputs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.inputs.read')));
 
 CREATE POLICY imported_files_iam_read ON coherence.imported_files
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.inputs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.inputs.read')));
 
 CREATE POLICY engine_versions_iam_read ON coherence.engine_versions
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.runs.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.runs.read')));
 
 CREATE POLICY approvals_files_iam_read ON coherence.approvals_files
   FOR SELECT TO platform_view_owner
   USING (
-    (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
-    OR (SELECT app_views._read_tenant_right('act:coherence.runs.read'))
+    (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+    OR (SELECT app_views._read_workshop_right('act:coherence.runs.read'))
   );
 
 CREATE POLICY approval_rows_iam_read ON coherence.approval_rows
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.decisions.read')));
+  USING ((SELECT app_views._read_workshop_right('act:coherence.decisions.read')));
 
 CREATE POLICY review_submissions_iam_read ON coherence.review_submissions
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.decisions.read')));
+  USING (
+    (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+    AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'))
+  );
 
 CREATE POLICY review_drafts_iam_read ON coherence.review_drafts
   FOR SELECT TO platform_view_owner
-  USING ((SELECT app_views._read_tenant_right('act:coherence.decisions.read')));
+  USING (
+    (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+    AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'))
+  );
 
 CREATE POLICY artifacts_iam_read ON coherence.artifacts
   FOR SELECT TO platform_view_owner
@@ -67,14 +79,18 @@ CREATE POLICY artifacts_iam_read ON coherence.artifacts
       artifact_kind = 'data'
       AND store_kind = 'company_data'
       AND (
-        (SELECT app_views._read_tenant_right('act:coherence.outputs.read'))
-        OR (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
+        (SELECT app_views._read_has_full_tenant_right('act:coherence.outputs.read'))
+        OR (
+          (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+          AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'))
+        )
         OR (SELECT app_views._read_has_full_entity_finance())
       )
     )
     OR (
       rel_path IN ('bible.json', 'bible.html', 'adjust.json', 'adjust.html')
-      AND (SELECT app_views._read_tenant_right('act:coherence.decisions.read'))
+      AND (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+      AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'))
     )
     OR (
       rel_path LIKE 'emits/bundles/entity-managers/%/viewer.html'
@@ -97,52 +113,72 @@ TO platform_view_owner;
 -- 2. Security-barrier views in app_views.*, owned by NOBYPASSRLS platform_view_owner.
 CREATE OR REPLACE VIEW app_views.coherence_input_changes
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT (
+    app_views._read_has_full_tenant_right('col:coherence.member_phi')
+    AND app_views._read_has_full_tenant_right('col:coherence.member_contact')
+  ) AS show_file_handle
+)
 SELECT
   ic.input_version_id,
   ic.rel_path,
   ic.change_kind,
   ic.old_rel_path,
   ic.store_kind,
-  ic.file_sha256,
-  ic.prev_file_sha256,
+  CASE WHEN s.show_file_handle THEN ic.file_sha256 ELSE NULL END AS file_sha256,
+  CASE WHEN s.show_file_handle THEN ic.prev_file_sha256 ELSE NULL END AS prev_file_sha256,
   ic.journal_seq
-FROM coherence.input_changes ic;
+FROM coherence.input_changes ic
+CROSS JOIN scopes s;
 
 CREATE OR REPLACE VIEW app_views.coherence_input_entries
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT (
+    app_views._read_has_full_tenant_right('col:coherence.member_phi')
+    AND app_views._read_has_full_tenant_right('col:coherence.member_contact')
+  ) AS show_file_handle
+)
 SELECT
   ie.input_version_id,
   ie.rel_path,
   ie.mac_key,
   ie.store_kind,
-  ie.file_sha256,
+  CASE WHEN s.show_file_handle THEN ie.file_sha256 ELSE NULL END AS file_sha256,
   sf.byte_size,
-  sf.md5_b64,
-  sf.crc32c_b64,
+  CASE WHEN s.show_file_handle THEN sf.md5_b64 ELSE NULL END AS md5_b64,
+  CASE WHEN s.show_file_handle THEN sf.crc32c_b64 ELSE NULL END AS crc32c_b64,
   ie.journal_seq
 FROM coherence.input_entries ie
 JOIN coherence.stored_files sf
   ON sf.store_kind = ie.store_kind
  AND sf.sha256 = ie.file_sha256
-WHERE ie.store_kind = 'company_data'
-  AND (SELECT app_views._read_tenant_right('act:coherence.inputs.read'));
+CROSS JOIN scopes s
+WHERE ie.store_kind = 'company_data';
 
 CREATE OR REPLACE VIEW app_views.coherence_staging_files
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT (
+    app_views._read_has_full_tenant_right('col:coherence.member_phi')
+    AND app_views._read_has_full_tenant_right('col:coherence.member_contact')
+  ) AS show_file_handle
+)
 SELECT
   f.id,
   f.rel_path,
-  f.file_sha256,
+  CASE WHEN s.show_file_handle THEN f.file_sha256 ELSE NULL END AS file_sha256,
   f.original_at,
   f.metadata,
   sf.byte_size,
-  sf.md5_b64,
-  sf.crc32c_b64,
+  CASE WHEN s.show_file_handle THEN sf.md5_b64 ELSE NULL END AS md5_b64,
+  CASE WHEN s.show_file_handle THEN sf.crc32c_b64 ELSE NULL END AS crc32c_b64,
   f.journal_seq
 FROM coherence.imported_files f
 JOIN coherence.stored_files sf
   ON sf.store_kind = f.store_kind
  AND sf.sha256 = f.file_sha256
+CROSS JOIN scopes s
 WHERE f.area = 'staging'
   AND f.store_kind = 'company_data';
 
@@ -161,6 +197,9 @@ FROM coherence.engine_versions ev;
 
 CREATE OR REPLACE VIEW app_views.coherence_step_attempt_events
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+)
 SELECT
   e.id,
   e.run_id,
@@ -172,11 +211,11 @@ SELECT
   e.census,
   e.born,
   e.log_store_kind,
-  e.log_file_sha256,
+  CASE WHEN s.show_member_phi THEN e.log_file_sha256 ELSE NULL END AS log_file_sha256,
   sf.byte_size AS log_byte_size,
-  sf.md5_b64 AS log_md5_b64,
-  sf.crc32c_b64 AS log_crc32c_b64,
-  e.error_summary,
+  CASE WHEN s.show_member_phi THEN sf.md5_b64 ELSE NULL END AS log_md5_b64,
+  CASE WHEN s.show_member_phi THEN sf.crc32c_b64 ELSE NULL END AS log_crc32c_b64,
+  CASE WHEN s.show_member_phi THEN e.error_summary ELSE NULL END AS error_summary,
   e.artifact_count,
   e.artifacts_sha256,
   e.original_at,
@@ -185,7 +224,8 @@ FROM coherence.step_attempt_events e
 LEFT JOIN coherence.stored_files sf
   ON sf.store_kind = 'company_data'
  AND sf.sha256 = e.log_file_sha256
-WHERE (SELECT app_views._read_tenant_right('act:coherence.runs.read'));
+CROSS JOIN scopes s
+WHERE (SELECT app_views._read_workshop_right('act:coherence.runs.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_step_requests
 WITH (security_barrier = true) AS
@@ -212,12 +252,15 @@ FROM coherence.cancel_requests cr;
 
 CREATE OR REPLACE VIEW app_views.coherence_review_saves
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+)
 SELECT
   rs.id,
   rs.run_id,
   rs.surface,
   rs.attempt_event_id,
-  rs.approvals_file_sha256,
+  CASE WHEN s.show_member_phi THEN rs.approvals_file_sha256 ELSE NULL END AS approvals_file_sha256,
   rs.decision_commit_id,
   rs.imported,
   rs.original_at,
@@ -227,7 +270,9 @@ SELECT
   COALESCE(dc.header_contract, af.header_kind) AS header_kind
 FROM coherence.review_saves rs
 LEFT JOIN coherence.approvals_files af ON af.file_sha256 = rs.approvals_file_sha256
-LEFT JOIN coherence.decision_commits dc ON dc.id = rs.decision_commit_id;
+LEFT JOIN coherence.decision_commits dc ON dc.id = rs.decision_commit_id
+CROSS JOIN scopes s
+WHERE (SELECT app_views._read_workshop_right('act:coherence.runs.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_emit_confirmations
 WITH (security_barrier = true) AS
@@ -241,20 +286,30 @@ FROM coherence.emit_confirmations ec;
 
 CREATE OR REPLACE VIEW app_views.coherence_carries
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT
+    app_views._read_has_full_entity_finance() AS show_full_entity_finance,
+    app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+)
 SELECT
   c.id,
   c.run_id,
   c.statement_date,
   c.carry_kind,
   c.store_kind,
-  c.file_sha256,
+  CASE
+    WHEN c.carry_kind = 'sent' AND s.show_full_entity_finance THEN c.file_sha256
+    WHEN c.carry_kind IN ('approvals', 'decisions') AND s.show_member_phi THEN c.file_sha256
+    ELSE NULL
+  END AS file_sha256,
   c.carried_decision_commit_id,
   c.published_input_version_id,
   c.nothing_new,
   c.typed_phrase,
   c.journal_seq
 FROM coherence.carries c
-WHERE (SELECT app_views._read_tenant_right('act:coherence.runs.read'));
+CROSS JOIN scopes s
+WHERE (SELECT app_views._read_workshop_right('act:coherence.runs.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_abandonments
 WITH (security_barrier = true) AS
@@ -265,7 +320,7 @@ SELECT
   a.reason,
   a.journal_seq
 FROM coherence.abandonments a
-WHERE (SELECT app_views._read_tenant_right('act:coherence.runs.read'));
+WHERE (SELECT app_views._read_workshop_right('act:coherence.runs.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_review_submissions
 WITH (security_barrier = true) AS
@@ -298,10 +353,13 @@ WHERE rd.expires_at > pg_catalog.clock_timestamp();
 
 CREATE OR REPLACE VIEW app_views.coherence_approval_rows
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+)
 SELECT
-  ar.approvals_file_sha256,
+  CASE WHEN s.show_member_phi THEN ar.approvals_file_sha256 ELSE NULL END AS approvals_file_sha256,
   ar.row_no,
-  ar.record_id,
+  CASE WHEN s.show_member_phi THEN ar.record_id ELSE NULL END AS record_id,
   ar.disposition,
   ar.agent,
   ar.agency,
@@ -309,7 +367,7 @@ SELECT
   ar.book,
   ar.month,
   ar.status,
-  ar.note,
+  CASE WHEN s.show_member_phi THEN ar.note ELSE NULL END AS note,
   ar.committed_at,
   ar.approved_amount,
   ar.approved_agency,
@@ -320,7 +378,9 @@ SELECT
   rs.run_id,
   rs.surface
 FROM coherence.approval_rows ar
-LEFT JOIN coherence.review_saves rs ON rs.approvals_file_sha256 = ar.approvals_file_sha256;
+CROSS JOIN scopes s
+LEFT JOIN coherence.review_saves rs
+  ON rs.approvals_file_sha256 = ar.approvals_file_sha256;
 
 CREATE OR REPLACE VIEW app_views.coherence_review_configs
 WITH (security_barrier = true) AS
@@ -328,7 +388,7 @@ SELECT
   r.id AS run_id,
   pg_catalog.to_char(r.statement_date, 'YYYY-MM-DD') AS statement_date,
   e.step AS surface,
-  e.id AS attempt_event_id,
+  e.attempt_event_id,
   e.attempt_no,
   a.rel_path,
   a.store_kind,
@@ -337,22 +397,27 @@ SELECT
   sf.md5_b64,
   sf.crc32c_b64
 FROM coherence.runs r
-CROSS JOIN (VALUES ('bible'::text), ('adjust'::text)) AS surf(step)
-JOIN coherence.step_attempt_events e
-  ON e.id = app_views._read_current_finished_attempt(r.id, surf.step)
+JOIN coherence.v_current_finished_attempts e
+  ON e.run_id = r.id
+ AND e.step IN ('bible', 'adjust')
 JOIN coherence.artifacts a
-  ON a.attempt_event_id = e.id
+  ON a.attempt_event_id = e.attempt_event_id
  AND a.rel_path IN (e.step || '.json', e.step || '.html')
 JOIN coherence.stored_files sf
   ON sf.store_kind = a.store_kind
  AND sf.sha256 = a.file_sha256
-WHERE (SELECT app_views._read_tenant_right('act:coherence.decisions.read'));
+WHERE (SELECT app_views._read_workshop_right('act:coherence.decisions.read'))
+  AND (SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi'));
 
 CREATE OR REPLACE VIEW app_views.coherence_run_outputs
 WITH (security_barrier = true) AS
+WITH pub_emits AS MATERIALIZED (
+  SELECT attempt_event_id, is_sent
+  FROM app_views._read_published_emit_attempts()
+)
 SELECT
   r.id AS run_id,
-  e.id AS attempt_event_id,
+  e.attempt_event_id,
   a.rel_path,
   a.artifact_kind,
   a.store_kind,
@@ -361,23 +426,27 @@ SELECT
   sf.md5_b64,
   sf.crc32c_b64
 FROM coherence.runs r
-JOIN coherence.step_attempt_events e
-  ON e.id = app_views._read_current_finished_attempt(r.id, 'emit')
-LEFT JOIN app_views._read_published_emit_attempts() pe
-  ON pe.attempt_event_id = e.id
+JOIN coherence.v_current_finished_attempts e
+  ON e.run_id = r.id
+ AND e.step = 'emit'
+LEFT JOIN pub_emits pe
+  ON pe.attempt_event_id = e.attempt_event_id
 JOIN coherence.artifacts a
-  ON a.attempt_event_id = e.id
+  ON a.attempt_event_id = e.attempt_event_id
  AND a.artifact_kind = 'data'
  AND a.store_kind = 'company_data'
 JOIN coherence.stored_files sf
   ON sf.store_kind = 'company_data'
  AND sf.sha256 = a.file_sha256
-WHERE (SELECT app_views._read_tenant_right('act:coherence.outputs.read'))
+WHERE (SELECT app_views._read_has_full_tenant_right('act:coherence.outputs.read'))
+  AND (
+    (pe.attempt_event_id IS NOT NULL AND pe.is_sent)
+    OR (SELECT app_views._read_workshop_right('act:coherence.outputs.read'))
+  )
   AND (
     a.rel_path IN ('run.json', 'company_manifest.json')
     OR (
       pe.attempt_event_id IS NOT NULL
-      AND (pe.is_sent OR (SELECT app_views._read_has_full_tenant_right('act:coherence.unpublished.read')))
       AND (SELECT app_views._read_has_full_entity_finance())
     )
   );
@@ -445,7 +514,7 @@ SELECT
   true AS authorized
 FROM iam.database_context dc
 WHERE dc.singleton = true
-  AND (SELECT app_views._read_tenant_right('act:coherence.journal.read'));
+  AND (SELECT app_views._read_workshop_right('act:coherence.journal.read'));
 
 CREATE OR REPLACE VIEW app_views.coherence_journal_gate
 WITH (security_barrier = true) AS
@@ -454,7 +523,7 @@ SELECT
   true AS authorized
 FROM iam.database_context dc
 WHERE dc.singleton = true
-  AND (SELECT app_views._read_tenant_right('act:coherence.journal.read'));
+  AND (SELECT app_views._read_workshop_right('act:coherence.journal.read'));
 
 DO $$
 DECLARE

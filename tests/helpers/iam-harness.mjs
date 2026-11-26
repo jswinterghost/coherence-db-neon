@@ -206,6 +206,8 @@ export async function seedCoherenceIamFixture(pool, {
       ['act:platform.audit_journal.read', 'action', 'platform_audit', 'both', 'ordinary', true, null, null, null, 'Read platform audit journal'],
       ['col:coherence.statement_cash', 'column', 'coherence', 'both', 'money_statement', true, 'coherence', 'bob_policy_financials', 'amount', 'View agency statement cash'],
       ['col:coherence.upline_cash', 'column', 'coherence', 'both', 'money_upline', true, 'coherence', 'bob_policy_financials', 'upline_amount', 'View upline and gross cash'],
+      ['col:coherence.member_phi', 'column', 'coherence', 'both', 'member_phi', true, 'coherence', 'bob_policies', 'mbi', 'View member PHI (name, MBI, DOB, member record IDs)'],
+      ['col:coherence.member_contact', 'column', 'coherence', 'both', 'member_contact', true, 'coherence', 'bob_policies', 'phone', 'View member contact details (phone, email, address, county)'],
       ['col:platform.audit_journal.nusear_actor', 'column', 'platform_audit', 'both', 'platform_internal', true, 'platform', 'audit_journal', 'actor_person_id', 'View Nusear actor identity'],
       ['act:coherence.run.launch', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Launch Coherence run'],
       ['act:coherence.run.retry', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Retry Coherence step'],
@@ -282,14 +284,18 @@ export async function seedCoherenceIamFixture(pool, {
       'act:coherence.ledger.read', 'act:coherence.unpublished.read', 'act:coherence.runs.read',
       'act:coherence.inputs.read', 'act:coherence.outputs.read', 'act:coherence.decisions.read',
       'act:coherence.checks.read', 'act:coherence.journal.read', 'act:platform.audit_journal.read',
-      'col:coherence.statement_cash', 'col:coherence.upline_cash', 'col:platform.audit_journal.nusear_actor',
+      'col:coherence.statement_cash', 'col:coherence.upline_cash',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
+      'col:platform.audit_journal.nusear_actor',
     ]);
     await addRoleRights(ids.roleCoherenceOperator, [
       'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
       'act:coherence.ledger.read', 'act:coherence.unpublished.read', 'act:coherence.runs.read',
       'act:coherence.inputs.read', 'act:coherence.outputs.read', 'act:coherence.decisions.read',
       'act:coherence.checks.read', 'act:coherence.journal.read', 'act:platform.audit_journal.read',
-      'col:coherence.statement_cash', 'col:coherence.upline_cash', 'col:platform.audit_journal.nusear_actor',
+      'col:coherence.statement_cash', 'col:coherence.upline_cash',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
+      'col:platform.audit_journal.nusear_actor',
       'act:coherence.run.launch', 'act:coherence.run.retry', 'act:coherence.run.cancel',
       'act:coherence.review.submit', 'act:coherence.review.save', 'act:coherence.review.draft',
       'act:coherence.inputs.publish', 'act:coherence.approvals.register',
@@ -302,29 +308,38 @@ export async function seedCoherenceIamFixture(pool, {
     await addRoleRights(ids.roleEntityManager, [
       'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
       'act:coherence.ledger.read', 'act:coherence.unpublished.read',
+      'act:coherence.runs.read', 'act:coherence.inputs.read', 'act:coherence.outputs.read',
       'act:platform.audit_journal.read',
       'col:coherence.statement_cash', 'col:coherence.upline_cash',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
     await addRoleRights(ids.roleCompanyAdmin, [
       'act:coherence.runs.read', 'act:coherence.inputs.read', 'act:coherence.outputs.read',
+      'act:coherence.unpublished.read',
       'act:platform.audit_journal.read',
     ]);
-    await addRoleRights(ids.roleCompanyAdminRunsOnly, ['act:coherence.runs.read']);
+    await addRoleRights(ids.roleCompanyAdminRunsOnly, [
+      'act:coherence.runs.read', 'act:coherence.unpublished.read',
+    ]);
     await addRoleRights(ids.roleCompanyAdminNoGrants, ['act:platform.audit_journal.read']);
     await addRoleRights(ids.roleInvestor, [
       'act:coherence.bob.read', 'col:coherence.statement_cash', 'col:coherence.upline_cash',
     ]);
     await addRoleRights(ids.roleAgencyManager, [
       'act:coherence.bob.read', 'act:coherence.statements.read', 'col:coherence.statement_cash',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
     await addRoleRights(ids.roleTeamManager, [
       'act:coherence.bob.read', 'act:coherence.statements.read',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
     await addRoleRights(ids.roleSellingAgent, [
       'act:coherence.bob.read', 'act:coherence.statements.read',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
     await addRoleRights(ids.roleRetentionAgent, [
       'act:coherence.bob.read', 'act:coherence.statements.read',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
 
     for (const [orgId, , slug, name, parentId] of orgList) {

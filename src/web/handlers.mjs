@@ -262,6 +262,7 @@ export function createWebHandlers({
           [standingId],
         );
         for (const e of entriesRes.rows) {
+          if (!e.file_sha256) continue;
           const list = includedMap.get(e.file_sha256) || [];
           list.push(e.rel_path);
           includedMap.set(e.file_sha256, list);
@@ -277,7 +278,7 @@ export function createWebHandlers({
           byteSize: Number(r.byte_size),
           md5B64: r.md5_b64,
           originalAt: r.original_at ? formatTimestampUtcUs(r.original_at) : null,
-          includedAt: includedMap.get(r.file_sha256) || [],
+          includedAt: r.file_sha256 ? (includedMap.get(r.file_sha256) || []) : [],
         })),
       };
     });
@@ -863,7 +864,14 @@ export function createWebHandlers({
       report,
       dbToken,
     });
-    return { ...recorded, checkKind, passed: report.passed, report };
+    const maskedReport = await inReadTx(dbToken, async (tx) => {
+      const res = await tx.query(
+        'SELECT report FROM app_views.coherence_checks WHERE id = $1::uuid',
+        [recorded.result.checkId],
+      );
+      return res.rows[0]?.report ?? null;
+    });
+    return { ...recorded, checkKind, passed: report.passed, report: maskedReport };
   }
 
   async function getReviewDriftStatus(dbToken) {

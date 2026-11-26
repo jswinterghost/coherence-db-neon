@@ -11,7 +11,8 @@ const j = (...parts) => parts.join('');
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SKIP_DIRS = new Set(['node_modules', j('.', 'dev', 'in'), '.git']);
 const SKIP_REL_DIRS = new Set([`docs/${j('pha', 'lanx', '-plan')}`]);
-const SKIP_ROOT_FILE_PREFIXES = ['.pass2-', '.step5-', '.review-step5', j('.', 'ne', 'on', '-'), j('.', 'pha', 'lanx', '-')];
+const SKIP_ROOT_FILE_PREFIXES = ['.pass2-', '.step5-', '.review-step5', '.entity-', j('.', 'ne', 'on', '-'), j('.', 'pha', 'lanx', '-')];
+const SKIP_ROOT_FILE_SUFFIXES = ['.log'];
 const SKIP_ROOT_EXACT_FILES = new Set(['package-lock.json', '.git', '.history-folders.txt']);
 const ALLOWED_GITIGNORE_LINES = new Set([j('.', 'dev', 'in', '/'), j('.', 'ne', 'on', '-*')]);
 const HOST_PATH_ALLOWED_FILES = new Set([
@@ -70,6 +71,7 @@ async function walkKeptFiles(dir, rootDir = REPO_ROOT) {
       if (!relPath.includes('/')) {
         if (SKIP_ROOT_EXACT_FILES.has(relPath)) continue;
         if (SKIP_ROOT_FILE_PREFIXES.some((prefix) => relPath.startsWith(prefix))) continue;
+        if (SKIP_ROOT_FILE_SUFFIXES.some((suffix) => relPath.endsWith(suffix))) continue;
       }
       out.push(join(dir, entry.name));
     }
@@ -116,7 +118,7 @@ test('Clean Text: transient skips apply only at repository root by exact relativ
       .map((l) => l.trim())
       .filter(Boolean),
   );
-  for (const pat of ['.step5-*', '.review-*', '.real-proof-*', '.history-folders.txt']) {
+  for (const pat of ['.step5-*', '.review-*', '.real-proof-*', '.entity-*', '*.log', '.history-folders.txt']) {
     assert.equal(gitignoreLines.has(pat), true, `.gitignore must list ${pat}`);
   }
 
@@ -126,8 +128,12 @@ test('Clean Text: transient skips apply only at repository root by exact relativ
   await mkdir(join(tmp, 'docs'), { recursive: true });
   await writeFile(join(tmp, '.step5-temp.md'), 'root transient\n');
   await writeFile(join(tmp, '.review-step5-proof.diff'), 'root transient\n');
+  await writeFile(join(tmp, '.entity-temp.md'), 'root transient\n');
+  await writeFile(join(tmp, '.session.log'), 'root transient log\n');
   await writeFile(join(tmp, '.history-folders.txt'), 'root transient\n');
   await writeFile(join(tmp, 'src', '.step5-nested.mjs'), 'nested must be scanned\n');
+  await writeFile(join(tmp, 'src', '.entity-nested.md'), 'nested must be scanned\n');
+  await writeFile(join(tmp, 'src', 'nested.log'), 'nested must be scanned\n');
   await writeFile(join(tmp, 'docs', '.review-step5-nested.diff'), 'nested must be scanned\n');
   await writeFile(join(tmp, 'docs', '.history-folders.txt'), 'nested must be scanned\n');
   await writeFile(join(tmp, 'src', 'kept.mjs'), 'ok\n');
@@ -136,7 +142,9 @@ test('Clean Text: transient skips apply only at repository root by exact relativ
   assert.deepEqual(found, [
     'docs/.history-folders.txt',
     'docs/.review-step5-nested.diff',
+    'src/.entity-nested.md',
     'src/.step5-nested.mjs',
     'src/kept.mjs',
+    'src/nested.log',
   ]);
 });

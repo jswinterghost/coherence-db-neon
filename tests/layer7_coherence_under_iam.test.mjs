@@ -268,6 +268,8 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
       // Column rights
       ['col:coherence.statement_cash', 'column', 'coherence', 'both', 'money_statement', true, 'coherence', 'bob_policy_financials', 'amount', 'View agency statement cash'],
       ['col:coherence.upline_cash', 'column', 'coherence', 'both', 'money_upline', true, 'coherence', 'bob_policy_financials', 'upline_amount', 'View upline and gross cash'],
+      ['col:coherence.member_phi', 'column', 'coherence', 'both', 'member_phi', true, 'coherence', 'bob_policies', 'mbi', 'View member PHI (name, MBI, DOB, member record IDs)'],
+      ['col:coherence.member_contact', 'column', 'coherence', 'both', 'member_contact', true, 'coherence', 'bob_policies', 'phone', 'View member contact details (phone, email, address, county)'],
       ['col:platform.audit_journal.nusear_actor', 'column', 'platform_audit', 'both', 'platform_internal', true, 'platform', 'audit_journal', 'actor_person_id', 'View Nusear actor identity in audit journal'],
       // Operator write rights
       ['act:coherence.run.launch', 'action', 'coherence', 'both', 'ordinary', true, null, null, null, 'Launch Coherence run'],
@@ -348,14 +350,18 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
       'act:coherence.ledger.read', 'act:coherence.unpublished.read', 'act:coherence.runs.read',
       'act:coherence.inputs.read', 'act:coherence.decisions.read', 'act:coherence.checks.read',
       'act:coherence.journal.read', 'act:platform.audit_journal.read',
-      'col:coherence.statement_cash', 'col:coherence.upline_cash', 'col:platform.audit_journal.nusear_actor',
+      'col:coherence.statement_cash', 'col:coherence.upline_cash',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
+      'col:platform.audit_journal.nusear_actor',
     ]);
     await addRoleRights(ids.roleCoherenceOperator, [
       'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
       'act:coherence.ledger.read', 'act:coherence.unpublished.read', 'act:coherence.runs.read',
       'act:coherence.inputs.read', 'act:coherence.decisions.read', 'act:coherence.checks.read',
       'act:coherence.journal.read', 'act:platform.audit_journal.read',
-      'col:coherence.statement_cash', 'col:coherence.upline_cash', 'col:platform.audit_journal.nusear_actor',
+      'col:coherence.statement_cash', 'col:coherence.upline_cash',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
+      'col:platform.audit_journal.nusear_actor',
       'act:coherence.run.launch', 'act:coherence.run.retry', 'act:coherence.run.cancel',
       'act:coherence.review.submit', 'act:coherence.review.save', 'act:coherence.review.draft',
       'act:coherence.inputs.publish', 'act:coherence.approvals.register',
@@ -368,26 +374,33 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
     await addRoleRights(ids.roleEntityManager, [
       'act:coherence.bob.read', 'act:coherence.statements.read', 'act:coherence.upline.read',
       'act:coherence.ledger.read', 'act:coherence.unpublished.read',
+      'act:coherence.runs.read', 'act:coherence.inputs.read',
       'act:platform.audit_journal.read',
       'col:coherence.statement_cash', 'col:coherence.upline_cash',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
     await addRoleRights(ids.roleCompanyAdmin, [
-      'act:coherence.runs.read', 'act:coherence.inputs.read', 'act:platform.audit_journal.read',
+      'act:coherence.runs.read', 'act:coherence.inputs.read',
+      'act:coherence.unpublished.read', 'act:platform.audit_journal.read',
     ]);
     await addRoleRights(ids.roleInvestor, [
       'act:coherence.bob.read', 'col:coherence.statement_cash', 'col:coherence.upline_cash',
     ]);
     await addRoleRights(ids.roleAgencyManager, [
       'act:coherence.bob.read', 'act:coherence.statements.read', 'col:coherence.statement_cash',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
     await addRoleRights(ids.roleTeamManager, [
       'act:coherence.bob.read', 'act:coherence.statements.read',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
     await addRoleRights(ids.roleSellingAgent, [
       'act:coherence.bob.read', 'act:coherence.statements.read',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
     await addRoleRights(ids.roleRetentionAgent, [
       'act:coherence.bob.read', 'act:coherence.statements.read',
+      'col:coherence.member_phi', 'col:coherence.member_contact',
     ]);
 
     for (const [orgId, slug, name] of [
@@ -1873,17 +1886,22 @@ test('Layer 7B [app_cmd.coherence_* Commands, View-As Refusal & Worker Boundary]
     )
   ));
 
-  // Verify app_views.coherence_runs shows abandoned stage for Company Admin (runs.read) and 0 rows for Agent A
-  const adminRuns = await runAsPlatformApp(env.pool, { token: companyAdminTok, readOnly: true }, async (c) => (
-    (await c.query('SELECT id, stage, abandoned FROM app_views.coherence_runs WHERE id = $1::uuid', [runId])).rows
-  ));
-  assert.equal(adminRuns.length, 1);
-  assert.equal(adminRuns[0].stage, 'abandoned');
-  assert.equal(adminRuns[0].abandoned, true);
-  const agentRunsCnt = await runAsPlatformApp(env.pool, { token: agentATok, readOnly: true }, async (c) => (
-    (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs')).rows[0].n
-  ));
-  assert.equal(agentRunsCnt, 0);
+  // Verify app_views.coherence_runs shows abandoned stage for workshop holders (Owner and Company Admin),
+  // and returns 0 rows for finished-goods readers (Agent A and Beacon Agency Manager).
+  for (const [label, readerTok] of [['owner', ownerTok], ['company_admin', companyAdminTok]]) {
+    const runsSeen = await runAsPlatformApp(env.pool, { token: readerTok, readOnly: true }, async (c) => (
+      (await c.query('SELECT id, stage, abandoned FROM app_views.coherence_runs WHERE id = $1::uuid', [runId])).rows
+    ));
+    assert.equal(runsSeen.length, 1, `${label} must see abandoned run`);
+    assert.equal(runsSeen[0].stage, 'abandoned');
+    assert.equal(runsSeen[0].abandoned, true);
+  }
+  for (const [label, readerTok] of [['agentA', agentATok], ['beaconManager', tok(ids.beaconManager)]]) {
+    const cnt = await runAsPlatformApp(env.pool, { token: readerTok, readOnly: true }, async (c) => (
+      (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs')).rows[0].n
+    ));
+    assert.equal(cnt, 0, `${label} (finished-goods reader) must see 0 rows in coherence_runs`);
+  }
   await runAsPlatformApp(env.pool, { token: ownerTok, readOnly: false, serializable: true }, (c) => (
     c.query(
       `SELECT app_cmd.coherence_import_standalone_files($1, $2, $3::jsonb)`,
@@ -3848,37 +3866,53 @@ test('Layer 7B [Fix2-ShouldFix - Current Views No Stale Fallback, Reconciliation
     assert.ok(splitUnpubRecon.every((r) => r.reconciled === true && r.variance === '0.00'), `split-unpub reconciliation on unsent run R3 must never produce false variances: ${JSON.stringify(splitUnpubRecon)}`);
   });
 
-  await t.test('Fix2-SF5: app_views.coherence_runs.latest_journal_seq returns the true tip via narrow definer helper even for readers lacking decisions.read / statements.read / unpublished.read', async () => {
-    // R3 is UNSENT and materialized via a later journal entry than its finish_attempt,
-    // AND we also record a decision row attached to R3 at an even higher journal_seq.
+  await t.test('Fix2-SF5: app_views.coherence_runs.latest_journal_seq returns the true tip via narrow definer helper for workshop holders lacking decisions.read / statements.read while finished-goods readers see 0 rows', async () => {
+    // Attach a later decision row to SENT run R2 at an even higher journal_seq than its finish/carry_sent,
+    // and verify company_admin (no decisions.read / statements.read, holds workshop with unpublished.read)
+    // sees R2's true tip and unsent run R3 while finished-goods reader (beaconManager) sees 0 rows.
     await runAsPlatformApp(env.pool, { token: tok(ids.nusearOwner), readOnly: false, serializable: true }, (c) => (
       c.query('SELECT app_cmd.coherence_record_decision_baseline($1, $2, $3::jsonb)', [
         'f2-sf5-dec', sha256Hex('f2-sf5-dec'), JSON.stringify({
           commit_kind: 'historical_baseline',
           header_contract: 'v2',
           imported: true,
-          decisions: [{ run_id: r3.runId, surface: 'bible', record_id: 'policy:carrier_a:TIP#effective:2026-12-01', disposition: 'CONFIRM' }],
+          decisions: [{ run_id: r2.runId, surface: 'bible', record_id: 'policy:carrier_a:TIP#effective:2026-12-01', disposition: 'CONFIRM' }],
         }),
       ])
     ));
-    const trueTip = Number((await env.pool.query('SELECT coherence.run_latest_journal_seq($1::uuid) AS s', [r3.runId])).rows[0].s);
-    const adminRuns = await runAsPlatformApp(env.pool, { token: tok(ids.acmeCompanyAdmin), readOnly: true }, async (c) => (
-      (await c.query('SELECT id, latest_journal_seq FROM app_views.coherence_runs WHERE id = $1::uuid', [r3.runId])).rows
+    const trueTip = Number((await env.pool.query('SELECT coherence.run_latest_journal_seq($1::uuid) AS s', [r2.runId])).rows[0].s);
+    const adminSentRuns = await runAsPlatformApp(env.pool, { token: tok(ids.acmeCompanyAdmin), readOnly: true }, async (c) => (
+      (await c.query('SELECT id, latest_journal_seq FROM app_views.coherence_runs WHERE id = $1::uuid', [r2.runId])).rows
     ));
-    assert.equal(adminRuns.length, 1);
-    assert.equal(Number(adminRuns[0].latest_journal_seq), trueTip, `company_admin must see true tip ${trueTip} in coherence_runs.latest_journal_seq (got ${adminRuns[0].latest_journal_seq})`);
+    assert.equal(adminSentRuns.length, 1);
+    assert.equal(Number(adminSentRuns[0].latest_journal_seq), trueTip, `company_admin must see true tip ${trueTip} in coherence_runs.latest_journal_seq for sent run R2 (got ${adminSentRuns[0].latest_journal_seq})`);
+    const adminUnsentRuns = await runAsPlatformApp(env.pool, { token: tok(ids.acmeCompanyAdmin), readOnly: true }, async (c) => (
+      (await c.query('SELECT id FROM app_views.coherence_runs WHERE id = $1::uuid', [r3.runId])).rows
+    ));
+    assert.equal(adminUnsentRuns.length, 1, 'company_admin holding workshop must also see unsent run R3');
+    const mgrRunsCnt = await runAsPlatformApp(env.pool, { token: tok(ids.beaconManager), readOnly: true }, async (c) => (
+      (await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_runs')).rows[0].n
+    ));
+    assert.equal(mgrRunsCnt, 0, 'finished-goods reader (agency manager) must see 0 rows in coherence_runs');
     // company_admin still sees 0 rows in decisions & statement_batches
     await runAsPlatformApp(env.pool, { token: tok(ids.acmeCompanyAdmin), readOnly: true }, async (c) => {
       assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_decisions')).rows[0].n, 0);
       assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_batches')).rows[0].n, 0);
     });
-    // platform_app gets 42501 reading the narrow definer helper view directly
+    // platform_app gets 42501 reading the narrow definer helper view and stage wrapper directly
     await assert.rejects(
       () => runAsPlatformApp(env.pool, { token: tok(ids.acmeCompanyAdmin), readOnly: true }, (c) => (
-        c.query('SELECT * FROM coherence.v_run_latest_journal_seq WHERE run_id = $1::uuid', [r3.runId])
+        c.query('SELECT * FROM coherence.v_run_latest_journal_seq WHERE run_id = $1::uuid', [r2.runId])
       )),
       (err) => err?.code === '42501',
       'platform_app must get 42501 reading coherence.v_run_latest_journal_seq directly',
+    );
+    await assert.rejects(
+      () => runAsPlatformApp(env.pool, { token: tok(ids.acmeCompanyAdmin), readOnly: true }, (c) => (
+        c.query('SELECT coherence._ro_run_stage($1::uuid, NULL)', [r2.runId])
+      )),
+      (err) => err?.code === '42501',
+      'platform_app must get 42501 calling coherence._ro_run_stage directly',
     );
   });
 });
@@ -4374,7 +4408,8 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
       await env.pool.query('DROP FUNCTION IF EXISTS coherence.xresolve_probe()');
     }
 
-    // 5. Granting SELECT on narrow definer view coherence.v_run_latest_journal_seq to platform_worker must fail audit
+    // 5. Granting SELECT on narrow helper views coherence.v_run_latest_journal_seq or
+    //    coherence.v_current_finished_attempts, or EXECUTE on coherence._ro_run_stage, to platform_worker must fail audit
     await env.pool.query('GRANT SELECT ON coherence.v_run_latest_journal_seq TO platform_worker');
     try {
       const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
@@ -4382,6 +4417,22 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
       assert.ok(bad.problems.some((p) => /v_run_latest_journal_seq/i.test(p) && /platform_worker/i.test(p)));
     } finally {
       await env.pool.query('REVOKE SELECT ON coherence.v_run_latest_journal_seq FROM platform_worker');
+    }
+    await env.pool.query('GRANT SELECT ON coherence.v_current_finished_attempts TO platform_worker');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'granting SELECT on coherence.v_current_finished_attempts to platform_worker must fail audit');
+      assert.ok(bad.problems.some((p) => /v_current_finished_attempts/i.test(p) && /platform_worker/i.test(p)));
+    } finally {
+      await env.pool.query('REVOKE SELECT ON coherence.v_current_finished_attempts FROM platform_worker');
+    }
+    await env.pool.query('GRANT EXECUTE ON FUNCTION coherence._ro_run_stage(UUID, BIGINT) TO platform_worker');
+    try {
+      const bad = await policyChecks.verifyIamConfigInvariants(env.pool);
+      assert.equal(bad.passed, false, 'granting EXECUTE on coherence._ro_run_stage to platform_worker must fail audit');
+      assert.ok(bad.problems.some((p) => /_ro_run_stage/i.test(p) && /platform_worker/i.test(p)));
+    } finally {
+      await env.pool.query('REVOKE EXECUTE ON FUNCTION coherence._ro_run_stage(UUID, BIGINT) FROM platform_worker');
     }
 
     // 6. Stale comment check: migration 009 must not reference nonexistent expand_org_ids_with_archived

@@ -434,6 +434,17 @@ test('Layer 2 [Negative Invariant]: View-As never writes, worker-only exclusivit
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
 
   // Explicit company_admin per-area grants enforced strictly in PostgreSQL:
+  // Workshop holders (including companyAdminRunsOnly) see unfinished/unsent runs; finished-goods
+  // readers (agencyMgr) get 0 runs, 0 input versions, and 0 output files.
+  currentToken = iam.tokens.agencyMgr;
+  assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/runs`)).json()).runs, []);
+  assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/inputs/versions`)).json()).versions, []);
+  assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/outputs`)).json()).files, []);
+
+  currentToken = iam.tokens.companyAdminRunsOnly;
+  assert.equal((await (await fetch(`${baseUrl}/api/coherence/acme/runs`)).json()).runs.length, 1);
+  await env.commands.carrySent({ dbToken: env.ownerToken, commandKey: 'sec-carry-sent', runId, typedPhrase: 'sent 2026-11-21' });
+
   // companyAdminNoGrants sees 0 runs, 0 input versions, and 0 output files.
   currentToken = iam.tokens.companyAdminNoGrants;
   assert.deepEqual((await (await fetch(`${baseUrl}/api/coherence/acme/runs`)).json()).runs, []);
