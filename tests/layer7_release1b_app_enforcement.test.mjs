@@ -736,7 +736,7 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
           [randomUUID(), personId, display, `${slug}@acme.example`, jSeq],
         );
         await c.query(
-          "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+          "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
           [randomUUID(), personId, iam.ids.companyOrg, jSeq],
         );
         await c.query(
@@ -1342,7 +1342,7 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
         const memberOrgs = [...new Set(grants.map((g) => g.orgId))];
         for (const orgId of memberOrgs) {
           await c.query(
-            "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+            "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
             [randomUUID(), personId, orgId, seq],
           );
         }

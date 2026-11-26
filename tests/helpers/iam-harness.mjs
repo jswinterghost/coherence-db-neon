@@ -416,26 +416,26 @@ export async function seedCoherenceIamFixture(pool, {
       [randomUUID(), ids.workerService, seq],
     );
 
-    for (const [personId, orgId, cap] of [
-      [ids.nusearOwner, ids.rootOrg, 'owner'],
+    for (const [personId, orgId, arrangement] of [
+      [ids.nusearOwner, ids.rootOrg, 'employee'],
       [ids.nusearAdminNoCoh, ids.rootOrg, 'employee'],
       [ids.nusearOperator, ids.rootOrg, 'employee'],
       [ids.northstarOperator, ids.rootOrg, 'employee'],
       [ids.workerService, ids.rootOrg, 'employee'],
-      [ids.entityMgr, ids.companyOrg, 'owner'],
+      [ids.entityMgr, ids.companyOrg, 'employee'],
       [ids.companyAdmin, ids.companyOrg, 'employee'],
       [ids.companyAdminRunsOnly, ids.companyOrg, 'employee'],
       [ids.companyAdminNoGrants, ids.companyOrg, 'employee'],
-      [ids.investor, ids.companyOrg, 'investor'],
+      [ids.investor, ids.companyOrg, 'employee'],
       [ids.beaconManager, ids.beaconOrg, 'employee'],
       [ids.leadManager, ids.beaconOrg, 'employee'],
       [ids.teamManager, ids.beaconOrg, 'employee'],
       [ids.harborRetention, ids.harborOrg, 'employee'],
     ]) {
       await client.query(
-        `INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq)
+        `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq)
          VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)`,
-        [randomUUID(), personId, orgId, cap, seq],
+        [randomUUID(), personId, orgId, arrangement, seq],
       );
     }
 

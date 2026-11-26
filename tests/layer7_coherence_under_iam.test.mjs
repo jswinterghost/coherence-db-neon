@@ -503,15 +503,15 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
     );
 
     // Memberships
-    for (const [personId, orgId, cap] of [
-      [ids.nusearOwner, ids.rootOrg, 'owner'],
+    for (const [personId, orgId, arrangement] of [
+      [ids.nusearOwner, ids.rootOrg, 'employee'],
       [ids.nusearAdminNoCoh, ids.rootOrg, 'employee'],
       [ids.nusearOperator, ids.rootOrg, 'employee'],
       [ids.northstarOperator, ids.rootOrg, 'employee'],
       [ids.workerService, ids.rootOrg, 'employee'],
-      [ids.acmeEntityMgr, ids.acmeOrg, 'owner'],
+      [ids.acmeEntityMgr, ids.acmeOrg, 'employee'],
       [ids.acmeCompanyAdmin, ids.acmeOrg, 'employee'],
-      [ids.acmeInvestor, ids.acmeOrg, 'investor'],
+      [ids.acmeInvestor, ids.acmeOrg, 'employee'],
       [ids.beaconManager, ids.beaconOrg, 'employee'],
       [ids.leadManager, ids.beaconOrg, 'employee'],
       [ids.teamManager, ids.beaconOrg, 'employee'],
@@ -519,9 +519,9 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
       [ids.harborRetention, ids.harborOrg, 'employee'],
     ]) {
       await c.query(
-        `INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq)
+        `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq)
          VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)`,
-        [randomUUID(), personId, orgId, cap, seq],
+        [randomUUID(), personId, orgId, arrangement, seq],
       );
     }
 
@@ -2471,7 +2471,7 @@ test('Layer 7B [Fix1-3, Fix1-4, Fix1-5, Fix1-8 - Decisions Gate, Tenant-Scoped R
       [ledgerNoUplinePerson, ids.acmeOrg],
     ]) {
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), pid, oid, seq],
       );
     }
@@ -2605,13 +2605,13 @@ test('Layer 7B [Fix1-9 & Fix1-12 Note - Active-Only Affiliations, Tenant-Tree Or
   await inSerializableTx(env.pool, async (c) => {
     const j = await appendAuditEntry(c, { environment, commandKind: 'iam.seed_fix9', commandKey: 'f1-9-seed' });
     const seq = j.seq;
-    for (const [oid, kind, slug, name, parent] of [
-      [leadVendorOrg, 'lead_vendor', 'leadco', 'LeadCo', ids.acmeOrg],
-      [refFirmOrg, 'referral_firm', 'refco', 'RefCo', ids.acmeOrg],
-      [orphanAgencyOrg, 'agency', 'orphan_ag', 'Orphan Agency', null],
+    for (const [oid, kind, slug, name, parent, maskedName] of [
+      [leadVendorOrg, 'lead_vendor', 'leadco', 'LeadCo', ids.acmeOrg, 'Vendor 01'],
+      [refFirmOrg, 'referral_firm', 'refco', 'RefCo', ids.acmeOrg, null],
+      [orphanAgencyOrg, 'agency', 'orphan_ag', 'Orphan Agency', null, null],
     ]) {
       await c.query('INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,$2,$3)', [oid, kind, seq]);
-      await c.query("INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,$3,$4,'active',$5)", [randomUUID(), oid, slug, name, seq]);
+      await c.query("INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, masked_display_name, status, journal_seq) VALUES ($1,$2,$3,$4,$5,'active',$6)", [randomUUID(), oid, slug, name, maskedName, seq]);
       if (parent) {
         await c.query("INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), oid, parent, seq]);
       }
@@ -2629,7 +2629,7 @@ test('Layer 7B [Fix1-9 & Fix1-12 Note - Active-Only Affiliations, Tenant-Tree Or
       [randomUUID(), revokedAgent, ids.beaconOrg, seq],
     );
     await c.query(
-      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
       [randomUUID(), acmeNoDescPerson, ids.acmeOrg, seq],
     );
     await c.query(
@@ -3289,7 +3289,7 @@ test('Layer 7B [Fix2-Blocker1 - Archived Child Latest Non-Future Edge & Team Mov
       [randomUUID(), harborManager, seq],
     );
     await c.query(
-      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
       [randomUUID(), harborManager, ids.harborOrg, seq],
     );
     await c.query(
@@ -3535,7 +3535,7 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
         [randomUUID(), staffNoDesc, seq],
       );
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), staffNoDesc, ids.rootOrg, seq],
       );
       // Live Nusear grant on Acme with include_descendants = FALSE
@@ -3614,7 +3614,7 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
         );
         await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','nusear_staff',$2)", [staffNoDesc, j.seq]);
         await c.query("INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'nusear_staff','Staff NO','Staff NO','dual.no@nusear.example','active',$3)", [randomUUID(), staffNoDesc, j.seq]);
-        await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), staffNoDesc, w.ids.rootOrg, j.seq]);
+        await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), staffNoDesc, w.ids.rootOrg, j.seq]);
         await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), staffNoDesc, w.ids.roleNusearAdmin, w.ids.acmeOrg, j.seq]);
         await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,2024-01-01)'::daterange,'active',$5)", [randomUUID(), staffNoDesc, w.ids.roleNusearOwner, w.ids.acmeOrg, j.seq]);
       });
@@ -3843,7 +3843,7 @@ test('Layer 7B [Fix2-ShouldFix - Current Views No Stale Fallback, Reconciliation
     ]) {
       await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
       await c.query("INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)", [randomUUID(), pid, name, email, seq]);
-      await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), pid, memOrg, seq]);
+      await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), pid, memOrg, seq]);
     }
     for (const [pid, rid, oid, incDesc] of [
       [harborLedgerReader, roleHarborLedger, ids.harborOrg, true],
@@ -3975,13 +3975,13 @@ test('Layer 7B [Fix2-ShouldFix - Write Org Validation, accept_review_submission 
   const orphanAgencyOrg = randomUUID();
   await inSerializableTx(env.pool, async (c) => {
     const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f2_bad_orgs', commandKey: 'f2-bad-orgs' });
-    for (const [oid, kind, slug, name, parent] of [
-      [leadVendorOrg, 'lead_vendor', 'lead_v', 'Lead V', ids.acmeOrg],
-      [refFirmOrg, 'referral_firm', 'ref_f', 'Ref F', ids.acmeOrg],
-      [orphanAgencyOrg, 'agency', 'orphan_a', 'Orphan A', null],
+    for (const [oid, kind, slug, name, parent, maskedName] of [
+      [leadVendorOrg, 'lead_vendor', 'lead_v', 'Lead V', ids.acmeOrg, 'Vendor 01'],
+      [refFirmOrg, 'referral_firm', 'ref_f', 'Ref F', ids.acmeOrg, null],
+      [orphanAgencyOrg, 'agency', 'orphan_a', 'Orphan A', null, null],
     ]) {
       await c.query('INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,$2,$3)', [oid, kind, j.seq]);
-      await c.query("INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,$3,$4,'active',$5)", [randomUUID(), oid, slug, name, j.seq]);
+      await c.query("INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, masked_display_name, status, journal_seq) VALUES ($1,$2,$3,$4,$5,'active',$6)", [randomUUID(), oid, slug, name, maskedName, j.seq]);
       if (parent) {
         await c.query("INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), oid, parent, j.seq]);
       }
@@ -4562,7 +4562,7 @@ test('Layer 7B [Fix3-1A - Dual-Agency Tenant-Tree Bounds: Active Child Under Arc
       [dualAgencyNarrow, ids.harborOrg, 'employee'],
       [dualAgencyNarrow, ids.eastTeamOrg, 'employee'],
       [ids.agentEast, ids.harborOrg, 'employee'],
-      [acmePlusEastWide, ids.acmeOrg, 'owner'],
+      [acmePlusEastWide, ids.acmeOrg, 'employee'],
       [acmePlusEastWide, ids.eastTeamOrg, 'employee'],
       [acmeNoDollarPlusEastCash, ids.acmeOrg, 'employee'],
       [acmeNoDollarPlusEastCash, ids.eastTeamOrg, 'employee'],
@@ -4570,7 +4570,7 @@ test('Layer 7B [Fix3-1A - Dual-Agency Tenant-Tree Bounds: Active Child Under Arc
       [acmeNoDollarPlusEastNarrowCash, ids.eastTeamOrg, 'employee'],
     ]) {
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
         [randomUUID(), pid, orgId, cap, seq],
       );
     }
@@ -4720,7 +4720,7 @@ test('Layer 7B [Fix3-1A - Dual-Agency Tenant-Tree Bounds: Active Child Under Arc
     await inSerializableTx(env.pool, async (c) => {
       const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f3_agent_east_acme_nodollar', commandKey: 'f3-agent-east-acme-nodollar' });
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), ids.agentEast, ids.acmeOrg, j.seq],
       );
       await c.query(
@@ -4838,19 +4838,19 @@ test('Layer 7B [Item 4 - Moved Organizations in Working DB]: live Emit for moved
       );
     }
 
-    for (const [pid, orgId, cap] of [
+    for (const [pid, orgId, arrangement] of [
       [dualCoWide, ids.harborOrg, 'employee'],
       [dualCoWide, ids.northstarOrg, 'employee'],
       [dualCoNarrow, ids.harborOrg, 'employee'],
       [dualCoNarrow, ids.northstarOrg, 'employee'],
-      [northstarOnlyMgr, ids.northstarOrg, 'owner'],
-      [acmeAndNorthstarEM, ids.acmeOrg, 'owner'],
-      [acmeAndNorthstarEM, ids.northstarOrg, 'owner'],
+      [northstarOnlyMgr, ids.northstarOrg, 'employee'],
+      [acmeAndNorthstarEM, ids.acmeOrg, 'employee'],
+      [acmeAndNorthstarEM, ids.northstarOrg, 'employee'],
       [movedAgencyOwnMgr, ids.eastTeamOrg, 'employee'],
     ]) {
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
-        [randomUUID(), pid, orgId, cap, seq],
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
+        [randomUUID(), pid, orgId, arrangement, seq],
       );
     }
 
@@ -5262,21 +5262,21 @@ test('Layer 7B [Fix4 - Narrow unpublished.read Stays Narrow Across Keyed Tables 
       );
     }
 
-    for (const [pid, orgId, cap] of [
+    for (const [pid, orgId, arrangement] of [
       [ids.agentA, ids.beaconOrg, 'employee'],
       [sentAgencyPlusExplicitUnpub, ids.beaconOrg, 'employee'],
-      [sentEmPlusExplicitUnpub, ids.acmeOrg, 'owner'],
-      [sentEmAcmeWideBeaconNarrowUnpub, ids.acmeOrg, 'owner'],
+      [sentEmPlusExplicitUnpub, ids.acmeOrg, 'employee'],
+      [sentEmAcmeWideBeaconNarrowUnpub, ids.acmeOrg, 'employee'],
     ]) {
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
-        [randomUUID(), pid, orgId, cap, seq],
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
+        [randomUUID(), pid, orgId, arrangement, seq],
       );
     }
 
     // 1. agentA: wide sent-only Agency Manager on Beacon + narrow self unpublished.read on Beacon
     await c.query(
-      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
       [randomUUID(), ids.agentA, ids.acmeOrg, seq],
     );
     for (const [pid, roleId, orgId, incDesc, pMode] of [
@@ -5730,11 +5730,11 @@ test('Layer 7B [Release C1 Item 8 - Time-Consistent Chains in iam.v_organization
         [randomUUID(), pid, name, email, npn, seq],
       );
     }
-    for (const [pid, orgId, cap] of [
+    for (const [pid, orgId, arrangement] of [
       [movedAgencyMgr, movedAgency, 'employee'],
       [movedActiveTeamMgr, movedActiveTeam, 'employee'],
       [newTeamMgr, newPostMoveTeam, 'employee'],
-      [northstarEM, ids.northstarOrg, 'owner'],
+      [northstarEM, ids.northstarOrg, 'employee'],
       [nsOnlyMemberMovedGrant, ids.northstarOrg, 'employee'],
       [acmeMemberMovedGrant, ids.acmeOrg, 'employee'],
       [rejoinAgencyMgr, rejoinAgency, 'employee'],
@@ -5742,8 +5742,8 @@ test('Layer 7B [Release C1 Item 8 - Time-Consistent Chains in iam.v_organization
       [acmeMemberRejoinGrant, ids.acmeOrg, 'employee'],
     ]) {
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
-        [randomUUID(), pid, orgId, cap, seq],
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)",
+        [randomUUID(), pid, orgId, arrangement, seq],
       );
     }
     await c.query(
@@ -6187,7 +6187,7 @@ test('Layer 7B [Release E2 - No Holding-Company User-Grant Flow]: no grant above
         [randomUUID(), pid, name, email, seq],
       );
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'owner','[2020-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), pid, memOrg, seq],
       );
     }
@@ -6365,7 +6365,7 @@ test('Layer 7B [Release C2 Fix1 - Unified Tool-Switch Chain]: holdingCo preview 
       [randomUUID(), holdingExec, seq],
     );
     await c.query(
-      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'owner','[2020-01-01,)'::daterange,'active',$4)",
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
       [randomUUID(), holdingExec, holdingCo, seq],
     );
     await c.query(

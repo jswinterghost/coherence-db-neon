@@ -1,8 +1,10 @@
--- Migration 008: Database-only IAM core (Release 1A + Release E2).
+-- Migration 008: Database-only IAM core (Release 1A + Release E2 + Release E3).
 -- Installs bootstrap least-privilege roles (including platform_auth_lookup), hash-chained platform.audit_journal,
 -- BEFORE INSERT platform_versioner supersession triggers and ENABLE ALWAYS immutability triggers,
--- scoped iam_secret.signing_keys, core iam identity/org/role/right/scope/switch/auth-identity tables,
--- origin/role/control-DB/platform_iam_sync isolation triggers, America/New_York business_today(),
+-- scoped iam_secret.signing_keys, core iam identity/org/role/right/scope/switch/auth-identity tables
+-- (including external_upline organizations, per-company lead_vendor masked_display_name, and dated works-for
+-- memberships with work_arrangement and nullable tax_classification),
+-- origin/role/control-DB/platform_iam_sync/org-version isolation triggers, America/New_York business_today(),
 -- HMAC-SHA256 scope-checked session_context(), narrow resolve_auth_identity(), unified org closure and
 -- tenant-bounded grant evaluator (no cross-company holding-company grant flow), set-theoretic scope helpers,
 -- and deterministic iam.assert_can_write().
@@ -508,7 +510,7 @@ CREATE TABLE iam.tools (
 CREATE TABLE iam.organizations (
   id UUID PRIMARY KEY,
   org_kind TEXT NOT NULL CHECK (org_kind IN (
-    'platform_root', 'company', 'agency', 'team', 'lead_vendor', 'referral_firm'
+    'platform_root', 'company', 'agency', 'team', 'lead_vendor', 'referral_firm', 'external_upline'
   )),
   journal_seq BIGINT NOT NULL REFERENCES platform.audit_journal(seq)
 );
@@ -518,6 +520,7 @@ CREATE TABLE iam.organization_versions (
   organization_id UUID NOT NULL REFERENCES iam.organizations(id),
   slug TEXT NOT NULL CHECK (slug ~ '^[a-z0-9][a-z0-9_-]{0,47}$'),
   display_name TEXT NOT NULL CHECK (pg_catalog.length(pg_catalog.btrim(display_name)) > 0),
+  masked_display_name TEXT CHECK (masked_display_name IS NULL OR pg_catalog.length(pg_catalog.btrim(masked_display_name)) > 0),
   external_domain TEXT,
   status TEXT NOT NULL CHECK (status IN ('active', 'archived')),
   replaces_id UUID UNIQUE REFERENCES iam.organization_versions(id),
@@ -626,14 +629,15 @@ CREATE INDEX person_auth_identities_person_live_idx
   ON iam.person_auth_identities (person_id)
   WHERE superseded_by_id IS NULL AND status = 'active';
 
--- Dated non-agent memberships (grants nothing by itself; selling-agent membership derived from agent_affiliations).
+-- Dated works-for lines (grants nothing by itself; selling-agent affiliation lives in agent_affiliations).
 CREATE TABLE iam.organization_memberships (
   id UUID PRIMARY KEY,
   person_id UUID NOT NULL REFERENCES iam.people(id),
   organization_id UUID NOT NULL REFERENCES iam.organizations(id),
-  capacity TEXT NOT NULL CHECK (capacity IN (
-    'owner', 'employee', 'consultant', 'investor', 'vendor_rep', 'referral_partner'
+  work_arrangement TEXT NOT NULL DEFAULT 'employee' CHECK (work_arrangement IN (
+    'employee', 'self_employed_internal', 'self_employed_external'
   )),
+  tax_classification TEXT CHECK (tax_classification IN ('w2', '1099')),
   valid_range DATERANGE NOT NULL CHECK (NOT pg_catalog.isempty(valid_range) AND pg_catalog.lower_inc(valid_range) AND NOT pg_catalog.upper_inc(valid_range)),
   status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
   replaces_id UUID UNIQUE REFERENCES iam.organization_memberships(id),
@@ -646,7 +650,7 @@ CREATE TABLE iam.organization_memberships (
   CHECK (superseded_by_id IS NULL OR superseded_by_id <> id),
   CHECK ((superseded_by_id IS NULL) = (superseded_journal_seq IS NULL)),
   CONSTRAINT org_memberships_no_overlap
-    EXCLUDE USING gist (person_id WITH =, organization_id WITH =, capacity WITH =, valid_range WITH &&)
+    EXCLUDE USING gist (person_id WITH =, organization_id WITH =, valid_range WITH &&)
     WHERE (superseded_by_id IS NULL AND status = 'active')
 );
 CREATE INDEX org_memberships_person_live_idx ON iam.organization_memberships (person_id, organization_id)
@@ -879,7 +883,30 @@ BEGIN
 END;
 $$;
 
--- 6. Domain invariant triggers (org-edge cycle detection, origin/role/control-DB/sync isolation, and allows_org_wide_scope).
+-- 6. Domain invariant triggers (org-version masked names, org-edge cycle detection, origin/role/control-DB/sync isolation, and allows_org_wide_scope).
+
+CREATE OR REPLACE FUNCTION iam.trg_verify_organization_version()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_org_kind TEXT;
+BEGIN
+  SELECT o.org_kind INTO v_org_kind FROM iam.organizations o WHERE o.id = NEW.organization_id;
+  IF v_org_kind = 'lead_vendor'
+     AND (NEW.masked_display_name IS NULL OR pg_catalog.length(pg_catalog.btrim(NEW.masked_display_name)) = 0)
+  THEN
+    RAISE EXCEPTION 'LEAD_VENDOR_MASKED_NAME_REQUIRED: lead_vendor organization % requires a non-blank masked_display_name.',
+      NEW.organization_id USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_00b_verify_org_version
+  BEFORE INSERT ON iam.organization_versions
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_organization_version();
 
 CREATE OR REPLACE FUNCTION iam.trg_verify_people_origin()
 RETURNS TRIGGER
@@ -1399,11 +1426,11 @@ ALTER FUNCTION iam.resolve_auth_identity(TEXT, TEXT) OWNER TO platform_readonly;
 
 -- Internal 3NF live derivation views (never directly readable by platform_app or PUBLIC).
 CREATE OR REPLACE VIEW iam.v_all_memberships_live AS
-SELECT person_id, organization_id, capacity, valid_range
+SELECT person_id, organization_id, valid_range
 FROM iam.organization_memberships
 WHERE superseded_by_id IS NULL AND status = 'active'
 UNION ALL
-SELECT person_id, agency_org_id AS organization_id, 'agent'::text AS capacity, valid_range
+SELECT person_id, agency_org_id AS organization_id, valid_range
 FROM iam.agent_affiliations
 WHERE superseded_by_id IS NULL AND status = 'active';
 

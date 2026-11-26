@@ -625,7 +625,7 @@ test('Layer 7E [E2 Test 4]: cross-origin role grants, cross-origin memberships, 
     () => inSerializableTx(env.pool, async (c) => {
       const seq = (await appendIamAuditEntry(c, { environment, commandKey: `xorig-mem-1-${randomUUID()}` })).seq;
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), ids.nusearOperator, ids.companyOrg, seq],
       );
     }),
@@ -636,7 +636,7 @@ test('Layer 7E [E2 Test 4]: cross-origin role grants, cross-origin memberships, 
     () => inSerializableTx(env.pool, async (c) => {
       const seq = (await appendIamAuditEntry(c, { environment, commandKey: `xorig-mem-2-${randomUUID()}` })).seq;
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), ids.entityMgr, ids.rootOrg, seq],
       );
     }),
@@ -870,7 +870,7 @@ test('Layer 7E [E2 Test 6]: platform_iam_sync writes only Nusear people, entity 
       [randomUUID(), syncedStaffId, seq],
     );
     await c.query(
-      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
       [randomUUID(), syncedStaffId, ids.rootOrg, seq],
     );
     await c.query(
@@ -966,7 +966,7 @@ test('Layer 7E [E2 Test 6]: platform_iam_sync writes only Nusear people, entity 
     }],
     ['insert company_local membership', async (c, seq) => {
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2026-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2026-01-01,)'::daterange,'active',$4)",
         [randomUUID(), ids.entityMgr, ids.beaconOrg, seq],
       );
     }],
@@ -1055,9 +1055,9 @@ test('Layer 7E [E2 Test 7]: assert_can_write records writes deterministically (s
       [randomUUID(), samePersonStaffId, randomUUID(), samePersonLocalId, randomUUID(), companyJournalReaderId, seq],
     );
     await c.query(
-      `INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq)
-       VALUES ($1,$2,$5,'owner','[2020-01-01,)'::daterange,'active',$7),
-              ($3,$4,$6,'owner','[2020-01-01,)'::daterange,'active',$7),
+      `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq)
+       VALUES ($1,$2,$5,'employee','[2020-01-01,)'::daterange,'active',$7),
+              ($3,$4,$6,'employee','[2020-01-01,)'::daterange,'active',$7),
               ($8,$9,$6,'employee','[2020-01-01,)'::daterange,'active',$7)`,
       [randomUUID(), samePersonStaffId, randomUUID(), samePersonLocalId, ids.rootOrg, ids.companyOrg, seq, randomUUID(), companyJournalReaderId],
     );
@@ -1413,7 +1413,7 @@ test('Layer 7E [E2 Test 8]: holding-company user-grant branch is deleted (grant 
     ]) {
       await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
       await c.query("INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)", [randomUUID(), pid, name, email, seq]);
-      await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'owner','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), pid, memOrg, seq]);
+      await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), pid, memOrg, seq]);
       await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), pid, holdingRole, grantOrg, seq]);
     }
   });
@@ -1496,9 +1496,9 @@ test('Layer 7E [E2 Test 9]: app_views.coherence_journal masks materialize_emit b
       [randomUUID(), journalPhiNoFinId, randomUUID(), emFullJournalId, seq],
     );
     await c.query(
-      `INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq)
+      `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq)
        VALUES ($1,$2,$5,'employee','[2020-01-01,)'::daterange,'active',$6),
-              ($3,$4,$5,'owner','[2020-01-01,)'::daterange,'active',$6)`,
+              ($3,$4,$5,'employee','[2020-01-01,)'::daterange,'active',$6)`,
       [randomUUID(), journalPhiNoFinId, randomUUID(), emFullJournalId, ids.companyOrg, seq],
     );
     await c.query("INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,'j_phi_nofin_e2',$3,$4),($2,'em_full_j_e2',$3,$4)", [rPhiNoFin, rFullFin, ids.companyOrg, seq]);

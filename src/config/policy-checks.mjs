@@ -244,6 +244,14 @@ export const PLATFORM_AUTH_LOOKUP_FUNCTION_WHITELIST = Object.freeze([
   'iam.resolve_auth_identity(text, text)',
 ]);
 
+export const PLATFORM_IAM_SYNC_FUNCTION_WHITELIST = Object.freeze([
+  'platform.canonical_json(jsonb)',
+  'platform.sha256_text(text)',
+  'platform.format_utc_us(timestamp with time zone)',
+  'platform.compute_journal_hash(bigint, timestamp with time zone, text, uuid, text, uuid, text, text, text, text, jsonb)',
+  'iam.business_today(timestamp with time zone)',
+]);
+
 export const CLOUDSQL_BOOTSTRAP_CREATOR_ROLES = Object.freeze([
   'cloudsqlsuperuser',
 ]);
@@ -1450,6 +1458,7 @@ export async function verifyIamConfigInvariants(pool) {
     }
   }
   for (const [fq, trName] of [
+    ['iam.organization_versions', 'trg_00b_verify_org_version'],
     ['iam.people', 'trg_00b_verify_origin'],
     ['iam.person_versions', 'trg_00b_verify_origin'],
     ['iam.person_auth_identities', 'trg_00b_verify_origin'],
@@ -1468,9 +1477,9 @@ export async function verifyIamConfigInvariants(pool) {
   ]) {
     const tr = trigByKey.get(`${fq}:${trName}`);
     if (!tr) {
-      problems.push(`Missing E2 origin/sync guard trigger ${trName} on ${fq}`);
+      problems.push(`Missing IAM guard trigger ${trName} on ${fq}`);
     } else if (tr.tgenabled === 'D' || tr.tgenabled === 'R') {
-      problems.push(`E2 origin/sync guard trigger ${trName} on ${fq} must be enabled (got tgenabled='${tr.tgenabled}')`);
+      problems.push(`IAM guard trigger ${trName} on ${fq} must be enabled (got tgenabled='${tr.tgenabled}')`);
     }
   }
   if (supFnRes.rows.length !== 1 || !supFnRes.rows[0].prosecdef || supFnRes.rows[0].owner_name !== 'platform_versioner') {
@@ -1482,29 +1491,44 @@ export async function verifyIamConfigInvariants(pool) {
   //    every app_cmd.* function is SECURITY DEFINER owned by platform_writer;
   //    platform_app holds EXECUTE strictly on PLATFORM_APP_FUNCTION_WHITELIST + PLATFORM_APP_CMD_WHITELIST;
   //    platform_auth_lookup holds EXECUTE strictly on PLATFORM_AUTH_LOOKUP_FUNCTION_WHITELIST;
+  //    platform_iam_sync holds EXECUTE strictly on PLATFORM_IAM_SYNC_FUNCTION_WHITELIST (all SECURITY INVOKER)
+  //    and owns zero functions in any schema;
   //    platform_readonly holds ZERO EXECUTE on app_cmd.*; platform_worker holds EXECUTE strictly on PLATFORM_WORKER_CMD_WHITELIST.
-  const fnRes = await pool.query(
-    `SELECT p.oid,
-            n.nspname,
-            p.proname,
-            p.prosecdef,
-            r.rolname AS owner_name,
-            pg_catalog.format('%I.%I(%s)', n.nspname, p.proname, pg_catalog.oidvectortypes(p.proargtypes)) AS sig,
-            p.proconfig,
-            pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec,
-            pg_catalog.has_function_privilege('platform_app', p.oid, 'EXECUTE') AS app_exec,
-            pg_catalog.has_function_privilege('platform_readonly', p.oid, 'EXECUTE') AS ro_exec,
-            pg_catalog.has_function_privilege('platform_worker', p.oid, 'EXECUTE') AS wrk_exec,
-            pg_catalog.has_function_privilege('platform_auth_lookup', p.oid, 'EXECUTE') AS auth_exec,
-            pg_catalog.has_function_privilege('platform_writer', p.oid, 'EXECUTE') AS writer_exec,
-            pg_catalog.has_function_privilege('platform_iam_sync', p.oid, 'EXECUTE') AS sync_exec
-     FROM pg_catalog.pg_proc p
-     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-     JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
-     WHERE n.nspname = ANY($1::text[])
-     ORDER BY n.nspname, p.proname`,
-    [MANAGED_SCHEMAS],
-  );
+  const [fnRes, syncOwnedFnRes] = await Promise.all([
+    pool.query(
+      `SELECT p.oid,
+              n.nspname,
+              p.proname,
+              p.prosecdef,
+              r.rolname AS owner_name,
+              pg_catalog.format('%I.%I(%s)', n.nspname, p.proname, pg_catalog.oidvectortypes(p.proargtypes)) AS sig,
+              p.proconfig,
+              pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec,
+              pg_catalog.has_function_privilege('platform_app', p.oid, 'EXECUTE') AS app_exec,
+              pg_catalog.has_function_privilege('platform_readonly', p.oid, 'EXECUTE') AS ro_exec,
+              pg_catalog.has_function_privilege('platform_worker', p.oid, 'EXECUTE') AS wrk_exec,
+              pg_catalog.has_function_privilege('platform_auth_lookup', p.oid, 'EXECUTE') AS auth_exec,
+              pg_catalog.has_function_privilege('platform_writer', p.oid, 'EXECUTE') AS writer_exec,
+              pg_catalog.has_function_privilege('platform_iam_sync', p.oid, 'EXECUTE') AS sync_exec
+       FROM pg_catalog.pg_proc p
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+       JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
+       WHERE n.nspname = ANY($1::text[])
+       ORDER BY n.nspname, p.proname`,
+      [MANAGED_SCHEMAS],
+    ),
+    pool.query(
+      `SELECT pg_catalog.format('%I.%I(%s)', n.nspname, p.proname, pg_catalog.oidvectortypes(p.proargtypes)) AS sig
+       FROM pg_catalog.pg_proc p
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+       JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
+       WHERE r.rolname = 'platform_iam_sync'
+       ORDER BY n.nspname, p.proname`,
+    ),
+  ]);
+  for (const row of syncOwnedFnRes.rows) {
+    problems.push(`platform_iam_sync must not own function ${row.sig}`);
+  }
   if (existingRetiredRoles.length > 0 && fnRes.rows.length > 0) {
     const retiredFnExecRes = await pool.query(
       `SELECT f.fn_oid, p.principal
@@ -1527,10 +1551,12 @@ export async function verifyIamConfigInvariants(pool) {
   const combinedWhitelist = [...PLATFORM_APP_FUNCTION_WHITELIST, ...PLATFORM_APP_CMD_WHITELIST];
   const whitelistSet = new Set(combinedWhitelist);
   const authWhitelistSet = new Set(PLATFORM_AUTH_LOOKUP_FUNCTION_WHITELIST);
+  const syncWhitelistSet = new Set(PLATFORM_IAM_SYNC_FUNCTION_WHITELIST);
   const workerOnlySet = new Set(APP_CMD_WORKER_ONLY_FUNCTIONS);
   const workerCmdSet = new Set(PLATFORM_WORKER_CMD_WHITELIST);
   const foundWhitelisted = new Set();
   const foundAuthWhitelisted = new Set();
+  const foundSyncWhitelisted = new Set();
   const foundWorkerOnly = new Set();
   const foundWorkerCmd = new Set();
 
@@ -1567,6 +1593,17 @@ export async function verifyIamConfigInvariants(pool) {
     } else if (fn.auth_exec) {
       problems.push(`platform_auth_lookup holds forbidden EXECUTE privilege on non-whitelisted function ${fn.sig}`);
     }
+    if (syncWhitelistSet.has(fn.sig)) {
+      foundSyncWhitelisted.add(fn.sig);
+      if (!fn.sync_exec) {
+        problems.push(`platform_iam_sync is missing EXECUTE on whitelisted function ${fn.sig}`);
+      }
+      if (fn.prosecdef) {
+        problems.push(`Whitelisted platform_iam_sync function ${fn.sig} must be SECURITY INVOKER`);
+      }
+    } else if (fn.sync_exec) {
+      problems.push(`platform_iam_sync holds forbidden EXECUTE privilege on non-whitelisted function ${fn.sig}`);
+    }
     if (fn.nspname === 'app_cmd') {
       if (!fn.prosecdef) {
         problems.push(`Command function ${fn.sig} must be SECURITY DEFINER`);
@@ -1576,9 +1613,6 @@ export async function verifyIamConfigInvariants(pool) {
       }
       if (fn.ro_exec) {
         problems.push(`platform_readonly holds forbidden EXECUTE privilege on app_cmd function ${fn.sig}`);
-      }
-      if (fn.sync_exec) {
-        problems.push(`platform_iam_sync holds forbidden EXECUTE privilege on app_cmd function ${fn.sig}`);
       }
       if (workerCmdSet.has(fn.sig)) {
         foundWorkerCmd.add(fn.sig);
@@ -1609,6 +1643,11 @@ export async function verifyIamConfigInvariants(pool) {
   for (const expectedAuthSig of PLATFORM_AUTH_LOOKUP_FUNCTION_WHITELIST) {
     if (!foundAuthWhitelisted.has(expectedAuthSig)) {
       problems.push(`Whitelisted platform_auth_lookup function ${expectedAuthSig} was not found in pg_proc`);
+    }
+  }
+  for (const expectedSyncSig of PLATFORM_IAM_SYNC_FUNCTION_WHITELIST) {
+    if (!foundSyncWhitelisted.has(expectedSyncSig)) {
+      problems.push(`Whitelisted platform_iam_sync function ${expectedSyncSig} was not found in pg_proc`);
     }
   }
   for (const expectedWorkerSig of APP_CMD_WORKER_ONLY_FUNCTIONS) {

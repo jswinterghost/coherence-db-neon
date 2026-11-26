@@ -351,7 +351,7 @@ async function seedProofIamOwner(pool, { companySlug, displayName, environment =
       [randomUUID(), ownerPersonId, seq],
     );
     await client.query(
-      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'owner','[2020-01-01,)'::daterange,'active',$4)",
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
       [randomUUID(), ownerPersonId, rootOrgId, seq],
     );
     await client.query(

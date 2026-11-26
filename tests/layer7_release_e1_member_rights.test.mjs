@@ -274,7 +274,7 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
         );
         for (const orgId of memberships) {
           await c.query(
-            "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+            "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
             [randomUUID(), personId, orgId, seq],
           );
         }

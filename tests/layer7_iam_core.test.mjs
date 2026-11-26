@@ -323,19 +323,19 @@ async function seedStandardIamWorld(pool, { environment = 'local' } = {}) {
     );
 
     // Governing memberships (selling agents derive membership SOLELY from iam.agent_affiliations!)
-    for (const [personId, orgId, cap] of [
-      [ids.nusearOwner, ids.rootOrg, 'owner'],
+    for (const [personId, orgId, arrangement] of [
+      [ids.nusearOwner, ids.rootOrg, 'employee'],
       [ids.nusearSupport, ids.rootOrg, 'employee'],
-      [ids.acmeOwner, ids.acmeOrg, 'owner'],
+      [ids.acmeOwner, ids.acmeOrg, 'employee'],
       [ids.beaconManager, ids.beaconOrg, 'employee'],
       [ids.leadManager, ids.beaconOrg, 'employee'],
       [ids.teamManager, ids.beaconOrg, 'employee'],
-      [ids.northstarAdmin, ids.northstarOrg, 'owner'],
+      [ids.northstarAdmin, ids.northstarOrg, 'employee'],
     ]) {
       await c.query(
-        `INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq)
+        `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq)
          VALUES ($1,$2,$3,$4,'[2020-01-01,)'::daterange,'active',$5)`,
-        [randomUUID(), personId, orgId, cap, seq],
+        [randomUUID(), personId, orgId, arrangement, seq],
       );
     }
 
@@ -1085,7 +1085,7 @@ test('Layer 7 [Scope Derivation & Descendant Flow]: org_subtree, self, include_d
       [randomUUID(), nonDescPerson, seq],
     );
     await c.query(
-      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+      "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
       [randomUUID(), nonDescPerson, ids.acmeOrg, seq],
     );
     await c.query(
@@ -1214,12 +1214,12 @@ test('Layer 7 [Dated Ranges & Environment Scope]: expired/future valid_range acr
 
     for (const pid of [pastGrantPerson, futureGrantPerson, datedDataPerson]) {
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), pid, ids.beaconOrg, seq],
       );
     }
     await c.query(
-      `INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq)
+      `INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq)
        VALUES ($1,$2,$3,'employee',daterange(iam.business_today() - 30, iam.business_today(), '[)'),'active',$4)`,
       [randomUUID(), expiredMemPerson, ids.beaconOrg, seq],
     );
@@ -1937,7 +1937,7 @@ test('Layer 7 [Control DB Closure]: iam.person_effective_grants reads today live
         [randomUUID(), pid, name, email, seq],
       );
       await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
         [randomUUID(), pid, rootOrg, seq],
       );
       await c.query(
