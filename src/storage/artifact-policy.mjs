@@ -12,6 +12,20 @@ export const ARTIFACT_KINDS = Object.freeze({
   DATA: 'data',
 });
 
+export const ADJUST_STAMP_START = '<script>window.__ADJUST_CONFIG__=';
+export const ADJUST_STAMP_END = ';</script></head>';
+
+export function extractAdjustStamp(html) {
+  const headIdx = html.indexOf('</head>');
+  const start = html.lastIndexOf(ADJUST_STAMP_START, headIdx);
+  const end = start >= 0 ? html.indexOf(ADJUST_STAMP_END, start) : -1;
+  if (start < 0 || end < 0) return null;
+  return {
+    shell: html.slice(0, start) + html.slice(end + ADJUST_STAMP_END.length),
+    config: JSON.parse(html.slice(start + ADJUST_STAMP_START.length, end)),
+  };
+}
+
 const CODE_BEARING_EXT_RE = /\.(html?|xhtml|js|mjs|cjs|ts|tsx|jsx|py|sh|css|wasm|svg)$/i;
 const ENGINE_PATH_RE = /(?:^|\/)(?:coherence\/|web\/src\/|web\/dist\/|scripts\/coherence\/|pyproject\.toml$|uv\.lock$|pnpm-lock\.yaml$|vite\.config\.ts$|\.git(?:\/|$)|.*\.bundle$)/i;
 

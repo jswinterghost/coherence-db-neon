@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createCommandLayer } from '../src/commands/command-layer.mjs';
+import { createAppCommands } from '../src/commands/app-cmd.mjs';
 import {
   compareDatabasesAsOf,
   exportJournalNdjson,
@@ -517,7 +517,7 @@ export async function runHistoryProof({
     const codeStore = createCodeStore({ backend: createFileObjectStore({ rootDir: codeRoot, label: `proof-code-${suffix}` }) });
     const dataStore = createDataStore({ backend: createFileObjectStore({ rootDir: dataRoot, label: `proof-data-${suffix}` }) });
     const stores = createStorePair({ codeStore, dataStore });
-    const commands = createCommandLayer({ pool, companySlug: manifest.companySlug, stores });
+    const commands = createAppCommands({ pool, stores });
     const proofIam = await seedProofIamOwner(pool, {
       companySlug: manifest.companySlug,
       displayName: manifest.displayName || manifest.companySlug,

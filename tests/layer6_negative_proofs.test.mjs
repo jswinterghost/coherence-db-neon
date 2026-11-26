@@ -11,7 +11,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
-import { createCommandLayer } from '../src/commands/command-layer.mjs';
+import { createAppCommands } from '../src/commands/app-cmd.mjs';
 import {
   compareDatabasesAsOf,
   exportJournalNdjson,
@@ -64,7 +64,7 @@ async function createLayer6TestEnv({ companySlug = 'acme', displayName = 'Acme' 
   const codeStore = createCodeStore({ backend: createMemoryObjectStore({ label: `l6-code-${suffix}` }) });
   const dataStore = createDataStore({ backend: createMemoryObjectStore({ label: `l6-data-${suffix}` }) });
   const stores = createStorePair({ codeStore, dataStore });
-  const commands = createCommandLayer({ pool, companySlug, stores });
+  const commands = createAppCommands({ pool, stores });
   const tempDir = await mkdtemp(join(tmpdir(), `coherence-l6-${suffix}-`));
   const iam = await seedCoherenceIamFixture(pool, { companySlug, displayName });
   const ownerToken = iam.tokens.owner;

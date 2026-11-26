@@ -8,7 +8,7 @@ import { runMigrations } from '../../src/db/migrate.mjs';
 import { createMemoryObjectStore } from '../../src/storage/object-store.mjs';
 import { createCodeStore, createDataStore, createStorePair } from '../../src/storage/stores.mjs';
 import { seedCoherenceIamFixture } from './iam-harness.mjs';
-import { createCommandLayer } from '../../src/commands/command-layer.mjs';
+import { createAppCommands } from '../../src/commands/app-cmd.mjs';
 
 export const TEST_DB_PREFIX = 'coherence_test_';
 
@@ -127,7 +127,7 @@ export async function createTestEnv({
   const codeStore = createCodeStore({ backend: codeBackend });
   const dataStore = createDataStore({ backend: dataBackend });
   const stores = createStorePair({ codeStore, dataStore });
-  const commands = createCommandLayer({ pool, companySlug, stores });
+  const commands = createAppCommands({ pool, stores });
   const tempDir = await mkdtemp(join(tmpdir(), `coherence-test-${suffix}-`));
 
   const iam = await seedCoherenceIamFixture(pool, {

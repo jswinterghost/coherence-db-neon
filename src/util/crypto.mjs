@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
 
 export const GENESIS_HASH = '0'.repeat(64);
 export const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -13,7 +12,7 @@ for (let i = 0; i < 256; i++) {
   CRC32C_TABLE[i] = c >>> 0;
 }
 
-export function crc32cUpdate(crc, buf) {
+function crc32cUpdate(crc, buf) {
   let state = crc >>> 0;
   for (let i = 0; i < buf.length; i++) {
     state = CRC32C_TABLE[(state ^ buf[i]) & 0xff] ^ (state >>> 8);
@@ -21,7 +20,7 @@ export function crc32cUpdate(crc, buf) {
   return state >>> 0;
 }
 
-export function crc32cFinalBase64(crc) {
+function crc32cFinalBase64(crc) {
   const out = Buffer.allocUnsafe(4);
   out.writeUInt32BE((crc ^ 0xffffffff) >>> 0, 0);
   return out.toString('base64');
@@ -50,31 +49,6 @@ export function fingerprintBytes(data) {
     crc32cB64: crc32cBase64(buf),
     byteSize: buf.length,
   };
-}
-
-export function fingerprintFile(filePath) {
-  return new Promise((resolve, reject) => {
-    const sha = createHash('sha256');
-    const md5 = createHash('md5');
-    let crc = 0xffffffff;
-    let byteSize = 0;
-    const stream = createReadStream(filePath);
-    stream.on('data', (chunk) => {
-      sha.update(chunk);
-      md5.update(chunk);
-      crc = crc32cUpdate(crc, chunk);
-      byteSize += chunk.length;
-    });
-    stream.on('end', () => {
-      resolve({
-        sha256: sha.digest('hex'),
-        md5B64: md5.digest('base64'),
-        crc32cB64: crc32cFinalBase64(crc),
-        byteSize,
-      });
-    });
-    stream.on('error', reject);
-  });
 }
 
 export function compareUtf8Bytes(a, b) {
@@ -138,15 +112,6 @@ export function formatTimestampUtcUs(value) {
   return parsed.toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
 }
 
-export function computeRequestFingerprint({ commandKind, actor, actingFor = null, payload = {} }) {
-  return sha256Hex(canonicalJson({
-    acting_for: actingFor ?? null,
-    actor: String(actor),
-    command_kind: String(commandKind),
-    payload,
-  }));
-}
-
 export function computeJournalHash({
   seq,
   recordedAt,
@@ -179,43 +144,6 @@ export function canonicalInputEntriesText(entries) {
     .join('');
 }
 
-export function hashInputEntries(entries) {
-  return sha256Hex(canonicalInputEntriesText(entries));
-}
-
-export function canonicalInputChangesText(changes) {
-  return [...changes]
-    .sort((a, b) => compareUtf8Bytes(a.relPath ?? a.rel_path, b.relPath ?? b.rel_path))
-    .map((change) => `${canonicalJson([
-      change.changeKind ?? change.change_kind,
-      change.relPath ?? change.rel_path,
-      change.oldRelPath ?? change.old_rel_path ?? null,
-      change.fileSha256 ?? change.file_sha256 ?? null,
-      change.prevFileSha256 ?? change.prev_file_sha256 ?? null,
-    ])}\n`)
-    .join('');
-}
-
-export function hashInputChanges(changes) {
-  return sha256Hex(canonicalInputChangesText(changes));
-}
-
-export function canonicalArtifactsText(artifacts) {
-  return [...artifacts]
-    .sort((a, b) => compareUtf8Bytes(a.relPath ?? a.rel_path, b.relPath ?? b.rel_path))
-    .map((art) => `${canonicalJson([
-      art.relPath ?? art.rel_path,
-      art.artifactKind ?? art.artifact_kind,
-      art.storeKind ?? art.store_kind,
-      art.fileSha256 ?? art.file_sha256,
-    ])}\n`)
-    .join('');
-}
-
-export function hashArtifacts(artifacts) {
-  return sha256Hex(canonicalArtifactsText(artifacts));
-}
-
 export const APPROVAL_ROW_COLUMNS = [
   'record_id',
   'disposition',
@@ -233,31 +161,3 @@ export const APPROVAL_ROW_COLUMNS = [
   'approved_agency_from',
   'approved_agent_from',
 ];
-
-export function canonicalApprovalRowsText(rows) {
-  return [...rows]
-    .sort((a, b) => Number(a.rowNo ?? a.row_no) - Number(b.rowNo ?? b.row_no))
-    .map((row) => `${canonicalJson([
-      Number(row.rowNo ?? row.row_no),
-      row.record_id ?? row.recordId,
-      row.disposition ?? null,
-      row.agent ?? null,
-      row.agency ?? null,
-      row.policy ?? null,
-      row.book ?? null,
-      row.month ?? null,
-      row.status ?? null,
-      row.note ?? null,
-      row.committed_at ?? row.committedAt ?? null,
-      row.approved_amount ?? row.approvedAmount ?? null,
-      row.approved_agency ?? row.approvedAgency ?? null,
-      row.approved_agent ?? row.approvedAgent ?? null,
-      row.approved_agency_from ?? row.approvedAgencyFrom ?? null,
-      row.approved_agent_from ?? row.approvedAgentFrom ?? null,
-    ])}\n`)
-    .join('');
-}
-
-export function hashApprovalRows(rows) {
-  return sha256Hex(canonicalApprovalRowsText(rows));
-}

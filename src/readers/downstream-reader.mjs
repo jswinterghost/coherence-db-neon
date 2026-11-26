@@ -5,8 +5,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { basename } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { mapPgError } from '../commands/app-cmd.mjs';
-import { withRequestTx } from '../db/pg-client.mjs';
+import { inReadTx } from '../db/pg-client.mjs';
 import { toCsv } from '../util/csv.mjs';
 import { AppError } from '../util/redact.mjs';
 
@@ -47,14 +46,6 @@ export function extractViewerConfig(htmlText) {
     throw new AppError('The Coherence bundle configuration is not readable.', 502, 'INVALID_VIEWER_CONFIG');
   }
   return config;
-}
-
-async function inReadTx(pool, dbToken, fn) {
-  try {
-    return await withRequestTx(pool, dbToken, fn, { readOnly: true });
-  } catch (err) {
-    throw mapPgError(err);
-  }
 }
 
 async function findLatestPublishedRunTx(tx, { asOfSeq = null } = {}) {

@@ -7,7 +7,7 @@ import {
 } from '../util/crypto.mjs';
 import { generateOverlayCsv } from '../decisions/overlay-generator.mjs';
 import { isCodeBearingContent, isCodeBearingPath } from '../storage/artifact-policy.mjs';
-import { buildCommitments, BUSINESS_TABLES, formatIsoDate } from './commitments.mjs';
+import { buildCommitments, BUSINESS_TABLES, formatIsoDate } from '../journal/commitments.mjs';
 
 const EXPORT_TABLE_ORDER = [
   'company_meta',

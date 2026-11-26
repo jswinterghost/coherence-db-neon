@@ -4,13 +4,18 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { buildCommitments, hashDecisions } from '../src/commands/commitments.mjs';
+import {
+  buildCommitments,
+  hashDecisions,
+  hashInputChangesTable,
+  hashInputEntriesTable,
+} from '../src/journal/commitments.mjs';
 import { exportJournalNdjson, rebuildFromJournalExport, verifyChain, verifyCommitments } from '../src/commands/journal-export.mjs';
 import { queryRunEntityReconciliation } from '../src/compare/run-comparator.mjs';
 import { ALL_BUSINESS_TABLES } from '../src/config/policy-checks.mjs';
 import { buildConnectionConfig, createClient, withRequestTx } from '../src/db/pg-client.mjs';
 import { generateOverlayCsv, OVERLAY_V1_COLUMNS, OVERLAY_V2_COLUMNS } from '../src/decisions/overlay-generator.mjs';
-import { computeJournalHash, GENESIS_HASH, hashInputChanges, hashInputEntries, sha256Hex } from '../src/util/crypto.mjs';
+import { computeJournalHash, GENESIS_HASH, sha256Hex } from '../src/util/crypto.mjs';
 import { parseCsv } from '../src/util/csv.mjs';
 import { createEngineWorker } from '../src/worker/worker.mjs';
 import {
@@ -352,11 +357,12 @@ test('Layer 1 [Input Path & Folder Guards]: case twins, NFC/NFD twins, file-fold
   // Direct SQL helper bypassing command-layer pre-checks to prove PostgreSQL itself enforces path-clash and Sent/Overlay guards.
   const rawPublish = async (cmdKey, sourceKind, entries) => {
     const ivId = randomUUID();
-    const entriesSha = hashInputEntries(entries);
+    const entryRows = entries.map((e) => ({ inputVersionId: ivId, ...e }));
+    const entriesSha = hashInputEntriesTable(entryRows);
     const changes = entries
       .filter((e) => !renamedEntries.some((p) => p.relPath === e.relPath && p.fileSha256 === e.fileSha256))
       .map((e) => ({ inputVersionId: ivId, changeKind: 'added', relPath: e.relPath, oldRelPath: null, fileSha256: e.fileSha256, prevFileSha256: null }));
-    const changesSha = hashInputChanges(changes);
+    const changesSha = hashInputChangesTable(changes);
     const ivRow = {
       id: ivId, lineKind: 'standing', parentId: renPub.result.inputVersionId, sourceKind, reason: 'test',
       entryCount: entries.length, entriesSha256: entriesSha, entriesListFileSha256: null,
@@ -365,7 +371,7 @@ test('Layer 1 [Input Path & Folder Guards]: case twins, NFC/NFD twins, file-fold
     const body = {
       commitments: buildCommitments({
         input_versions: [ivRow],
-        input_entries: entries.map((e) => ({ inputVersionId: ivId, ...e })),
+        input_entries: entryRows,
         input_changes: changes,
       }),
     };

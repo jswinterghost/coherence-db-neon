@@ -3,28 +3,23 @@
 // Zero role checks, zero ability checks, zero SET LOCAL ROLE, and zero front-end HTML returned.
 import { basename } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { createAppCommands, mapPgError } from '../commands/app-cmd.mjs';
 import { verifyChain, verifyCommitments, verifyObjects } from '../commands/journal-export.mjs';
-import { withRequestTx } from '../db/pg-client.mjs';
-import { isCodeBearingPath } from '../storage/artifact-policy.mjs';
+import { createRuntimeCommands } from '../commands/runtime-commands.mjs';
+import { inReadTx as runReadTx, mapPgError } from '../db/pg-client.mjs';
+import { extractAdjustStamp, isCodeBearingPath } from '../storage/artifact-policy.mjs';
 import { formatTimestampUtcUs } from '../util/crypto.mjs';
 import { assertValidRelPath } from '../util/csv.mjs';
 import { AppError, redactPhi } from '../util/redact.mjs';
 import { checkReviewAppDrift } from './drift-check.mjs';
 
-const ADJUST_STAMP_START = '<script>window.__ADJUST_CONFIG__=';
-const ADJUST_STAMP_END = ';</script></head>';
 const MAX_BIGINT = '9223372036854775807';
 
 function extractReviewConfigJson(html, surface, expectedDate) {
-  const head = html.indexOf('</head>');
-  const start = html.lastIndexOf(ADJUST_STAMP_START, head);
-  const end = start >= 0 ? html.indexOf(ADJUST_STAMP_END, start) : -1;
-  if (start < 0 || end < 0) {
+  const stamped = extractAdjustStamp(html);
+  if (!stamped) {
     throw new AppError('The review page does not carry a valid Coherence stamp.', 502, 'INVALID_REVIEW_STAMP');
   }
-  const jsonText = html.slice(start + ADJUST_STAMP_START.length, end);
-  const config = JSON.parse(jsonText);
+  const { config } = stamped;
   if (!config.stamped || config.surface !== surface || config.statementDate !== expectedDate) {
     throw new AppError('The review stamp does not belong to this run and surface.', 502, 'REVIEW_STAMP_MISMATCH');
   }
@@ -38,15 +33,8 @@ export function createWebHandlers({
   stores,
   driftCheckConfig = null,
 }) {
-  const appCmd = createAppCommands({ pool, stores });
-
-  async function inReadTx(dbToken, fn) {
-    try {
-      return await withRequestTx(pool, dbToken, fn, { readOnly: true });
-    } catch (err) {
-      throw mapPgError(err);
-    }
-  }
+  const appCmd = createRuntimeCommands({ pool, stores });
+  const inReadTx = (dbToken, fn) => runReadTx(pool, dbToken, fn);
 
   async function resolveAsOfSeqTx(tx, { asOfSeq = null, asOf = null } = {}) {
     if (asOfSeq != null && asOfSeq !== '') {

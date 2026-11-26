@@ -10,7 +10,7 @@ import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { createCommandLayer } from '../src/commands/command-layer.mjs';
+import { createAppCommands } from '../src/commands/app-cmd.mjs';
 import {
   PLATFORM_ROLES,
   validateCloudSqlConfig,
@@ -364,7 +364,7 @@ test('Layer 2 [Negative Invariant]: View-As never writes, worker-only exclusivit
   const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
   const workerPool = createRoleScopedTestPool(env.pool, 'platform_worker');
   const readonlyPool = createRoleScopedTestPool(env.pool, 'platform_readonly');
-  const appCommands = createCommandLayer({ pool: appPool, companySlug: env.companySlug, stores: env.stores });
+  const appCommands = createAppCommands({ pool: appPool, stores: env.stores });
 
   // Worker-only exclusivity enforced in PostgreSQL: platform_app lacks EXECUTE (42501), and even
   // platform_worker carrying a human Owner signed token is refused with 42501 WORKER_ONLY.
@@ -775,7 +775,7 @@ test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline
 
   const iam = env.iam;
   const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
-  const appCommands = createCommandLayer({ pool: appPool, companySlug: env.companySlug, stores: env.stores });
+  const appCommands = createAppCommands({ pool: appPool, stores: env.stores });
 
   // View-As MUST refuse saveReviewDecisions, carryDecisions, recordDecisionBaseline, and materializeEmit strictly in PostgreSQL
   const viewAsTok = iam.tokens.viewAsAgencyMgr;

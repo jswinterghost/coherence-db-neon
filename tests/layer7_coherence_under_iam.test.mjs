@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createCommandLayer } from '../src/commands/command-layer.mjs';
+import { createAppCommands } from '../src/commands/app-cmd.mjs';
 import { verifyChain, verifyCommitments } from '../src/commands/journal-export.mjs';
 import * as policyChecks from '../src/config/policy-checks.mjs';
 import { runMigrations } from '../src/db/migrate.mjs';
@@ -87,7 +87,7 @@ async function createCoherenceIamTestEnv({ companySlug = 'acme', displayName = '
   const codeStore = createCodeStore({ backend: createMemoryObjectStore({ label: `r1-009-code-${suffix}` }) });
   const dataStore = createDataStore({ backend: createMemoryObjectStore({ label: `r1-009-data-${suffix}` }) });
   const stores = createStorePair({ codeStore, dataStore });
-  const commands = createCommandLayer({ pool, companySlug, stores });
+  const commands = createAppCommands({ pool, stores });
 
   async function cleanup() {
     await pool.end().catch(() => {});

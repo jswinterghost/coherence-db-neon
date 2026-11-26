@@ -1,5 +1,6 @@
 import { userInfo } from 'node:os';
 import pg from 'pg';
+import { AppError, sanitizeErrorMessage } from '../util/redact.mjs';
 
 const { Pool, Client, types } = pg;
 
@@ -174,5 +175,71 @@ export async function withRequestTx(
     } finally {
       if (isPool) client.release(destroyOnRelease ? new Error('Rollback failed') : undefined);
     }
+  }
+}
+
+function extractErrorCodePrefix(rawMessage) {
+  const m = /^([A-Z][A-Z0-9_]{2,50}):/.exec(String(rawMessage || '').trim());
+  return m ? m[1] : null;
+}
+
+export function mapPgError(error) {
+  if (error instanceof AppError) return error;
+  const pgCode = error?.code;
+  const rawMessage = String(error?.message || '');
+  const prefix = extractErrorCodePrefix(rawMessage);
+  const msg = sanitizeErrorMessage(error, 'Database refused the change.');
+
+  if (pgCode === '42501') {
+    if (prefix === 'VIEW_AS_READ_ONLY' || /VIEW_AS_READ_ONLY/i.test(rawMessage)) {
+      return new AppError('Cannot make changes while viewing as another user.', 403, 'VIEW_AS_READ_ONLY');
+    }
+    if (prefix === 'WORKER_ONLY') {
+      return new AppError('Only the Coherence engine worker service identity may perform this operation.', 403, 'WORKER_ONLY');
+    }
+    if (prefix === 'HUMAN_ONLY') {
+      return new AppError('The worker service identity cannot execute human decision commands.', 403, 'HUMAN_ONLY');
+    }
+    if (prefix === 'INVALID_STORE') {
+      return new AppError(msg, 403, 'INVALID_STORE');
+    }
+    return new AppError('Insufficient database privilege for this operation.', 403, 'FORBIDDEN');
+  }
+  if (pgCode === '25006') {
+    return new AppError('Cannot make changes in a read-only transaction.', 403, 'VIEW_AS_READ_ONLY');
+  }
+  if (pgCode === 'P0002') {
+    return new AppError(msg, 404, prefix || 'NOT_FOUND');
+  }
+  if (pgCode === '40001') {
+    if (prefix === 'STALE_JOURNAL_POSITION' || /STALE_JOURNAL_POSITION/i.test(rawMessage)) {
+      return new AppError('State changed since the screen loaded; reload and try again.', 409, 'STALE_JOURNAL_POSITION');
+    }
+    return new AppError('Concurrent change conflicted; retry with current state.', 409, 'SERIALIZATION_FAILURE');
+  }
+  if (pgCode === '23505') {
+    return new AppError(msg, 409, prefix || 'UNIQUE_VIOLATION');
+  }
+  if (pgCode === '22023') {
+    const isInputErr = prefix && (prefix.startsWith('MISSING_') || prefix.startsWith('INVALID_'));
+    return new AppError(msg, isInputErr ? 400 : 409, prefix || 'INVARIANT_VIOLATION');
+  }
+  if (pgCode === '23514') {
+    return new AppError(msg, 409, prefix || 'INVARIANT_VIOLATION');
+  }
+  if (pgCode === '23503') {
+    return new AppError(msg, 409, prefix || 'REFERENCE_VIOLATION');
+  }
+  if (pgCode === '55000') {
+    return new AppError(msg, 409, prefix || 'STATE_CONFLICT');
+  }
+  return new AppError(msg, 500, 'DB_ERROR');
+}
+
+export async function inReadTx(poolOrClient, dbToken, fn) {
+  try {
+    return await withRequestTx(poolOrClient, dbToken, fn, { readOnly: true });
+  } catch (err) {
+    throw mapPgError(err);
   }
 }

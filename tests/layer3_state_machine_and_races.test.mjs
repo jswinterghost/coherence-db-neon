@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createCommandLayer } from '../src/commands/command-layer.mjs';
+import { createAppCommands } from '../src/commands/app-cmd.mjs';
 import { verifyChain, verifyCommitments, verifyObjects } from '../src/commands/journal-export.mjs';
 import { createClient } from '../src/db/pg-client.mjs';
 import {
@@ -18,6 +18,7 @@ import {
 } from '../src/state-machine/coherence-machines.mjs';
 import { defineStateMachine, StateMachineDefinitionError } from '../src/state-machine/declarative-machine.mjs';
 import { createSafeLogger } from '../src/util/redact.mjs';
+import { createWebHandlers } from '../src/web/handlers.mjs';
 import { killProcessGroup, runCoherenceProcess } from '../src/worker/engine-runner.mjs';
 import { reconcileInterruptedAttempts } from '../src/worker/reconciler.mjs';
 import { acquireRunningSlot } from '../src/worker/slot.mjs';
@@ -250,7 +251,7 @@ test('Layer 3 [Idempotency & Permissions]: idempotent resend acts once, reused c
 
   const iam = env.iam;
   const appPool = createRoleScopedTestPool(env.pool, 'platform_app');
-  const appCommands = createCommandLayer({ pool: appPool, companySlug: env.companySlug, stores: env.stores });
+  const appCommands = createAppCommands({ pool: appPool, stores: env.stores });
 
   // Database-only IAM additive role enforcement: Nusear Admin lacking coherence_operator role and
   // coherence_operator granted only on another company (Northstar) are both refused with 403 (42501).
@@ -364,10 +365,11 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
   assert.equal(adj1.step, 'adjust');
   assert.equal(adj1.attemptNo, 1);
 
+  const handlers = createWebHandlers({ pool: env.pool, companySlug: env.companySlug, stores: env.stores });
   await env.commands.saveReviewDraft({
     dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 1, born: 'b1', checksum: 'c1', rows: [{ record_id: 'x' }],
   });
-  assert.ok(await env.commands.getReviewDraft({ dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 1 }));
+  assert.ok((await handlers.getReviewDraft(env.ownerToken, runId, 'adjust', 1)).draft);
   await assert.rejects(
     () => env.commands.saveReviewDraft({ dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 2, born: 'b1', checksum: 'c1', rows: [] }),
     /current finished/i,
@@ -383,7 +385,7 @@ test('Layer 3 [Concurrency & Review Guards]: racing commands, review save vs Emi
   const adj2 = await worker.runOnce();
   assert.equal(adj2.action, 'step_finished');
   assert.equal(adj2.attemptNo, 2);
-  assert.equal(await env.commands.getReviewDraft({ dbToken: env.ownerToken, runId, surface: 'adjust', attemptNo: 2 }), null);
+  assert.equal((await handlers.getReviewDraft(env.ownerToken, runId, 'adjust', 2)).draft, null);
 
   const seqAfterAdj2 = Number((await env.pool.query('SELECT latest_journal_seq FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].latest_journal_seq);
   const rowAdj1 = sampleApprovalRow({ record_id: 'carrier_a~direct~P10001~100.00~2026-11', note: 'adj-1' });
@@ -962,4 +964,104 @@ test('Layer 3 [Synchronous Review Command & Engine Copy Workflow]: engine_kind r
 
   assert.equal((await verifyChain(env.pool)).passed, true);
   assert.equal((await verifyCommitments(env.pool)).passed, true);
+});
+
+test('Layer 3 [Reconciler Exclusive Slot Read]: reconcileInterruptedAttempts reads open attempts inside slot.runExclusive without racing liveness probes and fails closed when slot is lost', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+  const env = await createTestEnv();
+  t.after(() => env.cleanup());
+
+  const { engineVersionId } = await seedEngineVersion(env);
+  await seedStandingInput(env);
+
+  const launch = await env.commands.launchRun({
+    dbToken: env.ownerToken,
+    commandKey: 'launch-rec-exclusive',
+    statementDate: '2026-11-21',
+    engineVersionId,
+  });
+  const runId = launch.result.runId;
+  const adminKiller = env.registerClient(await createClient(env.pgConfig));
+
+  const dyingWorker = env.registerWorker(createEngineWorker({
+    pool: env.pool,
+    pgConfig: env.pgConfig,
+    companySlug: env.companySlug,
+    stores: env.stores,
+    commands: env.commands,
+    workerToken: env.workerToken,
+    materializeEngine: createMockEngineMaterializer(),
+    tempBaseDir: env.tempDir,
+    livenessIntervalMs: 50,
+    onAfterStart: async ({ slot }) => {
+      await adminKiller.query('SELECT pg_catalog.pg_terminate_backend($1)', [slot.backendPid]);
+      await new Promise((r) => setTimeout(r, 150));
+    },
+  }));
+  assert.equal((await dyingWorker.runOnce()).action, 'slot_lost');
+
+  const livenessInTx = [];
+  const slot = await acquireRunningSlot({
+    pgConfig: env.pgConfig,
+    livenessIntervalMs: 10,
+    onLivenessQuery: ({ inTransaction }) => livenessInTx.push(inTransaction),
+  });
+  assert.ok(slot, 'expected replacement slot acquisition to succeed');
+  t.after(() => slot.release());
+
+  const nonLivenessQueries = [];
+  const origQuery = slot.client.query.bind(slot.client);
+  slot.client.query = async (...args) => {
+    const sql = typeof args[0] === 'string' ? args[0] : (args[0]?.text || '');
+    if (!sql.includes('this_connection_holds_slot') && !sql.includes('pg_advisory_unlock')) {
+      nonLivenessQueries.push({ sql, inTransaction: slot.isInTransaction() });
+      if (sql.includes('coherence.step_attempt_events')) {
+        await new Promise((r) => setTimeout(r, 30));
+      }
+    }
+    return origQuery(...args);
+  };
+
+  let runExclusiveCalls = 0;
+  const observedSlot = {
+    ...slot,
+    runExclusive: async (fn) => {
+      runExclusiveCalls += 1;
+      return slot.runExclusive(fn);
+    },
+  };
+
+  const rec = await reconcileInterruptedAttempts({
+    pool: env.pool,
+    slot: observedSlot,
+    commands: env.commands,
+    workerToken: env.workerToken,
+  });
+  assert.equal(rec.interrupted.length, 1);
+  assert.equal(rec.interrupted[0].runId, runId);
+  assert.equal((await env.pool.query('SELECT stage FROM coherence.run_states WHERE id = $1::uuid', [runId])).rows[0].stage, 'interrupted');
+
+  const openAttemptsReads = nonLivenessQueries.filter((q) => q.sql.includes('coherence.step_attempt_events'));
+  assert.equal(openAttemptsReads.length, 1, 'expected exactly one open-attempts SELECT on slot.client');
+  assert.equal(openAttemptsReads[0].inTransaction, true, 'findOpenAttempts on slot.client must execute inside slot.runExclusive()');
+  assert.ok(nonLivenessQueries.every((q) => q.inTransaction === true), 'every reconciler query on slot.client must run inside slot.runExclusive()');
+  assert.ok(runExclusiveCalls >= 3, `expected >= 3 runExclusive calls (findOpenAttempts, interrupt, expireOldDrafts), got ${runExclusiveCalls}`);
+  for (let i = 0; i < 50 && livenessInTx.length === 0; i += 1) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.ok(livenessInTx.length >= 1, 'expected at least one slot liveness probe to run');
+  assert.ok(livenessInTx.every((inTx) => inTx === false), 'slot liveness probes must never fire while runExclusive is active');
+
+  // When the slot is lost before reconciliation begins, the open-attempts read fails closed with 409 SLOT_LOST.
+  const queriesBeforeAbort = nonLivenessQueries.length;
+  slot.abort('test slot lost before reconcile');
+  await assert.rejects(
+    () => reconcileInterruptedAttempts({
+      pool: env.pool,
+      slot: observedSlot,
+      commands: env.commands,
+      workerToken: env.workerToken,
+    }),
+    (err) => err?.status === 409 && err?.code === 'SLOT_LOST',
+  );
+  assert.equal(nonLivenessQueries.length, queriesBeforeAbort, 'lost slot must not execute any query on slot.client');
 });

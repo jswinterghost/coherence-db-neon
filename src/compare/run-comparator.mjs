@@ -6,14 +6,13 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { extractViewerConfig } from '../readers/downstream-reader.mjs';
+import { extractAdjustStamp } from '../storage/artifact-policy.mjs';
 import { canonicalJson, fingerprintBytes, sha256Hex } from '../util/crypto.mjs';
 import { normalizeMacKey, parseCsv, toCsv } from '../util/csv.mjs';
 import { AppError } from '../util/redact.mjs';
 import { formatCents, parseCents } from '../worker/emit-materializer.mjs';
 import { listFilesRecursive, rebuildRunFolderFromDb } from '../worker/folder-builder.mjs';
 
-const ADJUST_STAMP_START = '<script>window.__ADJUST_CONFIG__=';
-const ADJUST_STAMP_END = ';</script></head>';
 const UNIDENTIFIED_KEY_RE = /^policy:([^:]+):unidentified:[0-9a-f]{64}$/;
 const STATEMENTS_DELTA_RE = /^emits\/statements_(\d{8})\.csv$/;
 const DEFAULT_MAX_DIFF_ROWS = 50;
@@ -115,12 +114,9 @@ function normalizeCsvForTrial(text, { stripCommittedAt = false, normalizeUnident
 }
 
 function normalizeReviewHtmlForTrial(html) {
-  const headIdx = html.indexOf('</head>');
-  const start = html.lastIndexOf(ADJUST_STAMP_START, headIdx);
-  const end = start >= 0 ? html.indexOf(ADJUST_STAMP_END, start) : -1;
-  if (start < 0 || end < 0) return { shell: html, config: null };
-  const shell = html.slice(0, start) + html.slice(end + ADJUST_STAMP_END.length);
-  const cfg = JSON.parse(html.slice(start + ADJUST_STAMP_START.length, end));
+  const stamped = extractAdjustStamp(html);
+  if (!stamped) return { shell: html, config: null };
+  const { shell, config: cfg } = stamped;
   cfg.runBorn = '<RUN_BORN>';
   cfg.checksum = '<CHECKSUM>';
   if (Array.isArray(cfg.overlay)) {

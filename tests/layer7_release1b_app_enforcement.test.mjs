@@ -1016,6 +1016,45 @@ test('Layer 7C [Worker app_cmd Path & Privileged-Write Deletion]: privileged wri
   // Passing an actor object without dbToken to createAppCommands fails closed with 403!
   const appCommands = createAppCommands({ pool: appPool, stores: env.stores });
   const workerCommands = createAppCommands({ pool: workerPool, stores: env.stores });
+  assert.deepEqual(
+    Object.keys(appCommands).sort(),
+    [
+      'abandonRun',
+      'acceptReviewSubmission',
+      'authorizeCheckRun',
+      'cancelStepAttempt',
+      'carryApprovals',
+      'carryDecisions',
+      'carrySent',
+      'confirmEmit',
+      'expireOldDrafts',
+      'failStepAttempt',
+      'finishStepAttempt',
+      'importHistoricalRun',
+      'importStandaloneFiles',
+      'includeStagingFile',
+      'initCompany',
+      'interruptStepAttempt',
+      'launchRun',
+      'materializeEmit',
+      'publishInputVersion',
+      'recordCheck',
+      'recordDecisionBaseline',
+      'recordGeneratedOverlay',
+      'recordStatementBatch',
+      'registerApprovalsFile',
+      'registerEngineVersion',
+      'registerStoredFiles',
+      'rejectReviewSubmission',
+      'requestCancel',
+      'requestRetry',
+      'saveReviewDecisions',
+      'saveReviewDraft',
+      'startStepAttempt',
+      'submitReview',
+    ],
+    'createAppCommands must expose the exact 33 write command keys and omit the deleted duplicate getReviewDraft read',
+  );
   await assert.rejects(
     () => appCommands.recordCheck({
       actor: { id: 'spoof-owner', kind: 'owner' },

@@ -41,8 +41,9 @@ export async function reconcileInterruptedAttempts({
   if (typeof workerToken !== 'string' || !workerToken.trim()) {
     throw new AppError('Reconciler requires a signed workerToken.', 400, 'MISSING_WORKER_TOKEN');
   }
-  const db = slot ? slot.client : pool;
-  const open = await findOpenAttempts(db);
+  const open = slot
+    ? await slot.runExclusive((client) => findOpenAttempts(client))
+    : await findOpenAttempts(pool);
   const interrupted = [];
 
   for (const item of open) {

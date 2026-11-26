@@ -6,7 +6,7 @@ import {
   hashLedgerRows,
   hashStatementAgencyLines,
   hashStatementUplineLines,
-} from '../commands/commitments.mjs';
+} from '../journal/commitments.mjs';
 import { isValidIsoDate, parseCsv } from '../util/csv.mjs';
 import { AppError } from '../util/redact.mjs';
 

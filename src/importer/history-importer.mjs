@@ -19,7 +19,7 @@ import { canonicalJson, fingerprintBytes, formatTimestampUtcUs, sha256Hex } from
 import { isValidIsoDate, normalizeMacKey, parseCsv } from '../util/csv.mjs';
 import { AppError, sanitizeErrorMessage } from '../util/redact.mjs';
 import { verifyObjects } from '../commands/journal-export.mjs';
-import { hashDecisions } from '../commands/commitments.mjs';
+import { hashDecisions } from '../journal/commitments.mjs';
 import { parseCents } from '../worker/emit-materializer.mjs';
 import { listFilesRecursive, materializeInputEntries, rebuildRunFolderFromDb } from '../worker/folder-builder.mjs';
 

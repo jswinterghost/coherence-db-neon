@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { assertLocalPgHost, assertSafeStoresDir, ensureProofIamSubjectsForBatches, runHistoryPlan, runHistoryProof } from '../scripts/prove-history.mjs';
-import { createCommandLayer } from '../src/commands/command-layer.mjs';
+import { createAppCommands } from '../src/commands/app-cmd.mjs';
 import { compareDatabasesAsOf, exportJournalNdjson, rebuildFromJournalExport, verifyChain, verifyCommitments } from '../src/commands/journal-export.mjs';
 import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstruction.mjs';
 import { compareCsvExactText, compareDbRuns, compareRunFolders, mapEntitiesCsv, queryRunEntityReconciliation } from '../src/compare/run-comparator.mjs';
@@ -3781,7 +3781,7 @@ test('Layer 4 [Fix2-3 - Zone-Less Timestamps on Non-UTC Session]: normalizes man
   await env.pool.query(`ALTER DATABASE "${env.dbName}" SET TimeZone = 'America/New_York'`);
   nyPool = await createPool(env.pgConfig);
   assert.equal((await nyPool.query("SELECT current_setting('TimeZone') AS tz")).rows[0].tz, 'America/New_York');
-  const nyCommands = createCommandLayer({ pool: nyPool, companySlug: env.companySlug, stores: env.stores });
+  const nyCommands = createAppCommands({ pool: nyPool, stores: env.stores });
 
   const zonelessTs = '2026-10-15T10:30:00';
 
