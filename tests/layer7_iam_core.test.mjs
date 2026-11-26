@@ -81,6 +81,10 @@ async function runAsPlatformApp(pool, { token = null, readOnly = true } = {}, fn
 async function seedStandardIamWorld(pool, { environment = 'local' } = {}) {
   const keyId = 'k_test_2026';
   const secretBytes = randomBytes(32);
+  const staffKeyId = 'k_staff_2026';
+  const staffSecretBytes = randomBytes(32);
+  const serviceKeyId = 'k_service_2026';
+  const serviceSecretBytes = randomBytes(32);
 
   const ids = {
     rootOrg: randomUUID(),
@@ -137,11 +141,13 @@ async function seedStandardIamWorld(pool, { environment = 'local' } = {}) {
       [environment, ids.acmeOrg, seq],
     );
 
-    // Signing key
+    // Signing keys (one per scope)
     await c.query(
-      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from, active_until)
-       VALUES ($1, $2, $3, pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
-      [keyId, secretBytes, environment],
+      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, key_scope, active_from, active_until)
+       VALUES ($1, $2, $7, 'company_local', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours'),
+              ($3, $4, $7, 'nusear_staff', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours'),
+              ($5, $6, $7, 'service', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
+      [keyId, secretBytes, staffKeyId, staffSecretBytes, serviceKeyId, serviceSecretBytes, environment],
     );
 
     // Tools
@@ -289,25 +295,32 @@ async function seedStandardIamWorld(pool, { environment = 'local' } = {}) {
 
     // People + versions
     const peopleSpecs = [
-      [ids.nusearOwner, 'Pat Platform', 'pat.platform@nusear.example', null],
-      [ids.nusearSupport, 'Jordan Support', 'jordan.support@nusear.example', null],
-      [ids.acmeOwner, 'Dana Owner', 'dana.owner@acme.example', null],
-      [ids.beaconManager, 'Taylor Beacon', 'taylor.beacon@beacon.example', null],
-      [ids.leadManager, 'Casey Lead', 'casey.lead@beacon.example', null],
-      [ids.teamManager, 'Riley Team', 'riley.team@beacon.example', null],
-      [ids.agentA, 'Sam Seller', 'sam.a@beacon.example', '11111111'],
-      [ids.agentB, 'Sam Seller', 'sam.b@beacon.example', '22222222'],
-      [ids.agentC, 'Morgan Agent', 'morgan.c@beacon.example', '33333333'],
-      [ids.northstarAdmin, 'Quinn Northstar', 'quinn@northstar.example', null],
+      [ids.nusearOwner, 'nusear_staff', 'Pat Platform', 'pat.platform@nusear.example', null],
+      [ids.nusearSupport, 'nusear_staff', 'Jordan Support', 'jordan.support@nusear.example', null],
+      [ids.acmeOwner, 'company_local', 'Dana Owner', 'dana.owner@acme.example', null],
+      [ids.beaconManager, 'company_local', 'Taylor Beacon', 'taylor.beacon@beacon.example', null],
+      [ids.leadManager, 'company_local', 'Casey Lead', 'casey.lead@beacon.example', null],
+      [ids.teamManager, 'company_local', 'Riley Team', 'riley.team@beacon.example', null],
+      [ids.agentA, 'company_local', 'Sam Seller', 'sam.a@beacon.example', '11111111'],
+      [ids.agentB, 'company_local', 'Sam Seller', 'sam.b@beacon.example', '22222222'],
+      [ids.agentC, 'company_local', 'Morgan Agent', 'morgan.c@beacon.example', '33333333'],
+      [ids.northstarAdmin, 'company_local', 'Quinn Northstar', 'quinn@northstar.example', null],
     ];
-    for (const [id, name, email, npn] of peopleSpecs) {
-      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [id, seq]);
+    for (const [id, origin, name, email, npn] of peopleSpecs) {
+      await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human',$2,$3)", [id, origin, seq]);
       await c.query(
-        `INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, journal_seq)
-         VALUES ($1,$2,$3,$3,$4,$5,'active',$6)`,
-        [randomUUID(), id, name, email, npn, seq],
+        `INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, npn, status, journal_seq)
+         VALUES ($1,$2,$3,$4,$4,$5,$6,'active',$7)`,
+        [randomUUID(), id, origin, name, email, npn, seq],
       );
     }
+
+    // Seed one active per-company sign-in identity so immutability tests cover person_auth_identities non-vacuously
+    await c.query(
+      `INSERT INTO iam.person_auth_identities (id, person_id, principal_origin, auth_issuer, auth_subject, status, journal_seq)
+       VALUES ($1,$2,'company_local','https://clerk.acme.example','user_acme_owner','active',$3)`,
+      [randomUUID(), ids.acmeOwner, seq],
+    );
 
     // Governing memberships (selling agents derive membership SOLELY from iam.agent_affiliations!)
     for (const [personId, orgId, cap] of [
@@ -359,7 +372,7 @@ async function seedStandardIamWorld(pool, { environment = 'local' } = {}) {
     }
   });
 
-  return { ids, keyId, secretBytes, environment };
+  return { ids, keyId, secretBytes, staffKeyId, staffSecretBytes, serviceKeyId, serviceSecretBytes, environment };
 }
 
 test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 42501 on every iam, iam_secret, and platform base table and internal helper; IAM catalog audit passes', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
@@ -376,7 +389,7 @@ test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 
   const iamTables = tblRes.rows.filter((r) => r.table_schema === 'iam');
   const secretTables = tblRes.rows.filter((r) => r.table_schema === 'iam_secret');
   const platformTables = tblRes.rows.filter((r) => r.table_schema === 'platform');
-  assert.equal(iamTables.length, 16, `expected 16 iam base tables, found ${iamTables.length}`);
+  assert.equal(iamTables.length, 17, `expected 17 iam base tables, found ${iamTables.length}`);
   assert.ok(secretTables.some((r) => r.table_name === 'signing_keys'), 'expected iam_secret.signing_keys');
   assert.ok(platformTables.some((r) => r.table_name === 'audit_journal'), 'expected platform.audit_journal');
 
@@ -669,7 +682,7 @@ test('Layer 7 [Immutability & Supersession]: UPDATE, DELETE, and TRUNCATE fail o
      WHERE table_schema IN ('iam', 'platform') AND table_type = 'BASE TABLE'
      ORDER BY table_schema, table_name`,
   );
-  assert.equal(iamTablesRes.rows.length, 17);
+  assert.equal(iamTablesRes.rows.length, 18);
 
   for (const replicaMode of [false, true]) {
     for (const row of iamTablesRes.rows) {
@@ -829,7 +842,7 @@ test('Layer 7 [Immutability & Supersession]: UPDATE, DELETE, and TRUNCATE fail o
       await c.query(
         `INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, replaces_id, journal_seq)
          VALUES ($1,$2,'Sam Seller','Email Conflict','sam.b@beacon.example','11111111','active',$3,$4)
-         ON CONFLICT (primary_email) WHERE superseded_by_id IS NULL AND primary_email IS NOT NULL DO NOTHING`,
+         ON CONFLICT (principal_origin, primary_email) WHERE superseded_by_id IS NULL AND primary_email IS NOT NULL DO NOTHING`,
         [randomUUID(), ids.agentA, newPersonVersionId, j.seq],
       );
     }),
@@ -847,7 +860,7 @@ test('Layer 7 [Signed Tokens Fail-Closed]: unset, blank, malformed, 1-bit tamper
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
-  const { ids, keyId, secretBytes } = await seedStandardIamWorld(db.pool, { environment: 'prod' });
+  const { ids, keyId, secretBytes, staffKeyId, staffSecretBytes } = await seedStandardIamWorld(db.pool, { environment: 'prod' });
 
   // Verify pure-SQL HMAC-SHA256 matches Node crypto (including >64-byte key)
   for (const [k, msg] of [
@@ -954,7 +967,7 @@ test('Layer 7 [Signed Tokens Fail-Closed]: unset, blank, malformed, 1-bit tamper
 
   // Viewing as a suspended target must also fail closed
   const viewAsSuspendedToken = mintSignedToken({
-    keyId, secretBytes, environment: 'prod', actorPersonId: ids.nusearOwner, viewAsPersonId: ids.acmeOwner,
+    keyId: staffKeyId, secretBytes: staffSecretBytes, environment: 'prod', actorPersonId: ids.nusearOwner, viewAsPersonId: ids.acmeOwner,
   });
   await runAsPlatformApp(db.pool, { token: viewAsSuspendedToken, readOnly: true }, async (c) => {
     assert.equal((await c.query('SELECT * FROM iam.session_context()')).rows[0].actor_person_id, null);
@@ -965,11 +978,11 @@ test('Layer 7 [View-As Enforcement]: View-as refuses every write with 42501 VIEW
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
-  const { ids, keyId, secretBytes, environment } = await seedStandardIamWorld(db.pool);
+  const { ids, keyId, secretBytes, staffKeyId, staffSecretBytes, environment } = await seedStandardIamWorld(db.pool);
 
   // 1. Nusear Owner (wide org_subtree) viewing as Selling Agent A (narrow self) inside a deliberate READ WRITE tx
   const ownerAsAgent = mintSignedToken({
-    keyId, secretBytes, environment, actorPersonId: ids.nusearOwner, viewAsPersonId: ids.agentA,
+    keyId: staffKeyId, secretBytes: staffSecretBytes, environment, actorPersonId: ids.nusearOwner, viewAsPersonId: ids.agentA,
   });
 
   await runAsPlatformApp(db.pool, { token: ownerAsAgent, readOnly: false }, async (c) => {
@@ -1309,11 +1322,11 @@ test('Layer 7 [Tool Switches & Nusear Bypass]: off/held/preview block customers,
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
-  const { ids, keyId, secretBytes, environment } = await seedStandardIamWorld(db.pool);
+  const { ids, keyId, secretBytes, staffKeyId, staffSecretBytes, environment } = await seedStandardIamWorld(db.pool);
 
   const ownerTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.acmeOwner });
-  const supportTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.nusearSupport });
-  const supportAsOwnerTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.nusearSupport, viewAsPersonId: ids.acmeOwner });
+  const supportTok = mintSignedToken({ keyId: staffKeyId, secretBytes: staffSecretBytes, environment, actorPersonId: ids.nusearSupport });
+  const supportAsOwnerTok = mintSignedToken({ keyId: staffKeyId, secretBytes: staffSecretBytes, environment, actorPersonId: ids.nusearSupport, viewAsPersonId: ids.acmeOwner });
 
   // 1. Held without hold_reason must fail CHECK (23514)
   const transSwitchId = (await db.pool.query("SELECT id FROM iam.organization_tool_switches WHERE organization_id = $1 AND tool_id = 'transmittals' AND superseded_by_id IS NULL", [ids.acmeOrg])).rows[0].id;
@@ -1653,28 +1666,47 @@ test('Layer 7 [Service Role Least-Privilege Transactions]: real SET LOCAL ROLE t
       [randomUUID(), syncedParent, prevParentRv, seq],
     );
 
-    // Supersede an existing person_version under platform_iam_sync
+    // Supersede an existing nusear_staff person_version under platform_iam_sync
     const prevPvId = (await c.query(
       'SELECT id FROM iam.person_versions WHERE person_id = $1 AND superseded_by_id IS NULL',
-      [ids.agentA],
+      [ids.nusearSupport],
     )).rows[0].id;
     await c.query(
-      `INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, replaces_id, journal_seq)
-       VALUES ($1,$2,'Sam Seller','Sam Synced','sam.a@beacon.example','11111111','active',$3,$4)`,
-      [randomUUID(), ids.agentA, prevPvId, seq],
+      `INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, status, replaces_id, journal_seq)
+       VALUES ($1,$2,'nusear_staff','Jordan Support','Jordan Synced','jordan.support@nusear.example','active',$3,$4)`,
+      [randomUUID(), ids.nusearSupport, prevPvId, seq],
     );
 
     // Closure views under platform_iam_sync (calls iam.business_today)
     const orgClosure = (await c.query('SELECT COUNT(*)::int AS n FROM iam.v_organization_closure_live')).rows[0].n;
     assert.ok(orgClosure > 0);
 
-    // Signing key write under platform_iam_sync
+    // Signing key write under platform_iam_sync (nusear_staff scope)
     await c.query(
-      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from)
-       VALUES ('k_sync_2026', $1, $2, pg_catalog.now())`,
+      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, key_scope, active_from)
+       VALUES ('k_sync_2026', $1, $2, 'nusear_staff', pg_catalog.now())`,
       [randomBytes(32), environment],
     );
   });
+
+  // platform_iam_sync is denied superseding company_local people or inserting company_local signing keys
+  const agentAPvId = (await db.pool.query(
+    'SELECT id FROM iam.person_versions WHERE person_id = $1 AND superseded_by_id IS NULL',
+    [ids.agentA],
+  )).rows[0].id;
+  await assert.rejects(
+    () => inSerializableTx(db.pool, async (c) => {
+      await c.query('SET LOCAL ROLE platform_iam_sync');
+      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.sync_bad_local', commandKey: 'sync-bad-local-1' });
+      await c.query(
+        `INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, npn, status, replaces_id, journal_seq)
+         VALUES ($1,$2,'company_local','Sam Seller','Sam Hijack','sam.a@beacon.example','11111111','active',$3,$4)`,
+        [randomUUID(), ids.agentA, agentAPvId, j.seq],
+      );
+    }),
+    (err) => err?.code === '42501',
+    'platform_iam_sync must be denied superseding company_local person_versions',
+  );
 
   // 4. platform_readonly: reads platform.audit_journal, iam base tables, and closure views; denied writes & iam_secret
   await inSerializableTx(db.pool, async (c) => {
@@ -1708,7 +1740,7 @@ test('Layer 7 [Append-Only Right Retirements]: iam.right_retirements replaces re
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
-  const { ids, keyId, secretBytes, environment } = await seedStandardIamWorld(db.pool);
+  const { ids, keyId, secretBytes, staffKeyId, staffSecretBytes, environment } = await seedStandardIamWorld(db.pool);
 
   // Verify retired_journal_seq column is removed from iam.rights and iam.right_retirements table exists
   const oldCol = await db.pool.query(
@@ -1717,7 +1749,7 @@ test('Layer 7 [Append-Only Right Retirements]: iam.right_retirements replaces re
   assert.equal(oldCol.rows.length, 0, 'iam.rights must no longer have mutable-never-set retired_journal_seq column');
 
   const ownerTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.acmeOwner });
-  const supportTok = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.nusearSupport });
+  const supportTok = mintSignedToken({ keyId: staffKeyId, secretBytes: staffSecretBytes, environment, actorPersonId: ids.nusearSupport });
 
   // Before retirement, act:transmittals.approve works for Acme Owner and Nusear Support
   await runAsPlatformApp(db.pool, { token: ownerTok, readOnly: false }, async (c) => {
@@ -1819,7 +1851,7 @@ test('Layer 7 [Release 1A Journal Hash Parity]: platform.compute_journal_hash us
   assert.equal(row.h, expectedHash, 'platform.compute_journal_hash must match Release 1A canonical_json serialization byte-for-byte');
 });
 
-test('Layer 7 [Control DB Closure]: iam.person_effective_grants reads today live tree in control database (moved agency follows new upline; old company member and archived orgs excluded)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7 [Control DB Closure]: iam.person_effective_grants reads today live tree in control database for Nusear staff (moved agency follows new upline, archived orgs excluded) and forbids company_local people', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const db = await createEmptyMigratedTestDb();
   t.after(() => db.cleanup());
 
@@ -1831,9 +1863,9 @@ test('Layer 7 [Control DB Closure]: iam.person_effective_grants reads today live
   const northstarOrg = randomUUID();
   const movedAgency = randomUUID();
   const archivedTeam = randomUUID();
-  const acmeMember = randomUUID();
-  const nsMember = randomUUID();
-  const roleMgr = randomUUID();
+  const acmeStaffOp = randomUUID();
+  const nsStaffOp = randomUUID();
+  const roleCtrlStaff = randomUUID();
 
   await inSerializableTx(db.pool, async (c) => {
     const j = await appendAuditEntry(c, { environment, commandKind: 'iam.ctrl_seed', commandKey: 'ctrl-seed' });
@@ -1850,8 +1882,8 @@ test('Layer 7 [Control DB Closure]: iam.person_effective_grants reads today live
       [environment, seq],
     );
     await c.query(
-      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from, active_until)
-       VALUES ($1, $2, $3, pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
+      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, key_scope, active_from, active_until)
+       VALUES ($1, $2, $3, 'nusear_staff', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
       [keyId, secretBytes, environment],
     );
     await c.query("INSERT INTO iam.tools (id, display_name, is_nusear_only, is_customer_switchable, journal_seq) VALUES ('coherence','Coherence',false,true,$1)", [seq]);
@@ -1889,39 +1921,49 @@ test('Layer 7 [Control DB Closure]: iam.person_effective_grants reads today live
         [randomUUID(), oid, seq],
       );
     }
-    await c.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleMgr, 'ctrl_mgr', seq]);
+    await c.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleCtrlStaff, 'ctrl_staff', seq]);
     await c.query(
-      "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Ctrl Mgr',false,false,true,'active',$3)",
-      [randomUUID(), roleMgr, seq],
+      "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Ctrl Staff',false,true,true,'active',$3)",
+      [randomUUID(), roleCtrlStaff, seq],
     );
-    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), roleMgr, seq]);
-    for (const [pid, name, email, memOrg, grantOrg] of [
-      [acmeMember, 'Acme Mem', 'acme.ctrl@example.test', acmeOrg, movedAgency],
-      [nsMember, 'NS Mem', 'ns.ctrl@example.test', northstarOrg, northstarOrg],
+    await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,'act:coherence.bob.read','active',$3)", [randomUUID(), roleCtrlStaff, seq]);
+    for (const [pid, name, email, grantOrg] of [
+      [acmeStaffOp, 'Acme Staff Op', 'acme.ctrl@nusear.example', acmeOrg],
+      [nsStaffOp, 'NS Staff Op', 'ns.ctrl@nusear.example', northstarOrg],
     ]) {
-      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
+      await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','nusear_staff',$2)", [pid, seq]);
       await c.query(
-        "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,$3,$3,$4,'active',$5)",
+        "INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'nusear_staff',$3,$3,$4,'active',$5)",
         [randomUUID(), pid, name, email, seq],
       );
       await c.query(
         "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
-        [randomUUID(), pid, memOrg, seq],
+        [randomUUID(), pid, rootOrg, seq],
       );
       await c.query(
         "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
-        [randomUUID(), pid, roleMgr, grantOrg, seq],
+        [randomUUID(), pid, roleCtrlStaff, grantOrg, seq],
       );
     }
   });
 
+  // Control DB strictly refuses company_local people.
+  await assert.rejects(
+    () => inSerializableTx(db.pool, async (c) => {
+      const j = await appendAuditEntry(c, { environment, commandKind: 'iam.ctrl_bad_local', commandKey: 'ctrl-bad-local' });
+      await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','company_local',$2)", [randomUUID(), j.seq]);
+    }),
+    (err) => err?.code === '23514',
+    'control database must refuse company_local people',
+  );
+
   const tok = (pid) => mintSignedToken({ keyId, secretBytes, environment, actorPersonId: pid });
-  const acmeWide = await runAsPlatformApp(db.pool, { token: tok(acmeMember), readOnly: true }, async (c) => (
+  const acmeWide = await runAsPlatformApp(db.pool, { token: tok(acmeStaffOp), readOnly: true }, async (c) => (
     (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v
   ));
-  assert.deepEqual(acmeWide, [], 'control DB uses today live tree: old company member with grant on moved agency gets 0 orgs');
+  assert.deepEqual(acmeWide, [acmeOrg], 'control DB uses today live tree: grant on acmeOrg excludes movedAgency');
 
-  const nsWide = await runAsPlatformApp(db.pool, { token: tok(nsMember), readOnly: true }, async (c) => (
+  const nsWide = await runAsPlatformApp(db.pool, { token: tok(nsStaffOp), readOnly: true }, async (c) => (
     (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v
   ));
   assert.deepEqual([...nsWide].sort(), [movedAgency, northstarOrg].sort(), 'control DB uses today live tree: new upline sees moved agency and excludes archived team');

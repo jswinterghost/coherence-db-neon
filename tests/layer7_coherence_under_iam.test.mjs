@@ -36,6 +36,9 @@ function assertStrictTestDbName(dbName) {
   }
 }
 
+const SCOPED_KEYS_BY_BASE_KEY = new Map();
+const ORIGIN_BY_PERSON_ID = new Map();
+
 function mintSignedToken({
   keyId,
   secretBytes,
@@ -44,10 +47,21 @@ function mintSignedToken({
   actorPersonId,
   viewAsPersonId = null,
   expEpoch = Math.floor(Date.now() / 1000) + 60,
+  exactKey = false,
 }) {
+  let effectiveKeyId = keyId;
+  let effectiveSecret = secretBytes;
+  if (!exactKey && SCOPED_KEYS_BY_BASE_KEY.has(keyId)) {
+    const origin = ORIGIN_BY_PERSON_ID.get(actorPersonId) || 'company_local';
+    const scoped = SCOPED_KEYS_BY_BASE_KEY.get(keyId)[origin];
+    if (scoped) {
+      effectiveKeyId = scoped.keyId;
+      effectiveSecret = scoped.secretBytes;
+    }
+  }
   const viewAsPart = viewAsPersonId ?? '-';
-  const payload = `v1|${keyId}|${environment}|${sessionId}|${actorPersonId}|${viewAsPart}|${expEpoch}`;
-  const sig = createHmac('sha256', secretBytes).update(payload, 'utf8').digest('hex');
+  const payload = `v1|${effectiveKeyId}|${environment}|${sessionId}|${actorPersonId}|${viewAsPart}|${expEpoch}`;
+  const sig = createHmac('sha256', effectiveSecret).update(payload, 'utf8').digest('hex');
   return `${payload}|${sig}`;
 }
 
@@ -172,8 +186,13 @@ async function runAsPlatformApp(pool, opts, fn) {
 }
 
 async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToolNusearOnly = false, bobReadEnvScope = 'both' } = {}) {
-  const keyId = 'k_coh_2026';
+  const suffix = randomBytes(4).toString('hex');
+  const keyId = `k_coh_${suffix}`;
   const secretBytes = randomBytes(32);
+  const staffKeyId = `k_stf_${suffix}`;
+  const staffSecretBytes = randomBytes(32);
+  const serviceKeyId = `k_svc_${suffix}`;
+  const serviceSecretBytes = randomBytes(32);
 
   const ids = {
     rootOrg: randomUUID(),
@@ -237,9 +256,11 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
     );
 
     await c.query(
-      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from, active_until)
-       VALUES ($1, $2, $3, pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
-      [keyId, secretBytes, environment],
+      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, key_scope, active_from, active_until)
+       VALUES ($1, $2, $7, 'company_local', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours'),
+              ($3, $4, $7, 'nusear_staff', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours'),
+              ($5, $6, $7, 'service', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
+      [keyId, secretBytes, staffKeyId, staffSecretBytes, serviceKeyId, serviceSecretBytes, environment],
     );
 
     for (const [id, display, nusearOnly, switchable] of [
@@ -444,38 +465,40 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
     }
 
     const humanPeople = [
-      [ids.nusearOwner, 'Pat Platform', 'pat.owner@nusear.example', null, 'active'],
-      [ids.nusearAdminNoCoh, 'Drew Admin', 'drew.admin@nusear.example', null, 'active'],
-      [ids.nusearOperator, 'Morgan Operator', 'morgan.op@nusear.example', null, 'active'],
-      [ids.northstarOperator, 'Quinn Northstar', 'quinn.op@nusear.example', null, 'active'],
-      [ids.acmeEntityMgr, 'Dana Entity', 'dana.em@acme.example', null, 'active'],
-      [ids.acmeCompanyAdmin, 'Jamie Admin', 'jamie.admin@acme.example', null, 'active'],
-      [ids.acmeInvestor, 'Avery Investor', 'avery.inv@acme.example', null, 'active'],
-      [ids.beaconManager, 'Taylor Beacon', 'taylor.mgr@beacon.example', null, 'active'],
-      [ids.leadManager, 'Casey Lead', 'casey.lead@beacon.example', null, 'active'],
-      [ids.teamManager, 'Riley Team', 'riley.team@beacon.example', null, 'active'],
-      [ids.multiAgencyPerson, 'Skylar Dual', 'skylar.dual@acme.example', null, 'active'],
-      [ids.harborRetention, 'Jordan Retain', 'jordan.ret@harbor.example', null, 'active'],
-      [ids.agentA, 'Sam Seller', 'sam.a@beacon.example', '11111111', 'active'],
-      [ids.agentB, 'Sam Seller', 'sam.b@beacon.example', '22222222', 'active'],
-      [ids.agentEast, 'East Producer', 'east.prod@beacon.example', '44444444', 'active'],
-      [ids.agentHarbor, 'Robin Harbor', 'robin.h@harbor.example', '33333333', 'active'],
-      [ids.suspendedAgent, 'Suspended Producer', 'susp@beacon.example', '55555555', 'suspended'],
+      [ids.nusearOwner, 'nusear_staff', 'Pat Platform', 'pat.owner@nusear.example', null, 'active'],
+      [ids.nusearAdminNoCoh, 'nusear_staff', 'Drew Admin', 'drew.admin@nusear.example', null, 'active'],
+      [ids.nusearOperator, 'nusear_staff', 'Morgan Operator', 'morgan.op@nusear.example', null, 'active'],
+      [ids.northstarOperator, 'nusear_staff', 'Quinn Northstar', 'quinn.op@nusear.example', null, 'active'],
+      [ids.acmeEntityMgr, 'company_local', 'Dana Entity', 'dana.em@acme.example', null, 'active'],
+      [ids.acmeCompanyAdmin, 'company_local', 'Jamie Admin', 'jamie.admin@acme.example', null, 'active'],
+      [ids.acmeInvestor, 'company_local', 'Avery Investor', 'avery.inv@acme.example', null, 'active'],
+      [ids.beaconManager, 'company_local', 'Taylor Beacon', 'taylor.mgr@beacon.example', null, 'active'],
+      [ids.leadManager, 'company_local', 'Casey Lead', 'casey.lead@beacon.example', null, 'active'],
+      [ids.teamManager, 'company_local', 'Riley Team', 'riley.team@beacon.example', null, 'active'],
+      [ids.multiAgencyPerson, 'company_local', 'Skylar Dual', 'skylar.dual@acme.example', null, 'active'],
+      [ids.harborRetention, 'company_local', 'Jordan Retain', 'jordan.ret@harbor.example', null, 'active'],
+      [ids.agentA, 'company_local', 'Sam Seller', 'sam.a@beacon.example', '11111111', 'active'],
+      [ids.agentB, 'company_local', 'Sam Seller', 'sam.b@beacon.example', '22222222', 'active'],
+      [ids.agentEast, 'company_local', 'East Producer', 'east.prod@beacon.example', '44444444', 'active'],
+      [ids.agentHarbor, 'company_local', 'Robin Harbor', 'robin.h@harbor.example', '33333333', 'active'],
+      [ids.suspendedAgent, 'company_local', 'Suspended Producer', 'susp@beacon.example', '55555555', 'suspended'],
     ];
-    for (const [id, name, email, npn, status] of humanPeople) {
-      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [id, seq]);
+    for (const [id, origin, name, email, npn, status] of humanPeople) {
+      ORIGIN_BY_PERSON_ID.set(id, origin);
+      await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human',$2,$3)", [id, origin, seq]);
       await c.query(
-        `INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, journal_seq)
-         VALUES ($1,$2,$3,$3,$4,$5,$6,$7)`,
-        [randomUUID(), id, name, email, npn, status, seq],
+        `INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, npn, status, journal_seq)
+         VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8)`,
+        [randomUUID(), id, origin, name, email, npn, status, seq],
       );
     }
 
     // Worker service principal
-    await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'service',$2)", [ids.workerService, seq]);
+    ORIGIN_BY_PERSON_ID.set(ids.workerService, 'service');
+    await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'service','service',$2)", [ids.workerService, seq]);
     await c.query(
-      `INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, status, journal_seq)
-       VALUES ($1,$2,'Coherence Engine Worker','Coherence Engine Worker','active',$3)`,
+      `INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, status, journal_seq)
+       VALUES ($1,$2,'service','Coherence Engine Worker','Coherence Engine Worker','active',$3)`,
       [randomUUID(), ids.workerService, seq],
     );
 
@@ -546,6 +569,12 @@ async function seedCoherenceIamWorld(pool, { environment = 'local', coherenceToo
         [randomUUID(), personId, roleId, orgId, incDesc, pMode, seq],
       );
     }
+  });
+
+  SCOPED_KEYS_BY_BASE_KEY.set(keyId, {
+    company_local: { keyId, secretBytes },
+    nusear_staff: { keyId: staffKeyId, secretBytes: staffSecretBytes },
+    service: { keyId: serviceKeyId, secretBytes: serviceSecretBytes },
   });
 
   const ownerToken = mintSignedToken({ keyId, secretBytes, environment, actorPersonId: ids.nusearOwner });
@@ -2435,7 +2464,7 @@ test('Layer 7B [Fix1-3, Fix1-4, Fix1-5, Fix1-8 - Decisions Gate, Tenant-Scoped R
       );
     }
     for (const [pid, oid] of [
-      [crossMixedPerson, ids.rootOrg],
+      [crossMixedPerson, ids.northstarOrg],
       [crossMixedPerson, ids.beaconOrg],
       [intraMixedPerson, ids.acmeOrg],
       [ledgerNoStmtPerson, ids.acmeOrg],
@@ -2447,7 +2476,7 @@ test('Layer 7B [Fix1-3, Fix1-4, Fix1-5, Fix1-8 - Decisions Gate, Tenant-Scoped R
       );
     }
     for (const [pid, rid, oid] of [
-      [crossMixedPerson, ids.roleCoherenceOperator, ids.northstarOrg],
+      [crossMixedPerson, ids.roleEntityManager, ids.northstarOrg],
       [crossMixedPerson, ids.roleAgencyManager, ids.beaconOrg],
       [intraMixedPerson, ids.roleAgencyManager, ids.beaconOrg],
       [intraMixedPerson, roleUnpubStmtOnly, ids.harborOrg],
@@ -3485,12 +3514,13 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
     }
   });
 
-  await t.test('Fix2-B2b: a dead customer grant with include_descendants=true cannot expand a live Nusear grant with include_descendants=false', async () => {
-    const dualPerson = randomUUID();
+  await t.test('Fix2-B2b: a dead expired grant with include_descendants=true cannot expand a live Nusear grant with include_descendants=false (and cross-origin grants are refused)', async () => {
+    const staffNoDesc = randomUUID();
+    ORIGIN_BY_PERSON_ID.set(staffNoDesc, 'nusear_staff');
     await inSerializableTx(env.pool, async (c) => {
       const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f2_b2b_dual', commandKey: 'f2-b2b-dual' });
       const seq = j.seq;
-      // Switch Acme OFF (so every customer grant on Acme is DEAD, while Nusear internal grants on Acme stay alive)
+      // Switch Acme OFF (Nusear internal grants on Acme stay alive)
       const prevAcmeTs = (await c.query(
         "SELECT id FROM iam.organization_tool_switches WHERE organization_id = $1 AND tool_id = 'coherence' AND superseded_by_id IS NULL",
         [ids.acmeOrg],
@@ -3499,33 +3529,41 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
         "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, replaces_id, journal_seq) VALUES ($1,$2,'coherence','off','active',$3,$4)",
         [randomUUID(), ids.acmeOrg, prevAcmeTs, seq],
       );
-      await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [dualPerson, seq]);
+      await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','nusear_staff',$2)", [staffNoDesc, seq]);
       await c.query(
-        "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'Dual Principal','Dual Principal','dual@nusear.example','active',$3)",
-        [randomUUID(), dualPerson, seq],
-      );
-      // Both platform_root membership (for Nusear grant) and acmeOrg membership (for customer grant)
-      await c.query(
-        "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
-        [randomUUID(), dualPerson, ids.rootOrg, seq],
+        "INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'nusear_staff','Staff NoDesc','Staff NoDesc','dual@nusear.example','active',$3)",
+        [randomUUID(), staffNoDesc, seq],
       );
       await c.query(
         "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
-        [randomUUID(), dualPerson, ids.acmeOrg, seq],
+        [randomUUID(), staffNoDesc, ids.rootOrg, seq],
       );
       // Live Nusear grant on Acme with include_descendants = FALSE
       await c.query(
         "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
-        [randomUUID(), dualPerson, ids.roleNusearAdmin, ids.acmeOrg, seq],
+        [randomUUID(), staffNoDesc, ids.roleNusearAdmin, ids.acmeOrg, seq],
       );
-      // Dead customer grant on Acme with include_descendants = TRUE (dead because Acme switch is OFF)
+      // Dead expired internal grant on Acme with include_descendants = TRUE
       await c.query(
-        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
-        [randomUUID(), dualPerson, ids.roleEntityManager, ids.acmeOrg, seq],
+        "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,2024-01-01)'::daterange,'active',$5)",
+        [randomUUID(), staffNoDesc, ids.roleNusearOwner, ids.acmeOrg, seq],
       );
     });
 
-    await runAsPlatformApp(env.pool, { token: tok(dualPerson), readOnly: true }, async (c) => {
+    // Cross-origin customer grant on nusear_staff principal is refused outright (23514).
+    await assert.rejects(
+      () => inSerializableTx(env.pool, async (c) => {
+        const j = await appendAuditEntry(c, { environment, commandKind: 'iam.f2_b2b_xorig', commandKey: 'f2-b2b-xorig' });
+        await c.query(
+          "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+          [randomUUID(), staffNoDesc, ids.roleEntityManager, ids.acmeOrg, j.seq],
+        );
+      }),
+      (err) => err?.code === '23514',
+      'cross-origin customer grant on nusear_staff must fail 23514',
+    );
+
+    await runAsPlatformApp(env.pool, { token: tok(staffNoDesc), readOnly: true }, async (c) => {
       // Sees Acme's own house ledger row (via live Nusear grant with include_descendants=false),
       // and ZERO archived Harbor or East Team rows!
       const acmeLed = (await c.query("SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger WHERE entity = 'Acme'")).rows[0].n;
@@ -3533,9 +3571,9 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
       const archBob = (await c.query("SELECT COUNT(*)::int AS n FROM app_views.coherence_bob WHERE entity IN ('Harbor', 'East Team')")).rows[0].n;
       const archLed = (await c.query("SELECT COUNT(*)::int AS n FROM app_views.coherence_ledger WHERE entity IN ('Harbor', 'East Team')")).rows[0].n;
       const archUp = (await c.query("SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_upline_lines WHERE source_entity IN ('Harbor', 'East Team')")).rows[0].n;
-      assert.equal(archBob, 0, 'dead customer grant with descendants must NOT expand Nusear no-descendants grant in coherence_bob');
-      assert.equal(archLed, 0, 'dead customer grant with descendants must NOT expand Nusear no-descendants grant in coherence_ledger');
-      assert.equal(archUp, 0, 'dead customer grant with descendants must NOT expand Nusear no-descendants grant in statement_upline_lines');
+      assert.equal(archBob, 0, 'expired grant with descendants must NOT expand Nusear no-descendants grant in coherence_bob');
+      assert.equal(archLed, 0, 'expired grant with descendants must NOT expand Nusear no-descendants grant in coherence_ledger');
+      assert.equal(archUp, 0, 'expired grant with descendants must NOT expand Nusear no-descendants grant in statement_upline_lines');
     });
   });
 
@@ -3557,7 +3595,7 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
       assert.equal(harborSt[0].amount, null, 'retired col:coherence.statement_cash must mask statement amount to NULL on archived Harbor');
     });
 
-    // 2. is_nusear_only = true tool: customer sees 0 archived Harbor rows (and cannot expand a Nusear no-desc grant!), Nusear Owner still sees them
+    // 2. is_nusear_only = true tool: customer sees 0 archived Harbor rows, Nusear Owner still sees them
     const envNusearOnly = await createCoherenceIamTestEnv();
     try {
       const w = await seedCoherenceIamWorld(envNusearOnly.pool, { coherenceToolNusearOnly: true });
@@ -3565,7 +3603,8 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
       await runAsRole(envNusearOnly.pool, 'platform_migrator', { readOnly: false }, (c) => (
         c.query('SELECT * FROM coherence.backfill_iam_foreign_keys()')
       ));
-      const dualNoDesc = randomUUID();
+      const staffNoDesc = randomUUID();
+      ORIGIN_BY_PERSON_ID.set(staffNoDesc, 'nusear_staff');
       await inSerializableTx(envNusearOnly.pool, async (c) => {
         const j = await appendAuditEntry(c, { environment: w.environment, commandKind: 'iam.f2_no_arch', commandKey: 'f2-no-arch' });
         const prevOv = (await c.query('SELECT id FROM iam.organization_versions WHERE organization_id = $1 AND superseded_by_id IS NULL', [w.ids.harborOrg])).rows[0].id;
@@ -3573,22 +3612,21 @@ test('Layer 7B [Fix2-Blocker2 - Archived Descendants Full IAM Rules: Switches, V
           "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, replaces_id, journal_seq) VALUES ($1,$2,'harbor','Harbor','archived',$3,$4)",
           [randomUUID(), w.ids.harborOrg, prevOv, j.seq],
         );
-        await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [dualNoDesc, j.seq]);
-        await c.query("INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'Dual NO','Dual NO','dual.no@nusear.example','active',$3)", [randomUUID(), dualNoDesc, j.seq]);
-        await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), dualNoDesc, w.ids.rootOrg, j.seq]);
-        await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), dualNoDesc, w.ids.acmeOrg, j.seq]);
-        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), dualNoDesc, w.ids.roleNusearAdmin, w.ids.acmeOrg, j.seq]);
-        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), dualNoDesc, w.ids.roleEntityManager, w.ids.acmeOrg, j.seq]);
+        await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','nusear_staff',$2)", [staffNoDesc, j.seq]);
+        await c.query("INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'nusear_staff','Staff NO','Staff NO','dual.no@nusear.example','active',$3)", [randomUUID(), staffNoDesc, j.seq]);
+        await c.query("INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)", [randomUUID(), staffNoDesc, w.ids.rootOrg, j.seq]);
+        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,false,'org_subtree','[2020-01-01,)'::daterange,'active',$5)", [randomUUID(), staffNoDesc, w.ids.roleNusearAdmin, w.ids.acmeOrg, j.seq]);
+        await c.query("INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,2024-01-01)'::daterange,'active',$5)", [randomUUID(), staffNoDesc, w.ids.roleNusearOwner, w.ids.acmeOrg, j.seq]);
       });
       const noTok = (pid) => mintSignedToken({ keyId: w.keyId, secretBytes: w.secretBytes, environment: w.environment, actorPersonId: pid });
       const custCnt = await runAsPlatformApp(envNusearOnly.pool, { token: noTok(w.ids.acmeEntityMgr), readOnly: true }, async (c) => (
         (await c.query("SELECT COUNT(*)::int AS n FROM app_views.coherence_bob WHERE entity = 'Harbor'")).rows[0].n
       ));
       assert.equal(custCnt, 0, 'is_nusear_only tool must block customer access to archived Harbor');
-      const dualCnt = await runAsPlatformApp(envNusearOnly.pool, { token: noTok(dualNoDesc), readOnly: true }, async (c) => (
+      const staffNoDescCnt = await runAsPlatformApp(envNusearOnly.pool, { token: noTok(staffNoDesc), readOnly: true }, async (c) => (
         (await c.query("SELECT COUNT(*)::int AS n FROM app_views.coherence_bob WHERE entity = 'Harbor'")).rows[0].n
       ));
-      assert.equal(dualCnt, 0, 'dead customer grant on is_nusear_only tool must not expand Nusear no-desc grant');
+      assert.equal(staffNoDescCnt, 0, 'expired internal grant on is_nusear_only tool must not expand Nusear no-desc grant');
       const ownerCnt = await runAsPlatformApp(envNusearOnly.pool, { token: noTok(w.ids.nusearOwner), readOnly: true }, async (c) => (
         (await c.query("SELECT COUNT(*)::int AS n FROM app_views.coherence_bob WHERE entity = 'Harbor'")).rows[0].n
       ));
@@ -6043,7 +6081,7 @@ test('Layer 7B [Release C1 Item 8 - Time-Consistent Chains in iam.v_organization
   });
 });
 
-test('Layer 7B [Release C2 - Holding Company Above Tenant]: non-internal org above tenant is followed only through today live chains (live parent and grandparent reach tenant; expired former parent and expired grandparent do not; tool switches follow same rule)', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7B [Release E2 - No Holding-Company User-Grant Flow]: no grant above the tenant reaches into a company database (holding, grandparent, holding-member-on-tenant, former parent, and sister all get 0 orgs and 0 rows), while live parent tool switches still veto non-internal callers and Nusear internal bypasses', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const env = await createCoherenceIamTestEnv();
   t.after(() => env.cleanup());
 
@@ -6198,43 +6236,13 @@ test('Layer 7B [Release C2 - Holding Company Above Tenant]: non-internal org abo
   });
   await env.pool.query('SELECT * FROM coherence.backfill_iam_foreign_keys()');
 
-  const expectedLiveTenantOrgs = [ids.acmeOrg, ids.beaconOrg, ids.harborOrg, ids.eastTeamOrg].sort();
-
-  // 1. Live holding company and live grandparent reach the tenant's live tree (strictly tenant-bounded: no holdingCo/sisterCo/archived/movedOut).
-  for (const [label, pid] of [
-    ['holdingExec', holdingExec],
-    ['grandHoldingExec', grandHoldingExec],
-    ['View-as holdingExec', null],
-  ]) {
-    const token = pid ? tok(pid) : tok(ids.nusearOwner, holdingExec);
-    await runAsPlatformApp(env.pool, { token, readOnly: true }, async (c) => {
-      const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v.sort();
-      assert.deepEqual(wide, expectedLiveTenantOrgs, `${label} must reach Acme live tree only (no holdingCo, sisterCo, archived, or movedOut)`);
-      const bobEntities = (await c.query('SELECT DISTINCT entity FROM app_views.coherence_bob ORDER BY entity')).rows.map((r) => r.entity);
-      assert.deepEqual(bobEntities, ['Beacon', 'East Team', 'Harbor'], `${label} must read Acme BoB rows`);
-      const histCount = (await c.query(
-        "SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines WHERE entity IN ('Archived Old Agency', 'Moved Out Agency')",
-      )).rows[0].n;
-      assert.equal(histCount, 0, `${label} (above tenant, live chains only) must not read pre-acquisition archived/moved-out agency rows`);
-    });
-  }
-
-  // Holding company member with direct grant on tenant reaches tenant's live AND historical tree (grant anchored at tenant).
-  await runAsPlatformApp(env.pool, { token: tok(holdingMemTenantGrant), readOnly: true }, async (c) => {
-    const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v;
-    assert.ok(wide.includes(ids.acmeOrg) && wide.includes(ids.beaconOrg) && wide.includes(archivedAgency) && wide.includes(movedOutAgency));
-    assert.ok(!wide.includes(holdingCo) && !wide.includes(sisterCo));
-  });
-
-  // Holding company executive can authorize writes at tenantOrg via assert_can_write.
-  const holdWrite = await runAsPlatformApp(env.pool, { token: tok(holdingExec), readOnly: true }, (c) => (
-    c.query("SELECT actor_person_id, recorded_as FROM iam.assert_can_write('act:coherence.inputs.publish', $1::uuid)", [ids.acmeOrg])
-  ));
-  assert.equal(holdWrite.rows[0].actor_person_id, holdingExec);
-  assert.equal(holdWrite.rows[0].recorded_as, 'self');
-
-  // 2. Expired former parent, expired grandparent, non-descending holding grant, and sister company get 0 orgs and 0 rows everywhere.
+  // 1. Release E2: holding company, grandparent, holding-member-with-tenant-grant, non-descending holding grant,
+  //    expired former parent, expired grandparent, and sister company ALL get 0 orgs, 0 rows, and 42501 on writes.
   for (const [label, token] of [
+    ['holdingExec', tok(holdingExec)],
+    ['grandHoldingExec', tok(grandHoldingExec)],
+    ['View-as holdingExec', tok(ids.nusearOwner, holdingExec)],
+    ['holdingMemTenantGrant', tok(holdingMemTenantGrant)],
     ['holdingNoDesc', tok(holdingNoDesc)],
     ['expiredGrandExec', tok(expiredGrandExec)],
     ['formerParentExec', tok(formerParentExec)],
@@ -6251,7 +6259,11 @@ test('Layer 7B [Release C2 - Holding Company Above Tenant]: non-internal org abo
     });
   }
 
-  for (const [label, pid] of [['formerParentExec', formerParentExec], ['formerParentMemTenantGrant', formerParentMemTenantGrant]]) {
+  for (const [label, pid] of [
+    ['holdingExec', holdingExec],
+    ['formerParentExec', formerParentExec],
+    ['formerParentMemTenantGrant', formerParentMemTenantGrant],
+  ]) {
     await assert.rejects(
       () => runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, (c) => (
         c.query("SELECT * FROM iam.assert_can_write('act:coherence.inputs.publish', $1::uuid)", [ids.acmeOrg])
@@ -6261,7 +6273,7 @@ test('Layer 7B [Release C2 - Holding Company Above Tenant]: non-internal org abo
     );
   }
 
-  // 3. Tool switches above the tenant: expired former parent switch=off/held has ZERO effect; live holdingCo switch=held vetoes non-internal callers while Nusear internal bypasses.
+  // 2. Tool switches above the tenant: expired former parent switch=off/held has ZERO effect; live holdingCo switch=held vetoes non-internal company users while Nusear internal bypasses.
   await inSerializableTx(env.pool, async (c) => {
     const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_former_parent_off', commandKey: 'c2-former-parent-off' });
     await c.query(
@@ -6269,11 +6281,9 @@ test('Layer 7B [Release C2 - Holding Company Above Tenant]: non-internal org abo
       [randomUUID(), formerParentCo, j.seq],
     );
   });
-  for (const [label, pid] of [['acmeEntityMgr', ids.acmeEntityMgr], ['holdingExec', holdingExec]]) {
-    await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
-      assert.ok((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n > 0, `former parent switch=off must not block ${label}`);
-    });
-  }
+  await runAsPlatformApp(env.pool, { token: tok(ids.acmeEntityMgr), readOnly: true }, async (c) => {
+    assert.ok((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_bob')).rows[0].n > 0, 'former parent switch=off must not block acmeEntityMgr');
+  });
 
   await inSerializableTx(env.pool, async (c) => {
     const j = await appendAuditEntry(c, { environment, commandKind: 'iam.c2_holding_held', commandKey: 'c2-holding-held' });
@@ -6282,12 +6292,10 @@ test('Layer 7B [Release C2 - Holding Company Above Tenant]: non-internal org abo
       [randomUUID(), holdingCo, j.seq],
     );
   });
-  for (const [label, pid] of [['acmeEntityMgr', ids.acmeEntityMgr], ['holdingExec', holdingExec], ['holdingMemTenantGrant', holdingMemTenantGrant]]) {
-    await runAsPlatformApp(env.pool, { token: tok(pid), readOnly: true }, async (c) => {
-      assert.deepEqual((await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], `live holdingCo switch=held must veto ${label} (including archived/moved orgs)`);
-      assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n, 0, `live holdingCo switch=held must hide all statement lines from ${label}`);
-    });
-  }
+  await runAsPlatformApp(env.pool, { token: tok(ids.acmeEntityMgr), readOnly: true }, async (c) => {
+    assert.deepEqual((await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v, [], 'live holdingCo switch=held must veto acmeEntityMgr (including archived/moved orgs)');
+    assert.equal((await c.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n, 0, 'live holdingCo switch=held must hide all statement lines from acmeEntityMgr');
+  });
   await runAsPlatformApp(env.pool, { token: tok(ids.nusearOwner), readOnly: true }, async (c) => {
     const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v;
     assert.ok(wide.includes(ids.acmeOrg) && wide.includes(archivedAgency) && wide.includes(movedOutAgency), 'Nusear Owner must bypass holdingCo switch=held and retain live + historical orgs');
@@ -6424,7 +6432,7 @@ test('Layer 7B [Release C2 Fix1 - Unified Tool-Switch Chain]: holdingCo preview 
 
   await runAsPlatformApp(env.pool, { token: tok(holdingExec), readOnly: true }, async (c) => {
     const wide = (await c.query("SELECT iam.effective_wide_org_ids('act:coherence.bob.read') AS v")).rows[0].v.sort();
-    assert.deepEqual(wide, expectedLiveOrgs, 'holdingExec (grant above tenant) still reaches only live tenant orgs');
+    assert.deepEqual(wide, [], 'holdingExec (grant above tenant) gets 0 orgs inside company DB after E2 removes holding-company grant flow');
   });
 
   // 2. holdingCo 'preview' with rootOrg 'on' (plus expired direct rootOrg -> acmeOrg edge) blocks live, archived, and moved-out orgs alike.

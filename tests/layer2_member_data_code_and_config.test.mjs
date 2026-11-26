@@ -713,6 +713,9 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
   assert.deepEqual(csql.config.roles.platform_worker.businessTables, ['SELECT']);
   assert.deepEqual(csql.config.roles.platform_writer.businessTables, ['SELECT', 'INSERT']);
   assert.deepEqual(csql.config.roles.platform_readonly.businessTables, ['SELECT']);
+  assert.deepEqual(csql.config.roles.platform_iam_sync.agentAffiliations, ['SELECT']);
+  assert.deepEqual(csql.config.roles.platform_iam_sync.personAuthIdentities, []);
+  assert.deepEqual(csql.config.roles.platform_iam_sync.signingKeyScopes, ['nusear_staff', 'service']);
   for (const retired of ['coherence_app', 'coherence_worker', 'coherence_readonly']) {
     assert.equal(csql.config.roles[retired], undefined, `cloudsql-instance.json must retire ${retired}`);
   }
@@ -726,6 +729,11 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
       coherence_app: { businessTables: ['SELECT', 'INSERT'] },
       platform_app: { businessTables: ['SELECT'], appViews: ['SELECT'], appCmd: ['EXECUTE'] },
       platform_worker: { businessTables: ['SELECT', 'INSERT'], appCmd: ['EXECUTE'] },
+      platform_iam_sync: {
+        ...csql.config.roles.platform_iam_sync,
+        personAuthIdentities: ['SELECT'],
+        signingKeyScopes: ['company_local', 'nusear_staff', 'service'],
+      },
     },
   });
   assert.equal(badCsql.passed, false);
@@ -735,6 +743,8 @@ test('Layer 2 [Config Assertions]: roles/grants, ENABLE ALWAYS triggers, fixed s
   assert.ok(badCsql.problems.some((p) => /coherence_app/i.test(p)));
   assert.ok(badCsql.problems.some((p) => /platform_app/i.test(p)));
   assert.ok(badCsql.problems.some((p) => /platform_worker/i.test(p)));
+  assert.ok(badCsql.problems.some((p) => /platform_iam_sync.*personAuthIdentities/i.test(p)));
+  assert.ok(badCsql.problems.some((p) => /platform_iam_sync.*signingKeyScopes/i.test(p)));
 });
 
 test('Layer 2 [Cross-Entity & Zero-Dollar Isolation]: FORCE RLS, physical upline/financial walls, security_barrier side-channel defense across all 5 scoped roles, and View-As refusal on review saves', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {

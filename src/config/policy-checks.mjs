@@ -72,6 +72,7 @@ export const IAM_VERSIONED_TABLES = Object.freeze([
   'organization_versions',
   'organization_edges',
   'person_versions',
+  'person_auth_identities',
   'organization_memberships',
   'agent_affiliations',
   'role_versions',
@@ -236,6 +237,11 @@ export const PLATFORM_ROLES = Object.freeze([
   'platform_iam_sync',
   'platform_readonly',
   'platform_migrator',
+  'platform_auth_lookup',
+]);
+
+export const PLATFORM_AUTH_LOOKUP_FUNCTION_WHITELIST = Object.freeze([
+  'iam.resolve_auth_identity(text, text)',
 ]);
 
 export const CLOUDSQL_BOOTSTRAP_CREATOR_ROLES = Object.freeze([
@@ -435,6 +441,27 @@ export function validateCloudSqlConfig(config) {
   if (!hasExactPrivileges(roles.platform_readonly?.businessTables, ['SELECT'])) {
     problems.push('roles.platform_readonly.businessTables must be strictly ["SELECT"]');
   }
+  if (!hasExactPrivileges(roles.platform_auth_lookup?.authLookup, ['EXECUTE'])) {
+    problems.push('roles.platform_auth_lookup.authLookup must be strictly ["EXECUTE"]');
+  }
+  if (!hasExactPrivileges(roles.platform_iam_sync?.iamTables, ['SELECT', 'INSERT'])) {
+    problems.push('roles.platform_iam_sync.iamTables must be strictly ["SELECT", "INSERT"]');
+  }
+  if (!hasExactPrivileges(roles.platform_iam_sync?.agentAffiliations, ['SELECT'])) {
+    problems.push('roles.platform_iam_sync.agentAffiliations must be strictly ["SELECT"]');
+  }
+  if (!hasExactPrivileges(roles.platform_iam_sync?.personAuthIdentities, [])) {
+    problems.push('roles.platform_iam_sync.personAuthIdentities must be strictly [] (zero access)');
+  }
+  if (!hasExactPrivileges(roles.platform_iam_sync?.signingKeys, ['SELECT', 'INSERT', 'UPDATE'])) {
+    problems.push('roles.platform_iam_sync.signingKeys must be strictly ["SELECT", "INSERT", "UPDATE"]');
+  }
+  if (!hasExactPrivileges(roles.platform_iam_sync?.signingKeyScopes, ['nusear_staff', 'service'])) {
+    problems.push('roles.platform_iam_sync.signingKeyScopes must be strictly ["nusear_staff", "service"]');
+  }
+  if (!hasExactPrivileges(roles.platform_iam_sync?.auditJournal, ['SELECT', 'INSERT'])) {
+    problems.push('roles.platform_iam_sync.auditJournal must be strictly ["SELECT", "INSERT"]');
+  }
 
   return { passed: problems.length === 0, problems };
 }
@@ -538,7 +565,7 @@ export async function verifyIamConfigInvariants(pool) {
     problems.push('Retired schema coherence_views must not exist');
   }
 
-  const schemaPrincipals = ['public', 'platform_app', ...existingRetiredRoles];
+  const schemaPrincipals = ['public', 'platform_app', 'platform_auth_lookup', 'platform_iam_sync', ...existingRetiredRoles];
   const schemaPrivRes = await pool.query(
     `SELECT p.principal,
             s.schema_name,
@@ -549,6 +576,7 @@ export async function verifyIamConfigInvariants(pool) {
     [schemaPrincipals, MANAGED_SCHEMAS],
   );
   const allowedAppUsageSchemas = new Set(['iam', 'app_views', 'app_cmd']);
+  const allowedSyncUsageSchemas = new Set(['platform', 'iam', 'iam_secret']);
   for (const row of schemaPrivRes.rows) {
     if (row.principal === 'public') {
       if (row.has_usage || row.has_create) {
@@ -560,6 +588,20 @@ export async function verifyIamConfigInvariants(pool) {
       }
       if (row.has_create) {
         problems.push(`platform_app must not hold CREATE on schema ${row.schema_name}`);
+      }
+    } else if (row.principal === 'platform_auth_lookup') {
+      if (row.schema_name !== 'iam' && row.has_usage) {
+        problems.push(`platform_auth_lookup must not hold USAGE on schema ${row.schema_name}`);
+      }
+      if (row.has_create) {
+        problems.push(`platform_auth_lookup must not hold CREATE on schema ${row.schema_name}`);
+      }
+    } else if (row.principal === 'platform_iam_sync') {
+      if (!allowedSyncUsageSchemas.has(row.schema_name) && row.has_usage) {
+        problems.push(`platform_iam_sync must not hold USAGE on schema ${row.schema_name}`);
+      }
+      if (row.has_create) {
+        problems.push(`platform_iam_sync must not hold CREATE on schema ${row.schema_name}`);
       }
     } else if (row.has_usage || row.has_create) {
       problems.push(`Retired role ${row.principal} must have zero privileges on schema ${row.schema_name}`);
@@ -594,8 +636,8 @@ export async function verifyIamConfigInvariants(pool) {
 
   const baseTblOids = tblRes.rows.map((r) => r.table_oid);
   const tblInfoByOid = new Map(tblRes.rows.map((r) => [Number(r.table_oid), r]));
-  const lockedPrincipals = ['platform_app', 'public', ...existingRetiredRoles];
-  const baseRelPrincipals = [...lockedPrincipals, 'platform_worker', 'platform_writer', 'platform_readonly'];
+  const lockedPrincipals = ['platform_app', 'platform_auth_lookup', 'public', ...existingRetiredRoles];
+  const baseRelPrincipals = [...lockedPrincipals, 'platform_worker', 'platform_writer', 'platform_readonly', 'platform_iam_sync'];
 
   const [baseRelPrivRes, baseColPrivRes, pvSelRes] = await Promise.all([
     pool.query(
@@ -612,7 +654,7 @@ export async function verifyIamConfigInvariants(pool) {
        CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
        CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
        WHERE pg_catalog.has_any_column_privilege(p.principal, t.table_oid, pr.priv)`,
-      [baseTblOids, [...lockedPrincipals, 'platform_worker'], ALL_COLUMN_PRIVS],
+      [baseTblOids, baseRelPrincipals, ALL_COLUMN_PRIVS],
     ),
     pool.query(
       `SELECT t.table_oid
@@ -626,6 +668,18 @@ export async function verifyIamConfigInvariants(pool) {
   const workerForbiddenPrivs = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
   const writerForbiddenBizPrivs = new Set(['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
   const roForbiddenBizPrivs = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
+
+  const syncAllowedPrivForBaseTable = (schema, fq) => {
+    if (schema === 'coherence') return new Set();
+    if (schema === 'platform') return fq === 'platform.audit_journal' ? new Set(['SELECT', 'INSERT']) : new Set();
+    if (schema === 'iam_secret') return fq === 'iam_secret.signing_keys' ? new Set(['SELECT', 'INSERT', 'UPDATE']) : new Set();
+    if (schema === 'iam') {
+      if (fq === 'iam.person_auth_identities') return new Set();
+      if (fq === 'iam.agent_affiliations') return new Set(['SELECT']);
+      return new Set(['SELECT', 'INSERT']);
+    }
+    return new Set();
+  };
 
   const roleTablePrivs = new Map();
   for (const row of baseRelPrivRes.rows) {
@@ -648,6 +702,13 @@ export async function verifyIamConfigInvariants(pool) {
         }
       } else if (fq === 'platform.audit_journal' && workerForbiddenPrivs.has(row.priv)) {
         problems.push(`platform_worker must not hold ${row.priv} on platform.audit_journal`);
+      } else if (fq === 'iam.person_auth_identities' || tbl.table_schema === 'iam_secret') {
+        problems.push(`platform_worker must not hold ${row.priv} on ${fq}`);
+      }
+    } else if (row.principal === 'platform_iam_sync') {
+      const allowed = syncAllowedPrivForBaseTable(tbl.table_schema, fq);
+      if (!allowed.has(row.priv)) {
+        problems.push(`platform_iam_sync must not hold ${row.priv} on base table ${fq}`);
       }
     } else if (row.principal === 'platform_writer' && tbl.table_schema === 'coherence') {
       if (businessTblSet.has(tbl.table_name) && writerForbiddenBizPrivs.has(row.priv)) {
@@ -659,6 +720,8 @@ export async function verifyIamConfigInvariants(pool) {
       if (businessTblSet.has(tbl.table_name) && roForbiddenBizPrivs.has(row.priv)) {
         problems.push(`platform_readonly has forbidden privilege ${row.priv} on ${fq}`);
       }
+    } else if ((row.principal === 'platform_writer' || row.principal === 'platform_readonly') && tbl.table_schema === 'iam_secret') {
+      problems.push(`${row.principal} must not hold ${row.priv} on ${fq}`);
     }
   }
 
@@ -681,10 +744,23 @@ export async function verifyIamConfigInvariants(pool) {
     const fq = `${tbl.table_schema}.${tbl.table_name}`;
     if (lockedPrincipalSet.has(row.principal)) {
       problems.push(`${row.principal} must not hold column-level ${row.priv} on base table ${fq}`);
-    } else if (row.principal === 'platform_worker' && tbl.table_schema === 'coherence') {
-      if (tbl.table_name === 'schema_migrations' || ['INSERT', 'UPDATE', 'REFERENCES'].includes(row.priv)) {
+    } else if (row.principal === 'platform_worker') {
+      if (tbl.table_schema === 'coherence') {
+        if (tbl.table_name === 'schema_migrations' || ['INSERT', 'UPDATE', 'REFERENCES'].includes(row.priv)) {
+          problems.push(`platform_worker must not hold column-level ${row.priv} on base table ${fq}`);
+        }
+      } else if (fq === 'platform.audit_journal' && row.priv !== 'SELECT') {
+        problems.push(`platform_worker must not hold column-level ${row.priv} on base table ${fq}`);
+      } else if (fq === 'iam.person_auth_identities' || tbl.table_schema === 'iam_secret') {
         problems.push(`platform_worker must not hold column-level ${row.priv} on base table ${fq}`);
       }
+    } else if (row.principal === 'platform_iam_sync') {
+      const allowed = syncAllowedPrivForBaseTable(tbl.table_schema, fq);
+      if (!allowed.has(row.priv)) {
+        problems.push(`platform_iam_sync must not hold column-level ${row.priv} on base table ${fq}`);
+      }
+    } else if ((row.principal === 'platform_writer' || row.principal === 'platform_readonly') && tbl.table_schema === 'iam_secret') {
+      problems.push(`${row.principal} must not hold column-level ${row.priv} on base table ${fq}`);
     }
   }
 
@@ -705,6 +781,7 @@ export async function verifyIamConfigInvariants(pool) {
   }
   const viewOids = viewRes.rows.map((r) => r.view_oid);
   const viewInfoByOid = new Map(viewRes.rows.map((r) => [Number(r.view_oid), r]));
+  const viewAuditPrincipals = [...lockedPrincipals, 'platform_iam_sync'];
   const [viewRelPrivRes, viewColPrivRes] = await Promise.all([
     pool.query(
       `SELECT v.view_oid, p.principal, pr.priv
@@ -712,7 +789,7 @@ export async function verifyIamConfigInvariants(pool) {
        CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
        CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
        WHERE pg_catalog.has_table_privilege(p.principal, v.view_oid, pr.priv)`,
-      [viewOids, lockedPrincipals, ALL_RELATION_PRIVS],
+      [viewOids, viewAuditPrincipals, ALL_RELATION_PRIVS],
     ),
     pool.query(
       `SELECT v.view_oid, p.principal, pr.priv
@@ -720,15 +797,17 @@ export async function verifyIamConfigInvariants(pool) {
        CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
        CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
        WHERE pg_catalog.has_any_column_privilege(p.principal, v.view_oid, pr.priv)`,
-      [viewOids, lockedPrincipals, ALL_COLUMN_PRIVS],
+      [viewOids, viewAuditPrincipals, ALL_COLUMN_PRIVS],
     ),
   ]);
   for (const row of viewRelPrivRes.rows) {
     const v = viewInfoByOid.get(Number(row.view_oid));
+    if (row.principal === 'platform_iam_sync' && v.schema_name === 'iam' && row.priv === 'SELECT') continue;
     problems.push(`${row.principal} must not hold ${row.priv} on view ${v.schema_name}.${v.view_name}`);
   }
   for (const row of viewColPrivRes.rows) {
     const v = viewInfoByOid.get(Number(row.view_oid));
+    if (row.principal === 'platform_iam_sync' && v.schema_name === 'iam' && row.priv === 'SELECT') continue;
     problems.push(`${row.principal} must not hold column-level ${row.priv} on view ${v.schema_name}.${v.view_name}`);
   }
 
@@ -765,7 +844,7 @@ export async function verifyIamConfigInvariants(pool) {
        CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
        CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
        WHERE pg_catalog.has_table_privilege(p.principal, v.view_oid, pr.priv)`,
-      [appViewOids, lockedPrincipals, ALL_RELATION_PRIVS],
+      [appViewOids, viewAuditPrincipals, ALL_RELATION_PRIVS],
     ),
     pool.query(
       `SELECT v.view_oid, p.principal, pr.priv
@@ -773,7 +852,7 @@ export async function verifyIamConfigInvariants(pool) {
        CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
        CROSS JOIN pg_catalog.unnest($3::text[]) AS pr(priv)
        WHERE pg_catalog.has_any_column_privilege(p.principal, v.view_oid, pr.priv)`,
-      [appViewOids, lockedPrincipals, ALL_COLUMN_PRIVS],
+      [appViewOids, viewAuditPrincipals, ALL_COLUMN_PRIVS],
     ),
   ]);
   const appViewInfoByOid = new Map(appViewsRes.rows.map((v) => [Number(v.view_oid), v]));
@@ -786,6 +865,8 @@ export async function verifyIamConfigInvariants(pool) {
     } else if (row.principal === 'platform_app') {
       if (row.priv === 'SELECT') appViewSelectOids.add(Number(row.view_oid));
       else problems.push(`platform_app must not hold ${row.priv} on ${fq}`);
+    } else if (row.principal === 'platform_auth_lookup' || row.principal === 'platform_iam_sync') {
+      problems.push(`${row.principal} must not hold ${row.priv} on ${fq}`);
     } else {
       problems.push(`Retired role ${row.principal} must not hold ${row.priv} on ${fq}`);
     }
@@ -796,8 +877,8 @@ export async function verifyIamConfigInvariants(pool) {
     const fq = `app_views.${v.view_name}`;
     if (row.principal === 'public') {
       problems.push(`PUBLIC must not hold column-level ${row.priv} on ${fq}`);
-    } else if (row.principal === 'platform_app') {
-      problems.push(`platform_app must not hold column-level ${row.priv} on ${fq}`);
+    } else if (row.principal === 'platform_app' || row.principal === 'platform_auth_lookup' || row.principal === 'platform_iam_sync') {
+      problems.push(`${row.principal} must not hold column-level ${row.priv} on ${fq}`);
     } else {
       problems.push(`Retired role ${row.principal} must not hold column-level ${row.priv} on ${fq}`);
     }
@@ -838,12 +919,15 @@ export async function verifyIamConfigInvariants(pool) {
   const [cohRlsRes, cohTrigRes, fkRes, npnChkRes] = await Promise.all([
     pool.query(
       `SELECT n.nspname AS schema_name, c.relname AS table_name, c.relrowsecurity, c.relforcerowsecurity,
+              r.rolname AS owner_name,
               (SELECT pg_catalog.count(*)::int FROM pg_catalog.pg_policies p
                WHERE p.schemaname = n.nspname AND p.tablename = c.relname) AS pol_cnt
        FROM pg_catalog.pg_class c
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
        WHERE (n.nspname = 'coherence' AND c.relkind IN ('r', 'p') AND c.relname <> 'schema_migrations')
-          OR (n.nspname = 'platform' AND c.relname = 'audit_journal')`,
+          OR (n.nspname = 'platform' AND c.relname = 'audit_journal')
+          OR (n.nspname = 'iam_secret' AND c.relname = 'signing_keys')`,
     ),
     pool.query(
       `SELECT c.relname AS table_name,
@@ -879,13 +963,17 @@ export async function verifyIamConfigInvariants(pool) {
     ),
   ]);
 
+  const signingKeysRow = cohRlsRes.rows.find((r) => r.schema_name === 'iam_secret' && r.table_name === 'signing_keys');
+  if (!signingKeysRow) problems.push('Expected table iam_secret.signing_keys is missing from RLS audit');
+  else if (signingKeysRow.owner_name === 'platform_iam_sync') problems.push('Table iam_secret.signing_keys must not be owned by platform_iam_sync');
   for (const r of cohRlsRes.rows) {
-    if (!r.relrowsecurity || !r.relforcerowsecurity) {
-      problems.push(`Table ${r.schema_name}.${r.table_name} must have ENABLE + FORCE ROW LEVEL SECURITY`);
+    const isSigningKeys = r === signingKeysRow;
+    if (!r.relrowsecurity || (isSigningKeys ? r.relforcerowsecurity : !r.relforcerowsecurity)) {
+      problems.push(isSigningKeys
+        ? 'Table iam_secret.signing_keys must have ENABLE ROW LEVEL SECURITY without FORCE ROW LEVEL SECURITY'
+        : `Table ${r.schema_name}.${r.table_name} must have ENABLE + FORCE ROW LEVEL SECURITY`);
     }
-    if (r.pol_cnt < 1) {
-      problems.push(`Table ${r.schema_name}.${r.table_name} must have at least one RLS policy`);
-    }
+    if (r.pol_cnt < 1) problems.push(`Table ${r.schema_name}.${r.table_name} must have at least one RLS policy`);
   }
 
   const cohTrigByKey = new Map(cohTrigRes.rows.map((r) => [`${r.table_name}:${r.trigger_name}`, r]));
@@ -930,6 +1018,8 @@ export async function verifyIamConfigInvariants(pool) {
   const retiredRoleSet = new Set(RETIRED_COHERENCE_ROLES);
   const cohViewPolTables = new Set();
   const auditViewPols = [];
+  const signingKeySyncCmds = new Set();
+  const syncSigningKeyScopeRe = /^\(*key_scope\s*=\s*ANY\s*\(\s*ARRAY\[\s*(?:'nusear_staff'::text\s*,\s*'service'::text|'service'::text\s*,\s*'nusear_staff'::text)\s*\]\s*\)\)*$/;
   const legacyGucRe = /rls_allowed_entities|rls_actor_npn|rls_access_tier|app\.allowed_entities|app\.actor_npn|app\.access_tier/;
 
   for (const p of allPolRes.rows) {
@@ -972,6 +1062,31 @@ export async function verifyIamConfigInvariants(pool) {
     if (p.schemaname === 'platform' && p.tablename === 'audit_journal' && roleList.includes('platform_view_owner')) {
       auditViewPols.push(p);
     }
+    if (p.schemaname === 'iam_secret' && p.tablename === 'signing_keys') {
+      const unexpectedRoles = roleList.filter((r) => r !== 'platform_iam_sync');
+      if (unexpectedRoles.length > 0) {
+        problems.push(`RLS policy ${p.policyname} on iam_secret.signing_keys grants unexpected role(s) ${unexpectedRoles.join(',')}`);
+      }
+      if (roleList.includes('platform_iam_sync')) {
+        if (!['SELECT', 'INSERT', 'UPDATE'].includes(p.cmd)) {
+          problems.push(`RLS policy ${p.policyname} on iam_secret.signing_keys grants platform_iam_sync forbidden command ${p.cmd}`);
+        } else {
+          signingKeySyncCmds.add(p.cmd);
+          if ((p.cmd === 'SELECT' || p.cmd === 'UPDATE') && !syncSigningKeyScopeRe.test(qual.trim())) {
+            problems.push(`RLS policy ${p.policyname} on iam_secret.signing_keys must restrict platform_iam_sync USING strictly to nusear_staff/service keys (got ${qual})`);
+          }
+          if ((p.cmd === 'INSERT' || p.cmd === 'UPDATE') && !syncSigningKeyScopeRe.test(withCheck.trim())) {
+            problems.push(`RLS policy ${p.policyname} on iam_secret.signing_keys must restrict platform_iam_sync WITH CHECK strictly to nusear_staff/service keys (got ${withCheck})`);
+          }
+        }
+      }
+    }
+  }
+
+  for (const reqCmd of ['SELECT', 'INSERT', 'UPDATE']) {
+    if (!signingKeySyncCmds.has(reqCmd)) {
+      problems.push(`Table iam_secret.signing_keys is missing scoped platform_iam_sync ${reqCmd} RLS policy`);
+    }
   }
 
   for (const tbl of COHERENCE_IAM_FK_TABLES) {
@@ -989,8 +1104,8 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`Table coherence.${tbl} is missing CHECK constraint requiring writing_person_id IS NULL when writing_npn IS NULL`);
     }
     const bfTr = cohTrigByKey.get(`${tbl}:trg_guard_iam_fk_backfill`);
-    if (!bfTr || bfTr.tgenabled !== 'A' || !bfTr.def.includes('guard_iam_fk_backfill')) {
-      problems.push(`Table coherence.${tbl} must carry ENABLE ALWAYS trg_guard_iam_fk_backfill trigger`);
+    if (!bfTr || bfTr.tgenabled !== 'A' || !bfTr.def.includes('BEFORE INSERT OR UPDATE') || !bfTr.def.includes('guard_iam_fk_backfill')) {
+      problems.push(`Table coherence.${tbl} must carry ENABLE ALWAYS BEFORE INSERT OR UPDATE trg_guard_iam_fk_backfill trigger`);
     }
   }
 
@@ -1301,7 +1416,7 @@ export async function verifyIamConfigInvariants(pool) {
        FROM pg_catalog.pg_trigger t
        JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-       WHERE n.nspname IN ('iam', 'platform') AND NOT t.tgisinternal`,
+       WHERE n.nspname IN ('iam', 'iam_secret', 'platform') AND NOT t.tgisinternal`,
     ),
     pool.query(
       `SELECT p.prosecdef, r.rolname AS owner_name
@@ -1334,6 +1449,30 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`Missing BEFORE INSERT trg_01_supersede on versioned table ${fq}`);
     }
   }
+  for (const [fq, trName] of [
+    ['iam.people', 'trg_00b_verify_origin'],
+    ['iam.person_versions', 'trg_00b_verify_origin'],
+    ['iam.person_auth_identities', 'trg_00b_verify_origin'],
+    ['iam.organization_memberships', 'trg_00b_verify_origin'],
+    ['iam.agent_affiliations', 'trg_00b_verify_origin'],
+    ['iam.roles', 'trg_00b_verify_sync'],
+    ['iam.role_versions', 'trg_00b_verify_sync'],
+    ['iam.role_rights', 'trg_00b_verify_sync'],
+    ['iam.role_grants', 'trg_00b_verify_sync'],
+    ['iam.people', 'trg_people_verify_db_origin'],
+    ['iam.database_context', 'trg_database_context_verify_db_origin'],
+    ['iam.person_auth_identities', 'trg_person_auth_identities_verify_db_origin'],
+    ['iam.role_grants', 'trg_role_grants_verify_scope'],
+    ['iam.role_versions', 'trg_role_versions_verify_invariants'],
+    ['iam_secret.signing_keys', 'trg_00_verify_signing_key_sync'],
+  ]) {
+    const tr = trigByKey.get(`${fq}:${trName}`);
+    if (!tr) {
+      problems.push(`Missing E2 origin/sync guard trigger ${trName} on ${fq}`);
+    } else if (tr.tgenabled === 'D' || tr.tgenabled === 'R') {
+      problems.push(`E2 origin/sync guard trigger ${trName} on ${fq} must be enabled (got tgenabled='${tr.tgenabled}')`);
+    }
+  }
   if (supFnRes.rows.length !== 1 || !supFnRes.rows[0].prosecdef || supFnRes.rows[0].owner_name !== 'platform_versioner') {
     problems.push('platform.stamp_superseded_before_insert() must be SECURITY DEFINER owned by platform_versioner');
   }
@@ -1342,6 +1481,7 @@ export async function verifyIamConfigInvariants(pool) {
   //    pin SET search_path = pg_catalog and revoke EXECUTE from PUBLIC and retired roles;
   //    every app_cmd.* function is SECURITY DEFINER owned by platform_writer;
   //    platform_app holds EXECUTE strictly on PLATFORM_APP_FUNCTION_WHITELIST + PLATFORM_APP_CMD_WHITELIST;
+  //    platform_auth_lookup holds EXECUTE strictly on PLATFORM_AUTH_LOOKUP_FUNCTION_WHITELIST;
   //    platform_readonly holds ZERO EXECUTE on app_cmd.*; platform_worker holds EXECUTE strictly on PLATFORM_WORKER_CMD_WHITELIST.
   const fnRes = await pool.query(
     `SELECT p.oid,
@@ -1354,7 +1494,10 @@ export async function verifyIamConfigInvariants(pool) {
             pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec,
             pg_catalog.has_function_privilege('platform_app', p.oid, 'EXECUTE') AS app_exec,
             pg_catalog.has_function_privilege('platform_readonly', p.oid, 'EXECUTE') AS ro_exec,
-            pg_catalog.has_function_privilege('platform_worker', p.oid, 'EXECUTE') AS wrk_exec
+            pg_catalog.has_function_privilege('platform_worker', p.oid, 'EXECUTE') AS wrk_exec,
+            pg_catalog.has_function_privilege('platform_auth_lookup', p.oid, 'EXECUTE') AS auth_exec,
+            pg_catalog.has_function_privilege('platform_writer', p.oid, 'EXECUTE') AS writer_exec,
+            pg_catalog.has_function_privilege('platform_iam_sync', p.oid, 'EXECUTE') AS sync_exec
      FROM pg_catalog.pg_proc p
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
      JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
@@ -1383,9 +1526,11 @@ export async function verifyIamConfigInvariants(pool) {
   }
   const combinedWhitelist = [...PLATFORM_APP_FUNCTION_WHITELIST, ...PLATFORM_APP_CMD_WHITELIST];
   const whitelistSet = new Set(combinedWhitelist);
+  const authWhitelistSet = new Set(PLATFORM_AUTH_LOOKUP_FUNCTION_WHITELIST);
   const workerOnlySet = new Set(APP_CMD_WORKER_ONLY_FUNCTIONS);
   const workerCmdSet = new Set(PLATFORM_WORKER_CMD_WHITELIST);
   const foundWhitelisted = new Set();
+  const foundAuthWhitelisted = new Set();
   const foundWorkerOnly = new Set();
   const foundWorkerCmd = new Set();
 
@@ -1400,6 +1545,28 @@ export async function verifyIamConfigInvariants(pool) {
     if (fn.nspname === 'platform' && ['compute_journal_hash', 'canonical_json', 'sha256_text', 'format_utc_us'].includes(fn.proname) && fn.wrk_exec) {
       problems.push(`platform_worker holds forbidden EXECUTE privilege on ${fn.sig}`);
     }
+    if (fn.sig === 'iam.session_context()') {
+      if (!fn.prosecdef) problems.push('Function iam.session_context() must be SECURITY DEFINER');
+      if (signingKeysRow && fn.owner_name !== signingKeysRow.owner_name) {
+        problems.push(`Function iam.session_context() owner (${fn.owner_name}) must match iam_secret.signing_keys owner (${signingKeysRow.owner_name})`);
+      }
+    }
+    if (fn.sig === 'iam.resolve_auth_identity(text, text)') {
+      if (!fn.prosecdef || fn.owner_name !== 'platform_readonly') {
+        problems.push(`Function ${fn.sig} must be SECURITY DEFINER owned by platform_readonly (got prosecdef=${fn.prosecdef}, owner=${fn.owner_name})`);
+      }
+      if (fn.app_exec || fn.wrk_exec || fn.writer_exec || fn.sync_exec) {
+        problems.push(`Function ${fn.sig} must not grant EXECUTE to platform_app, platform_worker, platform_writer, or platform_iam_sync`);
+      }
+    }
+    if (authWhitelistSet.has(fn.sig)) {
+      foundAuthWhitelisted.add(fn.sig);
+      if (!fn.auth_exec) {
+        problems.push(`platform_auth_lookup is missing EXECUTE on whitelisted function ${fn.sig}`);
+      }
+    } else if (fn.auth_exec) {
+      problems.push(`platform_auth_lookup holds forbidden EXECUTE privilege on non-whitelisted function ${fn.sig}`);
+    }
     if (fn.nspname === 'app_cmd') {
       if (!fn.prosecdef) {
         problems.push(`Command function ${fn.sig} must be SECURITY DEFINER`);
@@ -1409,6 +1576,9 @@ export async function verifyIamConfigInvariants(pool) {
       }
       if (fn.ro_exec) {
         problems.push(`platform_readonly holds forbidden EXECUTE privilege on app_cmd function ${fn.sig}`);
+      }
+      if (fn.sync_exec) {
+        problems.push(`platform_iam_sync holds forbidden EXECUTE privilege on app_cmd function ${fn.sig}`);
       }
       if (workerCmdSet.has(fn.sig)) {
         foundWorkerCmd.add(fn.sig);
@@ -1434,6 +1604,11 @@ export async function verifyIamConfigInvariants(pool) {
   for (const expectedSig of combinedWhitelist) {
     if (!foundWhitelisted.has(expectedSig)) {
       problems.push(`Whitelisted platform_app function ${expectedSig} was not found in pg_proc`);
+    }
+  }
+  for (const expectedAuthSig of PLATFORM_AUTH_LOOKUP_FUNCTION_WHITELIST) {
+    if (!foundAuthWhitelisted.has(expectedAuthSig)) {
+      problems.push(`Whitelisted platform_auth_lookup function ${expectedAuthSig} was not found in pg_proc`);
     }
   }
   for (const expectedWorkerSig of APP_CMD_WORKER_ONLY_FUNCTIONS) {

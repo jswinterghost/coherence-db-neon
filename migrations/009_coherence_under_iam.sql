@@ -139,6 +139,16 @@ DECLARE
   v_bp_org UUID;
   v_bp_person UUID;
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.writing_person_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM iam.people p WHERE p.id = NEW.writing_person_id AND p.principal_origin = 'company_local'
+    ) THEN
+      RAISE EXCEPTION 'business table %.% writing_person_id must reference a company_local person',
+        TG_TABLE_SCHEMA, TG_TABLE_NAME USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+
   IF CURRENT_USER <> 'platform_versioner' THEN
     RAISE EXCEPTION 'business table %.% is immutable: UPDATE is forbidden',
       TG_TABLE_SCHEMA, TG_TABLE_NAME USING ERRCODE = '55000';
@@ -177,6 +187,13 @@ BEGIN
       TG_TABLE_SCHEMA, TG_TABLE_NAME USING ERRCODE = '55000';
   END IF;
 
+  IF NEW.writing_person_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM iam.people p WHERE p.id = NEW.writing_person_id AND p.principal_origin = 'company_local'
+  ) THEN
+    RAISE EXCEPTION 'business table %.% writing_person_id must reference a company_local person',
+      TG_TABLE_SCHEMA, TG_TABLE_NAME USING ERRCODE = '55000';
+  END IF;
+
   IF TG_TABLE_NAME = 'bob_policy_financials' THEN
     SELECT bp.organization_id, bp.writing_person_id
     INTO v_bp_org, v_bp_person
@@ -202,7 +219,7 @@ BEGIN
     'statement_agency_lines', 'statement_upline_lines', 'coherent_ledger_rows'
   ] LOOP
     EXECUTE pg_catalog.format(
-      'CREATE TRIGGER trg_guard_iam_fk_backfill BEFORE UPDATE ON coherence.%I FOR EACH ROW EXECUTE FUNCTION coherence.guard_iam_fk_backfill()',
+      'CREATE TRIGGER trg_guard_iam_fk_backfill BEFORE INSERT OR UPDATE ON coherence.%I FOR EACH ROW EXECUTE FUNCTION coherence.guard_iam_fk_backfill()',
       v_tbl
     );
     EXECUTE pg_catalog.format(
@@ -299,7 +316,7 @@ BEGIN
 END;
 $$;
 
--- Strict deterministic resolver for writing_npn -> iam.people(id); uses only status = 'active' affiliations; never guesses.
+-- Strict deterministic resolver for writing_npn -> company_local iam.people(id); ignores nusear_staff/service and never guesses.
 CREATE OR REPLACE FUNCTION coherence._resolve_writing_person_id(
   p_writing_npn TEXT,
   p_table_name TEXT,
@@ -333,8 +350,10 @@ BEGIN
       RAISE EXCEPTION 'INVALID_NPN_MAP: npn map value for coherence.% is not a valid UUID', p_table_name
         USING ERRCODE = '22023';
     END;
-    IF v_person_id IS NULL OR NOT EXISTS (SELECT 1 FROM iam.people p WHERE p.id = v_person_id) THEN
-      RAISE EXCEPTION 'INVALID_NPN_MAP: mapped person_id for coherence.% does not exist in iam.people', p_table_name
+    IF v_person_id IS NULL OR NOT EXISTS (
+      SELECT 1 FROM iam.people p WHERE p.id = v_person_id AND p.principal_origin = 'company_local'
+    ) THEN
+      RAISE EXCEPTION 'INVALID_NPN_MAP: mapped person_id for coherence.% is not a company_local person in iam.people', p_table_name
         USING ERRCODE = '23503';
     END IF;
     RETURN v_person_id;
@@ -343,10 +362,13 @@ BEGIN
   WITH matched AS (
     SELECT pv.person_id
     FROM iam.person_versions pv
-    WHERE pv.superseded_by_id IS NULL AND pv.npn = v_trimmed
+    WHERE pv.superseded_by_id IS NULL
+      AND pv.principal_origin = 'company_local'
+      AND pv.npn = v_trimmed
     UNION
     SELECT aa.person_id
     FROM iam.agent_affiliations aa
+    JOIN iam.people p ON p.id = aa.person_id AND p.principal_origin = 'company_local'
     WHERE aa.superseded_by_id IS NULL AND aa.status = 'active' AND aa.npn = v_trimmed
   )
   SELECT pg_catalog.count(DISTINCT person_id), pg_catalog.min(person_id::text)::uuid
@@ -354,10 +376,10 @@ BEGIN
   FROM matched;
 
   IF v_cnt = 0 THEN
-    RAISE EXCEPTION 'UNMAPPED_WRITING_NPN: cannot map writing_npn "%" in coherence.% to iam.people (provide explicit p_npn_map or seed iam.people).',
+    RAISE EXCEPTION 'UNMAPPED_WRITING_NPN: cannot map writing_npn "%" in coherence.% to a company_local iam.people row (provide explicit p_npn_map or seed iam.people).',
       v_trimmed, p_table_name USING ERRCODE = '22023';
   ELSIF v_cnt > 1 THEN
-    RAISE EXCEPTION 'AMBIGUOUS_WRITING_NPN: writing_npn "%" in coherence.% matches % iam.people rows; refusing to guess.',
+    RAISE EXCEPTION 'AMBIGUOUS_WRITING_NPN: writing_npn "%" in coherence.% matches % company_local iam.people rows; refusing to guess.',
       v_trimmed, p_table_name, v_cnt USING ERRCODE = '21000';
   END IF;
 
@@ -416,8 +438,10 @@ BEGIN
       EXCEPTION WHEN invalid_text_representation THEN
         RAISE EXCEPTION 'INVALID_NPN_MAP: value for npn "%" is not a valid UUID', v_kv.key USING ERRCODE = '22023';
       END;
-      IF v_check_uuid IS NULL OR NOT EXISTS (SELECT 1 FROM iam.people p WHERE p.id = v_check_uuid) THEN
-        RAISE EXCEPTION 'INVALID_NPN_MAP: person_id for npn "%" does not exist in iam.people', v_kv.key
+      IF v_check_uuid IS NULL OR NOT EXISTS (
+        SELECT 1 FROM iam.people p WHERE p.id = v_check_uuid AND p.principal_origin = 'company_local'
+      ) THEN
+        RAISE EXCEPTION 'INVALID_NPN_MAP: person_id for npn "%" is not a company_local person in iam.people', v_kv.key
           USING ERRCODE = '23503';
       END IF;
     END LOOP;
@@ -2085,7 +2109,10 @@ FROM coherence.decision_commits dc;
 CREATE OR REPLACE VIEW app_views.coherence_decisions
 WITH (security_barrier = true) AS
 WITH scopes AS MATERIALIZED (
-  SELECT app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+  SELECT
+    app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi,
+    app_views._read_has_full_tenant_right('col:platform.audit_journal.nusear_actor') AS show_nusear_actor,
+    (SELECT dc.support_external_label FROM iam.database_context dc WHERE dc.singleton = true) AS support_label
 )
 SELECT
   d.id,
@@ -2109,13 +2136,33 @@ SELECT
   d.approved_agent,
   d.approved_agency_from,
   d.approved_agent_from,
-  d.decided_by,
+  CASE
+    WHEN NOT s.show_nusear_actor
+      AND (d.acting_for = 'nusear_support' OR pv.principal_origin = 'nusear_staff')
+      THEN s.support_label
+    ELSE d.decided_by
+  END AS decided_by,
+  CASE
+    WHEN NOT s.show_nusear_actor
+      AND (d.acting_for = 'nusear_support' OR pv.principal_origin = 'nusear_staff')
+      THEN s.support_label
+    ELSE COALESCE(pv.preferred_name, d.decided_by)
+  END AS decided_by_display,
   d.acting_for,
   d.decided_at,
   d.committed_at_raw,
   d.imported,
   d.journal_seq
 FROM coherence.decisions d
+LEFT JOIN iam.person_versions pv
+  ON pv.person_id = (
+    CASE
+      WHEN d.decided_by ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        THEN d.decided_by::uuid
+      ELSE NULL
+    END
+  )
+ AND pv.superseded_by_id IS NULL
 CROSS JOIN scopes s;
 
 CREATE OR REPLACE VIEW app_views.coherence_checks
@@ -2139,29 +2186,56 @@ WITH (security_barrier = true) AS
 WITH scopes AS MATERIALIZED (
   SELECT
     app_views._read_has_full_entity_finance() AS show_full_entity_finance,
-    app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi
+    app_views._read_has_full_tenant_right('col:coherence.member_phi') AS show_member_phi,
+    app_views._read_has_full_tenant_right('col:platform.audit_journal.nusear_actor') AS show_nusear_actor,
+    (SELECT dc.support_external_label FROM iam.database_context dc WHERE dc.singleton = true) AS support_label
 )
 SELECT
   je.seq,
   je.recorded_at,
-  je.actor,
+  CASE
+    WHEN NOT s.show_nusear_actor
+      AND (je.acting_for = 'nusear_support' OR pv.principal_origin = 'nusear_staff')
+      THEN s.support_label
+    ELSE je.actor
+  END AS actor,
+  CASE
+    WHEN NOT s.show_nusear_actor
+      AND (je.acting_for = 'nusear_support' OR pv.principal_origin = 'nusear_staff')
+      THEN s.support_label
+    ELSE COALESCE(pv.preferred_name, je.actor)
+  END AS actor_display,
   je.acting_for,
   je.command_kind,
   je.command_key,
   je.request_sha256,
   CASE
-    WHEN je.command_kind = 'carry_sent' AND s.show_full_entity_finance THEN je.body
-    WHEN je.command_kind <> 'carry_sent' AND s.show_member_phi THEN je.body
+    WHEN je.command_kind IN ('carry_sent', 'materialize_emit') AND s.show_full_entity_finance THEN je.body
+    WHEN je.command_kind NOT IN ('carry_sent', 'materialize_emit') AND s.show_member_phi THEN je.body
     ELSE NULL
   END AS body,
   je.prev_hash,
   je.entry_hash
 FROM coherence.journal_entries je
+LEFT JOIN iam.person_versions pv
+  ON pv.person_id = (
+    CASE
+      WHEN je.actor ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        THEN je.actor::uuid
+      ELSE NULL
+    END
+  )
+ AND pv.superseded_by_id IS NULL
 CROSS JOIN scopes s;
 
 -- Platform audit journal view (from DESIGN.md section 2.5): masks Nusear staff identity for customers.
 CREATE OR REPLACE VIEW app_views.audit_journal
 WITH (security_barrier = true) AS
+WITH scopes AS MATERIALIZED (
+  SELECT
+    iam.effective_wide_org_ids('col:platform.audit_journal.nusear_actor') AS nusear_actor_orgs,
+    (SELECT dc.support_external_label FROM iam.database_context dc WHERE dc.singleton = true) AS support_label
+)
 SELECT
   j.seq,
   j.recorded_at,
@@ -2170,19 +2244,20 @@ SELECT
   j.target_org_id,
   j.command_kind,
   CASE
-    WHEN j.recorded_as = 'nusear_support'
-      AND NOT (j.target_org_id = ANY(((SELECT iam.effective_wide_org_ids('col:platform.audit_journal.nusear_actor')))::uuid[]))
-      THEN (SELECT dc.support_external_label FROM iam.database_context dc WHERE dc.singleton = true)
+    WHEN (j.recorded_as = 'nusear_support' OR pv.principal_origin = 'nusear_staff')
+      AND NOT (j.target_org_id = ANY(s.nusear_actor_orgs))
+      THEN s.support_label
     ELSE pv.preferred_name
   END AS recorded_by_display,
   CASE
-    WHEN j.target_org_id = ANY(((SELECT iam.effective_wide_org_ids('col:platform.audit_journal.nusear_actor')))::uuid[])
+    WHEN j.target_org_id = ANY(s.nusear_actor_orgs)
       THEN j.actor_person_id
     ELSE NULL
   END AS actor_person_id
 FROM platform.audit_journal j
 LEFT JOIN iam.person_versions pv
-  ON pv.person_id = j.actor_person_id AND pv.superseded_by_id IS NULL;
+  ON pv.person_id = j.actor_person_id AND pv.superseded_by_id IS NULL
+CROSS JOIN scopes s;
 
 -- Assign ownership of every app_views.* view to platform_view_owner and grant SELECT strictly to
 -- platform_app and platform_readonly.
@@ -2309,7 +2384,7 @@ BEGIN
       USING ERRCODE = '42501';
   END IF;
 
-  v_recorded_as := CASE WHEN v_kind = 'service' THEN 'service'::text ELSE v_auth.recorded_as END;
+  v_recorded_as := v_auth.recorded_as;
 
   RETURN QUERY SELECT
     v_dc.environment,
@@ -2505,6 +2580,8 @@ DECLARE
   v_elem JSONB;
   v_raw TEXT;
   v_org_id UUID;
+  v_wp_raw TEXT;
+  v_person_id UUID;
 BEGIN
   IF pg_catalog.jsonb_typeof(v_rows) <> 'array' THEN
     RAISE EXCEPTION 'INVALID_ROWS: % rows must be a JSON array.', p_table_name USING ERRCODE = '22023';
@@ -2517,19 +2594,35 @@ BEGIN
 
   FOR v_elem IN SELECT value FROM pg_catalog.jsonb_array_elements(v_rows) LOOP
     v_raw := v_elem ->> 'organization_id';
-    IF v_raw IS NULL OR pg_catalog.length(pg_catalog.btrim(v_raw)) = 0 THEN
-      CONTINUE;
+    IF v_raw IS NOT NULL AND pg_catalog.length(pg_catalog.btrim(v_raw)) > 0 THEN
+      BEGIN
+        v_org_id := v_raw::uuid;
+      EXCEPTION WHEN invalid_text_representation THEN
+        RAISE EXCEPTION 'INVALID_ORGANIZATION_ID: coherence.% organization_id "%" is not a valid UUID.', p_table_name, v_raw
+          USING ERRCODE = '22023';
+      END;
+      IF NOT (v_org_id = ANY(v_tenant_tree)) THEN
+        RAISE EXCEPTION 'INVALID_ORGANIZATION_ID: organization_id % for coherence.% is not a company/agency/team organization in this tenant tree.',
+          v_org_id, p_table_name
+          USING ERRCODE = '23503';
+      END IF;
     END IF;
-    BEGIN
-      v_org_id := v_raw::uuid;
-    EXCEPTION WHEN invalid_text_representation THEN
-      RAISE EXCEPTION 'INVALID_ORGANIZATION_ID: coherence.% organization_id "%" is not a valid UUID.', p_table_name, v_raw
-        USING ERRCODE = '22023';
-    END;
-    IF NOT (v_org_id = ANY(v_tenant_tree)) THEN
-      RAISE EXCEPTION 'INVALID_ORGANIZATION_ID: organization_id % for coherence.% is not a company/agency/team organization in this tenant tree.',
-        v_org_id, p_table_name
-        USING ERRCODE = '23503';
+
+    v_wp_raw := v_elem ->> 'writing_person_id';
+    IF v_wp_raw IS NOT NULL AND pg_catalog.length(pg_catalog.btrim(v_wp_raw)) > 0 THEN
+      BEGIN
+        v_person_id := v_wp_raw::uuid;
+      EXCEPTION WHEN invalid_text_representation THEN
+        RAISE EXCEPTION 'INVALID_WRITING_PERSON_ID: coherence.% writing_person_id "%" is not a valid UUID.', p_table_name, v_wp_raw
+          USING ERRCODE = '22023';
+      END;
+      IF NOT EXISTS (
+        SELECT 1 FROM iam.people p WHERE p.id = v_person_id AND p.principal_origin = 'company_local'
+      ) THEN
+        RAISE EXCEPTION 'INVALID_WRITING_PERSON_ID: writing_person_id % for coherence.% is not a company_local person in iam.people.',
+          v_person_id, p_table_name
+          USING ERRCODE = '23503';
+      END IF;
     END IF;
   END LOOP;
 END;
@@ -5197,8 +5290,20 @@ BEGIN
       'approved_agent', CASE WHEN v_hc = 'v1' THEN NULL ELSE c.elem ->> 'approved_agent' END,
       'approved_agency_from', CASE WHEN v_hc = 'v1' THEN NULL ELSE c.elem ->> 'approved_agency_from' END,
       'approved_agent_from', CASE WHEN v_hc = 'v1' THEN NULL ELSE c.elem ->> 'approved_agent_from' END,
-      'decided_by', COALESCE(c.elem ->> 'decided_by', v_ctx.actor_label),
-      'acting_for', COALESCE(c.elem ->> 'acting_for', v_ctx.acting_for_label),
+      'decided_by', CASE
+        WHEN v_imp
+         AND NULLIF(pg_catalog.btrim(c.elem ->> 'decided_by'), '') IS NOT NULL
+         AND pg_catalog.btrim(c.elem ->> 'decided_by') !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          THEN pg_catalog.btrim(c.elem ->> 'decided_by')
+        ELSE v_ctx.actor_label
+      END,
+      'acting_for', CASE
+        WHEN v_imp
+         AND NULLIF(pg_catalog.btrim(c.elem ->> 'decided_by'), '') IS NOT NULL
+         AND pg_catalog.btrim(c.elem ->> 'decided_by') !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          THEN NULLIF(pg_catalog.btrim(c.elem ->> 'acting_for'), '')
+        ELSE v_ctx.acting_for_label
+      END,
       'decided_at', coherence.format_utc_us(c.dec_at),
       'committed_at_raw', c.elem ->> 'committed_at_raw',
       'imported', v_imp
@@ -6046,8 +6151,15 @@ BEGIN
       'approved_agent', elem ->> 'approved_agent',
       'approved_agency_from', elem ->> 'approved_agency_from',
       'approved_agent_from', elem ->> 'approved_agent_from',
-      'decided_by', COALESCE(elem ->> 'decided_by', 'historical_import'),
-      'acting_for', elem ->> 'acting_for',
+      'decided_by', CASE
+        WHEN NULLIF(pg_catalog.btrim(elem ->> 'decided_by'), '') IS NULL THEN 'historical_import'
+        WHEN pg_catalog.btrim(elem ->> 'decided_by') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN v_ctx.actor_label
+        ELSE pg_catalog.btrim(elem ->> 'decided_by')
+      END,
+      'acting_for', CASE
+        WHEN pg_catalog.btrim(elem ->> 'decided_by') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN v_ctx.acting_for_label
+        ELSE NULLIF(pg_catalog.btrim(elem ->> 'acting_for'), '')
+      END,
       'decided_at', coherence.format_utc_us(COALESCE((elem ->> 'decided_at')::timestamptz, v_now)),
       'committed_at_raw', elem ->> 'committed_at_raw'
     ) ORDER BY ord),

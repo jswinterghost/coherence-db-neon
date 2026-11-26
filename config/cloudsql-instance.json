@@ -53,11 +53,17 @@
     },
     "platform_iam_sync": {
       "iamTables": ["SELECT", "INSERT"],
+      "agentAffiliations": ["SELECT"],
+      "personAuthIdentities": [],
       "signingKeys": ["SELECT", "INSERT", "UPDATE"],
+      "signingKeyScopes": ["nusear_staff", "service"],
       "auditJournal": ["SELECT", "INSERT"]
     },
     "platform_migrator": {
       "migrations": true
+    },
+    "platform_auth_lookup": {
+      "authLookup": ["EXECUTE"]
     }
   }
 }

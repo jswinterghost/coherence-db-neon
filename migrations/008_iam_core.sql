@@ -1,9 +1,11 @@
--- Migration 008: Database-only IAM core (Release 1A).
--- Installs bootstrap least-privilege roles, hash-chained platform.audit_journal,
+-- Migration 008: Database-only IAM core (Release 1A + Release E2).
+-- Installs bootstrap least-privilege roles (including platform_auth_lookup), hash-chained platform.audit_journal,
 -- BEFORE INSERT platform_versioner supersession triggers and ENABLE ALWAYS immutability triggers,
--- iam_secret.signing_keys, core iam identity/org/role/right/scope/switch tables,
--- America/New_York business_today(), HMAC-SHA256 session_context(), unified org closure and
--- tenant-bounded grant evaluator, set-theoretic scope helpers, and iam.assert_can_write().
+-- scoped iam_secret.signing_keys, core iam identity/org/role/right/scope/switch/auth-identity tables,
+-- origin/role/control-DB/platform_iam_sync isolation triggers, America/New_York business_today(),
+-- HMAC-SHA256 scope-checked session_context(), narrow resolve_auth_identity(), unified org closure and
+-- tenant-bounded grant evaluator (no cross-company holding-company grant flow), set-theoretic scope helpers,
+-- and deterministic iam.assert_can_write().
 -- All functions pin SET search_path = pg_catalog and schema-qualify all references.
 
 CREATE EXTENSION IF NOT EXISTS btree_gist;
@@ -26,7 +28,8 @@ BEGIN
     'platform_worker',
     'platform_iam_sync',
     'platform_readonly',
-    'platform_migrator'
+    'platform_migrator',
+    'platform_auth_lookup'
   ] LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = v_role) THEN
       BEGIN
@@ -404,15 +407,51 @@ END;
 $$;
 ALTER FUNCTION platform.stamp_superseded_before_insert() OWNER TO platform_versioner;
 
--- 3. Signing keys (unreadable by platform_app).
+-- 3. Signing keys (unreadable by platform_app; scoped strictly by principal_origin).
 CREATE TABLE iam_secret.signing_keys (
   key_id TEXT PRIMARY KEY CHECK (key_id ~ '^[a-z0-9_-]{4,32}$'),
   secret_bytes BYTEA NOT NULL CHECK (pg_catalog.octet_length(secret_bytes) >= 32),
   environment TEXT NOT NULL CHECK (environment IN ('prod', 'dev', 'local')),
+  key_scope TEXT NOT NULL DEFAULT 'company_local' CHECK (key_scope IN ('company_local', 'nusear_staff', 'service')),
   active_from TIMESTAMPTZ NOT NULL,
   active_until TIMESTAMPTZ,
   CHECK (active_until IS NULL OR active_until > active_from)
 );
+
+CREATE OR REPLACE FUNCTION iam_secret.trg_verify_signing_key_sync()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  IF CURRENT_USER = 'platform_iam_sync'
+     AND (NEW.key_scope = 'company_local' OR (TG_OP = 'UPDATE' AND OLD.key_scope = 'company_local'))
+  THEN
+    RAISE EXCEPTION 'SYNC_FORBIDDEN_KEY_SCOPE: platform_iam_sync cannot write or modify company_local signing keys.'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_00_verify_signing_key_sync
+  BEFORE INSERT OR UPDATE ON iam_secret.signing_keys
+  FOR EACH ROW EXECUTE FUNCTION iam_secret.trg_verify_signing_key_sync();
+
+ALTER TABLE iam_secret.signing_keys ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY signing_keys_platform_iam_sync_sel ON iam_secret.signing_keys
+  FOR SELECT TO platform_iam_sync
+  USING (key_scope IN ('nusear_staff', 'service'));
+
+CREATE POLICY signing_keys_platform_iam_sync_ins ON iam_secret.signing_keys
+  FOR INSERT TO platform_iam_sync
+  WITH CHECK (key_scope IN ('nusear_staff', 'service'));
+
+CREATE POLICY signing_keys_platform_iam_sync_upd ON iam_secret.signing_keys
+  FOR UPDATE TO platform_iam_sync
+  USING (key_scope IN ('nusear_staff', 'service'))
+  WITH CHECK (key_scope IN ('nusear_staff', 'service'));
 
 -- Pure-SQL RFC 2104 HMAC-SHA256 using built-in pg_catalog.sha256 (zero external C extensions).
 CREATE OR REPLACE FUNCTION iam_secret.hmac_sha256_hex(p_key BYTEA, p_msg TEXT)
@@ -441,7 +480,7 @@ BEGIN
 END;
 $$;
 
--- 4. Core IAM tables (all 16 tables in schema iam are strictly append-only).
+-- 4. Core IAM tables (all 17 tables in schema iam are strictly append-only).
 
 -- Immutable one-row identity of this database instance (env never supplied by app code).
 CREATE TABLE iam.database_context (
@@ -520,19 +559,24 @@ CREATE TABLE iam.organization_edges (
 CREATE INDEX org_edges_parent_live_idx ON iam.organization_edges (parent_org_id, child_org_id)
   WHERE superseded_by_id IS NULL AND status = 'active';
 
--- People (humans, house accounts, and service principals; zero Medicare member PHI).
+-- People (company-local humans/house accounts, mirrored Nusear staff, and service principals; zero Medicare member PHI).
 CREATE TABLE iam.people (
   id UUID PRIMARY KEY,
   person_kind TEXT NOT NULL CHECK (person_kind IN ('human', 'house_account', 'service')),
+  principal_origin TEXT NOT NULL DEFAULT 'company_local' CHECK (principal_origin IN ('company_local', 'nusear_staff', 'service')),
   house_org_id UUID REFERENCES iam.organizations(id),
   journal_seq BIGINT NOT NULL REFERENCES platform.audit_journal(seq),
+  UNIQUE (id, principal_origin),
   CHECK ((person_kind = 'house_account' AND house_org_id IS NOT NULL)
-      OR (person_kind <> 'house_account' AND house_org_id IS NULL))
+      OR (person_kind <> 'house_account' AND house_org_id IS NULL)),
+  CHECK ((person_kind = 'service') = (principal_origin = 'service')),
+  CHECK (person_kind <> 'house_account' OR principal_origin = 'company_local')
 );
 
 CREATE TABLE iam.person_versions (
   id UUID PRIMARY KEY,
   person_id UUID NOT NULL REFERENCES iam.people(id),
+  principal_origin TEXT NOT NULL DEFAULT 'company_local' CHECK (principal_origin IN ('company_local', 'nusear_staff', 'service')),
   legal_name TEXT NOT NULL CHECK (pg_catalog.length(pg_catalog.btrim(legal_name)) > 0),
   preferred_name TEXT NOT NULL CHECK (pg_catalog.length(pg_catalog.btrim(preferred_name)) > 0),
   primary_email TEXT CHECK (primary_email IS NULL OR primary_email = pg_catalog.lower(pg_catalog.btrim(primary_email))),
@@ -543,6 +587,7 @@ CREATE TABLE iam.person_versions (
   superseded_journal_seq BIGINT REFERENCES platform.audit_journal(seq),
   journal_seq BIGINT NOT NULL REFERENCES platform.audit_journal(seq),
   UNIQUE (id, replaces_id),
+  FOREIGN KEY (person_id, principal_origin) REFERENCES iam.people(id, principal_origin),
   FOREIGN KEY (superseded_by_id, id) REFERENCES iam.person_versions(id, replaces_id) DEFERRABLE INITIALLY DEFERRED,
   CHECK (replaces_id IS NULL OR replaces_id <> id),
   CHECK (superseded_by_id IS NULL OR superseded_by_id <> id),
@@ -551,9 +596,35 @@ CREATE TABLE iam.person_versions (
 CREATE UNIQUE INDEX person_versions_one_live
   ON iam.person_versions (person_id) WHERE superseded_by_id IS NULL;
 CREATE UNIQUE INDEX person_versions_unique_live_email
-  ON iam.person_versions (primary_email) WHERE superseded_by_id IS NULL AND primary_email IS NOT NULL;
+  ON iam.person_versions (principal_origin, primary_email) WHERE superseded_by_id IS NULL AND primary_email IS NOT NULL;
 CREATE UNIQUE INDEX person_versions_unique_live_npn
-  ON iam.person_versions (npn) WHERE superseded_by_id IS NULL AND npn IS NOT NULL;
+  ON iam.person_versions (principal_origin, npn) WHERE superseded_by_id IS NULL AND npn IS NOT NULL;
+
+-- Per-company sign-in identities (e.g., each company's own Clerk issuer + subject mapped to its own people only).
+CREATE TABLE iam.person_auth_identities (
+  id UUID PRIMARY KEY,
+  person_id UUID NOT NULL REFERENCES iam.people(id),
+  principal_origin TEXT NOT NULL DEFAULT 'company_local' CHECK (principal_origin IN ('company_local', 'nusear_staff')),
+  auth_issuer TEXT NOT NULL CHECK (pg_catalog.length(pg_catalog.btrim(auth_issuer)) BETWEEN 1 AND 255 AND auth_issuer = pg_catalog.btrim(auth_issuer)),
+  auth_subject TEXT NOT NULL CHECK (pg_catalog.length(pg_catalog.btrim(auth_subject)) BETWEEN 1 AND 255 AND auth_subject = pg_catalog.btrim(auth_subject)),
+  status TEXT NOT NULL CHECK (status IN ('active', 'suspended', 'revoked')),
+  replaces_id UUID UNIQUE REFERENCES iam.person_auth_identities(id),
+  superseded_by_id UUID UNIQUE,
+  superseded_journal_seq BIGINT REFERENCES platform.audit_journal(seq),
+  journal_seq BIGINT NOT NULL REFERENCES platform.audit_journal(seq),
+  UNIQUE (id, replaces_id),
+  FOREIGN KEY (person_id, principal_origin) REFERENCES iam.people(id, principal_origin),
+  FOREIGN KEY (superseded_by_id, id) REFERENCES iam.person_auth_identities(id, replaces_id) DEFERRABLE INITIALLY DEFERRED,
+  CHECK (replaces_id IS NULL OR replaces_id <> id),
+  CHECK (superseded_by_id IS NULL OR superseded_by_id <> id),
+  CHECK ((superseded_by_id IS NULL) = (superseded_journal_seq IS NULL))
+);
+CREATE UNIQUE INDEX person_auth_identities_live_issuer_sub_uniq
+  ON iam.person_auth_identities (auth_issuer, auth_subject)
+  WHERE superseded_by_id IS NULL AND status IN ('active', 'suspended');
+CREATE INDEX person_auth_identities_person_live_idx
+  ON iam.person_auth_identities (person_id)
+  WHERE superseded_by_id IS NULL AND status = 'active';
 
 -- Dated non-agent memberships (grants nothing by itself; selling-agent membership derived from agent_affiliations).
 CREATE TABLE iam.organization_memberships (
@@ -772,11 +843,12 @@ BEGIN
     EXECUTE pg_catalog.format('ALTER TABLE iam.%I ENABLE ALWAYS TRIGGER trg_immutable', v_tbl);
   END LOOP;
 
-  -- Versioned append-only iam tables (9 tables): table name + comma-separated anchor columns.
+  -- Versioned append-only iam tables (10 tables): table name + comma-separated anchor columns.
   FOREACH v_spec SLICE 1 IN ARRAY ARRAY[
     ARRAY['organization_versions', '''organization_id'''],
     ARRAY['organization_edges', '''child_org_id'''],
     ARRAY['person_versions', '''person_id'''],
+    ARRAY['person_auth_identities', '''person_id'', ''auth_issuer'', ''auth_subject'''],
     ARRAY['organization_memberships', '''person_id'''],
     ARRAY['agent_affiliations', '''person_id'''],
     ARRAY['role_versions', '''role_id'''],
@@ -807,7 +879,204 @@ BEGIN
 END;
 $$;
 
--- 6. Domain invariant triggers (org-edge cycle detection and allows_org_wide_scope guard).
+-- 6. Domain invariant triggers (org-edge cycle detection, origin/role/control-DB/sync isolation, and allows_org_wide_scope).
+
+CREATE OR REPLACE FUNCTION iam.trg_verify_people_origin()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_kind TEXT;
+BEGIN
+  IF TG_TABLE_NAME IN ('people', 'person_versions') THEN
+    IF CURRENT_USER = 'platform_iam_sync' AND NEW.principal_origin = 'company_local' THEN
+      RAISE EXCEPTION 'SYNC_FORBIDDEN_ORIGIN: platform_iam_sync cannot write company_local rows in iam.%.', TG_TABLE_NAME
+        USING ERRCODE = '42501';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'person_auth_identities' THEN
+    IF CURRENT_USER = 'platform_iam_sync' THEN
+      RAISE EXCEPTION 'SYNC_FORBIDDEN_TABLE: platform_iam_sync cannot write iam.person_auth_identities.'
+        USING ERRCODE = '42501';
+    END IF;
+    SELECT p.person_kind INTO v_kind FROM iam.people p WHERE p.id = NEW.person_id;
+    IF v_kind IS DISTINCT FROM 'human' THEN
+      RAISE EXCEPTION 'AUTH_IDENTITY_KIND_MISMATCH: only human principals may hold sign-in identities (got %).', v_kind
+        USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_00b_verify_origin
+  BEFORE INSERT ON iam.people
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_people_origin();
+CREATE TRIGGER trg_00b_verify_origin
+  BEFORE INSERT ON iam.person_versions
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_people_origin();
+CREATE TRIGGER trg_00b_verify_origin
+  BEFORE INSERT ON iam.person_auth_identities
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_people_origin();
+
+CREATE OR REPLACE FUNCTION iam.trg_verify_control_db_origin()
+RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_db_role_kind TEXT;
+BEGIN
+  SELECT dc.db_role_kind INTO v_db_role_kind
+  FROM iam.database_context dc
+  WHERE dc.singleton = true;
+
+  IF TG_TABLE_NAME = 'people' THEN
+    IF v_db_role_kind = 'control' AND NEW.principal_origin = 'company_local' THEN
+      RAISE EXCEPTION 'CONTROL_DB_FORBIDS_COMPANY_LOCAL: control database cannot contain company_local people.'
+        USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'database_context' THEN
+    IF NEW.db_role_kind = 'control' AND EXISTS (
+      SELECT 1 FROM iam.people p WHERE p.principal_origin = 'company_local'
+    ) THEN
+      RAISE EXCEPTION 'CONTROL_DB_FORBIDS_COMPANY_LOCAL: control database cannot contain company_local people.'
+        USING ERRCODE = '23514';
+    END IF;
+    IF NEW.db_role_kind = 'company_working' AND EXISTS (
+      SELECT 1 FROM iam.person_auth_identities ai
+      WHERE ai.principal_origin <> 'company_local'
+    ) THEN
+      RAISE EXCEPTION 'AUTH_IDENTITY_ORIGIN_MISMATCH: company working database auth identities must belong to company_local people.'
+        USING ERRCODE = '23514';
+    END IF;
+    IF NEW.db_role_kind = 'control' AND EXISTS (
+      SELECT 1 FROM iam.person_auth_identities ai
+      WHERE ai.principal_origin <> 'nusear_staff'
+    ) THEN
+      RAISE EXCEPTION 'AUTH_IDENTITY_ORIGIN_MISMATCH: control database auth identities must belong to nusear_staff people.'
+        USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'person_auth_identities' THEN
+    IF v_db_role_kind = 'company_working' AND NEW.principal_origin <> 'company_local' THEN
+      RAISE EXCEPTION 'AUTH_IDENTITY_ORIGIN_MISMATCH: company working database sign-in identities map to company_local people only.'
+        USING ERRCODE = '23514';
+    END IF;
+    IF v_db_role_kind = 'control' AND NEW.principal_origin <> 'nusear_staff' THEN
+      RAISE EXCEPTION 'AUTH_IDENTITY_ORIGIN_MISMATCH: control database sign-in identities map to nusear_staff people only.'
+        USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+ALTER FUNCTION iam.trg_verify_control_db_origin() OWNER TO platform_readonly;
+
+CREATE CONSTRAINT TRIGGER trg_people_verify_db_origin
+  AFTER INSERT ON iam.people
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_control_db_origin();
+CREATE CONSTRAINT TRIGGER trg_database_context_verify_db_origin
+  AFTER INSERT ON iam.database_context
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_control_db_origin();
+CREATE CONSTRAINT TRIGGER trg_person_auth_identities_verify_db_origin
+  AFTER INSERT ON iam.person_auth_identities
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_control_db_origin();
+
+CREATE OR REPLACE FUNCTION iam.trg_verify_membership_origin()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_origin TEXT;
+  v_org_kind TEXT;
+BEGIN
+  SELECT p.principal_origin INTO v_origin FROM iam.people p WHERE p.id = NEW.person_id;
+  IF TG_TABLE_NAME = 'organization_memberships' THEN
+    IF CURRENT_USER = 'platform_iam_sync' AND v_origin = 'company_local' THEN
+      RAISE EXCEPTION 'SYNC_FORBIDDEN_ORIGIN: platform_iam_sync cannot write memberships for company_local people.'
+        USING ERRCODE = '42501';
+    END IF;
+    SELECT o.org_kind INTO v_org_kind FROM iam.organizations o WHERE o.id = NEW.organization_id;
+    IF v_origin IN ('nusear_staff', 'service') AND v_org_kind <> 'platform_root' THEN
+      RAISE EXCEPTION 'ORIGIN_MEMBERSHIP_MISMATCH: % principals may only hold memberships at platform_root.', v_origin
+        USING ERRCODE = '23514';
+    END IF;
+    IF v_origin = 'company_local' AND v_org_kind = 'platform_root' THEN
+      RAISE EXCEPTION 'ORIGIN_MEMBERSHIP_MISMATCH: company_local principals cannot hold memberships at platform_root.'
+        USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'agent_affiliations' THEN
+    IF CURRENT_USER = 'platform_iam_sync' THEN
+      RAISE EXCEPTION 'SYNC_FORBIDDEN_TABLE: platform_iam_sync cannot write iam.agent_affiliations.'
+        USING ERRCODE = '42501';
+    END IF;
+    SELECT o.org_kind INTO v_org_kind FROM iam.organizations o WHERE o.id = NEW.agency_org_id;
+    IF v_origin <> 'company_local' THEN
+      RAISE EXCEPTION 'ORIGIN_AFFILIATION_MISMATCH: only company_local people may hold agent_affiliations (got %).', v_origin
+        USING ERRCODE = '23514';
+    END IF;
+    IF v_org_kind = 'platform_root' THEN
+      RAISE EXCEPTION 'ORIGIN_AFFILIATION_MISMATCH: agent_affiliations cannot target platform_root.'
+        USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_00b_verify_origin
+  BEFORE INSERT ON iam.organization_memberships
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_membership_origin();
+CREATE TRIGGER trg_00b_verify_origin
+  BEFORE INSERT ON iam.agent_affiliations
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_membership_origin();
+
+CREATE OR REPLACE FUNCTION iam.trg_verify_sync_role_boundary()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  IF CURRENT_USER <> 'platform_iam_sync' THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_TABLE_NAME = 'roles' THEN
+    IF NEW.owner_org_id IS NOT NULL THEN
+      RAISE EXCEPTION 'SYNC_FORBIDDEN_CUSTOM_ROLE: platform_iam_sync cannot write company custom roles.'
+        USING ERRCODE = '42501';
+    END IF;
+  ELSIF TG_TABLE_NAME IN ('role_versions', 'role_rights') THEN
+    IF EXISTS (SELECT 1 FROM iam.roles r WHERE r.id = NEW.role_id AND r.owner_org_id IS NOT NULL) THEN
+      RAISE EXCEPTION 'SYNC_FORBIDDEN_CUSTOM_ROLE: platform_iam_sync cannot write versions or rights for company custom roles.'
+        USING ERRCODE = '42501';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'role_grants' THEN
+    IF EXISTS (SELECT 1 FROM iam.people p WHERE p.id = NEW.person_id AND p.principal_origin = 'company_local') THEN
+      RAISE EXCEPTION 'SYNC_FORBIDDEN_ORIGIN: platform_iam_sync cannot write role grants for company_local people.'
+        USING ERRCODE = '42501';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_00b_verify_sync
+  BEFORE INSERT ON iam.roles
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_sync_role_boundary();
+CREATE TRIGGER trg_00b_verify_sync
+  BEFORE INSERT ON iam.role_versions
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_sync_role_boundary();
+CREATE TRIGGER trg_00b_verify_sync
+  BEFORE INSERT ON iam.role_rights
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_sync_role_boundary();
+CREATE TRIGGER trg_00b_verify_sync
+  BEFORE INSERT ON iam.role_grants
+  FOR EACH ROW EXECUTE FUNCTION iam.trg_verify_sync_role_boundary();
 
 CREATE OR REPLACE FUNCTION iam.trg_check_org_edge_no_cycle()
 RETURNS TRIGGER
@@ -852,12 +1121,16 @@ CREATE CONSTRAINT TRIGGER trg_org_edges_no_cycle
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION iam.trg_check_org_edge_no_cycle();
 
--- Enforce allows_org_wide_scope on iam.role_grants and iam.role_versions.
+-- Enforce allows_org_wide_scope and origin-role parity on iam.role_grants and iam.role_versions.
 CREATE OR REPLACE FUNCTION iam.trg_verify_role_grant_scope()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $$
+DECLARE
+  v_origin TEXT;
+  v_org_kind TEXT;
+  v_rv RECORD;
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM iam.role_grants cur
@@ -866,16 +1139,37 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  IF NEW.person_scope_mode = 'org_subtree' AND NOT EXISTS (
-    SELECT 1 FROM iam.role_versions rv
-    WHERE rv.role_id = NEW.role_id
-      AND rv.superseded_by_id IS NULL
-      AND rv.status = 'active'
-      AND rv.allows_org_wide_scope = true
-  ) THEN
+  SELECT p.principal_origin INTO v_origin FROM iam.people p WHERE p.id = NEW.person_id;
+  SELECT o.org_kind INTO v_org_kind FROM iam.organizations o WHERE o.id = NEW.organization_id;
+  SELECT rv.allows_org_wide_scope, rv.is_nusear_internal
+  INTO v_rv
+  FROM iam.role_versions rv
+  WHERE rv.role_id = NEW.role_id
+    AND rv.superseded_by_id IS NULL
+    AND rv.status = 'active';
+
+  IF NEW.person_scope_mode = 'org_subtree' AND COALESCE(v_rv.allows_org_wide_scope, false) = false THEN
     RAISE EXCEPTION 'ORG_WIDE_SCOPE_FORBIDDEN: role % does not allow person_scope_mode = org_subtree.',
       NEW.role_id USING ERRCODE = '23514';
   END IF;
+
+  IF v_rv.is_nusear_internal IS NULL THEN
+    RAISE EXCEPTION 'ROLE_NOT_ACTIVE: role % has no active live role_version.',
+      NEW.role_id USING ERRCODE = '23514';
+  END IF;
+
+  IF (v_origin IN ('nusear_staff', 'service') AND v_rv.is_nusear_internal = false)
+     OR (v_origin = 'company_local' AND v_rv.is_nusear_internal = true)
+  THEN
+    RAISE EXCEPTION 'CROSS_ORIGIN_ROLE_GRANT: principal origin % cannot be granted role % (is_nusear_internal = %).',
+      v_origin, NEW.role_id, v_rv.is_nusear_internal USING ERRCODE = '23514';
+  END IF;
+
+  IF v_origin = 'company_local' AND v_org_kind = 'platform_root' THEN
+    RAISE EXCEPTION 'CROSS_ORIGIN_ROLE_GRANT: company_local principal cannot hold a role grant anchored at platform_root.'
+      USING ERRCODE = '23514';
+  END IF;
+
   RETURN NULL;
 END;
 $$;
@@ -891,10 +1185,21 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $$
 BEGIN
-  IF EXISTS (
+  IF NOT EXISTS (
     SELECT 1 FROM iam.role_versions cur
     WHERE cur.id = NEW.id AND cur.superseded_by_id IS NULL
-  ) AND NEW.status = 'active' AND NEW.allows_org_wide_scope = false AND EXISTS (
+  ) THEN
+    RETURN NULL;
+  END IF;
+
+  IF NEW.is_nusear_internal = true AND EXISTS (
+    SELECT 1 FROM iam.roles r WHERE r.id = NEW.role_id AND r.owner_org_id IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'CROSS_ORIGIN_ROLE_VERSION: company-owned role % cannot set is_nusear_internal = true.',
+      NEW.role_id USING ERRCODE = '23514';
+  END IF;
+
+  IF NEW.status = 'active' AND NEW.allows_org_wide_scope = false AND EXISTS (
     SELECT 1 FROM iam.role_grants g
     WHERE g.role_id = NEW.role_id
       AND g.superseded_by_id IS NULL
@@ -904,6 +1209,23 @@ BEGIN
     RAISE EXCEPTION 'ORG_WIDE_SCOPE_FORBIDDEN: role % still has live org_subtree grants.',
       NEW.role_id USING ERRCODE = '23514';
   END IF;
+
+  IF NEW.status = 'active' AND EXISTS (
+    SELECT 1
+    FROM iam.role_grants g
+    JOIN iam.people p ON p.id = g.person_id
+    WHERE g.role_id = NEW.role_id
+      AND g.superseded_by_id IS NULL
+      AND g.status = 'active'
+      AND (
+        (NEW.is_nusear_internal = true AND p.principal_origin = 'company_local')
+        OR (NEW.is_nusear_internal = false AND p.principal_origin IN ('nusear_staff', 'service'))
+      )
+  ) THEN
+    RAISE EXCEPTION 'CROSS_ORIGIN_ROLE_GRANT: role % has incompatible live role grants for is_nusear_internal = %.',
+      NEW.role_id, NEW.is_nusear_internal USING ERRCODE = '23514';
+  END IF;
+
   RETURN NULL;
 END;
 $$;
@@ -932,7 +1254,8 @@ CREATE TYPE iam.verified_session AS (
   environment TEXT
 );
 
--- Verifies transaction-local app.session_token once per statement; fails closed (NULL) on any mismatch.
+-- Verifies transaction-local app.session_token once per statement; fails closed (NULL) on any mismatch
+-- including signing-key scope vs principal_origin.
 -- Safe inside BEGIN TRANSACTION READ ONLY (never calls pg_current_xact_id()).
 CREATE OR REPLACE FUNCTION iam.session_context()
 RETURNS iam.verified_session
@@ -951,6 +1274,9 @@ DECLARE
   v_exp_epoch BIGINT;
   v_sig TEXT;
   v_secret BYTEA;
+  v_key_scope TEXT;
+  v_actor_origin TEXT;
+  v_view_as_origin TEXT;
   v_expected_sig TEXT;
   v_db_env TEXT;
   v_diff INT := 0;
@@ -977,7 +1303,7 @@ BEGIN
   IF v_db_env IS NULL OR v_env <> v_db_env THEN RETURN NULL; END IF;
   IF pg_catalog.date_part('epoch', pg_catalog.now()) > v_exp_epoch THEN RETURN NULL; END IF;
 
-  SELECT sk.secret_bytes INTO v_secret
+  SELECT sk.secret_bytes, sk.key_scope INTO v_secret, v_key_scope
   FROM iam_secret.signing_keys sk
   WHERE sk.key_id = v_key_id AND sk.environment = v_db_env
     AND sk.active_from <= pg_catalog.now()
@@ -994,15 +1320,23 @@ BEGIN
   END LOOP;
   IF v_diff <> 0 THEN RETURN NULL; END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM iam.person_versions pv
-    WHERE pv.person_id = v_actor_id AND pv.superseded_by_id IS NULL AND pv.status = 'active'
-  ) THEN RETURN NULL; END IF;
+  SELECT p.principal_origin INTO v_actor_origin
+  FROM iam.people p
+  JOIN iam.person_versions pv
+    ON pv.person_id = p.id AND pv.superseded_by_id IS NULL AND pv.status = 'active'
+  WHERE p.id = v_actor_id;
+  IF v_actor_origin IS NULL OR v_actor_origin <> v_key_scope THEN RETURN NULL; END IF;
 
-  IF v_view_as_id IS NOT NULL AND NOT EXISTS (
-    SELECT 1 FROM iam.person_versions pv
-    WHERE pv.person_id = v_view_as_id AND pv.superseded_by_id IS NULL AND pv.status = 'active'
-  ) THEN RETURN NULL; END IF;
+  IF v_view_as_id IS NOT NULL THEN
+    IF v_key_scope = 'service' THEN RETURN NULL; END IF;
+    SELECT p.principal_origin INTO v_view_as_origin
+    FROM iam.people p
+    JOIN iam.person_versions pv
+      ON pv.person_id = p.id AND pv.superseded_by_id IS NULL AND pv.status = 'active'
+    WHERE p.id = v_view_as_id;
+    IF v_view_as_origin IS NULL OR v_view_as_origin = 'service' THEN RETURN NULL; END IF;
+    IF v_key_scope = 'company_local' AND v_view_as_origin <> 'company_local' THEN RETURN NULL; END IF;
+  END IF;
 
   RETURN ROW(v_session_id, v_actor_id, v_view_as_id, v_env)::iam.verified_session;
 END;
@@ -1015,6 +1349,53 @@ SET search_path = pg_catalog
 AS $$
   SELECT COALESCE((SELECT view_as_person_id IS NOT NULL FROM iam.session_context()), false);
 $$;
+
+-- Narrow per-company sign-in identity resolver (executable strictly by platform_auth_lookup and owner platform_readonly;
+-- never granted to platform_app or PUBLIC). Resolves active human identities strictly within this database's origin boundary.
+CREATE OR REPLACE FUNCTION iam.resolve_auth_identity(
+  p_auth_issuer TEXT,
+  p_auth_subject TEXT
+)
+RETURNS TABLE (
+  person_id UUID,
+  principal_origin TEXT,
+  company_slug TEXT,
+  tenant_org_id UUID,
+  environment TEXT
+)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT
+    p.id AS person_id,
+    p.principal_origin,
+    dc.company_slug,
+    dc.tenant_org_id,
+    dc.environment
+  FROM iam.database_context dc
+  JOIN iam.person_auth_identities ai
+    ON ai.auth_issuer = p_auth_issuer
+   AND ai.auth_subject = p_auth_subject
+   AND ai.superseded_by_id IS NULL
+   AND ai.status = 'active'
+  JOIN iam.people p
+    ON p.id = ai.person_id
+   AND p.person_kind = 'human'
+  JOIN iam.person_versions pv
+    ON pv.person_id = p.id
+   AND pv.superseded_by_id IS NULL
+   AND pv.status = 'active'
+  WHERE dc.singleton = true
+    AND p_auth_issuer IS NOT NULL
+    AND p_auth_subject IS NOT NULL
+    AND pg_catalog.length(pg_catalog.btrim(p_auth_issuer)) > 0
+    AND pg_catalog.length(pg_catalog.btrim(p_auth_subject)) > 0
+    AND (
+      (dc.db_role_kind = 'company_working' AND p.principal_origin = 'company_local')
+      OR (dc.db_role_kind = 'control' AND p.principal_origin = 'nusear_staff')
+    );
+$$;
+ALTER FUNCTION iam.resolve_auth_identity(TEXT, TEXT) OWNER TO platform_readonly;
 
 -- Internal 3NF live derivation views (never directly readable by platform_app or PUBLIC).
 CREATE OR REPLACE VIEW iam.v_all_memberships_live AS
@@ -1157,7 +1538,6 @@ AS $$
       c.eff_range,
       c.has_archived,
       COALESCE(tc.has_archived, false) AS tenant_has_archived,
-      (dc.db_role_kind = 'control' OR tc.descendant_org_id IS NOT NULL) AS is_target_org,
       (dc.db_role_kind = 'company_working' AND anc_tc.descendant_org_id IS NOT NULL) AS ancestor_in_tenant
     FROM dc
     JOIN raw_closure c ON true
@@ -1179,22 +1559,7 @@ AS $$
                OR (NOT c.has_archived AND c.eff_range @> iam.business_today())
              )
            )
-           OR (
-             ao.org_kind <> 'platform_root'
-             AND EXISTS (SELECT 1 FROM live_ancestors la WHERE la.org_id = c.ancestor_org_id)
-             AND NOT c.has_archived
-             AND c.eff_range @> iam.business_today()
-           )
          )
-       )
-       OR (
-         dc.db_role_kind = 'company_working'
-         AND tc.descendant_org_id IS NULL
-         AND ao.org_kind <> 'platform_root'
-         AND NOT c.has_archived
-         AND c.eff_range @> iam.business_today()
-         AND EXISTS (SELECT 1 FROM live_ancestors la WHERE la.org_id = c.ancestor_org_id)
-         AND EXISTS (SELECT 1 FROM live_ancestors ld WHERE ld.org_id = c.descendant_org_id)
        )
   ),
   switch_chain AS MATERIALIZED (
@@ -1214,7 +1579,6 @@ AS $$
     FROM dc
     JOIN scoped_closure swc
       ON dc.db_role_kind = 'company_working'
-     AND swc.is_target_org
      AND swc.ancestor_in_tenant
     UNION ALL
     SELECT
@@ -1252,12 +1616,16 @@ AS $$
    AND gov.superseded_by_id IS NULL AND gov.status = 'active'
   JOIN scoped_closure c
     ON c.ancestor_org_id = g.organization_id
-   AND c.is_target_org
    AND (g.include_descendants OR c.depth = 0)
   WHERE g.person_id = p_person_id
     AND g.superseded_by_id IS NULL
     AND g.status = 'active'
     AND g.valid_range @> iam.business_today()
+    AND (
+      (rv.is_nusear_internal AND pv.principal_origin IN ('nusear_staff', 'service'))
+      OR (NOT rv.is_nusear_internal AND pv.principal_origin = 'company_local')
+    )
+    AND (dc.db_role_kind <> 'control' OR pv.principal_origin IN ('nusear_staff', 'service'))
     AND (
       g.data_date_range IS NULL
       OR (p_data_date IS NOT NULL AND g.data_date_range @> p_data_date)
@@ -1451,6 +1819,8 @@ AS $$
 $$;
 
 -- Central write authorization guard called by every app_cmd.* function.
+-- Attribution is strictly deterministic from principal_origin: company_local -> 'self',
+-- nusear_staff -> 'nusear_support' in company databases ('self' in control), service -> 'service'.
 CREATE OR REPLACE FUNCTION iam.assert_can_write(
   p_right_id TEXT,
   p_record_org_id UUID,
@@ -1463,8 +1833,9 @@ SET search_path = pg_catalog
 AS $$
 DECLARE
   v_ctx iam.verified_session := iam.session_context();
-  v_has_non_internal_write BOOLEAN := false;
-  v_has_internal_write BOOLEAN := false;
+  v_has_write BOOLEAN := false;
+  v_origin TEXT;
+  v_db_role_kind TEXT;
 BEGIN
   IF v_ctx.actor_person_id IS NULL THEN
     RAISE EXCEPTION 'Authentication required.' USING ERRCODE = '42501';
@@ -1486,8 +1857,8 @@ BEGIN
     RAISE EXCEPTION 'FORBIDDEN: unknown, retired, or non-action write right %.', p_right_id USING ERRCODE = '42501';
   END IF;
 
-  WITH matching_grants AS (
-    SELECT g.grant_id, g.is_nusear_internal
+  SELECT EXISTS (
+    SELECT 1
     FROM iam.person_effective_grants(v_ctx.actor_person_id, p_right_id, p_data_date) g
     WHERE g.target_org_id = p_record_org_id
       AND NOT g.is_archived_path
@@ -1495,19 +1866,28 @@ BEGIN
         g.person_scope_mode = 'org_subtree'
         OR (g.person_scope_mode = 'self' AND p_subject_person_id = v_ctx.actor_person_id)
       )
-  )
-  SELECT
-    EXISTS (SELECT 1 FROM matching_grants WHERE is_nusear_internal = false),
-    EXISTS (SELECT 1 FROM matching_grants WHERE is_nusear_internal = true)
-  INTO v_has_non_internal_write, v_has_internal_write;
+  ) INTO v_has_write;
 
-  IF NOT (v_has_non_internal_write OR v_has_internal_write) THEN
+  IF NOT v_has_write THEN
     RAISE EXCEPTION 'FORBIDDEN: missing write right % in target scope.', p_right_id USING ERRCODE = '42501';
   END IF;
 
+  SELECT p.principal_origin INTO v_origin
+  FROM iam.people p
+  WHERE p.id = v_ctx.actor_person_id;
+
+  SELECT dc.db_role_kind INTO v_db_role_kind
+  FROM iam.database_context dc
+  WHERE dc.singleton = true;
+
   RETURN QUERY SELECT
     v_ctx.actor_person_id,
-    CASE WHEN (v_has_internal_write AND NOT v_has_non_internal_write) THEN 'nusear_support'::text ELSE 'self'::text END;
+    CASE v_origin
+      WHEN 'service' THEN 'service'::text
+      WHEN 'nusear_staff' THEN
+        CASE WHEN v_db_role_kind = 'company_working' THEN 'nusear_support'::text ELSE 'self'::text END
+      ELSE 'self'::text
+    END;
 END;
 $$;
 
@@ -1526,7 +1906,7 @@ BEGIN
   IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'platform_versioner') THEN
     GRANT USAGE ON SCHEMA iam TO platform_versioner;
     FOREACH v_tbl IN ARRAY ARRAY[
-      'organization_versions', 'organization_edges', 'person_versions',
+      'organization_versions', 'organization_edges', 'person_versions', 'person_auth_identities',
       'organization_memberships', 'agent_affiliations',
       'role_versions', 'role_rights', 'role_grants', 'organization_tool_switches'
     ] LOOP
@@ -1559,6 +1939,14 @@ BEGIN
     END IF;
   END LOOP;
 
+  -- platform_auth_lookup: strictly resolves per-company sign-in identities via iam.resolve_auth_identity()
+  -- (zero base-table access anywhere, zero app_views/app_cmd access; never granted to platform_app).
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'platform_auth_lookup') THEN
+    GRANT USAGE ON SCHEMA iam TO platform_auth_lookup;
+    GRANT EXECUTE ON FUNCTION iam.resolve_auth_identity(TEXT, TEXT) TO platform_auth_lookup;
+  END IF;
+  REVOKE ALL ON FUNCTION iam.resolve_auth_identity(TEXT, TEXT) FROM PUBLIC, platform_app, platform_worker, platform_writer, platform_iam_sync;
+
   -- platform_writer: writes to platform.audit_journal inside app_cmd.* commands (zero iam_secret access).
   IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'platform_writer') THEN
     GRANT USAGE ON SCHEMA platform TO platform_writer;
@@ -1578,22 +1966,34 @@ BEGIN
     GRANT SELECT ON ALL TABLES IN SCHEMA iam TO platform_readonly;
   END IF;
 
-  -- platform_worker: reads iam (including closure views calling iam.business_today) and audit_journal SELECT only
+  -- platform_worker: reads iam (excluding person_auth_identities) and audit_journal SELECT only
   -- (zero INSERT on platform.audit_journal, zero compute_journal_hash execute, zero iam_secret access; app_cmd writes journals).
   IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'platform_worker') THEN
     GRANT USAGE ON SCHEMA platform, iam TO platform_worker;
     GRANT SELECT ON platform.audit_journal TO platform_worker;
     GRANT SELECT ON ALL TABLES IN SCHEMA iam TO platform_worker;
+    REVOKE ALL ON iam.person_auth_identities FROM platform_worker;
     GRANT EXECUTE ON FUNCTION
       iam.business_today(TIMESTAMPTZ)
     TO platform_worker;
   END IF;
 
-  -- platform_iam_sync: mirrors iam.*, writes platform.audit_journal, and manages iam_secret.signing_keys.
+  -- platform_iam_sync: mirrors strictly Nusear people, entity tree, platform catalog, tool switches,
+  -- and Nusear/service signing keys (zero INSERT on agent_affiliations; zero privileges on person_auth_identities;
+  -- triggers enforce refusal of company_local people/memberships/grants, company custom roles, and company_local signing keys).
   IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'platform_iam_sync') THEN
     GRANT USAGE ON SCHEMA platform, iam, iam_secret TO platform_iam_sync;
     GRANT SELECT, INSERT ON platform.audit_journal TO platform_iam_sync;
-    GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA iam TO platform_iam_sync;
+    GRANT SELECT ON ALL TABLES IN SCHEMA iam TO platform_iam_sync;
+    REVOKE ALL ON iam.person_auth_identities FROM platform_iam_sync;
+    FOREACH v_tbl IN ARRAY ARRAY[
+      'database_context', 'tools', 'rights', 'right_retirements',
+      'organizations', 'organization_versions', 'organization_edges', 'organization_tool_switches',
+      'roles', 'role_versions', 'role_rights',
+      'people', 'person_versions', 'organization_memberships', 'role_grants'
+    ] LOOP
+      EXECUTE pg_catalog.format('GRANT INSERT ON iam.%I TO platform_iam_sync', v_tbl);
+    END LOOP;
     GRANT SELECT, INSERT, UPDATE ON iam_secret.signing_keys TO platform_iam_sync;
     GRANT EXECUTE ON FUNCTION
       platform.canonical_json(JSONB),

@@ -101,6 +101,10 @@ export async function seedCoherenceIamFixture(pool, {
 } = {}) {
   const keyId = `k_r1b_${randomBytes(4).toString('hex')}`;
   const secretBytes = randomBytes(32);
+  const staffKeyId = `k_stf_${randomBytes(4).toString('hex')}`;
+  const staffSecretBytes = randomBytes(32);
+  const serviceKeyId = `k_svc_${randomBytes(4).toString('hex')}`;
+  const serviceSecretBytes = randomBytes(32);
 
   const ids = {
     rootOrg: randomUUID(),
@@ -179,9 +183,11 @@ export async function seedCoherenceIamFixture(pool, {
       [environment, ids.companyOrg, companySlug, seq],
     );
     await client.query(
-      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from, active_until)
-       VALUES ($1, $2, $3, pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
-      [keyId, secretBytes, environment],
+      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, key_scope, active_from, active_until)
+       VALUES ($1, $2, $7, 'company_local', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours'),
+              ($3, $4, $7, 'nusear_staff', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours'),
+              ($5, $6, $7, 'service', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
+      [keyId, secretBytes, staffKeyId, staffSecretBytes, serviceKeyId, serviceSecretBytes, environment],
     );
 
     for (const [id, display] of [['coherence', 'Coherence'], ['platform_audit', 'Platform Audit']]) {
@@ -376,37 +382,37 @@ export async function seedCoherenceIamFixture(pool, {
     }
 
     const humanPeople = [
-      [ids.nusearOwner, 'Pat Platform', 'pat.owner@nusear.example', null, 'active'],
-      [ids.nusearAdminNoCoh, 'Morgan Admin', 'morgan.admin@nusear.example', null, 'active'],
-      [ids.nusearOperator, 'Casey Operator', 'casey.op@nusear.example', null, 'active'],
-      [ids.northstarOperator, 'Devon Northstar', 'devon.ns@nusear.example', null, 'active'],
-      [ids.entityMgr, 'Dana Entity', 'dana.em@acme.example', null, 'active'],
-      [ids.companyAdmin, 'Sloan Admin', 'sloan.admin@acme.example', null, 'active'],
-      [ids.companyAdminRunsOnly, 'Skylar Runs', 'skylar.runs@acme.example', null, 'active'],
-      [ids.companyAdminNoGrants, 'Quinn None', 'quinn.none@acme.example', null, 'active'],
-      [ids.investor, 'Avery Investor', 'avery.inv@acme.example', null, 'active'],
-      [ids.beaconManager, 'Taylor Beacon', 'taylor.bm@acme.example', null, 'active'],
-      [ids.leadManager, 'Lee Lead', 'lee.lm@acme.example', null, 'active'],
-      [ids.teamManager, 'Riley Team', 'riley.tm@acme.example', null, 'active'],
-      [ids.harborRetention, 'Jordan Retain', 'jordan.ret@acme.example', null, 'active'],
-      [ids.agentA, 'Sam Seller', 'sam.a@acme.example', '11111111', 'active'],
-      [ids.agentB, 'Sam Seller', 'sam.b@acme.example', '22222222', 'active'],
-      [ids.agentEast, 'Jamie East', 'jamie.east@acme.example', '44444444', 'active'],
-      [ids.agentHarbor, 'Robin Harbor', 'robin.harbor@acme.example', '33333333', 'active'],
-      [ids.suspendedAgent, 'Chris Suspended', 'chris.susp@acme.example', '55555555', 'suspended'],
+      [ids.nusearOwner, 'nusear_staff', 'Pat Platform', 'pat.owner@nusear.example', null, 'active'],
+      [ids.nusearAdminNoCoh, 'nusear_staff', 'Morgan Admin', 'morgan.admin@nusear.example', null, 'active'],
+      [ids.nusearOperator, 'nusear_staff', 'Casey Operator', 'casey.op@nusear.example', null, 'active'],
+      [ids.northstarOperator, 'nusear_staff', 'Devon Northstar', 'devon.ns@nusear.example', null, 'active'],
+      [ids.entityMgr, 'company_local', 'Dana Entity', 'dana.em@acme.example', null, 'active'],
+      [ids.companyAdmin, 'company_local', 'Sloan Admin', 'sloan.admin@acme.example', null, 'active'],
+      [ids.companyAdminRunsOnly, 'company_local', 'Skylar Runs', 'skylar.runs@acme.example', null, 'active'],
+      [ids.companyAdminNoGrants, 'company_local', 'Quinn None', 'quinn.none@acme.example', null, 'active'],
+      [ids.investor, 'company_local', 'Avery Investor', 'avery.inv@acme.example', null, 'active'],
+      [ids.beaconManager, 'company_local', 'Taylor Beacon', 'taylor.bm@acme.example', null, 'active'],
+      [ids.leadManager, 'company_local', 'Lee Lead', 'lee.lm@acme.example', null, 'active'],
+      [ids.teamManager, 'company_local', 'Riley Team', 'riley.tm@acme.example', null, 'active'],
+      [ids.harborRetention, 'company_local', 'Jordan Retain', 'jordan.ret@acme.example', null, 'active'],
+      [ids.agentA, 'company_local', 'Sam Seller', 'sam.a@acme.example', '11111111', 'active'],
+      [ids.agentB, 'company_local', 'Sam Seller', 'sam.b@acme.example', '22222222', 'active'],
+      [ids.agentEast, 'company_local', 'Jamie East', 'jamie.east@acme.example', '44444444', 'active'],
+      [ids.agentHarbor, 'company_local', 'Robin Harbor', 'robin.harbor@acme.example', '33333333', 'active'],
+      [ids.suspendedAgent, 'company_local', 'Chris Suspended', 'chris.susp@acme.example', '55555555', 'suspended'],
     ];
-    for (const [id, name, email, npn, status] of humanPeople) {
-      await client.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [id, seq]);
+    for (const [id, origin, name, email, npn, status] of humanPeople) {
+      await client.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human',$2,$3)", [id, origin, seq]);
       await client.query(
-        `INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, journal_seq)
-         VALUES ($1,$2,$3,$3,$4,$5,$6,$7)`,
-        [randomUUID(), id, name, email, npn, status, seq],
+        `INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, npn, status, journal_seq)
+         VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8)`,
+        [randomUUID(), id, origin, name, email, npn, status, seq],
       );
     }
-    await client.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'service',$2)", [ids.workerService, seq]);
+    await client.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'service','service',$2)", [ids.workerService, seq]);
     await client.query(
-      `INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, status, journal_seq)
-       VALUES ($1,$2,'Coherence Worker','Coherence Worker','active',$3)`,
+      `INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, status, journal_seq)
+       VALUES ($1,$2,'service','Coherence Worker','Coherence Worker','active',$3)`,
       [randomUUID(), ids.workerService, seq],
     );
 
@@ -498,14 +504,31 @@ export async function seedCoherenceIamFixture(pool, {
     client.release();
   }
 
-  const tokenFor = (actorPersonId, viewAsPersonId = null, opts = {}) => mintSignedToken({
-    keyId,
-    secretBytes,
-    environment: opts.environment ?? environment,
-    actorPersonId,
-    viewAsPersonId,
-    expEpoch: opts.expEpoch,
-  });
+  const originByPersonId = new Map([
+    [ids.nusearOwner, 'nusear_staff'],
+    [ids.nusearAdminNoCoh, 'nusear_staff'],
+    [ids.nusearOperator, 'nusear_staff'],
+    [ids.northstarOperator, 'nusear_staff'],
+    [ids.workerService, 'service'],
+  ]);
+  const keysByScope = {
+    company_local: { keyId, secretBytes },
+    nusear_staff: { keyId: staffKeyId, secretBytes: staffSecretBytes },
+    service: { keyId: serviceKeyId, secretBytes: serviceSecretBytes },
+  };
+
+  const tokenFor = (actorPersonId, viewAsPersonId = null, opts = {}) => {
+    const scope = opts.keyScope ?? originByPersonId.get(actorPersonId) ?? 'company_local';
+    const key = keysByScope[scope] || keysByScope.company_local;
+    return mintSignedToken({
+      keyId: opts.keyId ?? key.keyId,
+      secretBytes: opts.secretBytes ?? key.secretBytes,
+      environment: opts.environment ?? environment,
+      actorPersonId,
+      viewAsPersonId,
+      expEpoch: opts.expEpoch,
+    });
+  };
 
   const owner = tokenFor(ids.nusearOwner);
   const tampered = owner.slice(0, -1) + (owner.endsWith('0') ? '1' : '0');
@@ -514,6 +537,11 @@ export async function seedCoherenceIamFixture(pool, {
     ids,
     keyId,
     secretBytes,
+    staffKeyId,
+    staffSecretBytes,
+    serviceKeyId,
+    serviceSecretBytes,
+    keysByScope,
     environment,
     tokenFor,
     tokens: {
@@ -566,7 +594,7 @@ export async function seedExtraIamSubjects(pool, {
       if (r.d) existingOrgs.add(r.d);
     }
     const existingNpns = new Set(
-      (await client.query('SELECT npn FROM iam.person_versions WHERE superseded_by_id IS NULL AND npn IS NOT NULL')).rows.map((r) => r.npn),
+      (await client.query("SELECT npn FROM iam.person_versions WHERE superseded_by_id IS NULL AND principal_origin = 'company_local' AND npn IS NOT NULL")).rows.map((r) => r.npn),
     );
     const missingAgencies = agencies.filter((a) => {
       const k = String(a.displayName || a.slug || '').trim().toLowerCase();

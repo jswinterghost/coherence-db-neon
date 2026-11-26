@@ -265,8 +265,8 @@ async function seedProofIamOwner(pool, { companySlug, displayName, environment =
       [environment, companyOrgId, companySlug, seq],
     );
     await client.query(
-      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, active_from, active_until)
-       VALUES ($1, $2, $3, pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
+      `INSERT INTO iam_secret.signing_keys (key_id, secret_bytes, environment, key_scope, active_from, active_until)
+       VALUES ($1, $2, $3, 'nusear_staff', pg_catalog.now() - INTERVAL '1 hour', pg_catalog.now() + INTERVAL '24 hours')`,
       [keyId, secretBytes, environment],
     );
     await client.query(
@@ -308,27 +308,30 @@ async function seedProofIamOwner(pool, { companySlug, displayName, environment =
       'act:coherence.upline.read',
       'act:coherence.ledger.read',
       'act:coherence.unpublished.read',
+      'act:platform.audit_journal.read',
     ];
     const ownerColumnRights = [
-      ['col:coherence.statement_cash', 'money_statement', 'coherence', 'bob_policy_financials', 'amount', 'View agency statement cash'],
-      ['col:coherence.upline_cash', 'money_upline', 'coherence', 'bob_policy_financials', 'upline_amount', 'View upline and gross cash'],
-      ['col:coherence.member_phi', 'member_phi', 'coherence', 'bob_policies', 'mbi', 'View member PHI'],
-      ['col:coherence.member_contact', 'member_contact', 'coherence', 'bob_policies', 'phone', 'View member contact details'],
+      ['col:coherence.statement_cash', 'coherence', 'money_statement', 'coherence', 'bob_policy_financials', 'amount', 'View agency statement cash'],
+      ['col:coherence.upline_cash', 'coherence', 'money_upline', 'coherence', 'bob_policy_financials', 'upline_amount', 'View upline and gross cash'],
+      ['col:coherence.member_phi', 'coherence', 'member_phi', 'coherence', 'bob_policies', 'mbi', 'View member PHI'],
+      ['col:coherence.member_contact', 'coherence', 'member_contact', 'coherence', 'bob_policies', 'phone', 'View member contact details'],
+      ['col:platform.audit_journal.nusear_actor', 'platform_audit', 'platform_internal', 'platform', 'audit_journal', 'actor_person_id', 'View Nusear actor identity'],
     ];
     for (const rightId of ownerRights) {
+      const toolId = rightId.startsWith('act:platform.') ? 'platform_audit' : 'coherence';
       await client.query(
         `INSERT INTO iam.rights (id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power, description, journal_seq)
-         VALUES ($1,'action','coherence','both','ordinary',true,$1,$2)`,
-        [rightId, seq],
+         VALUES ($1,'action',$2,'both','ordinary',true,$1,$3)`,
+        [rightId, toolId, seq],
       );
     }
-    for (const [rightId, sensClass, tgtSchema, tgtTable, tgtCol, desc] of ownerColumnRights) {
+    for (const [rightId, toolId, sensClass, tgtSchema, tgtTable, tgtCol, desc] of ownerColumnRights) {
       await client.query(
         `INSERT INTO iam.rights (
            id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power,
            target_schema, target_table, target_column, description, journal_seq
-         ) VALUES ($1,'column','coherence','both',$2,true,$3,$4,$5,$6,$7)`,
-        [rightId, sensClass, tgtSchema, tgtTable, tgtCol, desc, seq],
+         ) VALUES ($1,'column',$2,'both',$3,true,$4,$5,$6,$7,$8)`,
+        [rightId, toolId, sensClass, tgtSchema, tgtTable, tgtCol, desc, seq],
       );
     }
     await client.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleOwnerId, 'nusear_owner', seq]);
@@ -342,9 +345,9 @@ async function seedProofIamOwner(pool, { companySlug, displayName, environment =
         [randomUUID(), roleOwnerId, rightId, seq],
       );
     }
-    await client.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [ownerPersonId, seq]);
+    await client.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','nusear_staff',$2)", [ownerPersonId, seq]);
     await client.query(
-      "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'Proof Importer','Proof Importer','proof.importer@nusear.example','active',$3)",
+      "INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'nusear_staff','Proof Importer','Proof Importer','proof.importer@nusear.example','active',$3)",
       [randomUUID(), ownerPersonId, seq],
     );
     await client.query(
@@ -402,7 +405,7 @@ export async function ensureProofIamSubjectsForBatches(pool, { companyOrgId, env
       if (r.d) existingOrgs.add(r.d);
     }
     const existingNpns = new Set(
-      (await client.query('SELECT npn FROM iam.person_versions WHERE superseded_by_id IS NULL AND npn IS NOT NULL')).rows.map((r) => r.npn),
+      (await client.query("SELECT npn FROM iam.person_versions WHERE superseded_by_id IS NULL AND principal_origin = 'company_local' AND npn IS NOT NULL")).rows.map((r) => r.npn),
     );
     const missingEntities = [...entities.entries()].filter(([k]) => !existingOrgs.has(k));
     const missingNpns = [...npns].filter((n) => !existingNpns.has(n));
@@ -439,9 +442,9 @@ export async function ensureProofIamSubjectsForBatches(pool, { companyOrgId, env
       }
       for (const npn of missingNpns) {
         const pid = randomUUID();
-        await client.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [pid, seq]);
+        await client.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','company_local',$2)", [pid, seq]);
         await client.query(
-          "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, npn, status, journal_seq) VALUES ($1,$2,$3,$3,$4,$5,'active',$6)",
+          "INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, npn, status, journal_seq) VALUES ($1,$2,'company_local',$3,$3,$4,$5,'active',$6)",
           [randomUUID(), pid, `Proof Agent ${npn}`, `proof.npn.${npn.toLowerCase().replace(/[^a-z0-9]/g, '_')}@proof.example`, npn, seq],
         );
       }

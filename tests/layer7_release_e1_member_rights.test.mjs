@@ -2333,7 +2333,7 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
   });
 });
 
-test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outputs require the right over the whole company tree (history included): agency held/off switch closes them to company users while Nusear staff stay unaffected, and a holding-company grant above the company closes once an archived or moved-out agency exists', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outputs require the right over the whole company tree (history included): agency held/off switch closes them to company users while Nusear staff stay unaffected, and company users + Nusear staff stay open with archived and moved-out agencies', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   async function seedFullTenantWorld(subT) {
     const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
     subT.after(() => env.cleanup());
@@ -2344,90 +2344,6 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
     const handlers = createWebHandlers({ pool: appPool, companySlug: 'acme', stores: env.stores });
     const reader = createDatabaseCoherenceReader({ pool: appPool, stores: env.stores, entity: 'Acme' });
     const qApp = (tok, sql, params = []) => withRequestTx(appPool, tok, (tx) => tx.query(sql, params), { readOnly: true });
-
-    // Place Acme under a live non-internal holding company (holdingOrg -> rootOrg, companyOrg -> holdingOrg)
-    // and seed holdingExec with full workshop + whole-company output rights anchored at holdingOrg.
-    const holdingOrg = randomUUID();
-    const holdingExec = randomUUID();
-    const holdingRole = randomUUID();
-    {
-      const c = await env.pool.connect();
-      try {
-        await c.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-        const seq = (await appendIamAuditEntry(c, {
-          environment: iam.environment,
-          targetOrgId: iam.ids.companyOrg,
-          commandKind: 'iam.seed_e1_holding',
-          commandKey: `e1-holding-${randomUUID()}`,
-        })).seq;
-
-        await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'company',$2)", [holdingOrg, seq]);
-        await c.query(
-          "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'acme_holding','Acme Holding','active',$3)",
-          [randomUUID(), holdingOrg, seq],
-        );
-        await c.query(
-          "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4)",
-          [randomUUID(), holdingOrg, iam.ids.rootOrg, seq],
-        );
-        const curCompanyEdgeId = (await c.query(
-          'SELECT id FROM iam.organization_edges WHERE child_org_id = $1 AND superseded_by_id IS NULL',
-          [iam.ids.companyOrg],
-        )).rows[0].id;
-        await c.query(
-          "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, replaces_id, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,)'::daterange,'active',$4,$5)",
-          [randomUUID(), iam.ids.companyOrg, holdingOrg, curCompanyEdgeId, seq],
-        );
-        await c.query(
-          "INSERT INTO iam.organization_tool_switches (id, organization_id, tool_id, switch_state, status, journal_seq) VALUES ($1,$2,'coherence','on','active',$3)",
-          [randomUUID(), holdingOrg, seq],
-        );
-
-        await c.query("INSERT INTO iam.people (id, person_kind, journal_seq) VALUES ($1,'human',$2)", [holdingExec, seq]);
-        await c.query(
-          "INSERT INTO iam.person_versions (id, person_id, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'Holding Exec','Holding Exec','holding@acme.example','active',$3)",
-          [randomUUID(), holdingExec, seq],
-        );
-        await c.query(
-          "INSERT INTO iam.organization_memberships (id, person_id, organization_id, capacity, valid_range, status, journal_seq) VALUES ($1,$2,$3,'owner','[2020-01-01,)'::daterange,'active',$4)",
-          [randomUUID(), holdingExec, holdingOrg, seq],
-        );
-        await c.query("INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,'holding_full_em',NULL,$2)", [holdingRole, seq]);
-        await c.query(
-          "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'Holding Full EM',false,false,true,'active',$3)",
-          [randomUUID(), holdingRole, seq],
-        );
-        for (const rightId of [
-          'act:coherence.bob.read',
-          'act:coherence.statements.read',
-          'act:coherence.upline.read',
-          'act:coherence.ledger.read',
-          'act:coherence.runs.read',
-          'act:coherence.inputs.read',
-          'act:coherence.outputs.read',
-          'act:coherence.unpublished.read',
-          'col:coherence.statement_cash',
-          'col:coherence.upline_cash',
-          'col:coherence.member_phi',
-          'col:coherence.member_contact',
-        ]) {
-          await c.query(
-            "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
-            [randomUUID(), holdingRole, rightId, seq],
-          );
-        }
-        await c.query(
-          "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
-          [randomUUID(), holdingExec, holdingRole, holdingOrg, seq],
-        );
-        await c.query('COMMIT');
-      } catch (err) {
-        await c.query('ROLLBACK').catch(() => {});
-        throw err;
-      } finally {
-        c.release();
-      }
-    }
 
     // Seed one standing input version + one sent run with an Entity Manager viewer bundle + emits/* outputs
     // + exempt files + carrySent, plus one Beacon historical statement batch so agency-scoped finished goods stay testable.
@@ -2524,7 +2440,7 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
       }
     };
 
-    return { env, iam, qApp, holdingOrg, holdingExec, holdingToken: iam.tokenFor(holdingExec), sentRunId, assertSurface };
+    return { env, iam, qApp, sentRunId, assertSurface };
   }
 
   await t.test('Case 1: agency Coherence switch held or off closes workshop and whole-company outputs to company users while Nusear staff are unaffected (and restoring on re-opens them)', async (subT) => {
@@ -2589,56 +2505,10 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
     await assertSurface('harbor restored on: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
   });
 
-  await t.test('Case 2: grant above the company through a holding company closes workshop and whole-company outputs once the company has an archived agency (company users and Nusear staff stay open)', async (subT) => {
-    const { env, iam, holdingToken, assertSurface } = await seedFullTenantWorld(subT);
+  await t.test('Case 2: company-anchored users and Nusear staff keep workshop and whole-company outputs open when archived and moved-out agencies exist', async (subT) => {
+    const { env, iam, assertSurface } = await seedFullTenantWorld(subT);
 
-    // Baseline (all company orgs live): holding-company grant opens workshop and whole-company outputs.
-    await assertSurface('before archived agency: holdingExec', holdingToken, { workshopOpen: true, wholeOutputsMode: 'full' });
-
-    // Add one archived historical agency under Acme.
     const archivedAgency = randomUUID();
-    const c = await env.pool.connect();
-    try {
-      await c.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-      const seq = (await appendIamAuditEntry(c, {
-        environment: iam.environment,
-        targetOrgId: iam.ids.companyOrg,
-        commandKind: 'iam.seed_e1_archived_agency',
-        commandKey: `ft-archived-${randomUUID()}`,
-      })).seq;
-      await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'agency',$2)", [archivedAgency, seq]);
-      await c.query(
-        "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'acme_archived','Archived Agency','archived',$3)",
-        [randomUUID(), archivedAgency, seq],
-      );
-      await c.query(
-        "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2025-06-01)'::daterange,'active',$4)",
-        [randomUUID(), archivedAgency, iam.ids.companyOrg, seq],
-      );
-      await c.query('COMMIT');
-    } catch (err) {
-      await c.query('ROLLBACK').catch(() => {});
-      throw err;
-    } finally {
-      c.release();
-    }
-
-    // Holding-company grant above Acme can no longer reach archived history -> workshop & whole-company outputs close.
-    await assertSurface('after archived agency: holdingExec', holdingToken, { workshopOpen: false, wholeOutputsMode: 'closed' });
-    // Company-anchored users and Nusear staff cover archived history -> workshop & whole-company outputs stay open.
-    await assertSurface('after archived agency: entityMgr', iam.tokens.entityMgr, { workshopOpen: true, wholeOutputsMode: 'full' });
-    await assertSurface('after archived agency: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
-    await assertSurface('after archived agency: nusearOwner', iam.tokens.owner, { workshopOpen: true, wholeOutputsMode: 'full' });
-    await assertSurface('after archived agency: nusearOperator', iam.tokens.operator, { workshopOpen: true, wholeOutputsMode: 'full' });
-  });
-
-  await t.test('Case 3: grant above the company through a holding company closes workshop and whole-company outputs once the company has a moved-out agency (company users and Nusear staff stay open)', async (subT) => {
-    const { env, iam, holdingToken, assertSurface } = await seedFullTenantWorld(subT);
-
-    // Baseline (all company orgs live): holding-company grant opens workshop and whole-company outputs.
-    await assertSurface('before moved-out agency: holdingExec', holdingToken, { workshopOpen: true, wholeOutputsMode: 'full' });
-
-    // Add one active agency that historically belonged to Acme and moved out to Northstar.
     const movedOutAgency = randomUUID();
     const c = await env.pool.connect();
     try {
@@ -2646,21 +2516,17 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
       const seq = (await appendIamAuditEntry(c, {
         environment: iam.environment,
         targetOrgId: iam.ids.companyOrg,
-        commandKind: 'iam.seed_e1_moved_out_agency',
-        commandKey: `ft-moved-out-${randomUUID()}`,
+        commandKind: 'iam.seed_e1_hist_agencies',
+        commandKey: `ft-hist-${randomUUID()}`,
       })).seq;
-      await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'agency',$2)", [movedOutAgency, seq]);
+      await c.query("INSERT INTO iam.organizations (id, org_kind, journal_seq) VALUES ($1,'agency',$3),($2,'agency',$3)", [archivedAgency, movedOutAgency, seq]);
       await c.query(
-        "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'acme_moved_out','Moved Out Agency','active',$3)",
-        [randomUUID(), movedOutAgency, seq],
+        "INSERT INTO iam.organization_versions (id, organization_id, slug, display_name, status, journal_seq) VALUES ($1,$2,'acme_archived','Archived Agency','archived',$5),($3,$4,'acme_moved_out','Moved Out Agency','active',$5)",
+        [randomUUID(), archivedAgency, randomUUID(), movedOutAgency, seq],
       );
       await c.query(
-        "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2025-06-01)'::daterange,'active',$4)",
-        [randomUUID(), movedOutAgency, iam.ids.companyOrg, seq],
-      );
-      await c.query(
-        "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2025-06-01,)'::daterange,'active',$4)",
-        [randomUUID(), movedOutAgency, iam.ids.northstarOrg, seq],
+        "INSERT INTO iam.organization_edges (id, child_org_id, parent_org_id, valid_range, status, journal_seq) VALUES ($1,$2,$3,'[2020-01-01,2025-06-01)'::daterange,'active',$8),($4,$5,$3,'[2020-01-01,2025-06-01)'::daterange,'active',$8),($6,$5,$7,'[2025-06-01,)'::daterange,'active',$8)",
+        [randomUUID(), archivedAgency, iam.ids.companyOrg, randomUUID(), movedOutAgency, randomUUID(), iam.ids.northstarOrg, seq],
       );
       await c.query('COMMIT');
     } catch (err) {
@@ -2670,12 +2536,9 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
       c.release();
     }
 
-    // Holding-company grant above Acme follows today's live chains only -> cannot reach moved-out agency's Acme history -> closes.
-    await assertSurface('after moved-out agency: holdingExec', holdingToken, { workshopOpen: false, wholeOutputsMode: 'closed' });
-    // Company-anchored users and Nusear staff cover historical moved-out agencies -> workshop & whole-company outputs stay open.
-    await assertSurface('after moved-out agency: entityMgr', iam.tokens.entityMgr, { workshopOpen: true, wholeOutputsMode: 'full' });
-    await assertSurface('after moved-out agency: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
-    await assertSurface('after moved-out agency: nusearOwner', iam.tokens.owner, { workshopOpen: true, wholeOutputsMode: 'full' });
-    await assertSurface('after moved-out agency: nusearOperator', iam.tokens.operator, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('with archived/moved-out agencies: entityMgr', iam.tokens.entityMgr, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('with archived/moved-out agencies: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
+    await assertSurface('with archived/moved-out agencies: nusearOwner', iam.tokens.owner, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('with archived/moved-out agencies: nusearOperator', iam.tokens.operator, { workshopOpen: true, wholeOutputsMode: 'full' });
   });
 });
