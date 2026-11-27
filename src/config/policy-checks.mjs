@@ -348,6 +348,19 @@ export const CLOUDSQL_IAM_MEMBER_MARKER_ROLES = Object.freeze([
   'cloudsqliamserviceaccount',
 ]);
 
+export const CLOUDSQL_IAM_LOGIN_MARKER_ROLES = Object.freeze([
+  'cloudsqliamserviceaccount',
+  'cloudsqliamuser',
+]);
+
+export const RUNTIME_MAPPABLE_PLATFORM_ROLES = Object.freeze([
+  'platform_app',
+  'platform_worker',
+  'platform_readonly',
+  'platform_auth_lookup',
+  'platform_iam_sync',
+]);
+
 const FORBIDDEN_BUSINESS_PRIVS = Object.freeze(['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']);
 const ALL_RELATION_PRIVS = Object.freeze(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']);
 const ALL_COLUMN_PRIVS = Object.freeze(['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']);
@@ -454,6 +467,21 @@ export function validateCloudSqlConfig(config) {
   if (config.databaseVersion !== 'POSTGRES_17') {
     problems.push(`databaseVersion must be POSTGRES_17, got ${config.databaseVersion}`);
   }
+
+  const topology = config.topology || {};
+  if (topology.model !== 'one_instance_per_environment') {
+    problems.push(`topology.model must be one_instance_per_environment, got ${topology.model}`);
+  }
+  if (topology.separateEnvironments !== true) {
+    problems.push('topology.separateEnvironments must be true (dev and prod strictly separate)');
+  }
+  if (topology.databasePerCompany !== true) {
+    problems.push('topology.databasePerCompany must be true (one dedicated database per company)');
+  }
+  if (topology.includesControlDatabase !== true) {
+    problems.push('topology.includesControlDatabase must be true (server holds Nusear control database alongside company databases)');
+  }
+
   const ip = config.ipConfiguration || {};
   if (ip.requireSsl !== true) {
     problems.push('ipConfiguration.requireSsl must be true (TLS required)');
@@ -464,19 +492,31 @@ export function validateCloudSqlConfig(config) {
   if (!Array.isArray(ip.authorizedNetworks) || ip.authorizedNetworks.length !== 0) {
     problems.push('ipConfiguration.authorizedNetworks must be empty (no direct authorized networks)');
   }
-  if (ip.ipv4Enabled !== false) {
-    problems.push('ipConfiguration.ipv4Enabled must be false (no direct public TCP connections)');
+  if (ip.ipv4Enabled !== true) {
+    problems.push('ipConfiguration.ipv4Enabled must be true (public address with zero authorized networks so Cloud SQL Connector connects without a relay machine)');
   }
 
   const proto = config.connectionProtocol || {};
   if (proto.connector !== 'cloud-sql-connector') {
     problems.push(`connectionProtocol.connector must be cloud-sql-connector, got ${proto.connector}`);
   }
+  if (proto.relayMachineAllowed !== false) {
+    problems.push('connectionProtocol.relayMachineAllowed must be false (connect via Cloud SQL Connector with no relay machine)');
+  }
   if (proto.dedicatedServiceAccount !== true) {
     problems.push('connectionProtocol.dedicatedServiceAccount must be true');
   }
   if (proto.passwordAuthAllowed !== false) {
     problems.push('connectionProtocol.passwordAuthAllowed must be false (IAM authentication only)');
+  }
+  if (proto.iamDatabaseAuthRequired !== true) {
+    problems.push('connectionProtocol.iamDatabaseAuthRequired must be true');
+  }
+  if (proto.runtimeRoleMapping !== 'non_inherited_set_with_startup_role') {
+    problems.push(`connectionProtocol.runtimeRoleMapping must be non_inherited_set_with_startup_role, got ${proto.runtimeRoleMapping}`);
+  }
+  if (proto.startupRoleOption !== '-c role=<platform_role>') {
+    problems.push(`connectionProtocol.startupRoleOption must be "-c role=<platform_role>", got ${proto.startupRoleOption}`);
   }
 
   const flags = config.databaseFlags || {};
@@ -581,18 +621,32 @@ export async function verifyDatabaseConfigInvariants(pool) {
   return verifyIamConfigInvariants(pool);
 }
 
+function hasNonEmptySessionTokenSetting(configEntries) {
+  if (!Array.isArray(configEntries)) return false;
+  return configEntries.some((entry) => (
+    typeof entry === 'string'
+    && entry.startsWith('app.session_token=')
+    && entry.slice('app.session_token='.length).trim().length > 0
+  ));
+}
+
 export async function verifyIamConfigInvariants(pool) {
   const problems = [];
 
-  // 1. All platform_* roles must exist and be non-superuser, NOINHERIT, NOBYPASSRLS.
-  const rolesRes = await pool.query(
-    `SELECT rolname, rolsuper, rolinherit, rolbypassrls, rolconfig
-     FROM pg_catalog.pg_roles
-     WHERE rolname = ANY($1::text[])`,
-    [[...PLATFORM_ROLES, ...RETIRED_COHERENCE_ROLES]],
-  );
+  // 1. All platform_* roles must exist and be non-superuser, NOINHERIT, NOBYPASSRLS, NOREPLICATION.
+  const [superRes, rolesRes] = await Promise.all([
+    pool.query("SELECT pg_catalog.current_setting('is_superuser') = 'on' AS is_super"),
+    pool.query(
+      `SELECT oid, rolname, rolsuper, rolinherit, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication, rolconfig
+       FROM pg_catalog.pg_roles
+       WHERE rolname = ANY($1::text[])`,
+      [[...PLATFORM_ROLES, ...RETIRED_COHERENCE_ROLES, ...CLOUDSQL_IAM_LOGIN_MARKER_ROLES]],
+    ),
+  ]);
+  const isSuperuser = Boolean(superRes.rows[0]?.is_super);
   const roleByName = new Map(rolesRes.rows.map((r) => [r.rolname, r]));
   const existingRetiredRoles = RETIRED_COHERENCE_ROLES.filter((r) => roleByName.has(r));
+  const existingIamMarkerRoles = CLOUDSQL_IAM_LOGIN_MARKER_ROLES.filter((r) => roleByName.has(r));
 
   for (const roleName of PLATFORM_ROLES) {
     const r = roleByName.get(roleName);
@@ -603,46 +657,81 @@ export async function verifyIamConfigInvariants(pool) {
     if (r.rolsuper) problems.push(`Role ${roleName} must not be SUPERUSER`);
     if (r.rolbypassrls) problems.push(`Role ${roleName} must have NOBYPASSRLS`);
     if (r.rolinherit) problems.push(`Role ${roleName} must have NOINHERIT`);
-    if (roleName === 'platform_app') {
-      const cfg = Array.isArray(r.rolconfig) ? r.rolconfig : [];
-      if (!cfg.includes('app.session_token=')) {
-        problems.push(`Role platform_app should default app.session_token='' (rolconfig: ${JSON.stringify(cfg)})`);
-      }
+    if (r.rolreplication) problems.push(`Role ${roleName} must not have REPLICATION`);
+    const cfg = Array.isArray(r.rolconfig) ? r.rolconfig : [];
+    if (hasNonEmptySessionTokenSetting(cfg)) {
+      problems.push(`Role ${roleName} must never carry a non-empty app.session_token default (rolconfig: ${JSON.stringify(cfg)})`);
+    }
+    if (roleName === 'platform_app' && isSuperuser && !cfg.includes('app.session_token=')) {
+      problems.push(`Role platform_app should default app.session_token='' (rolconfig: ${JSON.stringify(cfg)})`);
+    }
+  }
+  for (const markerName of existingIamMarkerRoles) {
+    const r = roleByName.get(markerName);
+    if (r.rolsuper || r.rolbypassrls || r.rolcreaterole || r.rolcreatedb || r.rolreplication) {
+      problems.push(
+        `IAM marker role ${markerName} must be unprivileged (super=${r.rolsuper}, bypassrls=${r.rolbypassrls}, createrole=${r.rolcreaterole}, createdb=${r.rolcreatedb}, replication=${r.rolreplication})`,
+      );
+    }
+    if (hasNonEmptySessionTokenSetting(r.rolconfig)) {
+      problems.push(`IAM marker role ${markerName} must never carry a non-empty app.session_token default`);
     }
   }
 
-  // 1b. Audit pg_auth_members: no platform_* role may hold membership in another role (except Cloud SQL's
-  //     cloudsqliamserviceaccount login marker without ADMIN OPTION), and no non-superuser may hold ANY
-  //     membership (including WITH ADMIN OPTION even when INHERIT and SET are false) in any platform_* role
-  //     except Cloud SQL's cloudsqlsuperuser bootstrap CREATEROLE record (INHERIT false, SET false).
+  // 1b. Audit pg_auth_members:
+  //     - No platform_* role may hold membership in another role (except Cloud SQL's
+  //       cloudsqliamserviceaccount login marker without ADMIN OPTION).
+  //     - No non-superuser may hold membership in any platform_* role except:
+  //       (a) Cloud SQL's cloudsqlsuperuser bootstrap CREATEROLE record (ADMIN true, INHERIT false, SET false,
+  //           granted by bootstrap creator, never an empty or self-granted row), or
+  //       (b) an unprivileged LOGIN runtime user (NOREPLICATION, NOCREATEROLE, NOCREATEDB, NOBYPASSRLS)
+  //           mapped to strictly ONE role in RUNTIME_MAPPABLE_PLATFORM_ROLES with ADMIN false, INHERIT false,
+  //           SET true, zero direct managed-schema privileges, zero owned objects in managed schemas, and no
+  //           other non-marker role memberships (entered via startup '-c role=<role>').
   const platformRoleSet = new Set(PLATFORM_ROLES);
   const bootstrapCreatorSet = new Set(CLOUDSQL_BOOTSTRAP_CREATOR_ROLES);
   const iamMarkerSet = new Set(CLOUDSQL_IAM_MEMBER_MARKER_ROLES);
+  const iamLoginMarkerSet = new Set(CLOUDSQL_IAM_LOGIN_MARKER_ROLES);
+  const runtimeMappableSet = new Set(RUNTIME_MAPPABLE_PLATFORM_ROLES);
   const authMemRes = await pool.query(
     `SELECT r.rolname AS granted_role,
             r.rolsuper AS granted_is_super,
             r.rolbypassrls AS granted_bypassrls,
             r.rolcreaterole AS granted_createrole,
+            r.rolcreatedb AS granted_createdb,
+            r.rolreplication AS granted_replication,
+            m.oid AS member_oid,
             m.rolname AS member_role,
             m.rolsuper AS member_is_super,
+            m.rolcanlogin AS member_can_login,
+            m.rolbypassrls AS member_bypassrls,
             m.rolcreaterole AS member_createrole,
+            m.rolcreatedb AS member_createdb,
+            m.rolreplication AS member_replication,
+            m.rolconfig AS member_config,
+            g.rolname AS grantor_role,
             am.admin_option,
             am.inherit_option,
             am.set_option
      FROM pg_catalog.pg_auth_members am
      JOIN pg_catalog.pg_roles r ON r.oid = am.roleid
      JOIN pg_catalog.pg_roles m ON m.oid = am.member
+     JOIN pg_catalog.pg_roles g ON g.oid = am.grantor
      WHERE r.rolname = ANY($1::text[]) OR m.rolname = ANY($1::text[])
      ORDER BY r.rolname, m.rolname`,
     [PLATFORM_ROLES],
   );
+  const mappedRuntimeRolesByLogin = new Map();
+  const mappedRuntimeConfigByLogin = new Map();
   for (const row of authMemRes.rows) {
     if (platformRoleSet.has(row.member_role)) {
       const allowedCloudSqlIamMarker = iamMarkerSet.has(row.granted_role)
         && !row.admin_option
         && !row.granted_is_super
         && !row.granted_bypassrls
-        && !row.granted_createrole;
+        && !row.granted_createrole
+        && !row.granted_createdb
+        && !row.granted_replication;
       if (!allowedCloudSqlIamMarker) {
         problems.push(
           `pg_auth_members violation: platform role ${row.member_role} must not be a member of ${row.granted_role} (admin=${row.admin_option}, inherit=${row.inherit_option}, set=${row.set_option})`,
@@ -651,18 +740,364 @@ export async function verifyIamConfigInvariants(pool) {
     } else if (platformRoleSet.has(row.granted_role) && !row.member_is_super) {
       const allowedCloudSqlBootstrap = bootstrapCreatorSet.has(row.member_role)
         && row.member_createrole
+        && row.admin_option
         && !row.inherit_option
-        && !row.set_option;
-      if (!allowedCloudSqlBootstrap) {
+        && !row.set_option
+        && row.grantor_role !== row.member_role;
+      const allowedRuntimeLoginMapping = runtimeMappableSet.has(row.granted_role)
+        && row.member_can_login
+        && !row.member_bypassrls
+        && !row.member_createrole
+        && !row.member_createdb
+        && !row.member_replication
+        && !row.admin_option
+        && !row.inherit_option
+        && row.set_option;
+      if (allowedCloudSqlBootstrap) {
+        continue;
+      }
+      if (allowedRuntimeLoginMapping) {
+        let grantedSet = mappedRuntimeRolesByLogin.get(row.member_role);
+        if (!grantedSet) {
+          grantedSet = new Set();
+          mappedRuntimeRolesByLogin.set(row.member_role, grantedSet);
+          mappedRuntimeConfigByLogin.set(row.member_role, row.member_config);
+        }
+        grantedSet.add(row.granted_role);
+        continue;
+      }
+      problems.push(
+        `pg_auth_members violation: non-superuser ${row.member_role} holds membership in ${row.granted_role} (admin=${row.admin_option}, inherit=${row.inherit_option}, set=${row.set_option}, replication=${row.member_replication}, grantor=${row.grantor_role})`,
+      );
+    }
+  }
+
+  const mappedRuntimeLogins = [...mappedRuntimeRolesByLogin.keys()].sort();
+  for (const loginRole of mappedRuntimeLogins) {
+    const granted = [...mappedRuntimeRolesByLogin.get(loginRole)].sort();
+    if (granted.length > 1) {
+      problems.push(
+        `pg_auth_members violation: runtime login user ${loginRole} must map to at most one platform role (mapped to ${granted.join(', ')})`,
+      );
+    }
+    const cfg = mappedRuntimeConfigByLogin.get(loginRole);
+    if (hasNonEmptySessionTokenSetting(cfg)) {
+      problems.push(`Runtime login user ${loginRole} must never carry a non-empty app.session_token default`);
+    }
+  }
+
+  // Verify pg_db_role_setting (via LEFT JOIN so setrole=0 database-wide defaults are included)
+  // never carries a non-empty app.session_token default on the database, any platform role
+  // (including platform_worker), any mapped login user, or any IAM marker role.
+  const tokenSettingAuditRoles = [...PLATFORM_ROLES, ...mappedRuntimeLogins, ...existingIamMarkerRoles];
+  const dbRoleSetRes = await pool.query(
+    `SELECT s.setrole,
+            COALESCE(r.rolname, '<database-default>') AS target_name,
+            s.setconfig
+     FROM pg_catalog.pg_db_role_setting s
+     LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.setrole
+     WHERE (s.setrole = 0 OR r.rolname = ANY($1::text[]))
+       AND (s.setdatabase = 0 OR s.setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()))`,
+    [tokenSettingAuditRoles],
+  );
+  for (const row of dbRoleSetRes.rows) {
+    if (hasNonEmptySessionTokenSetting(row.setconfig)) {
+      const subject = Number(row.setrole) === 0 ? 'Database default (setrole=0)' : `Role ${row.target_name}`;
+      problems.push(`${subject} carries a forbidden non-empty app.session_token in pg_db_role_setting`);
+    }
+  }
+
+  // Audit every mapped runtime LOGIN user and every existing IAM login marker role
+  // (cloudsqliamuser, cloudsqliamserviceaccount): zero extra non-marker memberships, zero owned
+  // objects in managed schemas, and zero direct schema/table/view/column/sequence/function
+  // privileges across all 6 managed schemas.
+  const zeroPrivManagedPrincipals = [...mappedRuntimeLogins, ...existingIamMarkerRoles];
+  const existingIamMarkerSet = new Set(existingIamMarkerRoles);
+  const labelZeroPrivPrincipal = (name) => (
+    existingIamMarkerSet.has(name) ? `IAM marker role ${name}` : `Runtime login user ${name}`
+  );
+  if (zeroPrivManagedPrincipals.length > 0) {
+    const [
+      loginExtraMemRes,
+      loginSchemaPrivRes,
+      loginRelPrivRes,
+      loginColPrivRes,
+      loginFnPrivRes,
+      loginOwnedObjRes,
+    ] = await Promise.all([
+      pool.query(
+        `SELECT m.rolname AS member_role,
+                r.rolname AS granted_role,
+                r.rolsuper AS granted_is_super,
+                r.rolbypassrls AS granted_bypassrls,
+                r.rolcreaterole AS granted_createrole,
+                r.rolcreatedb AS granted_createdb,
+                r.rolreplication AS granted_replication,
+                am.admin_option,
+                am.inherit_option,
+                am.set_option
+         FROM pg_catalog.pg_auth_members am
+         JOIN pg_catalog.pg_roles r ON r.oid = am.roleid
+         JOIN pg_catalog.pg_roles m ON m.oid = am.member
+         WHERE m.rolname = ANY($1::text[])
+         ORDER BY m.rolname, r.rolname`,
+        [zeroPrivManagedPrincipals],
+      ),
+      pool.query(
+        `SELECT p.principal,
+                s.schema_name,
+                pg_catalog.has_schema_privilege(p.principal, s.schema_name, 'USAGE') AS has_usage,
+                pg_catalog.has_schema_privilege(p.principal, s.schema_name, 'CREATE') AS has_create
+         FROM pg_catalog.unnest($1::text[]) AS p(principal)
+         CROSS JOIN pg_catalog.unnest($2::text[]) AS s(schema_name)
+         WHERE pg_catalog.has_schema_privilege(p.principal, s.schema_name, 'USAGE')
+            OR pg_catalog.has_schema_privilege(p.principal, s.schema_name, 'CREATE')`,
+        [zeroPrivManagedPrincipals, MANAGED_SCHEMAS],
+      ),
+      pool.query(
+        `SELECT p.principal, n.nspname AS schema_name, c.relname AS rel_name, pr.priv
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         CROSS JOIN pg_catalog.unnest($1::text[]) AS p(principal)
+         CROSS JOIN pg_catalog.unnest($2::text[]) AS pr(priv)
+         WHERE n.nspname = ANY($3::text[])
+           AND c.relkind IN ('r', 'p', 'v', 'm')
+           AND pg_catalog.has_table_privilege(p.principal, c.oid, pr.priv)`,
+        [zeroPrivManagedPrincipals, ALL_RELATION_PRIVS, MANAGED_SCHEMAS],
+      ),
+      pool.query(
+        `SELECT p.principal, n.nspname AS schema_name, c.relname AS rel_name, pr.priv
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         CROSS JOIN pg_catalog.unnest($1::text[]) AS p(principal)
+         CROSS JOIN pg_catalog.unnest($2::text[]) AS pr(priv)
+         WHERE n.nspname = ANY($3::text[])
+           AND c.relkind IN ('r', 'p', 'v', 'm')
+           AND pg_catalog.has_any_column_privilege(p.principal, c.oid, pr.priv)`,
+        [zeroPrivManagedPrincipals, ALL_COLUMN_PRIVS, MANAGED_SCHEMAS],
+      ),
+      pool.query(
+        `SELECT p.principal,
+                pg_catalog.format('%I.%I(%s)', n.nspname, fn.proname, pg_catalog.oidvectortypes(fn.proargtypes)) AS sig
+         FROM pg_catalog.pg_proc fn
+         JOIN pg_catalog.pg_namespace n ON n.oid = fn.pronamespace
+         CROSS JOIN pg_catalog.unnest($1::text[]) AS p(principal)
+         WHERE n.nspname = ANY($2::text[])
+           AND pg_catalog.has_function_privilege(p.principal, fn.oid, 'EXECUTE')`,
+        [zeroPrivManagedPrincipals, MANAGED_SCHEMAS],
+      ),
+      pool.query(
+        `SELECT r.rolname AS owner_name, 'schema' AS obj_kind, n.nspname AS obj_name
+         FROM pg_catalog.pg_namespace n
+         JOIN pg_catalog.pg_roles r ON r.oid = n.nspowner
+         WHERE n.nspname = ANY($2::text[]) AND r.rolname = ANY($1::text[])
+         UNION ALL
+         SELECT r.rolname AS owner_name, 'relation' AS obj_kind, n.nspname || '.' || c.relname AS obj_name
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
+         WHERE n.nspname = ANY($2::text[]) AND r.rolname = ANY($1::text[])
+         UNION ALL
+         SELECT r.rolname AS owner_name, 'function' AS obj_kind, n.nspname || '.' || fn.proname AS obj_name
+         FROM pg_catalog.pg_proc fn
+         JOIN pg_catalog.pg_namespace n ON n.oid = fn.pronamespace
+         JOIN pg_catalog.pg_roles r ON r.oid = fn.proowner
+         WHERE n.nspname = ANY($2::text[]) AND r.rolname = ANY($1::text[])`,
+        [zeroPrivManagedPrincipals, MANAGED_SCHEMAS],
+      ),
+    ]);
+
+    for (const row of loginExtraMemRes.rows) {
+      if (existingIamMarkerSet.has(row.member_role)) {
         problems.push(
-          `pg_auth_members violation: non-superuser ${row.member_role} holds membership in ${row.granted_role} (admin=${row.admin_option}, inherit=${row.inherit_option}, set=${row.set_option})`,
+          `pg_auth_members violation: IAM marker role ${row.member_role} must not hold membership in ${row.granted_role} (admin=${row.admin_option}, inherit=${row.inherit_option}, set=${row.set_option})`,
         );
+        continue;
+      }
+      if (mappedRuntimeRolesByLogin.get(row.member_role)?.has(row.granted_role)) continue;
+      const allowedMarker = iamLoginMarkerSet.has(row.granted_role)
+        && !row.admin_option
+        && !row.granted_is_super
+        && !row.granted_bypassrls
+        && !row.granted_createrole
+        && !row.granted_createdb
+        && !row.granted_replication;
+      if (!allowedMarker) {
+        problems.push(
+          `pg_auth_members violation: runtime login user ${row.member_role} must not hold extra membership in ${row.granted_role} (admin=${row.admin_option}, inherit=${row.inherit_option}, set=${row.set_option})`,
+        );
+      }
+    }
+    for (const row of loginSchemaPrivRes.rows) {
+      problems.push(`${labelZeroPrivPrincipal(row.principal)} must not hold direct schema privileges on ${row.schema_name} (usage=${row.has_usage}, create=${row.has_create})`);
+    }
+    for (const row of loginRelPrivRes.rows) {
+      problems.push(`${labelZeroPrivPrincipal(row.principal)} must not hold direct ${row.priv} on ${row.schema_name}.${row.rel_name}`);
+    }
+    for (const row of loginColPrivRes.rows) {
+      problems.push(`${labelZeroPrivPrincipal(row.principal)} must not hold direct column-level ${row.priv} on ${row.schema_name}.${row.rel_name}`);
+    }
+    for (const row of loginFnPrivRes.rows) {
+      problems.push(`${labelZeroPrivPrincipal(row.principal)} must not hold direct EXECUTE on ${row.sig}`);
+    }
+    for (const row of loginOwnedObjRes.rows) {
+      problems.push(`${labelZeroPrivPrincipal(row.owner_name)} must not own ${row.obj_kind} ${row.obj_name}`);
+    }
+  }
+
+  // 1c. Audit pg_default_acl in the managed schemas (and global default ACLs targeting audited roles),
+  //     database owner and CREATE on the database and schema public, and sequences in managed schemas.
+  const nonMigratorPlatformRoles = PLATFORM_ROLES.filter((r) => r !== 'platform_migrator');
+  const dbCreateAuditPrincipals = [
+    'public',
+    ...nonMigratorPlatformRoles,
+    ...mappedRuntimeLogins,
+    ...existingRetiredRoles,
+    ...existingIamMarkerRoles,
+  ];
+  const forbiddenDbOwners = new Set([
+    ...nonMigratorPlatformRoles,
+    ...mappedRuntimeLogins,
+    ...existingRetiredRoles,
+    ...existingIamMarkerRoles,
+  ]);
+  const globalDefaultAclForbiddenGrantees = new Set([
+    'public',
+    ...PLATFORM_ROLES,
+    ...mappedRuntimeLogins,
+    ...existingRetiredRoles,
+    ...existingIamMarkerRoles,
+  ]);
+  const [defaultAclRes, dbMetaRes, dbCreateRes, publicSchemaCreateRes, seqRes] = await Promise.all([
+    pool.query(
+      `SELECT r.rolname AS defacl_owner,
+              COALESCE(n.nspname, '<global>') AS schema_name,
+              d.defaclobjtype,
+              COALESCE(gr.rolname, 'public') AS grantee,
+              acl.privilege_type
+       FROM pg_catalog.pg_default_acl d
+       JOIN pg_catalog.pg_roles r ON r.oid = d.defaclrole
+       LEFT JOIN pg_catalog.pg_namespace n ON n.oid = d.defaclnamespace
+       CROSS JOIN LATERAL pg_catalog.aclexplode(d.defaclacl) AS acl
+       LEFT JOIN pg_catalog.pg_roles gr ON gr.oid = acl.grantee
+       WHERE d.defaclnamespace = 0 OR n.nspname = ANY($1::text[])
+       ORDER BY schema_name, defacl_owner, grantee, acl.privilege_type`,
+      [MANAGED_SCHEMAS],
+    ),
+    pool.query(
+      `SELECT d.datname AS db_name,
+              r.rolname AS owner_name,
+              EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'public') AS has_public_schema
+       FROM pg_catalog.pg_database d
+       JOIN pg_catalog.pg_roles r ON r.oid = d.datdba
+       WHERE d.datname = pg_catalog.current_database()`,
+    ),
+    pool.query(
+      `SELECT p.principal
+       FROM pg_catalog.unnest($1::text[]) AS p(principal)
+       WHERE pg_catalog.has_database_privilege(p.principal, pg_catalog.current_database(), 'CREATE')`,
+      [dbCreateAuditPrincipals],
+    ),
+    pool.query(
+      `SELECT p.principal
+       FROM pg_catalog.unnest($1::text[]) AS p(principal)
+       WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'public')
+         AND pg_catalog.has_schema_privilege(p.principal, 'public', 'CREATE')`,
+      [dbCreateAuditPrincipals],
+    ),
+    pool.query(
+      `SELECT c.oid AS seq_oid,
+              n.nspname AS schema_name,
+              c.relname AS seq_name,
+              r.rolname AS owner_name
+       FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
+       WHERE n.nspname = ANY($1::text[]) AND c.relkind = 'S'
+       ORDER BY n.nspname, c.relname`,
+      [MANAGED_SCHEMAS],
+    ),
+  ]);
+
+  for (const row of defaultAclRes.rows) {
+    if (row.schema_name !== '<global>' || globalDefaultAclForbiddenGrantees.has(row.grantee)) {
+      problems.push(
+        `pg_default_acl violation: default ${row.privilege_type} (objtype=${row.defaclobjtype}) by ${row.defacl_owner} on ${row.schema_name} to ${row.grantee} is forbidden`,
+      );
+    }
+  }
+  const dbMeta = dbMetaRes.rows[0];
+  if (dbMeta && forbiddenDbOwners.has(dbMeta.owner_name)) {
+    problems.push(`Database ${dbMeta.db_name} must not be owned by ${dbMeta.owner_name}`);
+  }
+  for (const row of dbCreateRes.rows) {
+    problems.push(`${row.principal} must not hold CREATE on database ${dbMeta?.db_name || '<current>'}`);
+  }
+  for (const row of publicSchemaCreateRes.rows) {
+    problems.push(`${row.principal} must not hold CREATE on schema public`);
+  }
+  if (seqRes.rows.length > 0) {
+    const seqAuditPrincipals = [
+      'public',
+      ...PLATFORM_ROLES,
+      ...mappedRuntimeLogins,
+      ...existingRetiredRoles,
+      ...existingIamMarkerRoles,
+    ];
+    const seqPrivRes = await pool.query(
+      `SELECT s.seq_oid, p.principal, pr.priv
+       FROM pg_catalog.unnest($1::oid[]) AS s(seq_oid)
+       CROSS JOIN pg_catalog.unnest($2::text[]) AS p(principal)
+       CROSS JOIN pg_catalog.unnest(ARRAY['USAGE', 'SELECT', 'UPDATE']::text[]) AS pr(priv)
+       WHERE pg_catalog.has_sequence_privilege(p.principal, s.seq_oid, pr.priv)`,
+      [seqRes.rows.map((s) => s.seq_oid), seqAuditPrincipals],
+    );
+    const seqByOid = new Map(seqRes.rows.map((s) => [Number(s.seq_oid), s]));
+    const zeroSeqPrivPrincipals = new Set([
+      'public',
+      'platform_app',
+      'platform_auth_lookup',
+      ...mappedRuntimeLogins,
+      ...existingRetiredRoles,
+      ...existingIamMarkerRoles,
+    ]);
+    const forbiddenSeqOwners = new Set([
+      'platform_app',
+      'platform_worker',
+      'platform_readonly',
+      'platform_view_owner',
+      'platform_auth_lookup',
+      'platform_iam_sync',
+      ...mappedRuntimeLogins,
+      ...existingRetiredRoles,
+      ...existingIamMarkerRoles,
+    ]);
+    for (const s of seqRes.rows) {
+      if (forbiddenSeqOwners.has(s.owner_name)) {
+        problems.push(`Sequence ${s.schema_name}.${s.seq_name} must not be owned by ${s.owner_name}`);
+      }
+    }
+    for (const row of seqPrivRes.rows) {
+      const s = seqByOid.get(Number(row.seq_oid));
+      const fq = `${s.schema_name}.${s.seq_name}`;
+      if (zeroSeqPrivPrincipals.has(row.principal)) {
+        problems.push(`${row.principal} must not hold ${row.priv} on sequence ${fq}`);
+      } else if (
+        (row.principal === 'platform_readonly' || row.principal === 'platform_worker' || row.principal === 'platform_view_owner')
+        && (row.priv !== 'SELECT' || s.schema_name === 'iam_secret')
+      ) {
+        problems.push(`${row.principal} must not hold ${row.priv} on sequence ${fq}`);
+      } else if (row.principal === 'platform_writer' && s.schema_name === 'iam_secret') {
+        problems.push(`platform_writer must not hold ${row.priv} on sequence ${fq}`);
+      } else if (row.principal === 'platform_iam_sync' && !['platform', 'iam', 'iam_secret'].includes(s.schema_name)) {
+        problems.push(`platform_iam_sync must not hold ${row.priv} on sequence ${fq}`);
       }
     }
   }
 
   // 2. Retired schema coherence_views must not exist; PUBLIC and retired roles hold zero privileges
-  //    on all managed schemas; platform_app holds USAGE strictly on iam, app_views, app_cmd and zero CREATE.
+  //    on all managed schemas; platform_app holds USAGE strictly on iam, app_views, app_cmd;
+  //    every platform role except platform_migrator holds zero CREATE on every managed schema.
   const retiredSchemaRes = await pool.query(
     "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'coherence_views'",
   );
@@ -670,7 +1105,7 @@ export async function verifyIamConfigInvariants(pool) {
     problems.push('Retired schema coherence_views must not exist');
   }
 
-  const schemaPrincipals = ['public', 'platform_app', 'platform_auth_lookup', 'platform_iam_sync', ...existingRetiredRoles];
+  const schemaPrincipals = ['public', ...PLATFORM_ROLES, ...existingRetiredRoles];
   const schemaPrivRes = await pool.query(
     `SELECT p.principal,
             s.schema_name,
@@ -682,6 +1117,7 @@ export async function verifyIamConfigInvariants(pool) {
   );
   const allowedAppUsageSchemas = new Set(['iam', 'app_views', 'app_cmd']);
   const allowedSyncUsageSchemas = new Set(['platform', 'iam', 'iam_secret']);
+  const nonMigratorPlatformRoleSet = new Set(nonMigratorPlatformRoles);
   for (const row of schemaPrivRes.rows) {
     if (row.principal === 'public') {
       if (row.has_usage || row.has_create) {
@@ -708,6 +1144,12 @@ export async function verifyIamConfigInvariants(pool) {
       if (row.has_create) {
         problems.push(`platform_iam_sync must not hold CREATE on schema ${row.schema_name}`);
       }
+    } else if (nonMigratorPlatformRoleSet.has(row.principal)) {
+      if (row.has_create) {
+        problems.push(`${row.principal} must not hold CREATE on schema ${row.schema_name}`);
+      }
+    } else if (row.principal === 'platform_migrator') {
+      continue;
     } else if (row.has_usage || row.has_create) {
       problems.push(`Retired role ${row.principal} must have zero privileges on schema ${row.schema_name}`);
     }
@@ -921,19 +1363,36 @@ export async function verifyIamConfigInvariants(pool) {
   }
 
   // 4. Views lockdown (batched): ZERO privileges for platform_app, PUBLIC, and retired roles on
-  //    every view in coherence, iam, iam_secret, platform.
+  //    every view in coherence, iam, iam_secret, platform, and every view must have its intended
+  //    platform owner so views under FORCE RLS never end up owned by a non-RLS-admitted migrator.
   const viewRes = await pool.query(
     `SELECT n.nspname AS schema_name,
             c.relname AS view_name,
-            c.oid AS view_oid
+            c.oid AS view_oid,
+            r.rolname AS owner_name
      FROM pg_catalog.pg_class c
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
      WHERE n.nspname IN ('coherence', 'iam', 'iam_secret', 'platform')
        AND c.relkind IN ('v', 'm')
      ORDER BY n.nspname, c.relname`,
   );
   if (viewRes.rows.length === 0) {
     problems.push('No views found in schemas coherence / iam / iam_secret / platform');
+  }
+  let foundRunStatesView = false;
+  for (const v of viewRes.rows) {
+    const fq = `${v.schema_name}.${v.view_name}`;
+    if (fq === 'coherence.run_states') foundRunStatesView = true;
+    const expectedOwner = fq === 'coherence.v_current_finished_attempts'
+      ? 'platform_view_owner'
+      : 'platform_readonly';
+    if (v.owner_name !== expectedOwner) {
+      problems.push(`View ${fq} must be owned by ${expectedOwner} (got ${v.owner_name})`);
+    }
+  }
+  if (!foundRunStatesView) {
+    problems.push('Expected view coherence.run_states is missing');
   }
   const viewOids = viewRes.rows.map((r) => r.view_oid);
   const viewInfoByOid = new Map(viewRes.rows.map((r) => [Number(r.view_oid), r]));
@@ -1800,6 +2259,7 @@ export async function verifyIamConfigInvariants(pool) {
   const foundSyncWhitelisted = new Set();
   const foundWorkerOnly = new Set();
   const foundWorkerCmd = new Set();
+  let foundEffectiveBatchesFn = false;
 
   for (const fn of fnRes.rows) {
     const cfg = Array.isArray(fn.proconfig) ? fn.proconfig : [];
@@ -1808,6 +2268,49 @@ export async function verifyIamConfigInvariants(pool) {
     }
     if (fn.pub_exec) {
       problems.push(`PUBLIC has EXECUTE privilege on ${fn.sig}`);
+    }
+    if (fn.sig === 'coherence.run_effective_statement_batches(uuid)') {
+      foundEffectiveBatchesFn = true;
+      if (!fn.prosecdef || fn.owner_name !== 'platform_readonly') {
+        problems.push(`Function ${fn.sig} must be SECURITY DEFINER owned by platform_readonly (got prosecdef=${fn.prosecdef}, owner=${fn.owner_name})`);
+      }
+    }
+    if (fn.prosecdef) {
+      if (fn.nspname === 'app_cmd') {
+        if (fn.owner_name !== 'platform_writer') {
+          problems.push(`SECURITY DEFINER function ${fn.sig} must be owned by platform_writer (got ${fn.owner_name})`);
+        }
+      } else if (fn.nspname === 'app_views') {
+        if (fn.owner_name !== 'platform_view_owner') {
+          problems.push(`SECURITY DEFINER function ${fn.sig} must be owned by platform_view_owner (got ${fn.owner_name})`);
+        }
+      } else if (fn.nspname === 'coherence') {
+        if (fn.sig === 'coherence.backfill_iam_foreign_keys(jsonb, jsonb)') {
+          if (fn.owner_name !== 'platform_versioner') {
+            problems.push(`SECURITY DEFINER function ${fn.sig} must be owned by platform_versioner (got ${fn.owner_name})`);
+          }
+        } else if (fn.sig === 'coherence._ro_run_stage(uuid, bigint)' || fn.sig === 'coherence.run_effective_statement_batches(uuid)') {
+          if (fn.owner_name !== 'platform_readonly') {
+            problems.push(`SECURITY DEFINER function ${fn.sig} must be owned by platform_readonly (got ${fn.owner_name})`);
+          }
+        } else {
+          problems.push(`Unexpected SECURITY DEFINER function ${fn.sig} owned by ${fn.owner_name}`);
+        }
+      } else if (fn.nspname === 'platform') {
+        if (fn.sig === 'platform.stamp_superseded_before_insert()') {
+          if (fn.owner_name !== 'platform_versioner') {
+            problems.push(`SECURITY DEFINER function ${fn.sig} must be owned by platform_versioner (got ${fn.owner_name})`);
+          }
+        } else {
+          problems.push(`Unexpected SECURITY DEFINER function ${fn.sig} owned by ${fn.owner_name}`);
+        }
+      } else if (fn.nspname === 'iam') {
+        if (fn.sig !== 'iam.session_context()' && fn.owner_name !== 'platform_readonly') {
+          problems.push(`SECURITY DEFINER function ${fn.sig} must be owned by platform_readonly (got ${fn.owner_name})`);
+        }
+      } else {
+        problems.push(`Unexpected SECURITY DEFINER function ${fn.sig} owned by ${fn.owner_name}`);
+      }
     }
     if (fn.nspname === 'platform' && ['compute_journal_hash', 'canonical_json', 'sha256_text', 'format_utc_us'].includes(fn.proname) && fn.wrk_exec) {
       problems.push(`platform_worker holds forbidden EXECUTE privilege on ${fn.sig}`);
@@ -1876,6 +2379,9 @@ export async function verifyIamConfigInvariants(pool) {
       problems.push(`platform_app holds forbidden EXECUTE privilege on non-whitelisted function ${fn.sig}`);
     }
   }
+  if (!foundEffectiveBatchesFn) {
+    problems.push('Expected function coherence.run_effective_statement_batches(uuid) was not found in pg_proc');
+  }
   for (const expectedSig of combinedWhitelist) {
     if (!foundWhitelisted.has(expectedSig)) {
       problems.push(`Whitelisted platform_app function ${expectedSig} was not found in pg_proc`);
@@ -1915,6 +2421,7 @@ export async function verifyIamConfigInvariants(pool) {
     checkedIamCmdHelpers: iamCmdFound.length,
     checkedIamRoLookupHelpers: iamRoLookupFound.length,
     checkedAppViewsIamReadHelpers: appViewsIamReadFound.length,
+    mappedRuntimeUsers: mappedRuntimeLogins.length,
     forbiddenBusinessPrivileges: FORBIDDEN_BUSINESS_PRIVS,
     problems,
   };

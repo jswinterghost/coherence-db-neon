@@ -3,21 +3,16 @@
 // imports a company-agnostic JSON manifest read-only (no network), runs Layers 0, 1, 2, 4 and the
 // substance comparator (Gates 1-4) where inputs exist, and prints only a strictly PHI-free summary.
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
+import { join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAppCommands } from '../src/commands/app-cmd.mjs';
 import {
   compareDatabasesAsOf,
   exportJournalNdjson,
   rebuildFromJournalExport,
-  verifyChain,
-  verifyCommitments,
-  verifyObjects,
 } from '../src/commands/journal-export.mjs';
-import { verifyOverlayReconstruction } from '../src/compare/overlay-reconstruction.mjs';
-import { compareDbRuns, compareRunFolders } from '../src/compare/run-comparator.mjs';
 import { runMigrations } from '../src/db/migrate.mjs';
 import { createClient, createPool, resolveLocalUser } from '../src/db/pg-client.mjs';
 import { CANONICAL_TOOLS, seedIamCatalog } from '../src/iam/catalog.mjs';
@@ -27,16 +22,24 @@ import {
   planImportManifestFile,
   readLegacyStatementBatches,
 } from '../src/importer/history-importer.mjs';
+import {
+  runComparatorChecks,
+  runLayer0AndLayer2Checks,
+  snapshotTableCounts,
+  summarizeImportLayer1,
+} from '../src/importer/post-import-checks.mjs';
+import {
+  assertSafeStoresDir,
+  isSameOrInsidePath,
+} from '../src/importer/store-path-safety.mjs';
 import { createFileObjectStore } from '../src/storage/object-store.mjs';
 import { createCodeStore, createDataStore, createStorePair } from '../src/storage/stores.mjs';
 import { sha256Hex } from '../src/util/crypto.mjs';
 import { AppError, redactPhi } from '../src/util/redact.mjs';
 
-const TEST_DB_NAME_RE = /^test_[a-z0-9_]+$/;
+export { assertSafeStoresDir, isSameOrInsidePath };
 
-async function isDir(path) {
-  return stat(path).then((s) => s.isDirectory(), () => false);
-}
+const TEST_DB_NAME_RE = /^test_[a-z0-9_]+$/;
 
 export function assertProofDbName(dbName) {
   if (typeof dbName !== 'string' || !TEST_DB_NAME_RE.test(dbName)) {
@@ -68,110 +71,6 @@ export function assertLocalPgHost(host) {
       400,
       'NON_LOCAL_PGHOST',
     );
-  }
-}
-
-async function resolveCanonicalPath(targetPath) {
-  const abs = resolve(targetPath);
-  const trailing = [];
-  let cur = abs;
-  while (true) {
-    try {
-      const real = await realpath(cur);
-      return trailing.length ? join(real, ...trailing.reverse()) : real;
-    } catch {
-      const parent = dirname(cur);
-      if (parent === cur) return abs;
-      trailing.push(basename(cur));
-      cur = parent;
-    }
-  }
-}
-
-export function isSameOrInsidePath(candidatePath, protectedPath) {
-  const norm = (p) => (process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p);
-  const rel = relative(norm(protectedPath), norm(candidatePath));
-  if (rel === '') return true;
-  if (isAbsolute(rel)) return false;
-  return rel !== '..' && !rel.startsWith(`..${sep}`);
-}
-
-export async function assertSafeStoresDir(storesDir, manifestPath) {
-  if (!storesDir) return;
-  const absManifest = resolve(manifestPath);
-  const baseDir = dirname(absManifest);
-  const raw = JSON.parse(await readFile(absManifest, 'utf8'));
-  const resolveManifestPath = (val) => (
-    typeof val === 'string' && val.trim()
-      ? (isAbsolute(val) ? resolve(val) : resolve(baseDir, val))
-      : null
-  );
-
-  const protectedEntries = [];
-  const addProtected = (key, val) => {
-    const resolved = resolveManifestPath(val);
-    if (resolved) protectedEntries.push({ key, path: resolved });
-  };
-
-  addProtected('coherenceRoot', raw?.coherenceRoot);
-  addProtected('coherenceRepo', raw?.coherenceRepo);
-  addProtected('nusearDataDir', raw?.nusearDataDir);
-  addProtected('nusearSqlitePath', raw?.nusearSqlitePath);
-
-  if (raw?.sources && typeof raw.sources === 'object') {
-    for (const [key, val] of Object.entries(raw.sources)) {
-      if (typeof val === 'string') addProtected(`sources.${key}`, val);
-    }
-  }
-  if (Array.isArray(raw?.overlayCheckpoints)) {
-    raw.overlayCheckpoints.forEach((cp, idx) => {
-      addProtected(`overlayCheckpoints[${idx}]`, cp?.path || cp?.absPath);
-    });
-  }
-  if (Array.isArray(raw?.compareTargets)) {
-    raw.compareTargets.forEach((ct, idx) => {
-      addProtected(`compareTargets[${idx}].leftDir`, ct?.leftDir);
-      addProtected(`compareTargets[${idx}].rightDir`, ct?.rightDir);
-    });
-  }
-
-  const candidateResolved = resolve(storesDir);
-  const candidateCanonical = await resolveCanonicalPath(storesDir);
-  const codeResolved = join(candidateResolved, 'code');
-  const dataResolved = join(candidateResolved, 'data');
-  const writeTargets = [
-    { label: '--stores-dir', resolved: candidateResolved, canonical: candidateCanonical, checkContainsProtected: false },
-    { label: '--stores-dir/code', resolved: codeResolved, canonical: await resolveCanonicalPath(codeResolved), checkContainsProtected: true },
-    { label: '--stores-dir/data', resolved: dataResolved, canonical: await resolveCanonicalPath(dataResolved), checkContainsProtected: true },
-  ];
-
-  for (const entry of protectedEntries) {
-    const protectedCanonical = await resolveCanonicalPath(entry.path);
-    for (const target of writeTargets) {
-      if (
-        isSameOrInsidePath(target.resolved, entry.path)
-        || isSameOrInsidePath(target.canonical, protectedCanonical)
-      ) {
-        throw new AppError(
-          `Refusing ${target.label} equal to or inside configured source path (${entry.key}).`,
-          400,
-          'UNSAFE_STORES_DIR',
-        );
-      }
-      if (
-        target.checkContainsProtected
-        && (
-          isSameOrInsidePath(entry.path, target.resolved)
-          || isSameOrInsidePath(protectedCanonical, target.canonical)
-        )
-      ) {
-        throw new AppError(
-          `Refusing --stores-dir because ${target.label} would contain configured source path (${entry.key}).`,
-          400,
-          'UNSAFE_STORES_DIR',
-        );
-      }
-    }
   }
 }
 
@@ -394,90 +293,6 @@ export async function ensureProofIamSubjectsForBatches(pool, { companyOrgId, env
   }
 }
 
-async function snapshotTableCounts(pool) {
-  const tables = [
-    'runs',
-    'stored_files',
-    'decision_commits',
-    'decisions',
-    'generated_overlays',
-    'statement_batches',
-    'input_versions',
-    'imported_files',
-    'carries',
-  ];
-  const counts = {};
-  for (const tbl of tables) {
-    counts[tbl] = Number((await pool.query(`SELECT pg_catalog.count(*)::int AS n FROM coherence.${tbl}`)).rows[0]?.n ?? 0);
-  }
-  return counts;
-}
-
-function summarizeComparatorTarget(label, rep) {
-  const bob = rep.substance?.bob || null;
-  const ledger = rep.substance?.ledger || null;
-  const stmtDelta = rep.substance?.statementsDelta || null;
-  const entStmts = rep.entityStatements || rep.substance?.entityStatements || null;
-
-  return {
-    label,
-    passed: Boolean(rep.passed),
-    stoppedAtGate: rep.stoppedAtGate ?? null,
-    gates: {
-      gate1: {
-        passed: Boolean(rep.gates?.gate1?.passed),
-        fileCount: rep.inputs?.fileCount ?? 0,
-        sameCount: rep.inputs?.same ?? 0,
-        changedCount: rep.inputs?.changed?.length ?? 0,
-        onlyLeftCount: rep.inputs?.onlyLeft?.length ?? 0,
-        onlyRightCount: rep.inputs?.onlyRight?.length ?? 0,
-      },
-      gate2: {
-        passed: Boolean(rep.gates?.gate2?.passed),
-        skipped: Boolean(rep.gates?.gate2?.skipped),
-        leftRowCount: bob?.leftRowCount ?? null,
-        rightRowCount: bob?.rightRowCount ?? null,
-        differingRowCount: bob?.differingRowCount ?? null,
-        leftSha256: bob?.leftSha256 ?? null,
-        rightSha256: bob?.rightSha256 ?? null,
-        columnMismatchCounts: bob?.columnMismatchCounts ?? {},
-        moneyCentDeltas: bob?.moneyCentDeltas ?? {},
-      },
-      gate3: {
-        passed: Boolean(rep.gates?.gate3?.passed),
-        skipped: Boolean(rep.gates?.gate3?.skipped),
-        leftRowCount: ledger?.leftRowCount ?? null,
-        rightRowCount: ledger?.rightRowCount ?? null,
-        differingRowCount: ledger?.differingRowCount ?? null,
-        leftSha256: ledger?.leftSha256 ?? null,
-        rightSha256: ledger?.rightSha256 ?? null,
-        columnMismatchCounts: ledger?.columnMismatchCounts ?? {},
-        moneyCentDeltas: ledger?.moneyCentDeltas ?? {},
-        conservationPassed: ledger?.conservation?.passed ?? null,
-        bobDownlineRemainderCents: ledger?.conservation?.bobDownlineRemainderCents ?? null,
-        bobUplineRemainderCents: ledger?.conservation?.bobUplineRemainderCents ?? null,
-      },
-      gate4: {
-        passed: Boolean(rep.gates?.gate4?.passed),
-        skipped: Boolean(rep.gates?.gate4?.skipped),
-        statementsDeltaPassed: stmtDelta ? stmtDelta.passed : null,
-        statementsDeltaDifferingRows: stmtDelta?.differingRowCount ?? null,
-        statementsDeltaLeftSha256: stmtDelta?.leftSha256 ?? null,
-        statementsDeltaRightSha256: stmtDelta?.rightSha256 ?? null,
-        statementsDeltaCentDeltas: stmtDelta?.moneyCentDeltas ?? {},
-        entityStatementsPassed: entStmts?.passed ?? null,
-        datesChecked: entStmts?.datesChecked ?? null,
-        filesChecked: entStmts?.filesChecked ?? null,
-        totalLines: entStmts?.totalLines ?? null,
-        ledgerGrossTotal: entStmts?.ledgerGrossTotal ?? null,
-        ledgerRemainderCents: entStmts?.ledgerRemainderCents ?? null,
-        entityCentDeltas: entStmts?.entityCentDeltas ?? null,
-      },
-    },
-    problems: (rep.problems || []).map((p) => redactPhi(p)),
-  };
-}
-
 export async function runHistoryProof({
   manifestPath,
   database,
@@ -584,55 +399,19 @@ export async function runHistoryProof({
       }
     }
 
-    // Layer 0: Database chain, 100%-table commitments, and deep object verification.
-    const chain = await verifyChain(pool);
-    const commitments = await verifyCommitments(pool);
-    const objects = await verifyObjects(pool, stores, { deep: true });
-
-    await commands.recordCheck({
-      dbToken,
-      commandKey: `proof-l0-chain:${chain.headHash}`,
-      checkKind: 'chain',
-      passed: chain.passed,
-      report: chain,
-    });
-    await commands.recordCheck({
-      dbToken,
-      commandKey: `proof-l0-commitments:${sha256Hex(JSON.stringify(commitments))}`,
-      checkKind: 'commitments',
-      passed: commitments.passed,
-      report: commitments,
-    });
-    await commands.recordCheck({
-      dbToken,
-      commandKey: `proof-l0-objects:${sha256Hex(JSON.stringify(objects))}`,
-      checkKind: 'objects',
-      passed: objects.passed,
-      report: objects,
-    });
-
-    const layer0Passed = chain.passed && commitments.passed && objects.passed;
-    if (!layer0Passed) {
-      for (const p of [...chain.problems, ...commitments.problems, ...objects.problems]) {
-        problems.push(redactPhi(`Layer 0: ${p}`));
-      }
-    }
-
-    // Layer 2: Decision-record overlay reconstruction across every imported checkpoint.
-    const layer2Report = await verifyOverlayReconstruction({
-      pool,
+    // Layer 0 (chain, commitments, objects) and Layer 2 (overlay reconstruction).
+    const l02Checks = await runLayer0AndLayer2Checks({
+      readPool: pool,
       stores,
       commands,
       dbToken,
-      pythonPath: manifest.pythonPath || null,
-      coherenceRepo: manifest.coherenceRepo || null,
-      overlayCheckPath: manifest.overlayCheckPath || undefined,
+      manifest,
+      recordChecks: true,
+      checkKeyPrefix: 'proof-l0',
       tempBaseDir,
-      ...(parseOverlay ? { parseOverlay } : {}),
+      parseOverlay,
     });
-    if (!layer2Report.passed) {
-      problems.push(...layer2Report.problems.map((p) => redactPhi(`Layer 2: ${p}`)));
-    }
+    problems.push(...l02Checks.problems);
 
     // Layer 4: Point-in-time database rebuild from its own NDJSON journal (midpoint and tip).
     const tipSeq = Number((await pool.query('SELECT COALESCE(pg_catalog.max(seq), 0)::bigint AS seq FROM coherence.journal_entries')).rows[0]?.seq ?? 0);
@@ -686,206 +465,38 @@ export async function runHistoryProof({
       report: { layer: 4, checkKind: 'journal_rebuild', passed: layer4Passed, moments: layer4Moments },
     });
 
-    // Substance Comparator (Gates 1 to 4) where compareTargets exist in manifest.
-    const makeMissingTargetReport = (problem) => ({
-      passed: false,
-      stoppedAtGate: 1,
-      gates: {
-        gate1: { passed: false },
-        gate2: { passed: false, skipped: true },
-        gate3: { passed: false, skipped: true },
-        gate4: { passed: false, skipped: true },
-      },
-      problems: [problem],
+    // Substance Comparator (Gates 1 to 4) after Layer 4, preserving exact phase and problem order.
+    const comparatorChecks = await runComparatorChecks({
+      readPool: pool,
+      stores,
+      commands,
+      dbToken,
+      manifest,
+      recordChecks: true,
+      tempBaseDir,
     });
+    problems.push(...comparatorChecks.problems);
 
-    const comparatorResults = [];
-    for (const target of (manifest.compareTargets || [])) {
-      const label = target.label || `${target.leftRunSourceFolder || target.leftDir} vs ${target.rightRunSourceFolder || target.rightDir}`;
-      let rep;
-      if (target.leftRunSourceFolder) {
-        const leftRow = (await pool.query(
-          'SELECT id FROM coherence.runs WHERE source_folder = $1 ORDER BY journal_seq DESC LIMIT 1',
-          [target.leftRunSourceFolder],
-        )).rows[0];
-        if (!leftRow) {
-          rep = makeMissingTargetReport(`Left run not found in database: ${target.leftRunSourceFolder}`);
-        } else if (target.rightRunSourceFolder) {
-          const rightRow = (await pool.query(
-            'SELECT id FROM coherence.runs WHERE source_folder = $1 ORDER BY journal_seq DESC LIMIT 1',
-            [target.rightRunSourceFolder],
-          )).rows[0];
-          if (!rightRow) {
-            rep = makeMissingTargetReport(`Right run not found in database: ${target.rightRunSourceFolder}`);
-          } else {
-            rep = await compareDbRuns({
-              pool,
-              stores,
-              leftRunId: leftRow.id,
-              rightRunId: rightRow.id,
-              rightFolderDir: null,
-              mode: 'substance',
-              entity: target.entity || null,
-              entityMapping: target.entityMapping || null,
-              columns: target.columns || {},
-              moneyColumns: target.moneyColumns || null,
-              uplineAmountColumn: target.uplineAmountColumn || null,
-              requireStatementsDelta: Boolean(target.requireStatementsDelta),
-              requireConservation: Boolean(target.requireConservation),
-              expectedEntityParity: target.expectedEntityParity || null,
-              commands,
-              dbToken,
-              tempBaseDir,
-            });
-          }
-        } else if (target.rightDir) {
-          if (!(await isDir(target.rightDir))) {
-            rep = makeMissingTargetReport(`Right comparator folder does not exist: ${target.rightDir}`);
-          } else {
-            rep = await compareDbRuns({
-              pool,
-              stores,
-              leftRunId: leftRow.id,
-              rightRunId: null,
-              rightFolderDir: target.rightDir,
-              mode: 'substance',
-              entity: target.entity || null,
-              entityMapping: target.entityMapping || null,
-              columns: target.columns || {},
-              moneyColumns: target.moneyColumns || null,
-              uplineAmountColumn: target.uplineAmountColumn || null,
-              requireStatementsDelta: Boolean(target.requireStatementsDelta),
-              requireConservation: Boolean(target.requireConservation),
-              expectedEntityParity: target.expectedEntityParity || null,
-              commands,
-              dbToken,
-              tempBaseDir,
-            });
-          }
-        } else {
-          rep = makeMissingTargetReport(`Comparator target ${label} is missing both rightRunSourceFolder and rightDir.`);
-        }
-      } else if (target.leftDir || target.rightDir) {
-        if (!target.leftDir || !(await isDir(target.leftDir))) {
-          rep = makeMissingTargetReport(`Left comparator folder does not exist: ${target.leftDir || '(missing)'}`);
-        } else if (!target.rightDir || !(await isDir(target.rightDir))) {
-          rep = makeMissingTargetReport(`Right comparator folder does not exist: ${target.rightDir || '(missing)'}`);
-        } else {
-          rep = await compareRunFolders(target.leftDir, target.rightDir, {
-            mode: 'substance',
-            entity: target.entity || null,
-            entityMapping: target.entityMapping || null,
-            columns: target.columns || {},
-            moneyColumns: target.moneyColumns || null,
-            uplineAmountColumn: target.uplineAmountColumn || null,
-            requireStatementsDelta: Boolean(target.requireStatementsDelta),
-            requireConservation: Boolean(target.requireConservation),
-            expectedEntityParity: target.expectedEntityParity || null,
-            leftLabel: target.label ? `${target.label}:left` : 'left',
-            rightLabel: target.label ? `${target.label}:right` : 'right',
-          });
-        }
-      } else {
-        rep = makeMissingTargetReport(`Comparator target ${label} is missing leftRunSourceFolder and leftDir.`);
-      }
-      const summarized = summarizeComparatorTarget(label, rep);
-      comparatorResults.push(summarized);
-      if (!summarized.passed) {
-        problems.push(...summarized.problems.map((p) => redactPhi(`Comparator (${label}): ${p}`)));
-      }
-    }
-
-    const comparatorPassed = comparatorResults.every((r) => r.passed);
-    const layer1Passed = importReport.passed && idempotency.passed;
-    const allPassed = layer0Passed && layer1Passed && layer2Report.passed && layer4Passed && comparatorPassed;
+    const layer1 = summarizeImportLayer1(importReport, idempotency);
+    const allPassed = l02Checks.layer0.passed
+      && layer1.passed
+      && l02Checks.layer2.passed
+      && layer4Passed
+      && comparatorChecks.comparator.passed;
 
     return {
       passed: allPassed,
       database,
       companySlug: manifest.companySlug,
       executedAtUtc: new Date().toISOString(),
-      layer0: {
-        passed: layer0Passed,
-        chain: { passed: chain.passed, entries: chain.entries, headHash: chain.headHash },
-        commitments: { passed: commitments.passed, checkedEntries: commitments.checkedEntries },
-        objects: {
-          passed: objects.passed,
-          checkedObjects: objects.checkedObjects,
-          codeInDataStoreCount: objects.codeInDataStoreCount ?? 0,
-        },
-      },
-      layer1: {
-        passed: layer1Passed,
-        importedRunCount: importReport.importedRuns.length,
-        skippedRunCount: importReport.skippedRuns.length,
-        companySentCarryCount: importReport.companySentCarries.length,
-        preCoherenceBatchCount: importReport.preCoherenceBatchesImported,
-        methodCorrectionBatchCount: importReport.methodCorrectionBatchesImported,
-        standaloneFileCount: importReport.standaloneFilesImported,
-        overlayRootCount: (importReport.overlayRoots || []).length,
-        overlayRoots: (importReport.overlayRoots || []).map((r) => ({
-          folder: r.folder,
-          folders: Array.isArray(r.folders) && r.folders.length ? [...r.folders] : [r.folder],
-          commitId: r.commitId,
-          sha256: r.sha256,
-          rowCount: r.rowCount,
-        })),
-        carriedPriorCount: (importReport.carriedPriors || []).length,
-        carriedPriors: (importReport.carriedPriors || []).map((c) => ({
-          folder: c.folder,
-          commitId: c.commitId,
-          parentCommitId: c.parentCommitId,
-          sha256: c.sha256,
-          rowsAdded: c.rowsAdded,
-        })),
-        sqliteParity: importReport.sqliteParity,
-        rebuild: {
-          runsChecked: importReport.rebuildChecks.length,
-          runsPassed: importReport.rebuildChecks.filter((c) => c.passed).length,
-          standingInputPassed: importReport.standingInputRebuildCheck ? importReport.standingInputRebuildCheck.passed : null,
-          standingInputFiles: importReport.standingInputRebuildCheck?.files ?? 0,
-          incidentReportPassed: importReport.incidentReportRebuildCheck ? importReport.incidentReportRebuildCheck.passed : null,
-          incidentReportFiles: importReport.incidentReportRebuildCheck?.files ?? 0,
-          standalonePassed: importReport.standaloneRebuildCheck ? importReport.standaloneRebuildCheck.passed : null,
-          standaloneFiles: importReport.standaloneRebuildCheck?.files ?? 0,
-        },
-        idempotency,
-      },
-      layer2: {
-        passed: layer2Report.passed,
-        checkpointsChecked: layer2Report.checkpointsChecked,
-        checkpointsPassed: layer2Report.checkpointsPassed,
-        totalRowsChecked: layer2Report.totalRowsChecked,
-        replacementChainViolations: layer2Report.replacementChainViolations,
-        currentParityMismatches: layer2Report.currentParityMismatches,
-        bibleAppliedParityMismatches: layer2Report.bibleAppliedParityMismatches,
-        checkpoints: layer2Report.checkpoints.map((cp) => ({
-          purpose: cp.purpose,
-          statementDate: cp.statementDate,
-          origHeaderContract: cp.origHeaderContract,
-          genHeaderContract: cp.genHeaderContract,
-          origRowCount: cp.origRowCount,
-          genRowCount: cp.genRowCount,
-          origSha256: cp.origSha256,
-          genSha256: cp.genSha256,
-          rowsEqual: cp.rowsEqual,
-          replacementChainValid: cp.replacementChainValid,
-          currentParityOk: cp.currentParity.ok,
-          bibleAppliedParityOk: cp.bibleAppliedParity.ok,
-          passed: cp.passed,
-        })),
-      },
+      layer0: l02Checks.layer0,
+      layer1,
+      layer2: l02Checks.layer2,
       layer4: {
         passed: layer4Passed,
         moments: layer4Moments,
       },
-      comparator: {
-        ran: comparatorResults.length > 0,
-        passed: comparatorPassed,
-        targetsChecked: comparatorResults.length,
-        targetsPassed: comparatorResults.filter((r) => r.passed).length,
-        targets: comparatorResults,
-      },
+      comparator: comparatorChecks.comparator,
       problems,
     };
   } finally {

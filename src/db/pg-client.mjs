@@ -24,22 +24,85 @@ export function resolveLocalUser(getUserInfo = userInfo) {
   throw new Error('Could not determine local PostgreSQL user: set PGUSER or USER.');
 }
 
+const SAFE_ROLE_RE = /^[a-z_][a-z0-9_]{0,62}$/;
+const CLOUDSQL_FORBIDDEN_PG_ENV_VARS = Object.freeze([
+  'PGPASSWORD',
+  'PGPASSFILE',
+  'PGOPTIONS',
+  'PGREPLICATION',
+  'PGCLIENTENCODING',
+  'PGCLIENT_ENCODING',
+  'PGBINARY',
+  'PGCONNECT_TIMEOUT',
+  'PGHOSTADDR',
+  'PGSERVICE',
+  'PGSERVICEFILE',
+  'PGSSLMODE',
+  'PGSSLCERT',
+  'PGSSLKEY',
+  'PGSSLROOTCERT',
+  'PGSSLCRL',
+  'PGREQUIRESSL',
+  'PGSSL',
+  'PGCHANNELBINDING',
+  'PGTARGETSESSIONATTRS',
+]);
+
+function buildRoleStartupOption(role) {
+  if (role === undefined || role === null || role === '') return undefined;
+  if (typeof role !== 'string' || !SAFE_ROLE_RE.test(role)) {
+    throw new Error(`Invalid PostgreSQL startup role identifier: ${String(role)}`);
+  }
+  return `-c role=${role}`;
+}
+
+function assertCleanCloudSqlEnv(env) {
+  const forbidden = CLOUDSQL_FORBIDDEN_PG_ENV_VARS.filter(
+    (key) => env[key] !== undefined && String(env[key]).length > 0,
+  );
+  if (forbidden.length > 0) {
+    throw new Error(
+      `Cloud SQL mode forbids PG* environment variable(s) that alter the connection or pass static credentials: ${forbidden.join(', ')}.`,
+    );
+  }
+}
+
+function parsePort(rawPort, defaultPort = 5432) {
+  const port = rawPort !== undefined && rawPort !== null && rawPort !== ''
+    ? Number(rawPort)
+    : defaultPort;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid PostgreSQL port: ${String(rawPort)}`);
+  }
+  return port;
+}
+
 /**
  * Builds PostgreSQL connection options. Local mode connects via configured host or socket and OS user
  * (defaulting to standard port 5432); Cloud SQL mode requires IAM token authentication over TLS or the
- * Cloud SQL Auth Proxy Unix socket and forbids static passwords.
+ * Cloud SQL Auth Proxy Unix socket, sets port explicitly (5432 unless told), and forbids static passwords
+ * and connection-altering PG* environment variables. When options.role is set, sends PostgreSQL startup
+ * parameter options='-c role=<role>' so mapped IAM login users enter the target platform role at
+ * connection startup without application-side SET LOCAL ROLE.
  */
 export function buildConnectionConfig(options = {}) {
+  const startupOptions = buildRoleStartupOption(options.role);
+  if (options.connectionString && (options.mode || (options.env || process.env).COHERENCE_PG_MODE) === 'cloudsql') {
+    throw new Error('Cloud SQL connections take no connection string; use the Cloud SQL Auth Proxy socket or TLS with IAM authentication.');
+  }
   if (options.connectionString) {
     return {
       connectionString: options.connectionString,
       ssl: options.ssl,
       max: options.max ?? 10,
       application_name: options.applicationName || 'coherence-db',
+      ...(startupOptions ? { options: startupOptions } : {}),
     };
   }
-  const mode = options.mode || process.env.COHERENCE_PG_MODE || 'local';
+  const env = options.env || process.env;
+  const mode = options.mode || env.COHERENCE_PG_MODE || 'local';
   if (mode === 'cloudsql') {
+    assertCleanCloudSqlEnv(env);
     if (!options.ssl && !options.socketPath) {
       throw new Error('Cloud SQL connections require TLS or the Cloud SQL Auth Proxy Unix socket.');
     }
@@ -49,29 +112,38 @@ export function buildConnectionConfig(options = {}) {
     if (options.password !== undefined && options.password !== null) {
       throw new Error('Cloud SQL connections forbid static passwords; use iamAccessTokenProvider or the Cloud SQL Auth Proxy socket with IAM authentication.');
     }
+    if (!options.socketPath && !options.host) {
+      throw new Error('Cloud SQL connections require an explicit socketPath or host.');
+    }
     if (!options.socketPath && typeof options.iamAccessTokenProvider !== 'function') {
       throw new Error('Cloud SQL TCP/TLS connections require an iamAccessTokenProvider function for IAM authentication.');
     }
+    if (typeof options.database !== 'string' || !options.database.trim()) {
+      throw new Error('Cloud SQL connections require an explicit database name.');
+    }
+    const port = parsePort(options.port, 5432);
     return {
       host: options.socketPath || options.host,
-      port: options.socketPath ? undefined : Number(options.port || 5432),
-      database: options.database,
+      port,
+      database: options.database.trim(),
       user: options.user,
       password: options.iamAccessTokenProvider,
       ssl: options.socketPath ? false : (options.ssl ?? { rejectUnauthorized: true }),
       max: options.max ?? 10,
       application_name: options.applicationName || 'coherence-db-cloudsql',
+      ...(startupOptions ? { options: startupOptions } : {}),
     };
   }
   return {
-    host: options.host ?? process.env.PGHOST ?? '/tmp',
-    port: Number(options.port ?? process.env.PGPORT ?? 5432),
-    database: options.database ?? process.env.PGDATABASE ?? 'coherence_dev',
+    host: options.host ?? env.PGHOST ?? '/tmp',
+    port: parsePort(options.port ?? env.PGPORT, 5432),
+    database: options.database ?? env.PGDATABASE ?? 'coherence_dev',
     user: options.user ?? resolveLocalUser(options.getUserInfo),
-    password: options.password ?? process.env.PGPASSWORD ?? undefined,
+    password: options.password ?? env.PGPASSWORD ?? undefined,
     ssl: options.ssl ?? false,
     max: options.max ?? 10,
     application_name: options.applicationName || 'coherence-db',
+    ...(startupOptions ? { options: startupOptions } : {}),
   };
 }
 
@@ -141,15 +213,16 @@ export async function withRequestTx(
   fn,
   { readOnly = true, serializable = false, maxRetries = 5 } = {},
 ) {
-  const token = typeof dbToken === 'string' ? dbToken : '';
-  const effectiveReadOnly = Boolean(readOnly) || tokenHasViewAs(token);
   const iso = serializable ? 'ISOLATION LEVEL SERIALIZABLE ' : '';
-  const mode = effectiveReadOnly ? 'READ ONLY' : 'READ WRITE';
-  const beginSql = `BEGIN TRANSACTION ${iso}${mode}`;
   const isPool = isPgPool(poolOrClient);
   const retries = serializable ? Math.max(1, maxRetries) : 1;
 
   for (let attempt = 1; attempt <= retries; attempt++) {
+    const resolved = typeof dbToken === 'function' ? dbToken() : dbToken;
+    const token = typeof resolved === 'string' ? resolved : '';
+    const effectiveReadOnly = Boolean(readOnly) || tokenHasViewAs(token);
+    const mode = effectiveReadOnly ? 'READ ONLY' : 'READ WRITE';
+    const beginSql = `BEGIN TRANSACTION ${iso}${mode}`;
     const client = isPool ? await poolOrClient.connect() : poolOrClient;
     let destroyOnRelease = false;
     try {

@@ -16,3 +16,4 @@ tmp/
 .real-proof-*
 .entity-*
 .history-folders.txt
+*.key.json

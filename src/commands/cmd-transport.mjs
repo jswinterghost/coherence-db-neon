@@ -170,9 +170,9 @@ export function cmdReturn(out, buildFresh) {
 export function createCommandTransport({ pool }) {
   async function runCmd({ client = null, dbToken = null, serializable = true }, fn) {
     const target = client || pool;
-    const token = typeof dbToken === 'string' ? dbToken : '';
+    const tokenArg = typeof dbToken === 'function' || typeof dbToken === 'string' ? dbToken : '';
     try {
-      return await withRequestTx(target, token, fn, { readOnly: false, serializable });
+      return await withRequestTx(target, tokenArg, fn, { readOnly: false, serializable });
     } catch (err) {
       throw mapPgError(err);
     }

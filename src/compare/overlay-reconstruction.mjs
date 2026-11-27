@@ -387,10 +387,7 @@ export async function verifyOverlayReconstruction({
   };
 
   if (commands && dbToken) {
-    const digest = sha256Hex(JSON.stringify({
-      passed: report.passed,
-      checkpoints: results.map((r) => [r.decisionCommitId, r.origSha256, r.genSha256, r.passed]),
-    }));
+    const digest = sha256Hex(JSON.stringify(report));
     await commands.recordCheck({
       dbToken,
       commandKey: `check-overlay-reconstruction:${digest}`,

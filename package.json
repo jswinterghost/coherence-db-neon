@@ -14,7 +14,7 @@
     "check": "node scripts/check-syntax.mjs",
     "docs:state-machine": "node scripts/generate-state-machine-doc.mjs",
     "docs:state-machine:check": "node scripts/generate-state-machine-doc.mjs --check",
-    "test": "node scripts/check-syntax.mjs && node scripts/generate-state-machine-doc.mjs --check && node --test tests/layer1_money_and_history.test.mjs tests/layer2_member_data_code_and_config.test.mjs tests/layer3_state_machine_and_races.test.mjs tests/layer4_import_and_proofs.test.mjs tests/layer5_screens_and_readers.test.mjs tests/layer6_negative_proofs.test.mjs tests/layer7_*.test.mjs tests/clean-text.test.mjs",
+    "test": "node scripts/check-syntax.mjs && node scripts/generate-state-machine-doc.mjs --check && node --test tests/layer1_money_and_history.test.mjs tests/layer2_member_data_code_and_config.test.mjs tests/layer3_state_machine_and_races.test.mjs tests/layer4_import_and_proofs.test.mjs tests/layer5_screens_and_readers.test.mjs tests/layer6_negative_proofs.test.mjs tests/layer7_*.test.mjs tests/provision_and_import.test.mjs tests/clean-text.test.mjs",
     "migrate": "node src/db/migrate.mjs"
   }
 }

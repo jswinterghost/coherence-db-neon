@@ -519,6 +519,9 @@ test('Layer 7 [Base-Table Lockdown & Catalog Audit]: platform_app gets SQLSTATE 
     await db.pool.query('CREATE VIEW iam._audit_iam_view_probe AS SELECT 1 AS ok');
     await db.pool.query('CREATE VIEW platform._audit_platform_view_probe AS SELECT 1 AS ok');
     await db.pool.query('CREATE VIEW iam_secret._audit_secret_view_probe AS SELECT 1 AS ok');
+    await db.pool.query('ALTER VIEW iam._audit_iam_view_probe OWNER TO platform_readonly');
+    await db.pool.query('ALTER VIEW platform._audit_platform_view_probe OWNER TO platform_readonly');
+    await db.pool.query('ALTER VIEW iam_secret._audit_secret_view_probe OWNER TO platform_readonly');
     await db.pool.query('REVOKE ALL ON iam._audit_iam_view_probe, platform._audit_platform_view_probe, iam_secret._audit_secret_view_probe FROM PUBLIC');
     try {
       // Newly created views with no grants pass audit
