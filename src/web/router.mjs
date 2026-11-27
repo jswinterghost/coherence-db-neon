@@ -67,6 +67,113 @@ function sendFile(res, file, contentType = 'text/csv; charset=utf-8') {
   res.end(file.body);
 }
 
+function sendViewResult(res, result, { acceptsGzip = false } = {}) {
+  if (result && result.format === 'csv' && result.file) {
+    return sendFile(res, result.file);
+  }
+  return sendJson(res, 200, result, { acceptsGzip });
+}
+
+function assertReadOnlyGet(method) {
+  if (method !== 'GET') {
+    throw new AppError('This view endpoint is read-only; use GET.', 405, 'METHOD_NOT_ALLOWED');
+  }
+}
+
+async function routeReadOnlyView({ method, parts, q, h, dbToken, res, acceptsGzip }) {
+  if (parts[0] === 'views') {
+    if (parts[1] === 'bob' && parts.length === 2) {
+      assertReadOnlyGet(method);
+      const out = await h.getBookOfBusiness(dbToken, {
+        runId: q('runId'), asOfSeq: q('asOfSeq'), asOf: q('asOf'),
+        organizationId: q('organizationId'), entity: q('entity'), carrier: q('carrier'),
+        status: q('status'), planType: q('planType'), simplePlanType: q('simplePlanType'),
+        state: q('state'), writingNpn: q('writingNpn'), q: q('q'),
+        sort: q('sort'), dir: q('dir'), limit: q('limit'), offset: q('offset'),
+        format: q('format'), acceptsGzip,
+      });
+      sendViewResult(res, out, { acceptsGzip });
+      return true;
+    }
+    if (parts[1] === 'bob' && parts[2] === 'policies' && parts.length === 4) {
+      assertReadOnlyGet(method);
+      sendJson(res, 200, await h.getPolicyDetail(dbToken, parts[3], { runId: q('runId') }), { acceptsGzip });
+      return true;
+    }
+    if (parts[1] === 'ledger' && parts.length === 2) {
+      assertReadOnlyGet(method);
+      const out = await h.getCoherentLedger(dbToken, {
+        runId: q('runId'), asOfSeq: q('asOfSeq'), asOf: q('asOf'),
+        organizationId: q('organizationId'), entity: q('entity'), carrier: q('carrier'),
+        srcType: q('srcType'), revenueType: q('revenueType'), status: q('status'),
+        policyStatus: q('policyStatus'), planType: q('planType'), simplePlanType: q('simplePlanType'),
+        state: q('state'), writingNpn: q('writingNpn'), policyId: q('policyId'),
+        paymentMonth: q('paymentMonth'), statementDate: q('statementDate'), q: q('q'),
+        sort: q('sort'), dir: q('dir'), limit: q('limit'), offset: q('offset'),
+        format: q('format'), acceptsGzip,
+      });
+      sendViewResult(res, out, { acceptsGzip });
+      return true;
+    }
+    if (parts[1] === 'ledger' && parts[2] === 'transactions' && parts.length === 4) {
+      assertReadOnlyGet(method);
+      sendJson(res, 200, await h.getLedgerTransactionDetail(dbToken, parts[3], { runId: q('runId') }), { acceptsGzip });
+      return true;
+    }
+    if (parts[1] === 'statements' && parts.length === 3) {
+      if (parts[2] === 'batches') {
+        assertReadOnlyGet(method);
+        sendJson(res, 200, await h.listStatementBatches(dbToken, {
+          runId: q('runId'), statementDate: q('statementDate'), throughDate: q('throughDate'),
+          batchKind: q('batchKind'), includeUnsent: q('includeUnsent'),
+        }), { acceptsGzip });
+        return true;
+      }
+      if (parts[2] === 'matrix') {
+        assertReadOnlyGet(method);
+        const out = await h.getStatementMatrix(dbToken, {
+          mode: q('mode'), runId: q('runId'), batchId: q('batchId'),
+          statementDate: q('statementDate'), throughDate: q('throughDate'),
+          includeUnsent: q('includeUnsent'), format: q('format'), acceptsGzip,
+        });
+        sendViewResult(res, out, { acceptsGzip });
+        return true;
+      }
+      if (parts[2] === 'lines') {
+        assertReadOnlyGet(method);
+        const out = await h.listStatementLines(dbToken, {
+          batchId: q('batchId'), runId: q('runId'), mode: q('mode'),
+          statementDate: q('statementDate'), throughDate: q('throughDate'),
+          includeUnsent: q('includeUnsent'), organizationId: q('organizationId'),
+          statementEntity: q('statementEntity'), sourceEntity: q('sourceEntity'),
+          accountKind: q('accountKind'), entryKind: q('entryKind'), runAction: q('runAction'),
+          srcType: q('srcType'), srcTypeNull: q('srcTypeNull'),
+          paymentMonth: q('paymentMonth'), paymentMonthNull: q('paymentMonthNull'),
+          carrier: q('carrier'), writingNpn: q('writingNpn'),
+          policyId: q('policyId'), txId: q('txId'), markedSent: q('markedSent'),
+          q: q('q'), sort: q('sort'), dir: q('dir'),
+          limit: q('limit'), offset: q('offset'), format: q('format'), acceptsGzip,
+        });
+        sendViewResult(res, out, { acceptsGzip });
+        return true;
+      }
+      if (parts[2] === 'reconciliation') {
+        assertReadOnlyGet(method);
+        sendJson(res, 200, await h.getStatementReconciliation(dbToken, { runId: q('runId') }), { acceptsGzip });
+        return true;
+      }
+    }
+  }
+  if (parts[0] === 'iam' && parts[1] === 'view-as-candidates' && parts.length === 2) {
+    assertReadOnlyGet(method);
+    sendJson(res, 200, await h.listViewAsCandidates(dbToken, {
+      organizationId: q('organizationId'), roleSlug: q('roleSlug'), q: q('q'),
+    }), { acceptsGzip });
+    return true;
+  }
+  return false;
+}
+
 /**
  * Creates a Node HTTP request handler for /api/coherence/:company/... using handlersByCompany
  * (Map or lookup function) and authenticate(req), which returns ONLY the signed DB session token.
@@ -87,7 +194,16 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
       const pathname = url.pathname.replace(/\/+$/, '') || '/';
 
       // Reject member-identifying record_ids and policy keys in URL paths or query strings so they never enter HTTP access logs.
-      const decodedUrl = decodeURIComponent(`${pathname}${url.search}`);
+      // Query strings decode '+' as space (application/x-www-form-urlencoded) before percent-decoding, matching URLSearchParams.
+      let decodedPath;
+      let decodedSearch;
+      try {
+        decodedPath = decodeURIComponent(pathname);
+        decodedSearch = decodeURIComponent(url.search.replace(/\+/g, ' '));
+      } catch {
+        throw new AppError('Malformed percent-encoding in URL.', 400, 'INVALID_URL');
+      }
+      const decodedUrl = `${decodedPath}${decodedSearch}`;
       if (
         url.searchParams.has('recordId')
         || url.searchParams.has('record_id')
@@ -102,6 +218,10 @@ export function createCoherenceRouter({ handlersByCompany, authenticate }) {
       const parts = rest.split('/').filter(Boolean).map(decodeURIComponent);
       const h = resolveHandlers(company);
       const q = (key) => url.searchParams.get(key);
+
+      if (await routeReadOnlyView({ method, parts, q, h, dbToken, res, acceptsGzip })) {
+        return;
+      }
 
       if (parts[0] === 'inputs') {
         if (method === 'GET' && parts[1] === 'versions' && parts.length === 2) {

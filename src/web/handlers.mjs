@@ -11,6 +11,7 @@ import { formatTimestampUtcUs } from '../util/crypto.mjs';
 import { assertValidRelPath } from '../util/csv.mjs';
 import { AppError, redactPhi } from '../util/redact.mjs';
 import { checkReviewAppDrift } from './drift-check.mjs';
+import { createViewHandlers } from './view-handlers.mjs';
 
 const MAX_BIGINT = '9223372036854775807';
 
@@ -32,6 +33,7 @@ export function createWebHandlers({
   companySlug,
   stores,
   driftCheckConfig = null,
+  maxCsvRows,
 }) {
   const appCmd = createRuntimeCommands({ pool, stores });
   const inReadTx = (dbToken, fn) => runReadTx(pool, dbToken, fn);
@@ -873,8 +875,10 @@ export function createWebHandlers({
   }
 
   const obj = (body) => (body && typeof body === 'object' ? body : {});
+  const viewHandlers = createViewHandlers({ pool, companySlug, resolveAsOfSeqTx, maxCsvRows });
 
   return {
+    ...viewHandlers,
     listInputVersions,
     getInputVersionDetail,
     listStagingFiles,

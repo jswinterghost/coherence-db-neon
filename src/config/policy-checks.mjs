@@ -145,6 +145,7 @@ export const PLATFORM_APP_FUNCTION_WHITELIST = Object.freeze([
   'iam.effective_narrow_person_ids(text, date)',
   'iam.assert_can_write(text, uuid, uuid, date)',
   'app_views.coherence_effective_statement_batches(uuid)',
+  'app_views.coherence_statement_run_batches(uuid)',
   'app_views.coherence_run_stage(uuid, bigint)',
   'app_views.coherence_run_stages()',
   'app_views._read_audit_journal_orgs()',
