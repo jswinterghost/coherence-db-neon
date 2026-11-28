@@ -7,10 +7,9 @@ import { createIamCommands } from '../commands/iam-cmd.mjs';
 import { inReadTx, mapPgError, withRequestTx } from '../db/pg-client.mjs';
 import { canonicalJson, sha256Hex } from '../util/crypto.mjs';
 import { AppError } from '../util/redact.mjs';
-import { assertDatabaseNameAllowed, assertNonProdEndpoint } from './provision-guards.mjs';
 import {
   createStaffTokenProvider,
-  DB_IDENTITY_SQL,
+  inspectProvisionedCompanyDatabase,
   verifySameCompanyDatabase,
 } from './provisioned-runtime.mjs';
 import { intervalToDaterange, loadAgentRegisterExport, planAgentRegisterImport } from './register-plan.mjs';
@@ -68,48 +67,25 @@ async function inspectTargetDatabase(readPool, {
   companySlug, companyDisplayName, expectedEnvironment, allowNonDev, allowScratchDatabase,
   appPoolConfig, readPoolConfig,
 }) {
-  const [readIdentityRes, dbMetaRes, rootOrgRes, todayRes] = await Promise.all([
-    readPool.query(DB_IDENTITY_SQL),
-    readPool.query(`
-      SELECT dc.environment, dc.db_role_kind, dc.company_slug, dc.tenant_org_id, dc.support_external_label,
-             ov.display_name AS company_display_name, ov.status AS company_status
-      FROM iam.database_context dc
-      JOIN iam.organization_versions ov ON ov.organization_id = dc.tenant_org_id AND ov.superseded_by_id IS NULL
-      WHERE dc.singleton = true
-    `),
+  const [{ readIdentity, dbContext }, rootOrgRes, todayRes] = await Promise.all([
+    inspectProvisionedCompanyDatabase(readPool, {
+      companySlug,
+      companyDisplayName: companyDisplayName ? companyDisplayName.trim() : null,
+      expectedEnvironment,
+      allowNonDev,
+      allowScratchDatabase,
+      writePoolConfig: appPoolConfig,
+      readPoolConfig,
+      operationLabel: 'Agent Register import',
+    }),
     readPool.query("SELECT id FROM iam.organizations WHERE org_kind = 'platform_root' LIMIT 1"),
     readPool.query('SELECT iam.business_today()::text AS today'),
   ]);
-
-  const readIdentity = readIdentityRes.rows[0];
-  const dbContext = dbMetaRes.rows[0];
   const rootOrgId = rootOrgRes.rows[0]?.id || null;
   const businessToday = todayRes.rows[0]?.today || null;
-  if (!dbContext || !rootOrgId) {
-    throw new AppError('Target database is not provisioned: iam.database_context or platform_root is missing.', 409, 'DATABASE_NOT_PROVISIONED');
+  if (!rootOrgId) {
+    throw new AppError('Target database is not provisioned: platform_root is missing.', 409, 'DATABASE_NOT_PROVISIONED');
   }
-  if (dbContext.db_role_kind !== 'company_working') {
-    throw new AppError(`Refusing Agent Register import into non-company database (db_role_kind=${dbContext.db_role_kind}).`, 400, 'INVALID_DB_ROLE_KIND');
-  }
-  if (dbContext.company_status !== 'active') {
-    throw new AppError(`Company organization "${dbContext.company_slug}" is not active (status=${dbContext.company_status}).`, 409, 'COMPANY_ORG_INACTIVE');
-  }
-  if (expectedEnvironment && dbContext.environment !== expectedEnvironment) {
-    throw new AppError(`Database environment "${dbContext.environment}" does not match requested environment "${expectedEnvironment}".`, 409, 'ENVIRONMENT_MISMATCH');
-  }
-  if (dbContext.environment !== 'dev' && !allowNonDev) {
-    throw new AppError(`Refusing Agent Register import into non-dev environment "${dbContext.environment}" unless allowNonDev / --allow-non-dev is explicitly specified.`, 400, 'NON_DEV_ENVIRONMENT_REFUSED');
-  }
-  if (appPoolConfig) assertNonProdEndpoint({ pgConfig: appPoolConfig, environment: dbContext.environment, allowNonDev });
-  if (readPoolConfig) assertNonProdEndpoint({ pgConfig: readPoolConfig, environment: dbContext.environment, allowNonDev });
-  if (companySlug && companySlug !== dbContext.company_slug) {
-    throw new AppError(`Requested companySlug "${companySlug}" does not match provisioned database company_slug "${dbContext.company_slug}".`, 409, 'COMPANY_SLUG_MISMATCH');
-  }
-  if (companyDisplayName && companyDisplayName.trim() !== dbContext.company_display_name) {
-    throw new AppError(`Requested companyDisplayName "${companyDisplayName.trim()}" does not match provisioned company display_name "${dbContext.company_display_name}".`, 409, 'COMPANY_DISPLAY_NAME_MISMATCH');
-  }
-  assertDatabaseNameAllowed(readIdentity?.database, { companySlug: dbContext.company_slug, allowScratch: allowScratchDatabase });
-
   return { readIdentity, dbContext, rootOrgId, businessToday };
 }
 

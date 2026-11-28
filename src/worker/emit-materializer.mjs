@@ -29,14 +29,28 @@ const BUCKET_COLS = [
   'other_amount',
 ];
 
-export function parseCents(val) {
+function formatCellRef(context) {
+  if (!context) return '';
+  if (typeof context === 'string') return ` (${context})`;
+  const parts = [];
+  if (context.table) parts.push(`table ${context.table}`);
+  if (context.column) parts.push(`column ${context.column}`);
+  if (context.rowNo != null) parts.push(`row ${context.rowNo}`);
+  return parts.length > 0 ? ` (${parts.join(', ')})` : '';
+}
+
+export function parseCents(val, context = null) {
   if (val == null) return null;
   const s = String(val).trim();
   if (s === '') return null;
   const m = /^([+-])?(\d+)(?:\.(\d+))?$/.exec(s);
-  if (!m) throw new AppError(`Invalid monetary amount format: ${s}`, 422, 'INVALID_MONEY_AMOUNT');
+  if (!m) {
+    throw new AppError(`INVALID_MONEY_AMOUNT: invalid monetary amount${formatCellRef(context)}.`, 422, 'INVALID_MONEY_AMOUNT');
+  }
   const frac = (m[3] || '').padEnd(2, '0');
-  if (frac.length > 2) throw new AppError(`Monetary amount exceeds 2 decimal places: ${s}`, 422, 'INVALID_MONEY_AMOUNT');
+  if (frac.length > 2) {
+    throw new AppError(`INVALID_MONEY_AMOUNT: monetary amount exceeds 2 decimal places${formatCellRef(context)}.`, 422, 'INVALID_MONEY_AMOUNT');
+  }
   const abs = BigInt(m[2]) * 100n + BigInt(frac);
   return m[1] === '-' ? -abs : abs;
 }
@@ -56,29 +70,29 @@ function emptyToNull(val) {
   return s === '' ? null : s;
 }
 
-function parseIntOrNull(val, label) {
+function parseIntOrNull(val, context = null) {
   const s = emptyToNull(val);
   if (s === null) return null;
   if (!/^-?\d+$/.test(s.trim())) {
-    throw new AppError(`Invalid integer for ${label}.`, 422, 'INVALID_INTEGER');
+    throw new AppError(`INVALID_INTEGER: invalid integer${formatCellRef(context)}.`, 422, 'INVALID_INTEGER');
   }
   return Number.parseInt(s.trim(), 10);
 }
 
-function parseBool(val) {
+function parseBool(val, context = null) {
   if (typeof val === 'boolean') return val;
   const s = String(val ?? '').trim().toLowerCase();
   if (s === 'true' || s === '1' || s === 't' || s === 'yes') return true;
   if (s === 'false' || s === '0' || s === 'f' || s === 'no' || s === '') return false;
-  throw new AppError(`Invalid boolean value: ${s}`, 422, 'INVALID_BOOLEAN');
+  throw new AppError(`INVALID_BOOLEAN: invalid boolean${formatCellRef(context)}.`, 422, 'INVALID_BOOLEAN');
 }
 
-function parseDateOrNull(val, label) {
+function parseDateOrNull(val, context = null) {
   const s = emptyToNull(val);
   if (s === null) return null;
   const trimmed = s.trim();
   if (!isValidIsoDate(trimmed)) {
-    throw new AppError(`Invalid ISO date for ${label}.`, 422, 'INVALID_DATE');
+    throw new AppError(`INVALID_DATE: invalid ISO date${formatCellRef(context)}.`, 422, 'INVALID_DATE');
   }
   return trimmed;
 }
@@ -134,9 +148,10 @@ export function parseWorkingTxMap(workingTxCsv) {
   const { header, rows } = parseCsvObjects(workingTxCsv, 'working/tx.csv');
   if (!header.includes('tx_id')) return map;
   for (const r of rows) {
-    const txId = parseIntOrNull(r.tx_id, 'tx_id');
+    const txId = parseIntOrNull(r.tx_id, { table: 'working/tx.csv', column: 'tx_id', rowNo: r._rowNo });
     if (txId == null) continue;
-    const pos = parseIntOrNull(r.source_position ?? r.source_row_no, 'source_position');
+    const posCol = r.source_position !== undefined ? 'source_position' : 'source_row_no';
+    const pos = parseIntOrNull(r.source_position ?? r.source_row_no, { table: 'working/tx.csv', column: posCol, rowNo: r._rowNo });
     map.set(txId, {
       filename: emptyToNull(r.filename),
       sheetName: emptyToNull(r.sheet_name),
@@ -185,7 +200,7 @@ export async function prepareEmitMaterialization({
   const coherentStatusMap = metadata.coherentStatus || {};
   const coherentTrajectoryMap = metadata.coherentTrajectory || {};
   const corpusTail = emptyToNull(metadata.corpusTail);
-  const agencyStart = parseDateOrNull(metadata.agencyStart, 'agencyStart');
+  const agencyStart = parseDateOrNull(metadata.agencyStart, { table: 'emit_metadata', column: 'agencyStart' });
 
   const workingTxMap = parseWorkingTxMap(workingTxCsv);
 
@@ -198,17 +213,18 @@ export async function prepareEmitMaterialization({
   let bobUplineCents = 0n;
 
   for (const row of bobParsed.rows) {
-    const policyId = parseIntOrNull(row.policy_id, 'bob.policy_id');
+    const bobCell = (column) => ({ table: 'canonical_bob.csv', column, rowNo: row._rowNo });
+    const policyId = parseIntOrNull(row.policy_id, bobCell('policy_id'));
     if (policyId == null) {
-      throw new AppError('Every canonical_bob.csv row must have an integer policy_id.', 422, 'MISSING_POLICY_ID');
+      throw new AppError(`MISSING_POLICY_ID: missing integer policy_id${formatCellRef(bobCell('policy_id'))}.`, 422, 'MISSING_POLICY_ID');
     }
     const entity = emptyToNull(row.entity);
     if (!entity) {
-      throw new AppError('Every canonical_bob.csv row must have a non-empty entity.', 422, 'MISSING_ENTITY');
+      throw new AppError(`MISSING_ENTITY: missing entity${formatCellRef(bobCell('entity'))}.`, 422, 'MISSING_ENTITY');
     }
     const writingNpn = emptyToNull(row.writing_npn);
-    const amountCents = parseCents(row.amount);
-    const uplineCents = bobCols.uplineAmount ? parseCents(row[bobCols.uplineAmount]) : null;
+    const amountCents = parseCents(row.amount, bobCell('amount'));
+    const uplineCents = bobCols.uplineAmount ? parseCents(row[bobCols.uplineAmount], bobCell(bobCols.uplineAmount)) : null;
     if (amountCents != null) bobDownlineCents += amountCents;
     if (uplineCents != null) bobUplineCents += uplineCents;
 
@@ -232,10 +248,10 @@ export async function prepareEmitMaterialization({
       address: emptyToNull(row.address),
       county: emptyToNull(row.county),
       state: emptyToNull(row.state),
-      submissionDate: parseDateOrNull(row.submission_date, 'bob.submission_date'),
-      originEffective: parseDateOrNull(row.origin_effective, 'bob.origin_effective'),
-      effectiveDate: parseDateOrNull(row.effective_date, 'bob.effective_date'),
-      terminationDate: parseDateOrNull(row.termination_date, 'bob.termination_date'),
+      submissionDate: parseDateOrNull(row.submission_date, bobCell('submission_date')),
+      originEffective: parseDateOrNull(row.origin_effective, bobCell('origin_effective')),
+      effectiveDate: parseDateOrNull(row.effective_date, bobCell('effective_date')),
+      terminationDate: parseDateOrNull(row.termination_date, bobCell('termination_date')),
       writingNpn,
       writingAgent: emptyToNull(row.writing_agent),
       entity,
@@ -251,12 +267,12 @@ export async function prepareEmitMaterialization({
       amount: formatCents(amountCents),
       uplineAmount: formatCents(uplineCents),
       enrollmentCode: bobCols.enrollmentCode ? emptyToNull(row[bobCols.enrollmentCode]) : null,
-      minDate: parseDateOrNull(row.min_date, 'bob.min_date'),
-      anchorDate: parseDateOrNull(row.anchor_date, 'bob.anchor_date'),
+      minDate: parseDateOrNull(row.min_date, bobCell('min_date')),
+      anchorDate: parseDateOrNull(row.anchor_date, bobCell('anchor_date')),
       agencyId: emptyToNull(row.agency_id),
       conflicts: emptyToNull(row.conflicts),
       spineSource: emptyToNull(row.spine_source),
-      confidenceLevel: parseIntOrNull(row.confidence_level, 'bob.confidence_level'),
+      confidenceLevel: parseIntOrNull(row.confidence_level, bobCell('confidence_level')),
       coherentTrajectory: coherentTrajectoryMap[pidKey] ?? null,
     });
   }
@@ -275,22 +291,31 @@ export async function prepareEmitMaterialization({
   let policyLinkedUplineCents = 0n;
 
   for (const row of ledgerParsed.rows) {
-    const txId = parseIntOrNull(row.tx_id, 'ledger.tx_id');
+    const ledCell = (column) => ({ table: 'coherent_ledger.csv', column, rowNo: row._rowNo });
+    const txId = parseIntOrNull(row.tx_id, ledCell('tx_id'));
     if (txId == null) {
-      throw new AppError('Every coherent_ledger.csv row must have an integer tx_id.', 422, 'MISSING_TX_ID');
+      throw new AppError(`MISSING_TX_ID: missing integer tx_id${formatCellRef(ledCell('tx_id'))}.`, 422, 'MISSING_TX_ID');
     }
     const recordId = emptyToNull(row.record_id);
     const entity = emptyToNull(row.entity);
     const srcType = emptyToNull(row.src_type);
     if (!recordId || !entity || !srcType) {
-      throw new AppError('coherent_ledger.csv row is missing required record_id, entity, or src_type.', 422, 'MISSING_LEDGER_FIELDS');
+      throw new AppError(
+        `MISSING_LEDGER_FIELDS: missing required record_id, entity, or src_type (table coherent_ledger.csv, row ${row._rowNo}).`,
+        422,
+        'MISSING_LEDGER_FIELDS',
+      );
     }
 
-    const grossCents = parseCents(row.gross_comm);
-    const downlineCents = parseCents(row.downline_amount);
-    const uplineCents = parseCents(row[ledCols.uplineAmount]);
+    const grossCents = parseCents(row.gross_comm, ledCell('gross_comm'));
+    const downlineCents = parseCents(row.downline_amount, ledCell('downline_amount'));
+    const uplineCents = parseCents(row[ledCols.uplineAmount], ledCell(ledCols.uplineAmount));
     if (grossCents == null || downlineCents == null || uplineCents == null) {
-      throw new AppError('coherent_ledger.csv rows must carry non-null gross_comm, downline_amount, and upline split.', 422, 'NULL_LEDGER_SPLIT');
+      throw new AppError(
+        `NULL_LEDGER_SPLIT: missing gross_comm, downline_amount, or upline split (table coherent_ledger.csv, row ${row._rowNo}).`,
+        422,
+        'NULL_LEDGER_SPLIT',
+      );
     }
     if (downlineCents + uplineCents !== grossCents) {
       throw new AppError(
@@ -304,7 +329,7 @@ export async function prepareEmitMaterialization({
     let hotCount = 0;
     let hotVal = null;
     for (const col of BUCKET_COLS) {
-      const c = parseCents(row[col]);
+      const c = parseCents(row[col], ledCell(col));
       buckets[col] = formatCents(c);
       if (c != null) {
         hotCount += 1;
@@ -315,7 +340,7 @@ export async function prepareEmitMaterialization({
       throw new AppError(`Ledger row tx ${txId} must have exactly one revenue bucket equal to gross_comm.`, 409, 'INVALID_REVENUE_BUCKET');
     }
 
-    const policyId = parseIntOrNull(row.policy_id, 'ledger.policy_id');
+    const policyId = parseIntOrNull(row.policy_id, ledCell('policy_id'));
     ledgerGrossCents += grossCents;
     ledgerDownlineCents += downlineCents;
     ledgerUplineCents += uplineCents;
@@ -340,14 +365,14 @@ export async function prepareEmitMaterialization({
       state: emptyToNull(row.state),
       planType: emptyToNull(row.plan_type),
       simplePlanType: emptyToNull(row.simple_plan_type),
-      submissionDate: parseDateOrNull(row.submission_date, 'ledger.submission_date'),
-      originEffective: parseDateOrNull(row.origin_effective, 'ledger.origin_effective'),
-      effectiveDate: parseDateOrNull(row.effective_date, 'ledger.effective_date'),
-      terminationDate: parseDateOrNull(row.termination_date, 'ledger.termination_date'),
-      earnedDate: parseDateOrNull(row.earned_date, 'ledger.earned_date'),
-      paymentDate: parseDateOrNull(row.payment_date, 'ledger.payment_date'),
-      statementDate: parseDateOrNull(row.statement_date, 'ledger.statement_date'),
-      minDate: parseDateOrNull(row.min_date, 'ledger.min_date'),
+      submissionDate: parseDateOrNull(row.submission_date, ledCell('submission_date')),
+      originEffective: parseDateOrNull(row.origin_effective, ledCell('origin_effective')),
+      effectiveDate: parseDateOrNull(row.effective_date, ledCell('effective_date')),
+      terminationDate: parseDateOrNull(row.termination_date, ledCell('termination_date')),
+      earnedDate: parseDateOrNull(row.earned_date, ledCell('earned_date')),
+      paymentDate: parseDateOrNull(row.payment_date, ledCell('payment_date')),
+      statementDate: parseDateOrNull(row.statement_date, ledCell('statement_date')),
+      minDate: parseDateOrNull(row.min_date, ledCell('min_date')),
       grossComm: formatCents(grossCents),
       revenueType: emptyToNull(row.revenue_type),
       overrideAmount: buckets.override_amount,
@@ -364,13 +389,13 @@ export async function prepareEmitMaterialization({
       agencyId: emptyToNull(row.agency_id),
       status: emptyToNull(row.status),
       policyStatus: emptyToNull(row.policy_status),
-      cbobC: parseBool(row.cbob_c),
-      cbobS: parseBool(row.cbob_s),
-      sf: parseBool(row.sf),
+      cbobC: parseBool(row.cbob_c, ledCell('cbob_c')),
+      cbobS: parseBool(row.cbob_s, ledCell('cbob_s')),
+      sf: parseBool(row.sf, ledCell('sf')),
       notes: emptyToNull(row.notes),
       coherentNotes: emptyToNull(row.coherent_notes),
       sheetName: txMeta?.sheetName ?? emptyToNull(row.sheet_name),
-      sourceRowNo: txMeta?.sourceRowNo ?? parseIntOrNull(row.source_row_no, 'ledger.source_row_no'),
+      sourceRowNo: txMeta?.sourceRowNo ?? parseIntOrNull(row.source_row_no, ledCell('source_row_no')),
     });
   }
 
@@ -424,23 +449,36 @@ export async function prepareEmitMaterialization({
   }
 
   for (const row of stmtParsed.rows) {
+    const stmtCell = (column) => ({ table: resolvedFileName, column, rowNo: row._rowNo });
     const runAction = emptyToNull(row.run_action);
     if (!['NEW', 'RESTATED', 'REVERSAL', 'CANCEL'].includes(runAction)) {
-      throw new AppError(`Invalid statement run_action: ${runAction}`, 422, 'INVALID_RUN_ACTION');
+      throw new AppError(
+        `INVALID_RUN_ACTION: invalid statement run_action${formatCellRef(stmtCell('run_action'))}.`,
+        422,
+        'INVALID_RUN_ACTION',
+      );
     }
     const recordId = emptyToNull(row.record_id);
     const entity = emptyToNull(row.entity);
     if (!recordId || !entity) {
-      throw new AppError('Statement row is missing required record_id or entity.', 422, 'MISSING_STATEMENT_FIELDS');
+      throw new AppError(
+        `MISSING_STATEMENT_FIELDS: missing required record_id or entity (table ${resolvedFileName}, row ${row._rowNo}).`,
+        422,
+        'MISSING_STATEMENT_FIELDS',
+      );
     }
-    const grossCents = parseCents(row.gross_comm);
+    const grossCents = parseCents(row.gross_comm, stmtCell('gross_comm'));
     if (grossCents == null) {
-      throw new AppError('Statement row is missing gross_comm.', 422, 'MISSING_GROSS_COMM');
+      throw new AppError(
+        `MISSING_GROSS_COMM: missing gross_comm${formatCellRef(stmtCell('gross_comm'))}.`,
+        422,
+        'MISSING_GROSS_COMM',
+      );
     }
     statementsGrossCents += grossCents;
 
-    let downlineCents = parseCents(row.downline_amount);
-    let uplineCents = stmtCols.uplineAmount ? parseCents(row[stmtCols.uplineAmount]) : null;
+    let downlineCents = parseCents(row.downline_amount, stmtCell('downline_amount'));
+    let uplineCents = stmtCols.uplineAmount ? parseCents(row[stmtCols.uplineAmount], stmtCell(stmtCols.uplineAmount)) : null;
 
     if (downlineCents != null && uplineCents != null) {
       if (downlineCents + uplineCents !== grossCents) {
@@ -474,7 +512,7 @@ export async function prepareEmitMaterialization({
       );
     }
 
-    const txId = parseIntOrNull(row.tx_id, 'statement.tx_id');
+    const txId = parseIntOrNull(row.tx_id, stmtCell('tx_id'));
     const txMeta = txId != null ? workingTxMap.get(txId) : null;
     const baseLine = {
       batchId: statementBatchId,
@@ -494,18 +532,18 @@ export async function prepareEmitMaterialization({
       mbi: emptyToNull(row.mbi),
       member: emptyToNull(row.member),
       externalPolicyId: stmtCols.externalPolicyId ? emptyToNull(row[stmtCols.externalPolicyId]) : null,
-      policyId: parseIntOrNull(row.policy_id, 'statement.policy_id'),
+      policyId: parseIntOrNull(row.policy_id, stmtCell('policy_id')),
       txId,
       planType: emptyToNull(row.plan_type),
       simplePlanType: emptyToNull(row.simple_plan_type),
       state: emptyToNull(row.state),
-      submissionDate: parseDateOrNull(row.submission_date, 'statement.submission_date'),
-      originEffective: parseDateOrNull(row.origin_effective, 'statement.origin_effective'),
-      effectiveDate: parseDateOrNull(row.effective_date, 'statement.effective_date'),
-      terminationDate: parseDateOrNull(row.termination_date, 'statement.termination_date'),
-      earnedDate: parseDateOrNull(row.earned_date, 'statement.earned_date'),
-      paymentDate: parseDateOrNull(row.payment_date, 'statement.payment_date'),
-      postedStatementDate: parseDateOrNull(row.statement_date, 'statement.statement_date'),
+      submissionDate: parseDateOrNull(row.submission_date, stmtCell('submission_date')),
+      originEffective: parseDateOrNull(row.origin_effective, stmtCell('origin_effective')),
+      effectiveDate: parseDateOrNull(row.effective_date, stmtCell('effective_date')),
+      terminationDate: parseDateOrNull(row.termination_date, stmtCell('termination_date')),
+      earnedDate: parseDateOrNull(row.earned_date, stmtCell('earned_date')),
+      paymentDate: parseDateOrNull(row.payment_date, stmtCell('payment_date')),
+      postedStatementDate: parseDateOrNull(row.statement_date, stmtCell('statement_date')),
       revenueType: emptyToNull(row.revenue_type),
       grossComm: formatCents(grossCents),
       reason: emptyToNull(row.reason),

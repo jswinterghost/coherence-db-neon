@@ -297,8 +297,27 @@ export function mapPgError(error) {
     return new AppError(msg, 409, prefix || 'EXCLUSION_VIOLATION');
   }
   if (pgCode === '22023') {
+    if (prefix === 'UNMAPPED_WRITING_NPN') {
+      const tbl = /\bin\s+(coherence\.[a-z_][a-z0-9_]*)\b/i.exec(rawMessage)?.[1] || 'coherence';
+      return new AppError(
+        `UNMAPPED_WRITING_NPN: unmapped writing_npn in ${tbl} (column writing_npn).`,
+        409,
+        'UNMAPPED_WRITING_NPN',
+      );
+    }
     const isInputErr = prefix && (prefix.startsWith('MISSING_') || prefix.startsWith('INVALID_'));
     return new AppError(msg, isInputErr ? 400 : 409, prefix || 'INVARIANT_VIOLATION');
+  }
+  if (pgCode === '21000') {
+    if (prefix === 'AMBIGUOUS_WRITING_NPN') {
+      const tbl = /\bin\s+(coherence\.[a-z_][a-z0-9_]*)\b/i.exec(rawMessage)?.[1] || 'coherence';
+      return new AppError(
+        `AMBIGUOUS_WRITING_NPN: ambiguous writing_npn in ${tbl} (column writing_npn).`,
+        409,
+        'AMBIGUOUS_WRITING_NPN',
+      );
+    }
+    return new AppError(msg, 409, prefix || 'AMBIGUOUS_MATCH');
   }
   if (pgCode === '23514') {
     return new AppError(msg, 409, prefix || 'INVARIANT_VIOLATION');

@@ -7,10 +7,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAppCommands } from '../commands/app-cmd.mjs';
-import { assertDatabaseNameAllowed, assertNonProdEndpoint } from '../iam/provision-guards.mjs';
 import {
   createStaffTokenProvider,
-  DB_IDENTITY_SQL,
+  inspectProvisionedCompanyDatabase,
   verifySameCompanyDatabase,
 } from '../iam/provisioned-runtime.mjs';
 import { AppError, redactPhi } from '../util/redact.mjs';
@@ -58,59 +57,16 @@ export async function importHistoryIntoDatabase({
 
   try {
     const manifest = await loadImportManifestFile(manifestPath, { tempBaseDir });
-    const [readIdentityRes, dbMetaRes] = await Promise.all([
-      readPool.query(DB_IDENTITY_SQL),
-      readPool.query(`
-        SELECT dc.environment, dc.db_role_kind, dc.company_slug, dc.tenant_org_id, dc.support_external_label
-        FROM iam.database_context dc
-        WHERE dc.singleton = true
-      `),
-    ]);
-    const readIdentity = readIdentityRes.rows[0];
-    const dbContext = dbMetaRes.rows[0];
-    if (!dbContext) {
-      throw new AppError('Target database is not provisioned: iam.database_context is empty.', 409, 'DATABASE_NOT_PROVISIONED');
-    }
-    assertDatabaseNameAllowed(readIdentity?.database, {
-      companySlug: manifest.companySlug,
-      allowScratch: allowScratchDatabase,
-    });
-    if (dbContext.environment !== 'dev' && !allowNonDev) {
-      throw new AppError(
-        `Refusing history import into non-dev environment "${dbContext.environment}" unless allowNonDev / --allow-non-dev is explicitly specified.`,
-        400,
-        'NON_DEV_ENVIRONMENT_REFUSED',
-      );
-    }
-    if (appPoolConfig) {
-      assertNonProdEndpoint({ pgConfig: appPoolConfig, environment: dbContext.environment, allowNonDev });
-    }
-    if (readPoolConfig) {
-      assertNonProdEndpoint({ pgConfig: readPoolConfig, environment: dbContext.environment, allowNonDev });
-    }
-    if (dbContext.db_role_kind !== 'company_working') {
-      throw new AppError(`Refusing history import into non-company database (db_role_kind=${dbContext.db_role_kind}).`, 400, 'INVALID_DB_ROLE_KIND');
-    }
-    if (dbContext.company_slug !== manifest.companySlug) {
-      throw new AppError(
-        `Manifest companySlug "${manifest.companySlug}" does not match provisioned database company_slug "${dbContext.company_slug}".`,
-        409,
-        'COMPANY_SLUG_MISMATCH',
-      );
-    }
     // the upline statement's own lines name the company, so the manifest must name it exactly as the database does
-    const companyNameRes = await readPool.query(
-      'SELECT ov.display_name FROM iam.organization_versions ov WHERE ov.organization_id = $1 AND ov.superseded_by_id IS NULL',
-      [dbContext.tenant_org_id],
-    );
-    const companyDisplayName = companyNameRes.rows[0]?.display_name ?? null;
-    if (!companyDisplayName || manifest.displayName !== companyDisplayName) {
-      throw new AppError(
-        `Manifest displayName "${manifest.displayName}" does not match the provisioned company's name "${companyDisplayName}".`,
-        409,
-        'COMPANY_DISPLAY_NAME_MISMATCH',
-      );
-    }
+    const { readIdentity, dbContext } = await inspectProvisionedCompanyDatabase(readPool, {
+      companySlug: manifest.companySlug,
+      companyDisplayName: manifest.displayName ?? '',
+      allowNonDev,
+      allowScratchDatabase,
+      writePoolConfig: appPoolConfig,
+      readPoolConfig,
+      operationLabel: 'History import',
+    });
 
     let effectiveToken = dbToken;
     if (!effectiveToken) {

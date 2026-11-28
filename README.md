@@ -116,6 +116,25 @@ node scripts/import-history.mjs \
 
 The manifest's `displayName` must be the provisioned company's name exactly (`COMPANY_DISPLAY_NAME_MISMATCH` otherwise): a pre-Coherence upline statement is the company's own, so the legacy bridge's per-file rounding line on it names the company, never an invented entity (Release P2.1).
 
+To materialize finished, non-abandoned `company_import` runs' Emit outputs from the separated stores into Book of Business, Coherent Ledger, and statement tables so they appear in `app_views.coherence_published_runs`, the Book, the Ledger, and reconciliation (Release P4; publishes `company_import` runs only and skips legacy `mac_import` runs as `skippedLegacyMacImport`, ordering same-date runs unsent before sent so the sent run is current on its date; reads as `platform_readonly`, writes strictly as non-superuser `platform_worker` with the mode-600 `service` key verified inside PostgreSQL before any work, idempotent across reruns, all or nothing per run, refusing on any mismatch, and reporting counts only; add `--plan` to list the runs it would materialize and check prerequisites without writing anything):
+
+```sh
+node scripts/materialize-imported-emits.mjs \
+  --pg-mode cloudsql \
+  --worker-socket-path /path/to/worker/project:region:instance \
+  --readonly-socket-path /path/to/readonly/project:region:instance \
+  --database <company_slug> \
+  --worker-user <worker-iam-user> \
+  --readonly-user <readonly-iam-user> \
+  --stores-dir /path/to/stores \
+  --key-file /path/to/keys/<company_slug>-dev-service.key.json
+```
+
+Prerequisites before running `scripts/materialize-imported-emits.mjs`:
+- The target company database is provisioned (`scripts/provision-company-db.mjs`) with an active `coherence_worker_svc` principal and `platform_worker` / `platform_readonly` role mappings, and historical runs have been imported (`scripts/import-history.mjs`).
+- Every organization and `company_local` writing-agent NPN referenced in the runs' emitted CSVs is already seeded in IAM (e.g. from the Agent Register).
+- Every prior `Sent/statements_YYYYMMDD.csv` entry in each candidate run's frozen inputs matches a `historical_sent` batch or a prior sent `run_emission` batch in `coherence.statement_batches` (already materialized or earlier in the same plan). Both `--plan` (which returns `passed: false` with the missing dates and counts) and execute (`MISSING_PRIOR_SENT_BATCHES`) preflight this before writing anything, and execute also verifies every candidate run's store objects before its first write.
+
 The history import resolves every statement's organizations and writing NPNs to the company's own people, so the Agent Register's people go in first, from one approved register version (`scripts/import-agent-register.mjs`, Release P2; `--plan` reads the file only and touches no database):
 
 ```sh

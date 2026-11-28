@@ -1,8 +1,9 @@
 // Isolated PostgreSQL 17 test harness using throwaway test databases and in-memory stores with zero live-service access.
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { PLATFORM_ROLES } from '../../src/config/policy-checks.mjs';
 import { createClient, createPool, resolveLocalUser } from '../../src/db/pg-client.mjs';
 import { runMigrations } from '../../src/db/migrate.mjs';
 import { createMemoryObjectStore } from '../../src/storage/object-store.mjs';
@@ -11,6 +12,18 @@ import { seedCoherenceIamFixture } from './iam-harness.mjs';
 import { createAppCommands } from '../../src/commands/app-cmd.mjs';
 
 export const TEST_DB_PREFIX = 'coherence_test_';
+
+export function quoteIdent(ident) {
+  return `"${String(ident).replace(/"/g, '""')}"`;
+}
+
+export async function writeTree(baseDir, files) {
+  for (const [rel, content] of Object.entries(files)) {
+    const full = join(baseDir, ...rel.split('/'));
+    await mkdir(dirname(full), { recursive: true });
+    await writeFile(full, content, 'utf8');
+  }
+}
 
 export function getAdminPgConfig(options = {}) {
   return {
@@ -26,6 +39,71 @@ function assertTestDbName(dbName) {
   if (typeof dbName !== 'string' || !dbName.startsWith(TEST_DB_PREFIX) || !/^[a-z0-9_]+$/.test(dbName)) {
     throw new Error(`Refusing to manage database outside ${TEST_DB_PREFIX}* namespace: ${dbName}`);
   }
+}
+
+export async function createScratchDb(prefix = 'scratch', ownerRole = null, customAdminConfig = null) {
+  const suffix = randomBytes(5).toString('hex');
+  const dbName = `${TEST_DB_PREFIX}${prefix}_${suffix}`;
+  assertTestDbName(dbName);
+  const adminConfig = customAdminConfig || getAdminPgConfig();
+  const admin = await createClient(adminConfig);
+  try {
+    const ownerClause = ownerRole ? ` OWNER ${quoteIdent(ownerRole)}` : '';
+    await admin.query(`CREATE DATABASE ${quoteIdent(dbName)} ENCODING 'UTF8'${ownerClause}`);
+  } finally {
+    await admin.end();
+  }
+  const pgConfig = { ...adminConfig, database: dbName };
+  async function drop() {
+    const c = await createClient(adminConfig).catch(() => null);
+    if (!c) return;
+    try {
+      assertTestDbName(dbName);
+      await c.query(
+        'SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()',
+        [dbName],
+      );
+      await c.query(`DROP DATABASE IF EXISTS ${quoteIdent(dbName)}`);
+    } finally {
+      await c.end().catch(() => {});
+    }
+  }
+  return { dbName, pgConfig, adminConfig, drop };
+}
+
+export async function createLoginRoles(adminConfig, specs) {
+  const admin = await createClient(adminConfig);
+  const created = [];
+  try {
+    for (const s of specs) {
+      const password = s.password ?? `pw_${randomBytes(16).toString('hex')}`;
+      const attrs = s.attrs || 'LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOBYPASSRLS NOREPLICATION INHERIT';
+      await admin.query(`CREATE ROLE ${quoteIdent(s.name)} ${attrs} PASSWORD '${password}'`);
+      created.push({ name: s.name, password });
+    }
+  } catch (err) {
+    for (const r of created.reverse()) {
+      await admin.query(`DROP ROLE IF EXISTS ${quoteIdent(r.name)}`).catch(() => {});
+    }
+    throw err;
+  } finally {
+    await admin.end();
+  }
+  async function cleanup() {
+    const c = await createClient(adminConfig).catch(() => null);
+    if (!c) return;
+    try {
+      for (const r of [...created].reverse()) {
+        for (const pr of PLATFORM_ROLES) {
+          await c.query(`REVOKE ${quoteIdent(pr)} FROM ${quoteIdent(r.name)}`).catch(() => {});
+        }
+        await c.query(`DROP ROLE IF EXISTS ${quoteIdent(r.name)}`).catch(() => {});
+      }
+    } finally {
+      await c.end().catch(() => {});
+    }
+  }
+  return { roles: created, byName: new Map(created.map((r) => [r.name, r])), cleanup };
 }
 
 export async function createEmptyMigratedTestDb() {

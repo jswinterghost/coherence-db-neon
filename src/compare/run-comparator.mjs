@@ -14,8 +14,40 @@ import { formatCents, parseCents } from '../worker/emit-materializer.mjs';
 import { listFilesRecursive, rebuildRunFolderFromDb } from '../worker/folder-builder.mjs';
 
 const UNIDENTIFIED_KEY_RE = /^policy:([^:]+):unidentified:[0-9a-f]{64}$/;
-const STATEMENTS_DELTA_RE = /^emits\/statements_(\d{8})\.csv$/;
+export const STATEMENTS_DELTA_RE = /^emits\/statements_(\d{8})\.csv$/;
+export const ENTITY_MANAGER_BUNDLE_PREFIX_RE = /^(emits\/bundles\/entity-managers\/[^/]+\/)/;
 const DEFAULT_MAX_DIFF_ROWS = 50;
+
+export function resolveEntityManagerBundlePrefix(
+  paths,
+  { candidates = [], allowSingleFallback = true, errorPrefix = '' } = {},
+) {
+  const prefixes = new Set();
+  for (const relPath of paths) {
+    const m = ENTITY_MANAGER_BUNDLE_PREFIX_RE.exec(relPath);
+    if (m) prefixes.add(m[1]);
+  }
+  const list = [...prefixes].sort();
+  if (list.length === 0) return null;
+  for (const name of candidates) {
+    if (typeof name !== 'string' || name.trim().length === 0) continue;
+    const exact = `emits/bundles/entity-managers/${name}/`;
+    if (prefixes.has(exact)) return exact;
+  }
+  if (allowSingleFallback && list.length === 1) return list[0];
+  if (list.length === 1) {
+    throw new AppError(
+      `${errorPrefix}entity-manager bundle does not match run emit_display, default_emit_display, or company display name.`,
+      409,
+      'UNMATCHED_ENTITY_BUNDLE',
+    );
+  }
+  throw new AppError(
+    `${errorPrefix}multiple entity-manager bundles exist and none matches expected display name.`,
+    409,
+    'AMBIGUOUS_ENTITY_BUNDLE',
+  );
+}
 
 const STANDARD_MONEY_COLS = new Set([
   'amount',
@@ -598,27 +630,10 @@ function verifyManifestBundles(sideMap, manifestEntry) {
 
 function discoverSubstanceArtifacts(sideMap, { entity = null } = {}) {
   const keys = [...sideMap.keys()].sort();
-  const pickEntityManagerPrefix = () => {
-    const prefixes = new Set();
-    for (const k of keys) {
-      const m = /^(emits\/bundles\/entity-managers\/[^/]+\/)/.exec(k);
-      if (m) prefixes.add(m[1]);
-    }
-    const list = [...prefixes].sort();
-    if (list.length === 0) return null;
-    if (entity) {
-      const exact = `emits/bundles/entity-managers/${entity}/`;
-      if (prefixes.has(exact)) return exact;
-    }
-    if (list.length === 1) return list[0];
-    throw new AppError(
-      'Multiple entity-manager bundles exist in run; pass target entity for substance comparison.',
-      409,
-      'AMBIGUOUS_ENTITY_BUNDLE',
-    );
-  };
-
-  const emPrefix = pickEntityManagerPrefix();
+  const emPrefix = resolveEntityManagerBundlePrefix(keys, {
+    candidates: entity ? [entity] : [],
+    allowSingleFallback: true,
+  });
   let viewerCfg = null;
   if (emPrefix && sideMap.has(`${emPrefix}viewer.html`)) {
     try {

@@ -50,43 +50,12 @@ import {
   sampleApprovalRow,
 } from './helpers/fixtures.mjs';
 import { createRoleScopedTestPool } from './helpers/iam-harness.mjs';
-import { checkPgAvailable, getAdminPgConfig, TEST_DB_PREFIX } from './helpers/test-db.mjs';
+import { checkPgAvailable, createScratchDb, writeTree } from './helpers/test-db.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = join(REPO_ROOT, 'scripts', 'import-agent-register.mjs');
 const pgCheck = await checkPgAvailable();
-
-function quoteIdent(ident) {
-  return `"${String(ident).replace(/"/g, '""')}"`;
-}
-
-async function createScratchDb(prefix = 'regimp') {
-  const suffix = randomBytes(5).toString('hex');
-  const dbName = `${TEST_DB_PREFIX}${prefix}_${suffix}`;
-  const adminConfig = getAdminPgConfig();
-  const admin = await createClient(adminConfig);
-  try {
-    await admin.query(`CREATE DATABASE ${quoteIdent(dbName)} ENCODING 'UTF8'`);
-  } finally {
-    await admin.end();
-  }
-  const pgConfig = { ...adminConfig, database: dbName };
-  async function drop() {
-    const c = await createClient(adminConfig).catch(() => null);
-    if (!c) return;
-    try {
-      await c.query(
-        'SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()',
-        [dbName],
-      );
-      await c.query(`DROP DATABASE IF EXISTS ${quoteIdent(dbName)}`);
-    } finally {
-      await c.end().catch(() => {});
-    }
-  }
-  return { dbName, pgConfig, drop };
-}
 
 async function provisionScratchCompany(t, {
   companySlug = 'acme',
@@ -177,14 +146,6 @@ async function snapshotIamAndAuditCounts(pool) {
     out[tbl] = (await pool.query(`SELECT COUNT(*)::int AS n FROM ${tbl}`)).rows[0].n;
   }
   return out;
-}
-
-async function writeTree(baseDir, files) {
-  for (const [rel, content] of Object.entries(files)) {
-    const full = join(baseDir, ...rel.split('/'));
-    await mkdir(dirname(full), { recursive: true });
-    await writeFile(full, content, 'utf8');
-  }
 }
 
 function makeApprovedSyntheticRegister(overrides = {}) {

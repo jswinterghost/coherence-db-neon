@@ -14,6 +14,7 @@ const SQL_PG_KEY_DETAIL_RE = /\bKey\s*\([^)]+\)\s*=\s*\([^)]+\)/gi;
 const SQL_PG_FAILING_ROW_RE = /\bFailing row contains\s*\([^)]+\)/gi;
 const SQL_PG_PARAMS_LINE_RE = /\bPARAMETERS:\s*[^\r\n]+/gi;
 const SQL_BOUND_PARAM_RE = /\$\d+\s*=\s*'[^']*'/g;
+const WRITING_NPN_QUOTED_RE = /\bwriting_npn\s*(?:=\s*)?(?:"[^"\r\n]*"|'[^'\r\n]*')/gi;
 
 const SENSITIVE_LOG_KEYS = new Set([
   'recordid',
@@ -23,6 +24,11 @@ const SENSITIVE_LOG_KEYS = new Set([
   'member_name',
   'mbi',
   'ssn',
+  'npn',
+  'writing_npn',
+  'writingnpn',
+  'payee_npn',
+  'payeenpn',
   'policy',
   'policynumber',
   'policy_number',
@@ -43,6 +49,7 @@ export function redactPhi(text) {
     .replace(SQL_PG_FAILING_ROW_RE, 'Failing row contains ([redacted-sql-param])')
     .replace(SQL_PG_PARAMS_LINE_RE, 'PARAMETERS: [redacted-sql-params]')
     .replace(SQL_BOUND_PARAM_RE, '[redacted-sql-param]')
+    .replace(WRITING_NPN_QUOTED_RE, 'writing_npn "[redacted-npn]"')
     .replace(RECORD_ID_PIPE_RE, '[redacted-record-id]')
     .replace(RECORD_ID_MULTI_TILDE_RE, '[redacted-record-id]')
     .replace(RECORD_ID_TILDE_RE, '[redacted-record-id]')
