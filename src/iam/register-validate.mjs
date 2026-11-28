@@ -57,6 +57,7 @@ export const RELATIONSHIP_SPECS = Object.freeze({
   VERTICAL_MANAGER: Object.freeze({ defaultWorkArrangement: null, isOwnerRelationship: false }),
   AGENCY_MANAGER: Object.freeze({ defaultWorkArrangement: null, isOwnerRelationship: false }),
   CONTRACTOR: Object.freeze({ defaultWorkArrangement: null, isOwnerRelationship: false }),
+  PRINCIPAL: Object.freeze({ defaultWorkArrangement: null, isOwnerRelationship: false }),
 });
 
 export class RegisterValidationError extends AppError {

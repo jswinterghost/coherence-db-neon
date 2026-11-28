@@ -545,6 +545,20 @@ test('Agent Register Import [All Refusals & Personal Data Hygiene]: enforces own
     assert.ok(m, `the ${entity} relationship is planned`);
     assert.equal(m.workArrangement, null);
   }
+  // A principal with an NPN and no role (the owner, 11/28: 'a user with zero permissions'): imported, with no grant at all.
+  const principalPlan = planAgentRegisterImport({
+    ...base,
+    people: [...base.people, { id: 'p-pr', name: 'Pia Principal', npn: '55555555', emails: [] }],
+    memberships: [...base.memberships, { id: 'm-pr', person: 'p-pr', entity: 'Acme', role: 'PRINCIPAL', start: null, end: null }],
+  }, baseOpts);
+  assert.ok(principalPlan.people.some((p) => p.registerId === 'p-pr' && p.npn === '55555555'));
+  assert.ok(!principalPlan.roleGrants.some((g) => g.personRegisterId === 'p-pr'), 'a principal holds no permission');
+  assert.ok(!principalPlan.affiliations.some((a) => a.personRegisterId === 'p-pr'));
+  const principalLine = principalPlan.memberships.find((m) => m.personRegisterId === 'p-pr');
+  assert.equal(principalLine.entityName, 'Acme');
+  assert.equal(principalLine.workArrangement, null);
+  assert.equal(principalLine.taxClassification, null);
+  assert.equal(principalLine.validRange, '[0001-01-01,)');
   // The Nusear contractor (the owner, 11/27) maps to its catalog role and backs an administrator's website login, as the administrator does.
   const contractorPlan = planAgentRegisterImport({
     ...base,
