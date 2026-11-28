@@ -630,8 +630,12 @@ function hasNonEmptySessionTokenSetting(configEntries) {
   ));
 }
 
+const CLOUDSQL_DEV_ADMIN_GRANTED_ROLES = new Set(['platform_iam_sync', 'platform_readonly', 'platform_versioner', 'platform_view_owner', 'platform_writer']);
+
 export async function verifyIamConfigInvariants(pool) {
   const problems = [];
+  const contextRes = await pool.query('SELECT environment FROM iam.database_context WHERE singleton = true');
+  const isDevelopmentDatabase = contextRes.rows[0]?.environment === 'dev';
 
   // 1. All platform_* roles must exist and be non-superuser, NOINHERIT, NOBYPASSRLS, NOREPLICATION.
   const [superRes, rolesRes] = await Promise.all([
@@ -754,6 +758,14 @@ export async function verifyIamConfigInvariants(pool) {
         && !row.inherit_option
         && row.set_option;
       if (allowedCloudSqlBootstrap) {
+        continue;
+      }
+      const allowedCloudSqlDevAdminGrant = isDevelopmentDatabase
+        && row.member_role === 'cloudsqlsuperuser'
+        && row.grantor_role === 'cloudsqladmin'
+        && !row.admin_option
+        && CLOUDSQL_DEV_ADMIN_GRANTED_ROLES.has(row.granted_role);
+      if (allowedCloudSqlDevAdminGrant) {
         continue;
       }
       if (allowedRuntimeLoginMapping) {
