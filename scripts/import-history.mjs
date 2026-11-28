@@ -7,12 +7,12 @@
 import { mkdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createPool } from '../src/db/pg-client.mjs';
 import {
   assertDatabaseNameAllowed,
   assertNonProdEndpoint,
   isLocalTargetConfig,
 } from '../src/iam/provision-guards.mjs';
+import { buildProvisionedPoolConfig, withAppAndReadPools } from '../src/iam/provisioned-runtime.mjs';
 import { planImportManifestFile } from '../src/importer/history-importer.mjs';
 import { importHistoryIntoDatabase } from '../src/importer/provisioned-import.mjs';
 import {
@@ -134,27 +134,7 @@ export function parseImportCliArgs(argv) {
 }
 
 export function buildImportPoolConfig(args, kind) {
-  const socketPath = kind === 'app'
-    ? (args.appSocketPath || args.socketPath)
-    : (args.readonlySocketPath || args.socketPath);
-  const host = kind === 'app' ? (args.appHost || args.host) : (args.readonlyHost || args.host);
-  const port = kind === 'app' ? (args.appPort ?? args.port) : (args.readonlyPort ?? args.port);
-  const explicitUser = kind === 'app' ? args.appUser : args.readonlyUser;
-  const user = explicitUser || args.user;
-  const explicitRole = kind === 'app' ? args.appRole : args.readonlyRole;
-  const mode = args.pgMode || (socketPath ? 'cloudsql' : (process.env.COHERENCE_PG_MODE || 'local'));
-  const defaultRole = kind === 'app' ? 'platform_app' : 'platform_readonly';
-  const role = explicitRole || ((explicitUser || mode === 'cloudsql') ? defaultRole : null);
-  return {
-    mode,
-    database: args.database,
-    ...(socketPath ? { socketPath } : {}),
-    ...(host ? { host } : {}),
-    ...(port !== null && port !== undefined ? { port } : {}),
-    ...(user ? { user } : {}),
-    ...(role ? { role } : {}),
-    applicationName: `coherence-import-${kind}`,
-  };
+  return buildProvisionedPoolConfig(args, kind, { applicationPrefix: 'coherence-import' });
 }
 
 export async function runHistoryImportCli(args) {
@@ -198,10 +178,8 @@ export async function runHistoryImportCli(args) {
   const stores = createStorePair({ codeStore, dataStore });
 
   const allowScratchDatabase = isLocalTargetConfig(appPoolConfig) && isLocalTargetConfig(readPoolConfig);
-  const appPool = await createPool(appPoolConfig);
-  const readPool = await createPool(readPoolConfig);
-  try {
-    return await importHistoryIntoDatabase({
+  return withAppAndReadPools(appPoolConfig, readPoolConfig, ({ appPool, readPool }) => (
+    importHistoryIntoDatabase({
       readPool,
       appPool,
       stores,
@@ -214,13 +192,8 @@ export async function runHistoryImportCli(args) {
       appPoolConfig,
       readPoolConfig,
       skipIdempotency: args.skipIdempotency,
-    });
-  } finally {
-    await Promise.all([
-      appPool.end().catch(() => {}),
-      readPool.end().catch(() => {}),
-    ]);
-  }
+    })
+  ));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
