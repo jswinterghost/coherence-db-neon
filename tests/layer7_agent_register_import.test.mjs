@@ -545,6 +545,17 @@ test('Agent Register Import [All Refusals & Personal Data Hygiene]: enforces own
     assert.ok(m, `the ${entity} relationship is planned`);
     assert.equal(m.workArrangement, null);
   }
+  // The Nusear contractor (the owner, 11/27) maps to its catalog role and backs an administrator's website login, as the administrator does.
+  const contractorPlan = planAgentRegisterImport({
+    ...base,
+    people: [...base.people, { id: 'p-nc', name: 'Nico Contractor', npn: null, emails: ['nico@acme.example'] }],
+    memberships: [...base.memberships, { id: 'm-nc', person: 'p-nc', entity: 'Acme', role: 'CONSULTANT', start: '2024-01-01', end: null }],
+    roles: [...base.roles, { id: 'r-nc', person: 'p-nc', role: 'NUSEAR_CONTRACTOR', scope: 'all' }],
+    website: [{ email: 'nico@acme.example', person: 'p-nc', role: 'admin', status: 'active' }],
+  }, baseOpts);
+  const contractorGrant = contractorPlan.roleGrants.find((g) => g.personRegisterId === 'p-nc');
+  assert.equal(contractorGrant.roleSlug, 'nusear_contractor');
+  assert.equal(contractorGrant.includeDescendants, true);
   // A website owner backed by a company-wide entity manager line (the owner, 11/27: the entity manager is the control roles' view).
   assert.doesNotThrow(() => planAgentRegisterImport({
     ...base,

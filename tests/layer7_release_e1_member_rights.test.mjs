@@ -237,6 +237,7 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
     decisionsSubOrgPhi: randomUUID(),
     workshopAllNoUnpub: randomUUID(),
     workshopHouseOnlyUnpub: randomUUID(),
+    workshopNoFinance: randomUUID(),
     runsReadOnly: randomUUID(),
     runsPartialUnpub: randomUUID(),
     checksNoPhi: randomUUID(),
@@ -455,6 +456,10 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
           { orgId: iam.ids.companyOrg, mode: 'org_subtree', includeDescendants: true, rights: allWorkshopRights },
           { orgId: iam.ids.companyOrg, mode: 'org_subtree', includeDescendants: false, rights: ['act:coherence.unpublished.read'] },
         ],
+      });
+      await seedPersona(personas.workshopNoFinance, 'workshop_no_finance', 'Workshop No Finance', {
+        memberships: [iam.ids.companyOrg],
+        grants: [{ orgId: iam.ids.companyOrg, mode: 'org_subtree', rights: [...allWorkshopRights, 'act:coherence.unpublished.read'] }],
       });
       await seedPersona(personas.runsReadOnly, 'runs_read_only', 'Runs Read Only', {
         memberships: [iam.ids.companyOrg],
@@ -1350,11 +1355,20 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
     const fullEmits = (await qApp(fullEmTok, "SELECT rel_path FROM app_views.coherence_run_outputs WHERE run_id = $1::uuid AND rel_path LIKE 'emits/%'", [sentBundleRunId])).rows;
     assert.ok(fullEmits.length >= 2, 'full EM holding member_phi + member_contact + outputs.read must read emits/* outputs');
 
-    // Also verify default harness Entity Manager (iam.tokens.entityMgr) holds member_phi, member_contact, and unpublished.read!
-    const harnessEmBundles = (await qApp(iam.tokens.entityMgr, 'SELECT run_id, rel_path FROM app_views.coherence_entity_bundle_artifacts WHERE run_id = $1::uuid', [sentBundleRunId])).rows;
+    // Also verify default harness Entity Manager, Company Admin, and Nusear Contractor all hold member_phi, member_contact, finance, and unpublished.read!
+    const harnessEmBundles = (await qApp(iam.tokens.entityMgr, 'SELECT run_id, rel_path FROM app_views.coherence_entity_bundle_artifacts WHERE run_id = $1::uuid ORDER BY rel_path', [sentBundleRunId])).rows;
     assert.ok(harnessEmBundles.length >= 2, 'harness entityMgr must hold member_phi + member_contact and open entity bundle artifacts');
     const harnessEmBob = await readCurrentPolicyPeriods(appPool, iam.tokens.entityMgr);
     assert.ok(harnessEmBob.length > 0 && harnessEmBob.every((r) => r.run_id === unsentRunId && r.mbi !== null && r.phone !== null), 'harness entityMgr must see unsent run with non-NULL mbi and phone');
+    for (const [label, tok] of [
+      ['companyAdmin', iam.tokens.companyAdmin],
+      ['nusearContractor', iam.tokens.nusearContractor],
+    ]) {
+      const bundles = (await qApp(tok, 'SELECT run_id, rel_path FROM app_views.coherence_entity_bundle_artifacts WHERE run_id = $1::uuid ORDER BY rel_path', [sentBundleRunId])).rows;
+      assert.deepEqual(bundles, harnessEmBundles, `${label} must match entityMgr entity bundle artifacts`);
+      const bob = await readCurrentPolicyPeriods(appPool, tok);
+      assert.deepEqual(bob, harnessEmBob, `${label} must match entityMgr v_current_policy_periods`);
+    }
 
     // Input entry / staging file handle gating (Section 2.3 item 11):
     const noPhiEntries = (await qApp(iam.tokenFor(personas.inputsNoPhi), 'SELECT rel_path, file_sha256 FROM app_views.coherence_input_entries')).rows;
@@ -1586,28 +1600,40 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
     assert.equal(emSentSum.runId, sentBundleRunId, 'sent-only EM must open sent bundle run only');
     assert.equal(emSentSum.sent, true);
 
-    // 6. Default Company Administrator holds the whole Coherence workshop (unpublished.read, runs, inputs,
-    //    outputs, decisions, checks, and journal) and sees EVERY run, unfinished included, plus snapshot input
-    //    versions and unsent run.json/company_manifest.json (while staying out of revenue-gated emits/* outputs).
-    const adminRuns = new Set((await qApp(iam.tokens.companyAdmin, 'SELECT id FROM app_views.coherence_runs')).rows.map((r) => r.id));
-    for (const id of allRunIds) {
-      assert.equal(adminRuns.has(id), true, `default companyAdmin must see run ${id} (unfinished included)`);
-    }
-    const adminWebRuns = await handlers.listRuns(iam.tokens.companyAdmin);
-    assert.equal(adminWebRuns.runs.length, allRunIds.length, 'companyAdmin listRuns must return all runs including unfinished');
-    assert.equal((await qApp(iam.tokens.companyAdmin, 'SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [abandonedRunId])).rows[0].st, 'abandoned');
-    assert.equal((await qApp(iam.tokens.companyAdmin, 'SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [draftRunId])).rows[0].st, 'waiting for Bible');
-    assert.equal((await qApp(iam.tokens.companyAdmin, 'SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [cancelledRunId])).rows[0].st, 'cancelled');
-    const adminSnapIv = (await qApp(iam.tokens.companyAdmin, 'SELECT id FROM app_views.coherence_input_versions WHERE id = $1::uuid', [hiddenSnapshotInputVersionId])).rows;
-    assert.equal(adminSnapIv.length, 1, 'default companyAdmin must see snapshot input version');
-    const adminUnsentOuts = (await qApp(iam.tokens.companyAdmin, 'SELECT rel_path FROM app_views.coherence_run_outputs WHERE run_id = $1::uuid ORDER BY rel_path', [unsentRunId])).rows.map((r) => r.rel_path);
-    assert.deepEqual(adminUnsentOuts, ['run.json'], 'default companyAdmin sees exempt outputs on unsent run and 0 emits/*');
+    // 6. Custom workshop-without-finance persona sees every run, snapshot inputs, and exempt unsent run.json (0 emits/*),
+    //    while Company Administrator and Nusear Contractor hold ENTITY_MANAGER_RIGHTS and match Entity Manager identically.
+    const noFinTok = iam.tokenFor(personas.workshopNoFinance);
+    const noFinUnsentOuts = (await qApp(noFinTok, 'SELECT rel_path FROM app_views.coherence_run_outputs WHERE run_id = $1::uuid ORDER BY rel_path', [unsentRunId])).rows.map((r) => r.rel_path);
+    assert.deepEqual(noFinUnsentOuts, ['run.json'], 'workshop caller without finance rights sees exempt outputs on unsent run and 0 emits/*');
 
-    // 7. Owner, Nusear staff (operator & adminNoCoh), and Entity Manager see every run (unfinished included);
-    //    Owner & Entity Manager see everything across their surfaces (including unsent finished goods & bundles).
+    const emUnsentOuts = (await qApp(iam.tokens.entityMgr, 'SELECT rel_path FROM app_views.coherence_run_outputs WHERE run_id = $1::uuid ORDER BY rel_path', [unsentRunId])).rows.map((r) => r.rel_path);
+    assert.ok(emUnsentOuts.some((p) => p.startsWith('emits/')), 'entityMgr must see emits/* outputs on unsent run');
+    for (const [label, tok] of [
+      ['companyAdmin', iam.tokens.companyAdmin],
+      ['nusearContractor', iam.tokens.nusearContractor],
+    ]) {
+      const seenRuns = new Set((await qApp(tok, 'SELECT id FROM app_views.coherence_runs')).rows.map((r) => r.id));
+      for (const id of allRunIds) {
+        assert.equal(seenRuns.has(id), true, `default ${label} must see run ${id} (unfinished included)`);
+      }
+      const webRuns = await handlers.listRuns(tok);
+      assert.equal(webRuns.runs.length, allRunIds.length, `${label} listRuns must return all runs including unfinished`);
+      assert.equal((await qApp(tok, 'SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [abandonedRunId])).rows[0].st, 'abandoned');
+      assert.equal((await qApp(tok, 'SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [draftRunId])).rows[0].st, 'waiting for Bible');
+      assert.equal((await qApp(tok, 'SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [cancelledRunId])).rows[0].st, 'cancelled');
+      const snapIv = (await qApp(tok, 'SELECT id FROM app_views.coherence_input_versions WHERE id = $1::uuid', [hiddenSnapshotInputVersionId])).rows;
+      assert.equal(snapIv.length, 1, `default ${label} must see snapshot input version`);
+      const unsentOuts = (await qApp(tok, 'SELECT rel_path FROM app_views.coherence_run_outputs WHERE run_id = $1::uuid ORDER BY rel_path', [unsentRunId])).rows.map((r) => r.rel_path);
+      assert.deepEqual(unsentOuts, emUnsentOuts, `default ${label} must match entityMgr outputs on unsent run (emits/* included)`);
+    }
+
+    // 7. Owner, Nusear staff (operator & adminNoCoh), Entity Manager, Company Administrator, and Nusear Contractor see every run (unfinished included);
+    //    Owner, Entity Manager, Company Administrator, and Nusear Contractor see everything across their surfaces (including unsent finished goods & bundles).
     for (const [label, tok] of [
       ['owner', iam.tokens.owner],
       ['entityMgr', iam.tokens.entityMgr],
+      ['companyAdmin', iam.tokens.companyAdmin],
+      ['nusearContractor', iam.tokens.nusearContractor],
       ['operator', iam.tokens.operator],
       ['adminNoCoh', iam.tokens.adminNoCoh],
     ]) {
@@ -1619,8 +1645,13 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
     const emDetailIv = await handlers.getInputVersionDetail(iam.tokens.entityMgr, hiddenSnapshotInputVersionId);
     assert.equal(emDetailIv.id, hiddenSnapshotInputVersionId, 'entityMgr must see snapshot input version');
     assert.ok(emDetailIv.entries.every((e) => e.fileSha256 !== null), 'entityMgr must see non-NULL input file handles');
-    const emUnsentEmits = (await qApp(iam.tokens.entityMgr, "SELECT rel_path FROM app_views.coherence_run_outputs WHERE run_id = $1::uuid AND rel_path LIKE 'emits/%'", [unsentRunId])).rows;
-    assert.ok(emUnsentEmits.length > 0, 'entityMgr must see emits/* outputs on unsent run');
+    for (const [label, tok] of [
+      ['companyAdmin', iam.tokens.companyAdmin],
+      ['nusearContractor', iam.tokens.nusearContractor],
+    ]) {
+      const detailIv = await handlers.getInputVersionDetail(tok, hiddenSnapshotInputVersionId);
+      assert.deepEqual(detailIv, emDetailIv, `${label} must match entityMgr snapshot input version detail`);
+    }
   });
 
   await t.test('Fix2 Item 1: run-less check reports (import, overlay_reconstruction, objects) carry member-data file hashes and mask report to NULL without full-tenant member_phi', async () => {
@@ -1904,6 +1935,7 @@ test('Layer 7D [Release E1]: member_phi and member_contact column gates, whole-f
       ['owner', iam.tokens.owner],
       ['entityMgr', iam.tokens.entityMgr],
       ['companyAdmin', iam.tokens.companyAdmin],
+      ['nusearContractor', iam.tokens.nusearContractor],
       ['operator', iam.tokens.operator],
       ['adminNoCoh', iam.tokens.adminNoCoh],
     ]) {
@@ -2452,15 +2484,61 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
       }
     };
 
-    return { env, iam, qApp, sentRunId, assertSurface };
+    // Seed one custom workshop-without-finance persona so exempt_only outputs stay non-vacuously tested alongside full company roles.
+    const workshopNoFinId = randomUUID();
+    {
+      const c = await env.pool.connect();
+      try {
+        await c.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+        const seq = (await appendIamAuditEntry(c, {
+          environment: iam.environment,
+          targetOrgId: iam.ids.companyOrg,
+          commandKind: 'iam.seed_ft_no_fin',
+          commandKey: `ft-no-fin-${randomUUID()}`,
+        })).seq;
+        const roleId = randomUUID();
+        await c.query("INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,'ft_workshop_no_fin',$2,$3)", [roleId, iam.ids.companyOrg, seq]);
+        await c.query(
+          "INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq) VALUES ($1,$2,'FT Workshop No Finance',false,false,true,'active',$3)",
+          [randomUUID(), roleId, seq],
+        );
+        for (const r of ['act:coherence.runs.read', 'act:coherence.inputs.read', 'act:coherence.outputs.read', 'act:coherence.unpublished.read', 'col:coherence.member_phi', 'col:coherence.member_contact']) {
+          await c.query("INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)", [randomUUID(), roleId, r, seq]);
+        }
+        await c.query("INSERT INTO iam.people (id, person_kind, principal_origin, journal_seq) VALUES ($1,'human','company_local',$2)", [workshopNoFinId, seq]);
+        await c.query(
+          "INSERT INTO iam.person_versions (id, person_id, principal_origin, legal_name, preferred_name, primary_email, status, journal_seq) VALUES ($1,$2,'company_local','FT NoFin','FT NoFin','ft.nofin@acme.example','active',$3)",
+          [randomUUID(), workshopNoFinId, seq],
+        );
+        await c.query(
+          "INSERT INTO iam.organization_memberships (id, person_id, organization_id, work_arrangement, valid_range, status, journal_seq) VALUES ($1,$2,$3,'employee','[2020-01-01,)'::daterange,'active',$4)",
+          [randomUUID(), workshopNoFinId, iam.ids.companyOrg, seq],
+        );
+        await c.query(
+          "INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq) VALUES ($1,$2,$3,$4,true,'org_subtree','[2020-01-01,)'::daterange,'active',$5)",
+          [randomUUID(), workshopNoFinId, roleId, iam.ids.companyOrg, seq],
+        );
+        await c.query('COMMIT');
+      } catch (err) {
+        await c.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        c.release();
+      }
+    }
+    const workshopNoFinTok = iam.tokenFor(workshopNoFinId);
+
+    return { env, iam, qApp, sentRunId, assertSurface, workshopNoFinTok };
   }
 
   await t.test('Case 1: agency Coherence switch held or off closes workshop and whole-company outputs to company users while Nusear staff are unaffected (and restoring on re-opens them)', async (subT) => {
-    const { env, iam, qApp, assertSurface } = await seedFullTenantWorld(subT);
+    const { env, iam, qApp, assertSurface, workshopNoFinTok } = await seedFullTenantWorld(subT);
 
     // Baseline: all switches on -> company users and Nusear staff all have workshop & whole-company outputs open.
     await assertSurface('baseline entityMgr', iam.tokens.entityMgr, { workshopOpen: true, wholeOutputsMode: 'full' });
-    await assertSurface('baseline companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
+    await assertSurface('baseline companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('baseline nusearContractor', iam.tokens.nusearContractor, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('baseline workshopNoFin', workshopNoFinTok, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
     await assertSurface('baseline nusearOwner', iam.tokens.owner, { workshopOpen: true, wholeOutputsMode: 'full' });
     await assertSurface('baseline nusearOperator', iam.tokens.operator, { workshopOpen: true, wholeOutputsMode: 'full' });
     await assertSurface('baseline nusearAdminNoCoh', iam.tokens.adminNoCoh, { workshopOpen: true, wholeOutputsMode: 'full' });
@@ -2496,6 +2574,8 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
     const heldSwId = await setHarborSwitch('held');
     await assertSurface('harbor held: entityMgr', iam.tokens.entityMgr, { workshopOpen: false, wholeOutputsMode: 'closed' });
     await assertSurface('harbor held: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: false, wholeOutputsMode: 'closed' });
+    await assertSurface('harbor held: nusearContractor', iam.tokens.nusearContractor, { workshopOpen: false, wholeOutputsMode: 'closed' });
+    await assertSurface('harbor held: workshopNoFin', workshopNoFinTok, { workshopOpen: false, wholeOutputsMode: 'closed' });
     // Agency-scoped finished goods on unaffected Beacon stay open.
     const beaconStmtHeld = (await qApp(iam.tokens.agencyMgr, 'SELECT COUNT(*)::int AS n FROM app_views.coherence_statement_agency_lines')).rows[0].n;
     assert.equal(beaconStmtHeld, 1, 'Beacon agency manager keeps Beacon finished goods while Harbor switch is held');
@@ -2507,6 +2587,8 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
     const offSwId = await setHarborSwitch('off', heldSwId);
     await assertSurface('harbor off: entityMgr', iam.tokens.entityMgr, { workshopOpen: false, wholeOutputsMode: 'closed' });
     await assertSurface('harbor off: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: false, wholeOutputsMode: 'closed' });
+    await assertSurface('harbor off: nusearContractor', iam.tokens.nusearContractor, { workshopOpen: false, wholeOutputsMode: 'closed' });
+    await assertSurface('harbor off: workshopNoFin', workshopNoFinTok, { workshopOpen: false, wholeOutputsMode: 'closed' });
     await assertSurface('harbor off: nusearOwner', iam.tokens.owner, { workshopOpen: true, wholeOutputsMode: 'full' });
     await assertSurface('harbor off: nusearOperator', iam.tokens.operator, { workshopOpen: true, wholeOutputsMode: 'full' });
     await assertSurface('harbor off: nusearAdminNoCoh', iam.tokens.adminNoCoh, { workshopOpen: true, wholeOutputsMode: 'full' });
@@ -2514,11 +2596,13 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
     // 1c. Control: restoring Harbor switch to on re-opens workshop & whole-company outputs to company users.
     await setHarborSwitch('on', offSwId);
     await assertSurface('harbor restored on: entityMgr', iam.tokens.entityMgr, { workshopOpen: true, wholeOutputsMode: 'full' });
-    await assertSurface('harbor restored on: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
+    await assertSurface('harbor restored on: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('harbor restored on: nusearContractor', iam.tokens.nusearContractor, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('harbor restored on: workshopNoFin', workshopNoFinTok, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
   });
 
   await t.test('Case 2: company-anchored users and Nusear staff keep workshop and whole-company outputs open when archived and moved-out agencies exist', async (subT) => {
-    const { env, iam, assertSurface } = await seedFullTenantWorld(subT);
+    const { env, iam, assertSurface, workshopNoFinTok } = await seedFullTenantWorld(subT);
 
     const archivedAgency = randomUUID();
     const movedOutAgency = randomUUID();
@@ -2549,7 +2633,9 @@ test('Layer 7D [Release E1 - Full-Tenant Rule]: workshop and whole-company outpu
     }
 
     await assertSurface('with archived/moved-out agencies: entityMgr', iam.tokens.entityMgr, { workshopOpen: true, wholeOutputsMode: 'full' });
-    await assertSurface('with archived/moved-out agencies: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
+    await assertSurface('with archived/moved-out agencies: companyAdmin', iam.tokens.companyAdmin, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('with archived/moved-out agencies: nusearContractor', iam.tokens.nusearContractor, { workshopOpen: true, wholeOutputsMode: 'full' });
+    await assertSurface('with archived/moved-out agencies: workshopNoFin', workshopNoFinTok, { workshopOpen: true, wholeOutputsMode: 'exempt_only' });
     await assertSurface('with archived/moved-out agencies: nusearOwner', iam.tokens.owner, { workshopOpen: true, wholeOutputsMode: 'full' });
     await assertSurface('with archived/moved-out agencies: nusearOperator', iam.tokens.operator, { workshopOpen: true, wholeOutputsMode: 'full' });
   });

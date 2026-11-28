@@ -846,12 +846,12 @@ test('Layer 7G [E4 Test 2]: agent and retention-agent roles refuse company reven
   });
 });
 
-test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harness and scripts/prove-history.mjs, all 15 built-in roles exact rights & flags, investor role empty, and new role empty', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
+test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harness and scripts/prove-history.mjs, all 16 built-in roles exact rights & flags, investor role empty, and new role empty', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
   const catalogMod = await import('../src/iam/catalog.mjs');
   const { CANONICAL_TOOLS, CANONICAL_RIGHTS, CANONICAL_ROLES, seedIamCatalog } = catalogMod;
   assert.equal(CANONICAL_TOOLS.length, 9);
   assert.equal(CANONICAL_RIGHTS.length, 63);
-  assert.equal(CANONICAL_ROLES.length, 15);
+  assert.equal(CANONICAL_ROLES.length, 16);
   assert.equal(typeof seedIamCatalog, 'function');
 
   await t.test('3a: seedIamCatalog idempotency, database_context environment & mismatch refusal, and request_sha256 over missing versions & role rights', async (subT) => {
@@ -906,6 +906,92 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
       [acctRoleId],
     )).rows[0].status;
     assert.equal(revokedStatus, 'revoked', 'explicitly revoked right must remain revoked after catalog re-seed');
+
+    // Upgrade path (Release P3): an existing 15-role DB (missing nusear_contractor and with pre-P3 company_admin rights)
+    // picks up nusear_contractor and the missing company_admin rights on its next seedIamCatalog() run.
+    const upgradeDb = await createEmptyMigratedTestDb();
+    subT.after(() => upgradeDb.cleanup());
+    const preP3AdminRights = new Set([
+      'act:coherence.bob.read', 'act:coherence.checks.read', 'act:coherence.decisions.read',
+      'act:coherence.inputs.read', 'act:coherence.journal.read', 'act:coherence.outputs.read',
+      'act:coherence.runs.read', 'act:coherence.unpublished.read', 'act:hr.records.read',
+      'act:hr.records.write', 'act:iam.read', 'act:platform.audit_journal.read',
+      'col:coherence.member_contact', 'col:coherence.member_phi', 'col:vendors.real_name',
+    ]);
+    await inSerializableTx(upgradeDb.pool, async (c) => {
+      const seq = (await appendIamAuditEntry(c, { environment: 'local', commandKind: 'iam.seed_pre_p3', commandKey: `pre-p3-${randomUUID()}` })).seq;
+      for (const tool of CANONICAL_TOOLS) {
+        await c.query(
+          'INSERT INTO iam.tools (id, display_name, is_nusear_only, is_customer_switchable, journal_seq) VALUES ($1,$2,$3,$4,$5)',
+          [tool.id, tool.displayName, tool.isNusearOnly, tool.isCustomerSwitchable, seq],
+        );
+      }
+      for (const r of CANONICAL_RIGHTS) {
+        await c.query(
+          `INSERT INTO iam.rights (
+             id, right_kind, tool_id, environment_scope, sensitivity_class, is_delegable_power,
+             target_schema, target_table, target_column, description, journal_seq
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [r.id, r.rightKind, r.toolId, r.environmentScope, r.sensitivityClass, r.isDelegablePower, r.targetSchema, r.targetTable, r.targetColumn, r.description, seq],
+        );
+      }
+      for (const role of CANONICAL_ROLES) {
+        if (role.slug === 'nusear_contractor') continue;
+        const roleId = randomUUID();
+        await c.query('INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1,$2,NULL,$3)', [roleId, role.slug, seq]);
+        await c.query(
+          `INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, requires_self_scope, forbids_company_revenue_rights, status, journal_seq)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)`,
+          [randomUUID(), roleId, role.displayName, role.isPinned, role.isNusearInternal, role.allowsOrgWideScope, role.requiresSelfScope, role.forbidsCompanyRevenueRights, seq],
+        );
+        const rightsToSeed = role.slug === 'company_admin'
+          ? role.rights.filter((id) => preP3AdminRights.has(id))
+          : role.rights;
+        for (const rightId of rightsToSeed) {
+          await c.query(
+            "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1,$2,$3,'active',$4)",
+            [randomUUID(), roleId, rightId, seq],
+          );
+        }
+      }
+    });
+    const rightsBySlug = async () => {
+      const rows = (await upgradeDb.pool.query(
+        `SELECT r.slug, rr.right_id FROM iam.role_rights rr JOIN iam.roles r ON r.id = rr.role_id
+         WHERE rr.status = 'active' AND rr.superseded_by_id IS NULL ORDER BY r.slug, rr.right_id`,
+      )).rows;
+      const out = new Map();
+      for (const row of rows) out.set(row.slug, [...(out.get(row.slug) || []), row.right_id]);
+      return out;
+    };
+    const versionsBefore = (await upgradeDb.pool.query('SELECT id, role_id, is_pinned, forbids_company_revenue_rights FROM iam.role_versions ORDER BY id')).rows;
+    const rightsBefore = await rightsBySlug();
+    const upgraded = await inSerializableTx(upgradeDb.pool, async (c) => {
+      await c.query('SET LOCAL ROLE platform_iam_sync');
+      return seedIamCatalog(c);
+    });
+    assert.equal(upgraded.insertedTools, 0, 'P3 upgrade adds no tools');
+    assert.equal(upgraded.insertedRights, 0, 'P3 upgrade adds no rights');
+    assert.equal(upgraded.insertedRoles, 1, 'P3 upgrade must add nusear_contractor');
+    assert.equal(upgraded.insertedRoleVersions, 1, 'P3 upgrade must add nusear_contractor role_version');
+    assert.equal(upgraded.insertedRoleRights, 45, 'P3 upgrade must add 30 rights for nusear_contractor + 15 missing rights for company_admin');
+    const upgradeNoop = await seedIamCatalog(upgradeDb.pool);
+    assert.equal(upgradeNoop.journalSeq, null, 'second seedIamCatalog after P3 upgrade must be a no-op');
+    const versionsAfter = (await upgradeDb.pool.query('SELECT id, role_id, is_pinned, forbids_company_revenue_rights, superseded_by_id FROM iam.role_versions ORDER BY id')).rows;
+    for (const before of versionsBefore) {
+      const after = versionsAfter.find((v) => v.id === before.id);
+      assert.ok(after && after.superseded_by_id === null && after.is_pinned === before.is_pinned
+        && after.forbids_company_revenue_rights === before.forbids_company_revenue_rights, 'every earlier role version stays as it was');
+    }
+    const rightsAfter = await rightsBySlug();
+    const entityManagerRights = [...(rightsAfter.get('entity_manager') || [])].sort();
+    assert.ok(entityManagerRights.length > 0);
+    assert.deepEqual([...rightsAfter.get('company_admin')].sort(), entityManagerRights, 'the administrator holds exactly the entity manager view');
+    assert.deepEqual([...rightsAfter.get('nusear_contractor')].sort(), entityManagerRights, 'the Nusear contractor holds exactly the entity manager view');
+    for (const [slug, rights] of rightsBefore) {
+      if (slug === 'company_admin') continue;
+      assert.deepEqual(rightsAfter.get(slug), rights, `${slug}'s rights are unchanged`);
+    }
 
     // 2. When iam.database_context exists (e.g. environment = 'prod'), omitting environment reads 'prod',
     //    and passing a mismatched environment ('local' or 'dev') is refused even after seeding.
@@ -1007,20 +1093,20 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
     assert.notEqual(missVersion.hash, missRightA.hash, 'missing role_version hash must differ from missing role_right hash');
   });
 
-  // 2. Verify EVERY built-in role's exact rights and flags (all 15) in a harness-seeded DB, so any catalog drift fails.
+  // 2. Verify EVERY built-in role's exact rights and flags (all 16) in a harness-seeded DB, so any catalog drift fails.
   const env = await createTestEnv({ companySlug: 'acme', displayName: 'Acme' });
   t.after(() => env.cleanup());
   await seedSentE4Run(env);
 
-  await t.test('3b: every built-in role (all 15) has exact expected flags and rights, and entity_manager holds full workshop', async () => {
+  await t.test('3b: every built-in role (all 16) has exact expected flags and rights, and entity_manager, company_admin, and nusear_contractor share the exact same full view', async () => {
     const roleRightsRes = await env.pool.query(
-      `SELECT r.slug, rv.is_pinned, rv.is_nusear_internal, rv.allows_org_wide_scope, rv.forbids_company_revenue_rights,
+      `SELECT r.slug, rv.display_name, rv.is_pinned, rv.is_nusear_internal, rv.allows_org_wide_scope, rv.requires_self_scope, rv.forbids_company_revenue_rights,
               COALESCE(pg_catalog.array_agg(rr.right_id ORDER BY rr.right_id) FILTER (WHERE rr.right_id IS NOT NULL), ARRAY[]::text[]) AS rights
        FROM iam.roles r
        JOIN iam.role_versions rv ON rv.role_id = r.id AND rv.superseded_by_id IS NULL AND rv.status = 'active'
        LEFT JOIN iam.role_rights rr ON rr.role_id = r.id AND rr.superseded_by_id IS NULL AND rr.status = 'active'
        WHERE r.owner_org_id IS NULL
-       GROUP BY r.slug, rv.is_pinned, rv.is_nusear_internal, rv.allows_org_wide_scope, rv.forbids_company_revenue_rights
+       GROUP BY r.slug, rv.display_name, rv.is_pinned, rv.is_nusear_internal, rv.allows_org_wide_scope, rv.requires_self_scope, rv.forbids_company_revenue_rights
        ORDER BY r.slug`,
     );
     const bySlug = new Map(roleRightsRes.rows.map((r) => [r.slug, r]));
@@ -1140,19 +1226,19 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
 
     const EXPECTED_BUILT_IN_ROLES = {
       nusear_owner: {
-        is_pinned: true, is_nusear_internal: true, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Nusear Owner', is_pinned: true, is_nusear_internal: true, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: expectedNusearOwner,
       },
       nusear_support: {
-        is_pinned: false, is_nusear_internal: true, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Nusear Support', is_pinned: false, is_nusear_internal: true, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: expectedNusearSupport,
       },
       nusear_admin: {
-        is_pinned: false, is_nusear_internal: true, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Nusear Admin', is_pinned: false, is_nusear_internal: true, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: expectedNusearRead,
       },
       coherence_worker_svc: {
-        is_pinned: true, is_nusear_internal: true, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Coherence Worker', is_pinned: true, is_nusear_internal: true, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: [
           'act:coherence.checks.record',
           'act:coherence.emit.materialize',
@@ -1163,35 +1249,23 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         ],
       },
       owner: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Owner', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: expectedFullEntityRights,
       },
       entity_manager: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Entity Manager', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: expectedFullEntityRights,
       },
       company_admin: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
-        rights: [
-          'act:coherence.bob.read',
-          'act:coherence.checks.read',
-          'act:coherence.decisions.read',
-          'act:coherence.inputs.read',
-          'act:coherence.journal.read',
-          'act:coherence.outputs.read',
-          'act:coherence.runs.read',
-          'act:coherence.unpublished.read',
-          'act:hr.records.read',
-          'act:hr.records.write',
-          'act:iam.read',
-          'act:platform.audit_journal.read',
-          'col:coherence.member_contact',
-          'col:coherence.member_phi',
-          'col:vendors.real_name',
-        ],
+        display_name: 'Administrator', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
+        rights: expectedFullEntityRights,
+      },
+      nusear_contractor: {
+        display_name: 'Nusear Contractor', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
+        rights: expectedFullEntityRights,
       },
       agency_manager: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Agency Manager', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: [
           'act:coherence.bob.read',
           'act:coherence.statements.read',
@@ -1202,7 +1276,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         ],
       },
       director_of_sales: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: true,
+        display_name: 'Director of Sales', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: true,
         rights: [
           'act:coherence.bob.read',
           'act:iam.read',
@@ -1213,7 +1287,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         ],
       },
       director_of_operations: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: true,
+        display_name: 'Director of Operations', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: true,
         rights: [
           'act:coherence.bob.read',
           'act:iam.read',
@@ -1225,7 +1299,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         ],
       },
       accounting: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Accounting', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: [
           'act:billing.invoices.read',
           'act:coherence.bob.read',
@@ -1247,7 +1321,7 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         ],
       },
       compliance: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: false, forbids_company_revenue_rights: true,
+        display_name: 'Compliance', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: false, requires_self_scope: false, forbids_company_revenue_rights: true,
         rights: [
           'act:coherence.bob.read',
           'act:coherence.statements.read',
@@ -1257,15 +1331,15 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
         ],
       },
       retention_agent: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: false, forbids_company_revenue_rights: true,
+        display_name: 'Retention Agent', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: false, requires_self_scope: true, forbids_company_revenue_rights: true,
         rights: expectedAgentRights,
       },
       selling_agent: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: false, forbids_company_revenue_rights: true,
+        display_name: 'Agent', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: false, requires_self_scope: true, forbids_company_revenue_rights: true,
         rights: expectedAgentRights,
       },
       investor: {
-        is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, forbids_company_revenue_rights: false,
+        display_name: 'Investor', is_pinned: false, is_nusear_internal: false, allows_org_wide_scope: true, requires_self_scope: false, forbids_company_revenue_rights: false,
         rights: [],
       },
     };
@@ -1273,15 +1347,17 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
     assert.deepEqual(
       [...bySlug.keys()].sort(),
       Object.keys(EXPECTED_BUILT_IN_ROLES).sort(),
-      'exact 15 built-in roles must be seeded with no missing or unexpected built-in roles',
+      'exact 16 built-in roles must be seeded with no missing or unexpected built-in roles',
     );
     for (const [slug, expected] of Object.entries(EXPECTED_BUILT_IN_ROLES)) {
       const actual = bySlug.get(slug);
       assert.deepEqual(
         {
+          display_name: actual.display_name,
           is_pinned: actual.is_pinned,
           is_nusear_internal: actual.is_nusear_internal,
           allows_org_wide_scope: actual.allows_org_wide_scope,
+          requires_self_scope: actual.requires_self_scope,
           forbids_company_revenue_rights: actual.forbids_company_revenue_rights,
           rights: actual.rights,
         },
@@ -1290,15 +1366,39 @@ test('Layer 7G [E4 Test 3]: one canonical catalog seeded once and reused by harn
       );
     }
 
-    // Runtime check: entity_manager holds full Coherence workshop including decisions, checks, and journal.
+    // Runtime check: entity_manager, company_admin, and nusear_contractor all hold exact ENTITY_MANAGER_RIGHTS
+    // (full workshop, statements, upline, ledger, payroll, lead costs, billing, referrals, HR) and zero run/review/Nusear-only writes.
     const emPool = createRoleScopedTestPool(env.pool, 'platform_app');
-    await withRequestTx(emPool, env.iam.tokens.entityMgr, async (tx) => {
-      for (const right of ['act:coherence.decisions.read', 'act:coherence.checks.read', 'act:coherence.journal.read']) {
-        assert.equal((await tx.query('SELECT iam.has_right($1) AS ok', [right])).rows[0].ok, true, `entityMgr must hold ${right}`);
+    const readSnapshot = async (tok) => withRequestTx(emPool, tok, async (tx) => {
+      for (const right of expectedFullEntityRights) {
+        assert.equal((await tx.query('SELECT iam.has_right($1) AS ok', [right])).rows[0].ok, true, `caller must hold ${right}`);
       }
-      assert.ok((await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_journal')).rows[0].n > 0, 'entityMgr must read coherence_journal');
-      assert.equal((await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_review_drift_gate')).rows[0].n, 1, 'entityMgr must pass coherence_review_drift_gate');
+      for (const forbiddenRight of [
+        'col:platform.audit_journal.nusear_actor',
+        'act:coherence.run.launch',
+        'act:coherence.review.save',
+        'act:coherence.owner.confirm_emit',
+        'act:iam.roles.write',
+      ]) {
+        assert.equal((await tx.query('SELECT iam.has_right($1) AS ok', [forbiddenRight])).rows[0].ok, false, `caller must not hold ${forbiddenRight}`);
+      }
+      assert.ok((await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_journal')).rows[0].n > 0);
+      assert.equal((await tx.query('SELECT COUNT(*)::int AS n FROM app_views.coherence_review_drift_gate')).rows[0].n, 1);
+      return {
+        bob: (await tx.query('SELECT * FROM app_views.coherence_bob ORDER BY policy_id')).rows,
+        ledger: (await tx.query('SELECT * FROM app_views.coherence_ledger ORDER BY tx_id')).rows,
+        agency: (await tx.query('SELECT * FROM app_views.coherence_statement_agency_lines ORDER BY batch_id, line_no')).rows,
+        upline: (await tx.query('SELECT * FROM app_views.coherence_statement_upline_lines ORDER BY batch_id, line_no')).rows,
+      };
     }, { readOnly: true });
+    const emSnap = await readSnapshot(env.iam.tokens.entityMgr);
+    assert.ok(emSnap.bob.length > 0 && emSnap.ledger.length > 0 && emSnap.agency.length > 0 && emSnap.upline.length > 0);
+    for (const [label, tok] of [
+      ['company_admin', env.iam.tokens.companyAdmin],
+      ['nusear_contractor', env.iam.tokens.nusearContractor],
+    ]) {
+      assert.deepEqual(await readSnapshot(tok), emSnap, `${label} must see exact same Coherence rows, columns, and money as entity_manager`);
+    }
   });
 
   await t.test('3c: investor role empty, new role empty, and scripts/prove-history.mjs catalog reuse', async (subT) => {

@@ -459,6 +459,7 @@ test('Layer 2 [Negative Invariant]: View-As never writes, worker-only exclusivit
 
   const customerTokens = [
     ['company_admin', iam.tokens.companyAdmin],
+    ['nusear_contractor', iam.tokens.nusearContractor],
     ['company_admin_runs_only', iam.tokens.companyAdminRunsOnly],
     ['selling_agent', iam.tokens.agentA],
   ];
@@ -480,7 +481,7 @@ test('Layer 2 [Negative Invariant]: View-As never writes, worker-only exclusivit
     assert.equal((await fetch(`${baseUrl}/api/coherence/acme/bundles/config?output=selling-agents/Acme/jane-agent`)).status, 404);
     assert.equal((await fetch(`${baseUrl}/api/coherence/acme/bundles/file?output=selling-agents/Acme/jane-agent&path=viewer.html`)).status, 404);
 
-    if (label !== 'company_admin') {
+    if (label !== 'company_admin' && label !== 'nusear_contractor') {
       assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/review/bible/config`)).status, 404, `${label} must receive 0 rows (404) on review/bible/config`);
       assert.equal((await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/review/adjust/config`)).status, 404, `${label} must receive 0 rows (404) on review/adjust/config`);
       assert.equal((await fetch(`${baseUrl}/api/coherence/acme/review-drift`)).status, 403, `${label} must be refused on review-drift`);
@@ -497,10 +498,18 @@ test('Layer 2 [Negative Invariant]: View-As never writes, worker-only exclusivit
     })).status, 403, `${label} must get 403 on POST /runs`);
   }
 
-  currentToken = iam.tokens.companyAdmin;
-  const outList = await (await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/outputs`)).json();
-  assert.ok(outList.files.length > 0);
-  assert.ok(outList.files.every((f) => !/\.(html|js|mjs|py|sh|css)$/i.test(f.relPath)), 'company_admin output listing must never include code-bearing files');
+  currentToken = iam.tokens.entityMgr;
+  const emOutList = await (await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/outputs`)).json();
+  assert.ok(emOutList.files.length > 0);
+  for (const [label, tok] of [
+    ['company_admin', iam.tokens.companyAdmin],
+    ['nusear_contractor', iam.tokens.nusearContractor],
+  ]) {
+    currentToken = tok;
+    const outList = await (await fetch(`${baseUrl}/api/coherence/acme/runs/${runId}/outputs`)).json();
+    assert.deepEqual(outList.files, emOutList.files, `${label} output listing must match entity_manager exactly`);
+    assert.ok(outList.files.every((f) => !/\.(html|js|mjs|py|sh|css)$/i.test(f.relPath)), `${label} output listing must never include code-bearing files`);
+  }
 });
 
 test('Layer 2 [Workspace Code Isolation]: sealed wrapper verification rejects missing overlay checker and workspaces exclude bible.html and adjust.html', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {

@@ -314,6 +314,9 @@ export const CANONICAL_ROLES = Object.freeze([
     forbidsCompanyRevenueRights: false,
     rights: ENTITY_MANAGER_RIGHTS,
   }),
+  // The administrator and the Nusear contractor hold the entity manager's view (owner ruling, 2026-11-27: "The entity manager is
+  // just the function view for our administrator and other control roles"). Running Bible and Adjust comes with the run commands
+  // of the Runs release; this database has no customer-run commands yet, so no run or review write rights are granted here.
   Object.freeze({
     slug: 'company_admin',
     displayName: 'Administrator',
@@ -322,23 +325,17 @@ export const CANONICAL_ROLES = Object.freeze([
     allowsOrgWideScope: true,
     requiresSelfScope: false,
     forbidsCompanyRevenueRights: false,
-    rights: Object.freeze([
-      'act:coherence.runs.read',
-      'act:coherence.inputs.read',
-      'act:coherence.outputs.read',
-      'act:coherence.decisions.read',
-      'act:coherence.checks.read',
-      'act:coherence.journal.read',
-      'act:coherence.unpublished.read',
-      'act:coherence.bob.read',
-      'col:coherence.member_phi',
-      'col:coherence.member_contact',
-      'act:platform.audit_journal.read',
-      'act:iam.read',
-      'col:vendors.real_name',
-      'act:hr.records.read',
-      'act:hr.records.write',
-    ]),
+    rights: ENTITY_MANAGER_RIGHTS,
+  }),
+  Object.freeze({
+    slug: 'nusear_contractor',
+    displayName: 'Nusear Contractor',
+    isPinned: false,
+    isNusearInternal: false,
+    allowsOrgWideScope: true,
+    requiresSelfScope: false,
+    forbidsCompanyRevenueRights: false,
+    rights: ENTITY_MANAGER_RIGHTS,
   }),
   Object.freeze({
     slug: 'agency_manager',

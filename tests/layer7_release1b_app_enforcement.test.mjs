@@ -620,6 +620,9 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   assert.equal((await reader.summary(iam.tokens.entityMgr, { runId: sentRunId })).available, false, 'tool switch off must block Entity Manager');
   assert.equal((await feed.agentBook(iam.tokens.viewAsAgentA)).eligible, false, 'tool switch off must block Nusear Owner viewing as Agent');
   assert.deepEqual((await callHttp(iam.tokens.companyAdmin, '/api/coherence/acme/runs')).json.runs, [], 'tool switch off must block Company Admin');
+  assert.deepEqual((await callHttp(iam.tokens.nusearContractor, '/api/coherence/acme/runs')).json.runs, [], 'tool switch off must block Nusear Contractor');
+  assert.equal((await reader.summary(iam.tokens.companyAdmin, { runId: sentRunId })).available, false, 'tool switch off must block Company Admin entity bundle');
+  assert.equal((await reader.summary(iam.tokens.nusearContractor, { runId: sentRunId })).available, false, 'tool switch off must block Nusear Contractor entity bundle');
   assert.ok((await callHttp(iam.tokens.owner, '/api/coherence/acme/runs')).json.runs.length >= 2, 'Nusear Owner direct bypasses customer tool switch');
 
   await flipToolSwitch(env.pool, {
@@ -631,6 +634,8 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   });
   assert.equal((await feed.agentBook(iam.tokens.agentA)).rows, 1, 'restoring tool switch on must restore Agent A exact count');
   assert.equal((await reader.summary(iam.tokens.entityMgr, { runId: sentRunId })).available, true, 'restoring tool switch on must restore Entity Manager');
+  assert.equal((await reader.summary(iam.tokens.companyAdmin, { runId: sentRunId })).available, true, 'restoring tool switch on must restore Company Admin');
+  assert.equal((await reader.summary(iam.tokens.nusearContractor, { runId: sentRunId })).available, true, 'restoring tool switch on must restore Nusear Contractor');
   // 13. Item 1 HTTP negative test: untrusted JSON body cannot override dbToken, actor, client, runId, or surface!
   const maliciousPayload = {
     dbToken: iam.tokens.owner,
@@ -709,12 +714,14 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   assert.equal(wrongDraft.length, 0, 'Body runId/surface must never be written to review_drafts');
 
   // 14. Item 3 platform_app negative tests:
-  //     Seed two narrow personas to isolate each gate clause cleanly:
+  //     Seed narrow personas to isolate each gate clause cleanly:
   //     - sentOnlyFinanceTok: all cash/ledger/statements/upline/bob/outputs rights, WITHOUT act:coherence.unpublished.read
   //     - noCashColTok: all ledger/statements/upline/bob/outputs + unpublished.read, WITHOUT col:coherence.statement_cash
+  //     - workshopNoFinanceTok: workshop + outputs.read + member_phi + member_contact, WITHOUT statements/upline/ledger/cash rights
   const sentOnlyPersonId = randomUUID();
   const noCashPersonId = randomUUID();
   const subOrgUnpubPersonId = randomUUID();
+  const workshopNoFinancePersonId = randomUUID();
   {
     const c = await env.pool.connect();
     try {
@@ -785,6 +792,10 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
       ], {
         extraSubOrgGrant: { orgId: iam.ids.beaconOrg, rights: ['act:coherence.unpublished.read'] },
       });
+      await seedNarrowRole(workshopNoFinancePersonId, 'workshop_no_finance', 'Workshop No Finance', [
+        'act:coherence.bob.read', 'act:coherence.outputs.read', 'act:coherence.runs.read',
+        'act:coherence.unpublished.read', 'col:coherence.member_phi', 'col:coherence.member_contact',
+      ]);
       await c.query('COMMIT');
     } catch (err) {
       await c.query('ROLLBACK').catch(() => {});
@@ -796,6 +807,7 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   const sentOnlyFinanceTok = iam.tokenFor(sentOnlyPersonId);
   const noCashColTok = iam.tokenFor(noCashPersonId);
   const subOrgUnpubTok = iam.tokenFor(subOrgUnpubPersonId);
+  const workshopNoFinanceTok = iam.tokenFor(workshopNoFinancePersonId);
 
   //     (a) app_views.coherence_effective_statement_batches strictly gates on run_materializations RLS,
   //         the tenant-wide sent/unpublished.read predicate (matching coherence_entity_statement_reconciliation),
@@ -803,7 +815,7 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   const effBatchesFor = async (tok, runId) => withRequestTx(appPool, tok, async (tx) => (
     await tx.query('SELECT batch_id FROM app_views.coherence_effective_statement_batches($1::uuid)', [runId])
   ).rows.map((r) => r.batch_id));
-  assert.deepEqual(await effBatchesFor(iam.tokens.companyAdmin, sentRunId), [], 'companyAdmin (no cash/ledger rights) must get 0 effective batches on sent run');
+  assert.deepEqual(await effBatchesFor(workshopNoFinanceTok, sentRunId), [], 'workshop caller without cash/ledger rights must get 0 effective batches on sent run');
   assert.deepEqual(await effBatchesFor(iam.tokens.agentA, sentRunId), [], 'agentA must get 0 effective batches on sent run');
   assert.deepEqual(await effBatchesFor(iam.tokens.agencyMgr, sentRunId), [], 'agencyMgr (no upline_cash/ledger) must get 0 effective batches on sent run');
   assert.deepEqual(await effBatchesFor(noCashColTok, sentRunId), [], 'caller missing col:coherence.statement_cash must get 0 effective batches even on sent run');
@@ -817,6 +829,18 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   assert.ok((await effBatchesFor(iam.tokens.owner, unsentRunId)).length >= 1, 'owner with unpublished.read must see effective batches for unsent run');
   assert.deepEqual(await effBatchesFor(iam.tokens.owner, trialRunId), [], 'effective batches must hide trial runs even for owner');
   assert.deepEqual(await effBatchesFor(iam.tokens.owner, abandonedRunId), [], 'effective batches must hide abandoned runs even for owner');
+  const emSentBatches = await effBatchesFor(iam.tokens.entityMgr, sentRunId);
+  const emUnsentBatches = await effBatchesFor(iam.tokens.entityMgr, unsentRunId);
+  assert.ok(emSentBatches.length >= 1 && emUnsentBatches.length >= 1, 'entityMgr must see effective batches for sent and unsent runs');
+  for (const [label, tok] of [
+    ['companyAdmin', iam.tokens.companyAdmin],
+    ['nusearContractor', iam.tokens.nusearContractor],
+  ]) {
+    assert.deepEqual(await effBatchesFor(tok, sentRunId), emSentBatches, `${label} must match entityMgr effective batches on sent run`);
+    assert.deepEqual(await effBatchesFor(tok, unsentRunId), emUnsentBatches, `${label} must match entityMgr effective batches on unsent run`);
+    assert.deepEqual(await effBatchesFor(tok, trialRunId), [], `${label} must hide trial runs in effective batches`);
+    assert.deepEqual(await effBatchesFor(tok, abandonedRunId), [], `${label} must hide abandoned runs in effective batches`);
+  }
 
   //     (b) app_views.coherence_run_outputs: EVERY file under emits/ (CSVs, emit_metadata.json,
   //         policy_status_meta.json, etc.) gets the full gate; only run.json and company_manifest.json are exempt.
@@ -832,11 +856,11 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
       [runId],
     )
   ).rows.map((r) => r.rel_path));
-  assert.deepEqual(await emitOutputsFor(iam.tokens.companyAdmin, sentRunId), [], 'companyAdmin (no cash/ledger rights) must see 0 emits/* files on sent run (emit_metadata.json included)');
-  assert.deepEqual(await emitOutputsFor(iam.tokens.companyAdmin, unsentRunId), [], 'companyAdmin must see 0 emits/* files on unsent run (emit_metadata.json included)');
-  assert.deepEqual(await emitOutputsFor(iam.tokens.companyAdmin, trialRunId), [], 'companyAdmin must see 0 emits/* files on trial run (emit_metadata.json included)');
-  assert.deepEqual(await emitOutputsFor(iam.tokens.companyAdmin, abandonedRunId), [], 'companyAdmin must see 0 emits/* files on abandoned run (emit_metadata.json included)');
-  assert.deepEqual(await allOutputsFor(iam.tokens.companyAdmin, sentRunId), ['company_manifest.json', 'run.json'], 'companyAdmin with outputs.read sees only exempt run description files outside emits/');
+  assert.deepEqual(await emitOutputsFor(workshopNoFinanceTok, sentRunId), [], 'workshop caller without cash/ledger rights must see 0 emits/* files on sent run (emit_metadata.json included)');
+  assert.deepEqual(await emitOutputsFor(workshopNoFinanceTok, unsentRunId), [], 'workshop caller without cash/ledger rights must see 0 emits/* files on unsent run (emit_metadata.json included)');
+  assert.deepEqual(await emitOutputsFor(workshopNoFinanceTok, trialRunId), [], 'workshop caller without cash/ledger rights must see 0 emits/* files on trial run (emit_metadata.json included)');
+  assert.deepEqual(await emitOutputsFor(workshopNoFinanceTok, abandonedRunId), [], 'workshop caller without cash/ledger rights must see 0 emits/* files on abandoned run (emit_metadata.json included)');
+  assert.deepEqual(await allOutputsFor(workshopNoFinanceTok, sentRunId), ['company_manifest.json', 'run.json'], 'workshop caller with outputs.read and no finance rights sees only exempt run description files outside emits/');
   assert.deepEqual(await emitOutputsFor(noCashColTok, sentRunId), [], 'caller missing col:coherence.statement_cash must see 0 emits/* files even on sent run');
   const sentFinanceEmits = await emitOutputsFor(sentOnlyFinanceTok, sentRunId);
   assert.ok(sentFinanceEmits.includes('emits/emit_metadata.json'), 'sent-only finance caller must see emits/emit_metadata.json on sent run');
@@ -850,6 +874,18 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   assert.ok(ownerUnsentEmits.includes('emits/emit_metadata.json'), 'owner with unpublished.read must see emits/emit_metadata.json on unsent run');
   assert.deepEqual(await emitOutputsFor(iam.tokens.owner, trialRunId), [], 'app_views.coherence_run_outputs must hide all emits/* files on trial run');
   assert.deepEqual(await emitOutputsFor(iam.tokens.owner, abandonedRunId), [], 'app_views.coherence_run_outputs must hide all emits/* files on abandoned run');
+  const emSentAllOutputs = await allOutputsFor(iam.tokens.entityMgr, sentRunId);
+  const emUnsentAllOutputs = await allOutputsFor(iam.tokens.entityMgr, unsentRunId);
+  assert.ok(emSentAllOutputs.includes('emits/emit_metadata.json') && emUnsentAllOutputs.includes('emits/emit_metadata.json'));
+  for (const [label, tok] of [
+    ['companyAdmin', iam.tokens.companyAdmin],
+    ['nusearContractor', iam.tokens.nusearContractor],
+  ]) {
+    assert.deepEqual(await allOutputsFor(tok, sentRunId), emSentAllOutputs, `${label} must match entityMgr outputs on sent run`);
+    assert.deepEqual(await allOutputsFor(tok, unsentRunId), emUnsentAllOutputs, `${label} must match entityMgr outputs on unsent run`);
+    assert.deepEqual(await emitOutputsFor(tok, trialRunId), [], `${label} must hide emits/* files on trial run`);
+    assert.deepEqual(await emitOutputsFor(tok, abandonedRunId), [], `${label} must hide emits/* files on abandoned run`);
+  }
 
   //     (c) app_views.coherence_published_runs: unsent runs require unpublished.read (no runs.read fallback).
   //         sentOnlyFinanceTok holds runs.read while newer unsentRunId (2026-10-31) exists after sentRunId (2026-10-15).
@@ -863,11 +899,11 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   assert.equal(sentOnlySummary.available, true, 'sent-only finance caller reader.summary must succeed on sentRunId');
   assert.equal(sentOnlySummary.runId, sentRunId);
 
-  // Test reconciliation view gates too: sentOnlyFinanceTok and subOrgUnpubTok see sentRunId only; companyAdmin & noCashColTok see 0 rows!
+  // Test reconciliation view gates too: sentOnlyFinanceTok and subOrgUnpubTok see sentRunId only; workshopNoFinanceTok & noCashColTok see 0 rows; companyAdmin & nusearContractor match entityMgr!
   const reconRunIdsFor = async (tok) => withRequestTx(appPool, tok, async (tx) => (
     await tx.query('SELECT DISTINCT run_id FROM app_views.coherence_entity_statement_reconciliation')
   ).rows.map((r) => r.run_id));
-  assert.deepEqual(await reconRunIdsFor(iam.tokens.companyAdmin), [], 'companyAdmin without cash/ledger rights must see 0 reconciliation rows');
+  assert.deepEqual(await reconRunIdsFor(workshopNoFinanceTok), [], 'workshop caller without cash/ledger rights must see 0 reconciliation rows');
   assert.deepEqual(await reconRunIdsFor(noCashColTok), [], 'caller missing statement_cash must see 0 reconciliation rows');
   assert.deepEqual(await reconRunIdsFor(sentOnlyFinanceTok), [sentRunId], 'caller without unpublished.read must see reconciliation ONLY for sent run');
   assert.deepEqual(await reconRunIdsFor(subOrgUnpubTok), [sentRunId], 'sub-org unpublished.read must see reconciliation ONLY for sent run');
@@ -876,6 +912,14 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   assert.equal(ownerReconIds.has(unsentRunId), true);
   assert.equal(ownerReconIds.has(trialRunId), false, 'reconciliation must exclude trial runs');
   assert.equal(ownerReconIds.has(abandonedRunId), false, 'reconciliation must exclude abandoned runs');
+  const emReconIds = (await reconRunIdsFor(iam.tokens.entityMgr)).sort();
+  assert.equal(emReconIds.includes(sentRunId) && emReconIds.includes(unsentRunId), true);
+  for (const [label, tok] of [
+    ['companyAdmin', iam.tokens.companyAdmin],
+    ['nusearContractor', iam.tokens.nusearContractor],
+  ]) {
+    assert.deepEqual((await reconRunIdsFor(tok)).sort(), emReconIds, `${label} must match entityMgr reconciliation run IDs`);
+  }
 
   // 15. Item B HTTP negative test: publishInputVersion with storeCanonicalList must check the DB first
   //     and never write a new object to dataStore for agentA, a bad token, or a View-as token.
@@ -975,6 +1019,9 @@ test('Layer 7C [Release 1B platform_app Negative Matrix & Canary Sweep]: every H
   const adminAsOf = await callHttp(iam.tokens.companyAdmin, `/api/coherence/acme/runs?asOf=${asOfIso}`);
   assert.equal(adminAsOf.status, 200, 'administrator with full Coherence workshop must succeed on ?asOf=');
   assert.ok(adminAsOf.json.runs.length >= 2);
+  const contractorAsOf = await callHttp(iam.tokens.nusearContractor, `/api/coherence/acme/runs?asOf=${asOfIso}`);
+  assert.equal(contractorAsOf.status, 200, 'nusear_contractor with full Coherence workshop must succeed on ?asOf=');
+  assert.deepEqual(contractorAsOf.json.runs, adminAsOf.json.runs);
 });
 
 test('Layer 7C [Worker app_cmd Path & Privileged-Write Deletion]: privileged write path is completely gone, worker/reconciler mandate workerToken, and platform_worker runs full pipeline strictly via app_cmd.* with non-NULL organization_id', { skip: !pgCheck.available && pgCheck.reason }, async (t) => {
@@ -1557,6 +1604,11 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
     ).rows);
     assert.equal(adminGate.length, 1);
     assert.equal(adminGate[0].authorized, true);
+    const contractorGate = await withRequestTx(appPool, iam.tokens.nusearContractor, async (tx) => (
+      await tx.query('SELECT authorized FROM app_views.coherence_journal_gate LIMIT 1')
+    ).rows);
+    assert.equal(contractorGate.length, 1);
+    assert.equal(contractorGate[0].authorized, true);
     const runsOnlyGate = await withRequestTx(appPool, iam.tokens.companyAdminRunsOnly, async (tx) => (
       await tx.query('SELECT authorized FROM app_views.coherence_journal_gate LIMIT 1')
     ).rows);
@@ -1931,6 +1983,11 @@ test('Layer 7C [Release C1 - Shared Rights Checks (9a, 9b, Journal Gate) & Store
       (await withRequestTx(appPool, iam.tokens.companyAdmin, (tx) => tx.query('SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [stepRunId]), { readOnly: true })).rows[0].st,
       'done',
       'companyAdmin with workshop access must see unsent run stage',
+    );
+    assert.equal(
+      (await withRequestTx(appPool, iam.tokens.nusearContractor, (tx) => tx.query('SELECT app_views.coherence_run_stage($1::uuid, NULL) AS st', [stepRunId]), { readOnly: true })).rows[0].st,
+      'done',
+      'nusearContractor with workshop access must see unsent run stage',
     );
 
     await env.commands.carrySent({ dbToken: env.ownerToken, commandKey: 'c1-fix1-item4-sent', runId: stepRunId, typedPhrase: 'sent 2026-09-15' });

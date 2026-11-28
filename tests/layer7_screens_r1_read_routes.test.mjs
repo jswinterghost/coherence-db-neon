@@ -6,8 +6,8 @@
 //  2. Read-only HTTP routes: /views/bob, /views/bob/policies/:policyId, /views/ledger,
 //     /views/ledger/transactions/:txId, /views/statements/batches, /views/statements/matrix,
 //     /views/statements/lines, /views/statements/reconciliation, and /iam/view-as-candidates.
-//  3. Full role matrix (Nusear owner, company owner, entity manager, company administrator, accounting,
-//     agency manager, compliance with explicit_people, selling agent, outside company user, investor,
+//  3. Full role matrix (Nusear owner, company owner, entity manager, company administrator, Nusear contractor,
+//     accounting, agency manager, compliance with explicit_people, selling agent, outside company user, investor,
 //     bad tokens, and View-as across roles), proving exact data visibility, column masking (member PHI,
 //     member contact, statement/upline money, vendor names, Nusear support identity), unsent-run hiding,
 //     zero existence oracles on refusals, URL PHI blocking, CSV exports, and strict read-only refusal.
@@ -361,6 +361,8 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     northstarLocalUser: randomUUID(),
     beaconUnpubUser: randomUUID(),
     roleBeaconUnpub: randomUUID(),
+    workshopNoRevenueUser: randomUUID(),
+    roleWorkshopNoRevenue: randomUUID(),
     harborLegacyOrg: randomUUID(),
     vendorOrg: randomUUID(),
   };
@@ -416,6 +418,7 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
       [extraIds.complianceUser, 'company_local', 'Quinn Compliance', 'quinn.comp@acme.example', iam.ids.companyOrg],
       [extraIds.northstarLocalUser, 'company_local', 'Harper Outside', 'harper.out@northstar.example', iam.ids.northstarOrg],
       [extraIds.beaconUnpubUser, 'company_local', 'River Beacon Unpub', 'river.unpub@acme.example', iam.ids.beaconOrg],
+      [extraIds.workshopNoRevenueUser, 'company_local', 'Emery WorkshopNoRev', 'emery.norev@acme.example', iam.ids.companyOrg],
     ];
     for (const [pid, origin, name, email, memberOrg] of newPeople) {
       await seedClient.query(
@@ -457,12 +460,38 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
       );
     }
 
-    // Grants: Company Owner (owner), Accounting (accounting), Compliance (explicit_people=[agentA]), Northstar local (owner on Northstar), Beacon Unpub Reader (Beacon subtree).
+    // Custom role for 2026-11-26 workshop-decisions-without-revenue proof: BoB + decisions + runs + unpublished + member PHI/contact, ZERO statements/upline/ledger/cash.
+    await seedClient.query(
+      "INSERT INTO iam.roles (id, slug, owner_org_id, journal_seq) VALUES ($1, 'workshop_no_revenue_r1', $2, $3)",
+      [extraIds.roleWorkshopNoRevenue, iam.ids.companyOrg, seq],
+    );
+    await seedClient.query(
+      `INSERT INTO iam.role_versions (id, role_id, display_name, is_pinned, is_nusear_internal, allows_org_wide_scope, status, journal_seq)
+       VALUES ($1, $2, 'Workshop No Revenue', false, false, true, 'active', $3)`,
+      [randomUUID(), extraIds.roleWorkshopNoRevenue, seq],
+    );
+    for (const rightId of [
+      'act:coherence.bob.read',
+      'act:coherence.decisions.read',
+      'act:coherence.runs.read',
+      'act:coherence.unpublished.read',
+      'act:iam.read',
+      'col:coherence.member_phi',
+      'col:coherence.member_contact',
+    ]) {
+      await seedClient.query(
+        "INSERT INTO iam.role_rights (id, role_id, right_id, status, journal_seq) VALUES ($1, $2, $3, 'active', $4)",
+        [randomUUID(), extraIds.roleWorkshopNoRevenue, rightId, seq],
+      );
+    }
+
+    // Grants: Company Owner (owner), Accounting (accounting), Compliance (explicit_people=[agentA]), Northstar local (owner on Northstar), Beacon Unpub Reader (Beacon subtree), Workshop No Revenue (Acme subtree).
     for (const [pid, roleId, orgId, mode] of [
       [extraIds.companyOwner, iam.ids.roleOwner, iam.ids.companyOrg, 'org_subtree'],
       [extraIds.accountingUser, iam.ids.roleAccounting, iam.ids.companyOrg, 'org_subtree'],
       [extraIds.northstarLocalUser, iam.ids.roleOwner, iam.ids.northstarOrg, 'org_subtree'],
       [extraIds.beaconUnpubUser, extraIds.roleBeaconUnpub, iam.ids.beaconOrg, 'org_subtree'],
+      [extraIds.workshopNoRevenueUser, extraIds.roleWorkshopNoRevenue, iam.ids.companyOrg, 'org_subtree'],
     ]) {
       await seedClient.query(
         `INSERT INTO iam.role_grants (id, person_id, role_id, organization_id, include_descendants, person_scope_mode, valid_range, status, journal_seq)
@@ -497,7 +526,9 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     companyOwner: iam.tokenFor(extraIds.companyOwner, null, tokOpts),
     entityMgr: iam.tokenFor(iam.ids.entityMgr, null, tokOpts),
     companyAdmin: iam.tokenFor(iam.ids.companyAdmin, null, tokOpts),
+    nusearContractor: iam.tokenFor(iam.ids.nusearContractor, null, tokOpts),
     companyAdminRunsOnly: iam.tokenFor(iam.ids.companyAdminRunsOnly, null, tokOpts),
+    workshopNoRevenue: iam.tokenFor(extraIds.workshopNoRevenueUser, null, tokOpts),
     accounting: iam.tokenFor(extraIds.accountingUser, null, tokOpts),
     agencyMgr: iam.tokenFor(iam.ids.beaconManager, null, tokOpts),
     beaconUnpub: iam.tokenFor(extraIds.beaconUnpubUser, null, tokOpts),
@@ -509,7 +540,9 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     viewAsAgentA: iam.tokenFor(iam.ids.nusearOwner, iam.ids.agentA, tokOpts),
     viewAsAgencyMgr: iam.tokenFor(iam.ids.nusearOwner, iam.ids.beaconManager, tokOpts),
     viewAsCompanyAdmin: iam.tokenFor(iam.ids.nusearOwner, iam.ids.companyAdmin, tokOpts),
+    viewAsNusearContractor: iam.tokenFor(iam.ids.nusearOwner, iam.ids.nusearContractor, tokOpts),
     viewAsCompanyAdminRunsOnly: iam.tokenFor(iam.ids.nusearOwner, iam.ids.companyAdminRunsOnly, tokOpts),
+    viewAsWorkshopNoRevenue: iam.tokenFor(iam.ids.nusearOwner, extraIds.workshopNoRevenueUser, tokOpts),
     viewAsAccounting: iam.tokenFor(iam.ids.nusearOwner, extraIds.accountingUser, tokOpts),
     viewAsCompliance: iam.tokenFor(iam.ids.nusearOwner, extraIds.complianceUser, tokOpts),
     viewAsEntityMgr: iam.tokenFor(iam.ids.nusearOwner, iam.ids.entityMgr, tokOpts),
@@ -909,27 +942,66 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     assert.ok(coOwnerDrawer.json.decisions.length >= 1);
     assert.ok(coOwnerDrawer.json.decisions.every((d) => d.decidedBy === 'Nusear support' && d.decidedByDisplay === 'Nusear support'));
 
-    // Company Administrator: sees sent & unsent BoB + member PHI/contact + decisions, ZERO money / ZERO ledger / ZERO statements.
-    const adminBob = await callHttp(tokens.companyAdmin, '/api/coherence/acme/views/bob');
-    assert.equal(adminBob.status, 200);
-    assert.equal(adminBob.json.run.id, unsentRun.runId);
-    assert.equal(adminBob.json.totalCount, 7);
-    assert.equal(adminBob.json.summary.amountTotal, null);
-    assert.equal(adminBob.json.summary.uplineAmountTotal, null);
-    assert.ok(adminBob.json.rows.every((r) => r.amount === null && r.uplineAmount === null && r.conflicts === null && r.coherentStatus === null && r.member !== null && r.phone !== null));
-    const adminCsv = await callHttp(tokens.companyAdmin, '/api/coherence/acme/views/bob?format=csv');
-    assert.equal(adminCsv.status, 200);
-    assert.match(adminCsv.headers.get('content-type') || '', /text\/csv/i);
-    for (const canary of ['987654.32', '111111.11', '123456.78', '77777.77', 'conflict-note-pat']) {
-      assert.ok(!adminCsv.text.includes(canary), `Company Admin BoB CSV leaked ${canary}`);
+    // Entity Manager, Company Administrator, Nusear Contractor (and View-as of each): identical full BoB (sent & unsent), full money, member PHI/contact, ledger, statements, and masked decisions.
+    const emBob = await callHttp(tokens.entityMgr, '/api/coherence/acme/views/bob');
+    assert.equal(emBob.status, 200);
+    assert.equal(emBob.json.run.id, unsentRun.runId);
+    assert.equal(emBob.json.totalCount, 7);
+    assert.equal(emBob.json.summary.amountTotal, '1233682.81');
+    assert.equal(emBob.json.summary.uplineAmountTotal, '150060.00');
+    assert.ok(emBob.json.rows.every((r) => r.amount !== null && r.uplineAmount !== null && r.member !== null && r.phone !== null));
+    const emCsv = await callHttp(tokens.entityMgr, '/api/coherence/acme/views/bob?format=csv');
+    assert.equal(emCsv.status, 200);
+    assert.match(emCsv.headers.get('content-type') || '', /text\/csv/i);
+    const emDrawer = await callHttp(tokens.entityMgr, `/api/coherence/acme/views/bob/policies/101?runId=${sentRun.runId}`);
+    assert.equal(emDrawer.status, 200);
+    assert.equal(emDrawer.json.policy.amount, '987654.32');
+    assert.equal(emDrawer.json.policy.uplineAmount, '111111.11');
+    assert.equal(emDrawer.json.ledgerRows.length, 1);
+    assert.ok(emDrawer.json.statementAppearances.length >= 2);
+    assert.ok(emDrawer.json.statementLines.length >= 2);
+    assert.ok(emDrawer.json.decisions.length >= 1);
+    assert.ok(emDrawer.json.decisions.every((d) => d.decidedBy === 'Nusear support' && d.decidedByDisplay === 'Nusear support'));
+
+    for (const [label, tok] of [
+      ['companyAdmin', tokens.companyAdmin],
+      ['nusearContractor', tokens.nusearContractor],
+      ['viewAsEntityMgr', tokens.viewAsEntityMgr],
+      ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin],
+      ['viewAsNusearContractor', tokens.viewAsNusearContractor],
+    ]) {
+      const bobRes = await callHttp(tok, '/api/coherence/acme/views/bob');
+      assert.equal(bobRes.status, 200, `${label} /views/bob`);
+      assert.deepEqual(bobRes.json, emBob.json, `${label} /views/bob must match entityMgr exactly`);
+      const csvRes = await callHttp(tok, '/api/coherence/acme/views/bob?format=csv');
+      assert.equal(csvRes.status, 200, `${label} /views/bob?format=csv`);
+      assert.equal(csvRes.text, emCsv.text, `${label} /views/bob CSV must match entityMgr byte for byte`);
+      const drawerRes = await callHttp(tok, `/api/coherence/acme/views/bob/policies/101?runId=${sentRun.runId}`);
+      assert.equal(drawerRes.status, 200, `${label} policy 101 drawer`);
+      assert.deepEqual(drawerRes.json, emDrawer.json, `${label} policy 101 drawer must match entityMgr exactly`);
     }
-    const adminDrawer = await callHttp(tokens.companyAdmin, `/api/coherence/acme/views/bob/policies/101?runId=${sentRun.runId}`);
-    assert.equal(adminDrawer.status, 200);
-    assert.equal(adminDrawer.json.policy.amount, null);
-    assert.deepEqual(adminDrawer.json.ledgerRows, []);
-    assert.deepEqual(adminDrawer.json.statementAppearances, []);
-    assert.deepEqual(adminDrawer.json.statementLines, []);
-    assert.ok(adminDrawer.json.decisions.length >= 1, 'Company Admin keeps workshop decision visibility');
+
+    // Custom workshop-without-revenue role: sees sent & unsent BoB + member PHI/contact + decisions, ZERO money / ZERO ledger / ZERO statements.
+    const noRevBob = await callHttp(tokens.workshopNoRevenue, '/api/coherence/acme/views/bob');
+    assert.equal(noRevBob.status, 200);
+    assert.equal(noRevBob.json.run.id, unsentRun.runId);
+    assert.equal(noRevBob.json.totalCount, 7);
+    assert.equal(noRevBob.json.summary.amountTotal, null);
+    assert.equal(noRevBob.json.summary.uplineAmountTotal, null);
+    assert.ok(noRevBob.json.rows.every((r) => r.amount === null && r.uplineAmount === null && r.conflicts === null && r.coherentStatus === null && r.member !== null && r.phone !== null));
+    const noRevCsv = await callHttp(tokens.workshopNoRevenue, '/api/coherence/acme/views/bob?format=csv');
+    assert.equal(noRevCsv.status, 200);
+    assert.match(noRevCsv.headers.get('content-type') || '', /text\/csv/i);
+    for (const canary of ['987654.32', '111111.11', '123456.78', '77777.77', 'conflict-note-pat']) {
+      assert.ok(!noRevCsv.text.includes(canary), `WorkshopNoRevenue BoB CSV leaked ${canary}`);
+    }
+    const noRevDrawer = await callHttp(tokens.workshopNoRevenue, `/api/coherence/acme/views/bob/policies/101?runId=${sentRun.runId}`);
+    assert.equal(noRevDrawer.status, 200);
+    assert.equal(noRevDrawer.json.policy.amount, null);
+    assert.deepEqual(noRevDrawer.json.ledgerRows, []);
+    assert.deepEqual(noRevDrawer.json.statementAppearances, []);
+    assert.deepEqual(noRevDrawer.json.statementLines, []);
+    assert.ok(noRevDrawer.json.decisions.length >= 1, 'WorkshopNoRevenue keeps workshop decision visibility');
 
     // Accounting: sent run ONLY, full money, ZERO member PHI/contact!
     const acctBob = await callHttp(tokens.accounting, '/api/coherence/acme/views/bob');
@@ -1100,16 +1172,61 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
       assert.deepEqual(txDrawer.json.decisions, []);
     }
 
-    // Company Admin, Agency Manager, Compliance, Agent A, Outside users, Investor, and View-as of those roles see ZERO ledger rows/runs.
+    // Entity Manager, Company Administrator, Nusear Contractor (and View-as of each): identical full unsent & sent ledger, CSV, and transaction drawer.
+    const emLed = await callHttp(tokens.entityMgr, '/api/coherence/acme/views/ledger');
+    assert.equal(emLed.status, 200);
+    assert.equal(emLed.json.run.id, unsentRun.runId);
+    assert.equal(emLed.json.totalCount, 7);
+    assert.equal(emLed.json.summary.grossTotal, '1383742.81');
+    assert.equal(emLed.json.summary.downlineTotal, '1233682.81');
+    assert.equal(emLed.json.summary.uplineTotal, '150060.00');
+    assert.equal(emLed.json.summary.variance, '0.00');
+    assert.equal(emLed.json.summary.balanced, true);
+    const emLedAsOf = await callHttp(tokens.entityMgr, `/api/coherence/acme/views/ledger?asOfSeq=${sentRun.seqAfterCarry}`);
+    assert.equal(emLedAsOf.status, 200);
+    assert.equal(emLedAsOf.json.run.id, sentRun.runId);
+    assert.equal(emLedAsOf.json.totalCount, 6);
+    const emLedCsv = await callHttp(tokens.entityMgr, '/api/coherence/acme/views/ledger?format=csv');
+    assert.equal(emLedCsv.status, 200);
+    const emTxDrawer = await callHttp(tokens.entityMgr, `/api/coherence/acme/views/ledger/transactions/1?runId=${sentRun.runId}`);
+    assert.equal(emTxDrawer.status, 200);
+    assert.equal(emTxDrawer.json.transaction.txId, 1);
+    assert.equal(emTxDrawer.json.policy.policyId, 101);
+    assert.ok(emTxDrawer.json.decisions.every((d) => d.decidedBy === 'Nusear support' && d.decidedByDisplay === 'Nusear support'));
+
     for (const [label, tok] of [
       ['companyAdmin', tokens.companyAdmin],
+      ['nusearContractor', tokens.nusearContractor],
+      ['viewAsEntityMgr', tokens.viewAsEntityMgr],
+      ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin],
+      ['viewAsNusearContractor', tokens.viewAsNusearContractor],
+    ]) {
+      const led = await callHttp(tok, '/api/coherence/acme/views/ledger');
+      assert.equal(led.status, 200, `${label} /views/ledger`);
+      assert.deepEqual(led.json, emLed.json, `${label} /views/ledger must match entityMgr exactly`);
+      const ledAsOf = await callHttp(tok, `/api/coherence/acme/views/ledger?asOfSeq=${sentRun.seqAfterCarry}`);
+      assert.equal(ledAsOf.status, 200, `${label} /views/ledger?asOfSeq=`);
+      assert.deepEqual(ledAsOf.json, emLedAsOf.json, `${label} /views/ledger?asOfSeq= must match entityMgr exactly`);
+      const ledCsv = await callHttp(tok, '/api/coherence/acme/views/ledger?format=csv');
+      assert.equal(ledCsv.status, 200, `${label} /views/ledger?format=csv`);
+      assert.equal(ledCsv.text, emLedCsv.text, `${label} /views/ledger CSV must match entityMgr byte for byte`);
+      const txDrawer = await callHttp(tok, `/api/coherence/acme/views/ledger/transactions/1?runId=${sentRun.runId}`);
+      assert.equal(txDrawer.status, 200, `${label} /views/ledger/transactions/1`);
+      assert.deepEqual(txDrawer.json, emTxDrawer.json, `${label} /views/ledger/transactions/1 must match entityMgr exactly`);
+    }
+
+    // WorkshopNoRevenue, CompanyAdminRunsOnly, Agency Manager, Compliance, Agent A, Outside users, Investor, and View-as of those roles see ZERO ledger rows/runs.
+    for (const [label, tok] of [
+      ['workshopNoRevenue', tokens.workshopNoRevenue],
+      ['companyAdminRunsOnly', tokens.companyAdminRunsOnly],
       ['agencyMgr', tokens.agencyMgr],
       ['compliance', tokens.compliance],
       ['agentA', tokens.agentA],
       ['outsideOperator', tokens.outsideOperator],
       ['outsideLocal', tokens.outsideLocal],
       ['investor', tokens.investor],
-      ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin],
+      ['viewAsWorkshopNoRevenue', tokens.viewAsWorkshopNoRevenue],
+      ['viewAsCompanyAdminRunsOnly', tokens.viewAsCompanyAdminRunsOnly],
       ['viewAsAgencyMgr', tokens.viewAsAgencyMgr],
       ['viewAsCompliance', tokens.viewAsCompliance],
       ['viewAsAgentA', tokens.viewAsAgentA],
@@ -1272,15 +1389,53 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     assert.equal(compMat.json.summary.agencyNetTotal, null);
     assert.equal(compMat.json.summary.grandTotal, null);
 
-    // Company Admin, Agent A, Outside users, Investor, View-as Agent A, View-as Company Admin see ZERO statements!
+    // Entity Manager, Company Administrator, Nusear Contractor (and View-as of each): identical full statements (batches, matrix, lines, reconciliation).
+    const emStmtEndpoints = [
+      '/views/statements/batches',
+      '/views/statements/batches?includeUnsent=false',
+      '/views/statements/matrix',
+      '/views/statements/matrix?includeUnsent=true',
+      `/views/statements/matrix?runId=${sentRun.runId}`,
+      `/views/statements/lines?batchId=${histBatchId}&accountKind=upline&markedSent=false`,
+      `/views/statements/lines?runId=${sentRun.runId}`,
+      '/views/statements/reconciliation',
+    ];
+    const emStmtResponses = new Map();
+    for (const ep of emStmtEndpoints) {
+      const res = await callHttp(tokens.entityMgr, `/api/coherence/acme${ep}`);
+      assert.equal(res.status, 200, `entityMgr ${ep}`);
+      emStmtResponses.set(ep, res.json);
+    }
+    assert.equal(emStmtResponses.get('/views/statements/batches').batches.length, 5);
+    assert.equal(emStmtResponses.get(`/views/statements/matrix?runId=${sentRun.runId}`).summary.grandTotal, '1294853.93');
+    assert.equal(emStmtResponses.get(`/views/statements/lines?runId=${sentRun.runId}`).totalCount, 12);
+    assert.equal(emStmtResponses.get('/views/statements/reconciliation').available, true);
+    assert.equal(emStmtResponses.get('/views/statements/reconciliation').summary.variance, '0.00');
     for (const [label, tok] of [
       ['companyAdmin', tokens.companyAdmin],
+      ['nusearContractor', tokens.nusearContractor],
+      ['viewAsEntityMgr', tokens.viewAsEntityMgr],
+      ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin],
+      ['viewAsNusearContractor', tokens.viewAsNusearContractor],
+    ]) {
+      for (const ep of emStmtEndpoints) {
+        const res = await callHttp(tok, `/api/coherence/acme${ep}`);
+        assert.equal(res.status, 200, `${label} ${ep}`);
+        assert.deepEqual(res.json, emStmtResponses.get(ep), `${label} ${ep} must match entityMgr exactly`);
+      }
+    }
+
+    // WorkshopNoRevenue, CompanyAdminRunsOnly, Agent A, Outside users, Investor, and View-as of those roles see ZERO statements!
+    for (const [label, tok] of [
+      ['workshopNoRevenue', tokens.workshopNoRevenue],
+      ['companyAdminRunsOnly', tokens.companyAdminRunsOnly],
       ['agentA', tokens.agentA],
       ['outsideOperator', tokens.outsideOperator],
       ['outsideLocal', tokens.outsideLocal],
       ['investor', tokens.investor],
       ['viewAsAgentA', tokens.viewAsAgentA],
-      ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin],
+      ['viewAsWorkshopNoRevenue', tokens.viewAsWorkshopNoRevenue],
+      ['viewAsCompanyAdminRunsOnly', tokens.viewAsCompanyAdminRunsOnly],
     ]) {
       const sb = await callHttp(tok, '/api/coherence/acme/views/statements/batches');
       assert.equal(sb.status, 200, `${label} /batches`);
@@ -1323,8 +1478,11 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     const ownerCandidateIds = ownerCand.json.candidates.map((c) => c.id);
     assert.ok(ownerCandidateIds.includes(iam.ids.entityMgr));
     assert.ok(ownerCandidateIds.includes(iam.ids.companyAdmin));
+    assert.ok(ownerCandidateIds.includes(iam.ids.nusearContractor));
     assert.ok(ownerCandidateIds.includes(iam.ids.agentA));
     assert.ok(ownerCandidateIds.includes(extraIds.companyOwner));
+    const candContractor = ownerCand.json.candidates.find((c) => c.id === iam.ids.nusearContractor);
+    assert.ok(candContractor.roles.some((r) => r.roleSlug === 'nusear_contractor'));
     assert.ok(!ownerCandidateIds.includes(iam.ids.nusearOwner), 'nusear_staff must not appear as View-as candidate');
     assert.ok(!ownerCandidateIds.includes(iam.ids.workerService), 'service principal must not appear as View-as candidate');
     assert.ok(!ownerCandidateIds.includes(iam.ids.suspendedAgent), 'suspended user must not appear as View-as candidate');
@@ -1346,8 +1504,15 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     assert.equal(ownerBeaconAgents.status, 200);
     assert.deepEqual(ownerBeaconAgents.json.candidates.map((c) => c.id).sort(), [iam.ids.agentA, iam.ids.agentB].sort());
 
-    // Company Owner & Company Admin: see company_local humans & company orgs (real vendor), ZERO platform_root/nusear_staff.
-    for (const [label, tok] of [['companyOwner', tokens.companyOwner], ['companyAdmin', tokens.companyAdmin]]) {
+    // Company Owner, Entity Manager, Company Admin, and Nusear Contractor: see identical company_local humans & company orgs (real vendor), ZERO platform_root/nusear_staff.
+    const emCandRes = await callHttp(tokens.entityMgr, '/api/coherence/acme/iam/view-as-candidates');
+    assert.equal(emCandRes.status, 200);
+    for (const [label, tok] of [
+      ['companyOwner', tokens.companyOwner],
+      ['entityMgr', tokens.entityMgr],
+      ['companyAdmin', tokens.companyAdmin],
+      ['nusearContractor', tokens.nusearContractor],
+    ]) {
       const res = await callHttp(tok, '/api/coherence/acme/iam/view-as-candidates');
       assert.equal(res.status, 200, `${label} /iam/view-as-candidates`);
       assert.ok(res.json.candidates.length >= 10);
@@ -1356,9 +1521,11 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
       const v = res.json.organizations.find((o) => o.id === extraIds.vendorOrg);
       assert.equal(v.displayName, 'Cobalt Leads LLC');
       assert.equal(v.isVendorNameMasked, false);
+      assert.deepEqual(res.json.candidates, emCandRes.json.candidates, `${label} candidates must match entityMgr exactly`);
+      assert.deepEqual(res.json.organizations, emCandRes.json.organizations, `${label} organizations must match entityMgr exactly`);
     }
 
-    // Agency Manager (Beacon): sees ONLY Beacon + East Team active humans, masked vendor name, zero Harbor/EntityMgr.
+    // Agency Manager (Beacon): sees ONLY Beacon + East Team active humans, masked vendor name, zero Harbor/EntityMgr/CompanyAdmin/NusearContractor.
     const mgrCand = await callHttp(tokens.agencyMgr, '/api/coherence/acme/iam/view-as-candidates');
     assert.equal(mgrCand.status, 200);
     const mgrIds = mgrCand.json.candidates.map((c) => c.id);
@@ -1367,6 +1534,8 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     assert.ok(mgrIds.includes(iam.ids.agentEast));
     assert.ok(!mgrIds.includes(iam.ids.agentHarbor), 'Beacon manager must not see Harbor agents');
     assert.ok(!mgrIds.includes(iam.ids.entityMgr), 'Beacon manager must not see company-level entity manager');
+    assert.ok(!mgrIds.includes(iam.ids.companyAdmin), 'Beacon manager must not see company-level administrator');
+    assert.ok(!mgrIds.includes(iam.ids.nusearContractor), 'Beacon manager must not see company-level Nusear contractor');
     const mgrVendor = mgrCand.json.organizations.find((o) => o.id === extraIds.vendorOrg);
     assert.equal(mgrVendor.displayName, 'Vendor Alpha');
     assert.equal(mgrVendor.slug, null);
@@ -1538,7 +1707,7 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     }
   });
 
-  await t.test('8. [Owner ruling 2026-11-26] the workshop keeps its decision amounts: company_admin sees approved_amount and record_ids, the Book money stays hidden', async () => {
+  await t.test('8. [Owner rulings 2026-11-26 & 2026-11-27] workshop keeps decision amounts (even without revenue rights); company_admin and nusear_contractor match entity_manager across decisions, Book money, ledger, and statements', async () => {
     // app_views.coherence_decisions keeps Migration 009's definition: whoever holds the workshop's decisions right sees the amounts its reviews need.
     const ownerDecs = await withRequestTx(appPool, tokens.nusearOwner, async (tx) => (
       (await tx.query('SELECT surface, record_id, approved_amount FROM app_views.coherence_decisions ORDER BY journal_seq, row_order')).rows
@@ -1547,13 +1716,38 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
     assert.ok(ownerDecs.some((d) => d.record_id === 'carrier_a~direct~PAT CANARY~987654.32~2026-10'), 'Owner must see dollar-bearing baseline record_id');
     assert.ok(ownerDecs.some((d) => d.record_id === 'carrier_b~direct~CASEY MOCK~250.00~2026-10'), 'Owner must see dollar-bearing Adjust record_id');
 
-    for (const [label, tok] of [['companyAdmin', tokens.companyAdmin], ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin]]) {
-      const adminDecs = await withRequestTx(appPool, tok, async (tx) => (
+    const emDrawer = await callHttp(tokens.entityMgr, `/api/coherence/acme/views/bob/policies/101?runId=${sentRun.runId}`);
+    assert.equal(emDrawer.status, 200);
+    assert.equal(emDrawer.json.policy.amount, '987654.32');
+    assert.equal(emDrawer.json.policy.uplineAmount, '111111.11');
+    assert.equal(emDrawer.json.ledgerRows.length, 1);
+    assert.ok(emDrawer.json.statementAppearances.length >= 2);
+    assert.ok(emDrawer.json.statementLines.length >= 2);
+    assert.ok(emDrawer.json.decisions.length >= 2);
+
+    // Release P3 (owner ruling 2026-11-27): company_admin & nusear_contractor (direct & View-as) match entity_manager identically.
+    for (const [label, tok] of [
+      ['companyAdmin', tokens.companyAdmin],
+      ['nusearContractor', tokens.nusearContractor],
+      ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin],
+      ['viewAsNusearContractor', tokens.viewAsNusearContractor],
+    ]) {
+      const decs = await withRequestTx(appPool, tok, async (tx) => (
         (await tx.query('SELECT surface, record_id, approved_amount FROM app_views.coherence_decisions ORDER BY journal_seq, row_order')).rows
       ), { readOnly: true });
-      assert.deepEqual(adminDecs, ownerDecs, `${label} holds the whole workshop, so sees every decision as the Owner does, amounts included`);
+      assert.deepEqual(decs, ownerDecs, `${label} holds the whole workshop, so sees every decision as the Owner does, amounts included`);
+      const drawer = await callHttp(tok, `/api/coherence/acme/views/bob/policies/101?runId=${sentRun.runId}`);
+      assert.equal(drawer.status, 200);
+      assert.deepEqual(drawer.json, emDrawer.json, `${label} policy 101 drawer must match entity_manager identically (decisions, Book money, ledger, and statements)`);
+    }
 
-      // Policy drawer: its decisions carry their amounts; the Book's own money, the ledger and the statements stay hidden.
+    // 2026-11-26 workshop-without-revenue invariant preserved via custom workshopNoRevenue role: decisions keep amounts, Book money/ledger/statements stay hidden.
+    for (const [label, tok] of [['workshopNoRevenue', tokens.workshopNoRevenue], ['viewAsWorkshopNoRevenue', tokens.viewAsWorkshopNoRevenue]]) {
+      const noRevDecs = await withRequestTx(appPool, tok, async (tx) => (
+        (await tx.query('SELECT surface, record_id, approved_amount FROM app_views.coherence_decisions ORDER BY journal_seq, row_order')).rows
+      ), { readOnly: true });
+      assert.deepEqual(noRevDecs, ownerDecs, `${label} holds workshop decisions.read, so sees every decision amount`);
+
       const drawer = await callHttp(tok, `/api/coherence/acme/views/bob/policies/101?runId=${sentRun.runId}`);
       assert.equal(drawer.status, 200);
       assert.ok(drawer.json.decisions.length >= 2, `${label} policy drawer must include both baseline (by policy) and Bible decisions`);
@@ -1954,8 +2148,12 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
       ['companyOwner', tokens.companyOwner, 7, 200, 7, 200, 5, 3, 12, true, 10],
       ['entityMgr', tokens.entityMgr, 7, 200, 7, 200, 5, 3, 12, true, 10],
       ['viewAsEntityMgr', tokens.viewAsEntityMgr, 7, 200, 7, 200, 5, 3, 12, true, 10],
-      ['companyAdmin', tokens.companyAdmin, 7, 200, 0, 404, 0, 0, 0, false, 10],
-      ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin, 7, 200, 0, 404, 0, 0, 0, false, 10],
+      ['companyAdmin', tokens.companyAdmin, 7, 200, 7, 200, 5, 3, 12, true, 10],
+      ['viewAsCompanyAdmin', tokens.viewAsCompanyAdmin, 7, 200, 7, 200, 5, 3, 12, true, 10],
+      ['nusearContractor', tokens.nusearContractor, 7, 200, 7, 200, 5, 3, 12, true, 10],
+      ['viewAsNusearContractor', tokens.viewAsNusearContractor, 7, 200, 7, 200, 5, 3, 12, true, 10],
+      ['workshopNoRevenue', tokens.workshopNoRevenue, 7, 200, 0, 404, 0, 0, 0, false, 10],
+      ['viewAsWorkshopNoRevenue', tokens.viewAsWorkshopNoRevenue, 7, 200, 0, 404, 0, 0, 0, false, 10],
       ['companyAdminRunsOnly', tokens.companyAdminRunsOnly, 0, 404, 0, 404, 0, 0, 0, false, 0],
       ['viewAsCompanyAdminRunsOnly', tokens.viewAsCompanyAdminRunsOnly, 0, 404, 0, 404, 0, 0, 0, false, 0],
       ['accounting', tokens.accounting, 6, 200, 6, 200, 3, 3, 12, true, 10],
@@ -1971,6 +2169,8 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
       ['investor', tokens.investor, 0, 404, 0, 404, 0, 0, 0, false, 0],
       ['viewAsInvestor', tokens.viewAsInvestor, 0, 404, 0, 404, 0, 0, 0, false, 0],
     ];
+    let emBaseline = null;
+    const emParityLabels = new Set(['viewAsEntityMgr', 'companyAdmin', 'viewAsCompanyAdmin', 'nusearContractor', 'viewAsNusearContractor']);
     for (const [label, tok, bobCount, polStatus, ledCount, txStatus, batchCount, matBatchCount, linesSentCount, reconAvail, minCand] of roleExpectations) {
       const [rBob, rPol, rLed, rTx, rBat, rMat, rLines, rLinesCsv, rRec, rCand] = await Promise.all([
         callHttp(tok, '/api/coherence/acme/views/bob'),
@@ -2005,6 +2205,21 @@ test('Layer 7I [Screens R1]: Migration 011 is_sent, read-only routes (/views/bob
         assert.deepEqual(rCand.json.candidates, [], `${label} candidates must be empty`);
       } else {
         assert.ok(rCand.json.candidates.length >= minCand, `${label} candidates >= ${minCand} (got ${rCand.json.candidates.length})`);
+      }
+      if (label === 'entityMgr') {
+        emBaseline = { bob: rBob.json, pol: rPol.json, led: rLed.json, tx: rTx.json, bat: rBat.json, mat: rMat.json, lines: rLines.json, linesCsv: rLinesCsv.text, rec: rRec.json, candidates: rCand.json.candidates, organizations: rCand.json.organizations };
+      } else if (emParityLabels.has(label)) {
+        assert.deepEqual(rBob.json, emBaseline.bob, `${label} /views/bob must match entityMgr identically`);
+        assert.deepEqual(rPol.json, emBaseline.pol, `${label} /views/bob/policies/101 must match entityMgr identically`);
+        assert.deepEqual(rLed.json, emBaseline.led, `${label} /views/ledger must match entityMgr identically`);
+        assert.deepEqual(rTx.json, emBaseline.tx, `${label} /views/ledger/transactions/1 must match entityMgr identically`);
+        assert.deepEqual(rBat.json, emBaseline.bat, `${label} /views/statements/batches must match entityMgr identically`);
+        assert.deepEqual(rMat.json, emBaseline.mat, `${label} /views/statements/matrix must match entityMgr identically`);
+        assert.deepEqual(rLines.json, emBaseline.lines, `${label} /views/statements/lines must match entityMgr identically`);
+        assert.equal(rLinesCsv.text, emBaseline.linesCsv, `${label} /views/statements/lines CSV must match entityMgr byte for byte`);
+        assert.deepEqual(rRec.json, emBaseline.rec, `${label} /views/statements/reconciliation must match entityMgr identically`);
+        assert.deepEqual(rCand.json.candidates, emBaseline.candidates, `${label} /iam/view-as-candidates candidates must match entityMgr identically`);
+        assert.deepEqual(rCand.json.organizations, emBaseline.organizations, `${label} /iam/view-as-candidates organizations must match entityMgr identically`);
       }
     }
   });

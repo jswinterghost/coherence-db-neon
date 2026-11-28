@@ -418,7 +418,7 @@ test('Layer 7H [E5 Test 1]: vendor name masking by role in app_views.iam_organiz
     )).rows
   ), { readOnly: true });
 
-  // 1. Nusear staff (owner, support, admin), Company Owner, Entity Manager, Company Admin see REAL vendor names.
+  // 1. Nusear staff (owner, support, admin), Company Owner, Entity Manager, Company Admin, Nusear Contractor see REAL vendor names.
   for (const [label, tok] of [
     ['nusear_owner', env.iam.tokens.owner],
     ['nusear_support', env.iam.tokens.operator],
@@ -426,6 +426,7 @@ test('Layer 7H [E5 Test 1]: vendor name masking by role in app_views.iam_organiz
     ['company_owner', tokenFor(companyOwnerId)],
     ['entity_manager', env.iam.tokens.entityMgr],
     ['company_admin', env.iam.tokens.companyAdmin],
+    ['nusear_contractor', env.iam.tokens.nusearContractor],
   ]) {
     const rows = await queryVendors(tok);
     assert.deepEqual(
@@ -1764,6 +1765,8 @@ test('Layer 7H [E5 Test 5 - Refusals]: company_local callers (company owner, ent
   const abusingCallers = [
     ['company_owner', tokenFor(companyOwnerId)],
     ['entity_manager', env.iam.tokens.entityMgr],
+    ['company_admin', env.iam.tokens.companyAdmin],
+    ['nusear_contractor', env.iam.tokens.nusearContractor],
     ['delegated_custom_role', tokenFor(delegatedIamId)],
   ];
 
@@ -1892,6 +1895,7 @@ test('Layer 7H [E5 Test 6 - Refusals]: Nusear support and Nusear owner are refus
       ['updateRole built-in nusear_support', 'iam.role_versions', () => iamCmd.updateRole({ dbToken: tok, commandKey: `t6-${who}-bi-upd-sup`, roleId: ids.roleNusearSupport, displayName: 'Mutated Support' })],
       ['setRoleRight active on built-in investor', 'iam.role_rights', () => iamCmd.setRoleRight({ dbToken: tok, commandKey: `t6-${who}-bi-rr-inv`, roleId: ids.roleInvestor, rightId: 'act:iam.read', status: 'active' })],
       ['setRoleRight revoked on built-in agency_manager', 'iam.role_rights', () => iamCmd.setRoleRight({ dbToken: tok, commandKey: `t6-${who}-bi-rr-ag`, roleId: ids.roleAgencyManager, rightId: 'act:coherence.bob.read', status: 'revoked' })],
+      ['setRoleRight revoked on built-in nusear_contractor', 'iam.role_rights', () => iamCmd.setRoleRight({ dbToken: tok, commandKey: `t6-${who}-bi-rr-nc`, roleId: ids.roleNusearContractor, rightId: 'act:coherence.bob.read', status: 'revoked' })],
       ['setRoleRight active on built-in nusear_admin (delegable right)', 'iam.role_rights', () => iamCmd.setRoleRight({ dbToken: tok, commandKey: `t6-${who}-bi-rr-adm`, roleId: ids.roleNusearAdmin, rightId: 'act:coherence.run.launch', status: 'active' })],
       ['setRoleRight revoked on built-in nusear_support (delegable right)', 'iam.role_rights', () => iamCmd.setRoleRight({ dbToken: tok, commandKey: `t6-${who}-bi-rr-sup`, roleId: ids.roleNusearSupport, rightId: 'act:coherence.run.launch', status: 'revoked' })],
       ['grantRole Nusear-internal role to company_local', 'iam.role_grants', () => iamCmd.grantRole({ dbToken: tok, commandKey: `t6-${who}-grant-int`, personId: ids.entityMgr, roleId: ids.roleNusearSupport, organizationId: ids.companyOrg, personScopeMode: 'org_subtree', validRange: '[2028-01-01,)' })],

@@ -123,6 +123,7 @@ export async function seedCoherenceIamFixture(pool, {
     workerService: randomUUID(),
     entityMgr: randomUUID(),
     companyAdmin: randomUUID(),
+    nusearContractor: randomUUID(),
     companyAdminRunsOnly: randomUUID(),
     companyAdminNoGrants: randomUUID(),
     investor: randomUUID(),
@@ -191,6 +192,7 @@ export async function seedCoherenceIamFixture(pool, {
     ids.roleOwner = rolesBySlug.get('owner');
     ids.roleEntityManager = rolesBySlug.get('entity_manager');
     ids.roleCompanyAdmin = rolesBySlug.get('company_admin');
+    ids.roleNusearContractor = rolesBySlug.get('nusear_contractor');
     ids.roleInvestor = rolesBySlug.get('investor');
     ids.roleAgencyManager = rolesBySlug.get('agency_manager');
     ids.roleDirectorOfSales = rolesBySlug.get('director_of_sales');
@@ -257,6 +259,7 @@ export async function seedCoherenceIamFixture(pool, {
       [ids.northstarOperator, 'nusear_staff', 'Devon Northstar', 'devon.ns@nusear.example', null, 'active'],
       [ids.entityMgr, 'company_local', 'Dana Entity', 'dana.em@acme.example', null, 'active'],
       [ids.companyAdmin, 'company_local', 'Sloan Admin', 'sloan.admin@acme.example', null, 'active'],
+      [ids.nusearContractor, 'company_local', 'Reese Contractor', 'reese.contractor@acme.example', null, 'active'],
       [ids.companyAdminRunsOnly, 'company_local', 'Skylar Runs', 'skylar.runs@acme.example', null, 'active'],
       [ids.companyAdminNoGrants, 'company_local', 'Quinn None', 'quinn.none@acme.example', null, 'active'],
       [ids.investor, 'company_local', 'Avery Investor', 'avery.inv@acme.example', null, 'active'],
@@ -294,6 +297,7 @@ export async function seedCoherenceIamFixture(pool, {
       [ids.workerService, ids.rootOrg, null],
       [ids.entityMgr, ids.companyOrg, 'employee'],
       [ids.companyAdmin, ids.companyOrg, 'employee'],
+      [ids.nusearContractor, ids.companyOrg, 'self_employed_external'],
       [ids.companyAdminRunsOnly, ids.companyOrg, 'employee'],
       [ids.companyAdminNoGrants, ids.companyOrg, 'employee'],
       [ids.investor, ids.companyOrg, null],
@@ -350,6 +354,7 @@ export async function seedCoherenceIamFixture(pool, {
       [ids.workerService, ids.roleWorkerService, ids.rootOrg, 'org_subtree'],
       [ids.entityMgr, ids.roleEntityManager, ids.companyOrg, 'org_subtree'],
       [ids.companyAdmin, ids.roleCompanyAdmin, ids.companyOrg, 'org_subtree'],
+      [ids.nusearContractor, ids.roleNusearContractor, ids.companyOrg, 'org_subtree'],
       [ids.companyAdminRunsOnly, ids.roleCompanyAdminRunsOnly, ids.companyOrg, 'org_subtree'],
       [ids.companyAdminNoGrants, ids.roleCompanyAdminNoGrants, ids.companyOrg, 'org_subtree'],
       [ids.investor, ids.roleInvestor, ids.companyOrg, 'org_subtree'],
@@ -425,6 +430,7 @@ export async function seedCoherenceIamFixture(pool, {
       worker: tokenFor(ids.workerService),
       entityMgr: tokenFor(ids.entityMgr),
       companyAdmin: tokenFor(ids.companyAdmin),
+      nusearContractor: tokenFor(ids.nusearContractor),
       companyAdminRunsOnly: tokenFor(ids.companyAdminRunsOnly),
       companyAdminNoGrants: tokenFor(ids.companyAdminNoGrants),
       investor: tokenFor(ids.investor),
@@ -441,6 +447,8 @@ export async function seedCoherenceIamFixture(pool, {
       viewAsAgentA: tokenFor(ids.nusearOwner, ids.agentA),
       viewAsAgencyMgr: tokenFor(ids.nusearOwner, ids.beaconManager),
       viewAsEntityMgr: tokenFor(ids.nusearOwner, ids.entityMgr),
+      viewAsCompanyAdmin: tokenFor(ids.nusearOwner, ids.companyAdmin),
+      viewAsNusearContractor: tokenFor(ids.nusearOwner, ids.nusearContractor),
       expired: tokenFor(ids.nusearOwner, null, { expEpoch: Math.floor(Date.now() / 1000) - 30 }),
       wrongEnv: tokenFor(ids.nusearOwner, null, { environment: 'prod' }),
       tampered,

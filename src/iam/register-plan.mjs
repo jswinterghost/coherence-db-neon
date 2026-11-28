@@ -64,6 +64,7 @@ export const REGISTER_ROLE_TO_CATALOG = Object.freeze({
   OWNER: 'owner',
   ENTITY_MANAGER: 'entity_manager',
   APPLICATION_MANAGER: 'entity_manager',
+  NUSEAR_CONTRACTOR: 'nusear_contractor',
   COMPANY_ADMIN: 'company_admin',
   ADMINISTRATOR: 'company_admin',
   ADMIN: 'company_admin',
@@ -79,7 +80,7 @@ export const REGISTER_ROLE_TO_CATALOG = Object.freeze({
 
 const CATALOG_ROLE_BY_SLUG = new Map(CANONICAL_ROLES.map((r) => [r.slug, r]));
 // The company-wide roles that back an active website owner or admin login.
-const CONTROL_ROLE_SLUGS = Object.freeze(new Set(['owner', 'company_admin', 'entity_manager']));
+const CONTROL_ROLE_SLUGS = Object.freeze(new Set(['owner', 'company_admin', 'nusear_contractor', 'entity_manager']));
 
 export function deterministicUuid(namespace, key) {
   const bytes = createHash('sha256').update(`${namespace}\0${key}`, 'utf8').digest().subarray(0, 16);
@@ -700,7 +701,7 @@ function planRoleGrants(doc, {
         addIssue(
           'UNMATCHED_WEBSITE_ROLE',
           'website',
-          `Active website ${w.role} entry ${w.rowId} for person ${person.id} has no active company-wide control role in roles; add one (an owner, administrator or entity manager role with scope "all") in the Agent Register.`,
+          `Active website ${w.role} entry ${w.rowId} for person ${person.id} has no active company-wide control role in roles; add one (an owner, administrator, Nusear contractor or entity manager role with scope "all") in the Agent Register.`,
           { rowId: w.rowId, personId: person.id, personName: person.name, role: w.role },
         );
       }
