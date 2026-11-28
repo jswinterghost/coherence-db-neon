@@ -7,6 +7,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { assertLocalPgHost, assertSafeStoresDir, ensureProofIamSubjectsForBatches, runHistoryPlan, runHistoryProof } from '../scripts/prove-history.mjs';
 import { createAppCommands } from '../src/commands/app-cmd.mjs';
@@ -1322,7 +1323,7 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
   );
 
   // 1) plx upline-only rows + Coherence ROUND_HALF_UP rounding (positive and negative) + exact expected cents succeed
-  const okParsed = await readLegacyStatementBatches({
+  const okParsed = await readLegacyStatementBatches({ companyDisplayName: 'Acme',
     statementsDir: stmtDir,
     sentDir,
     agentsCsvPath: agentsCsv,
@@ -1379,7 +1380,7 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
 
   // 2) unreversedOnly without readable sentDir must fail loudly
   await assert.rejects(
-    () => readLegacyStatementBatches({
+    () => readLegacyStatementBatches({ companyDisplayName: 'Acme',
       statementsDir: stmtDir,
       sentDir: null,
       agentsCsvPath: agentsCsv,
@@ -1404,7 +1405,7 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
   const missingAgentCsv = join(env.tempDir, 'missing-agent.csv');
   await writeFile(missingAgentCsv, 'agent_name,agent_npn,entity,split_percentage\nSam Seller,11111111,Beacon,50%\n', 'utf8');
   await assert.rejects(
-    () => readLegacyStatementBatches({
+    () => readLegacyStatementBatches({ companyDisplayName: 'Acme',
       statementsDir: stmtDir,
       sentDir,
       agentsCsvPath: missingAgentCsv,
@@ -1431,7 +1432,7 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
 
   // 4) Missing expected totals on a method_correction spec must fail loudly
   await assert.rejects(
-    () => readLegacyStatementBatches({
+    () => readLegacyStatementBatches({ companyDisplayName: 'Acme',
       statementsDir: stmtDir,
       sentDir,
       agentsCsvPath: agentsCsv,
@@ -1488,7 +1489,7 @@ test('Layer 4 [Fix 2 - Legacy Bridge Derived Corrections]: plx upline-only rows 
   assert.equal((await env.pool.query('SELECT COUNT(*)::int AS n FROM coherence.statement_batches')).rows[0].n, 0);
 
   // 6) Fixed-rate split_reallocation (useAgentsSplit: false) also uses Coherence ROUND_HALF_UP downline = round_half_up(amount * split), upline = amount - downline
-  const fixedRateRes = await readLegacyStatementBatches({
+  const fixedRateRes = await readLegacyStatementBatches({ companyDisplayName: 'Acme',
     statementsDir: stmtDir,
     sentDir,
     methodCorrections: [
@@ -1563,7 +1564,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
       'carriera~spark~1AB2CD3EF45~250.00~2026-07,Beacon,11111111,-250.00,REVERSAL,carriera~spark~1AB2CD3EF45~250.00~2026-07,ALLAGENCY20260731Spark.csv',
     ].join('\n') + '\n',
   });
-  const posRes = await readLegacyStatementBatches({
+  const posRes = await readLegacyStatementBatches({ companyDisplayName: 'Acme',
     statementsDir: posStmtDir,
     sentDir: posSentDir,
     methodCorrections: [
@@ -1634,7 +1635,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
 
   // Expecting agency - / upline + against negative-net surviving lines produces the exact opposite-sign error
   await assert.rejects(
-    () => readLegacyStatementBatches({
+    () => readLegacyStatementBatches({ companyDisplayName: 'Acme',
       statementsDir: negStmtDir,
       sentDir: negSentDir,
       methodCorrections: [{
@@ -1667,7 +1668,7 @@ test('Layer 4 [8/1 Split Reallocation & 8/31 Upline Takeback Direction]: proves 
     const { engineVersionId } = await seedEngineVersion(env);
     await seedStandingInput(env, { commandKey: `neg-standing-${invertCorrectionSign}` });
 
-    const parsed = await readLegacyStatementBatches({
+    const parsed = await readLegacyStatementBatches({ companyDisplayName: 'Acme',
       statementsDir: negStmtDir,
       sentDir: negSentDir,
       methodCorrections: [{
@@ -1912,7 +1913,6 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   const env = await createTestEnv({
     companySlug: 'acme',
     displayName: 'Acme',
-    extraAgencies: [{ slug: 'upline', displayName: 'Upline' }],
   });
   t.after(() => env.cleanup());
 
@@ -2002,7 +2002,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
 
   // Old per-cell rounded total (-17009 cents vs exact-per-file -17007 cents) must be rejected.
   await assert.rejects(
-    () => readLegacyStatementBatches({
+    () => readLegacyStatementBatches({ companyDisplayName: 'Acme',
       statementsDir: stmtDir,
       sentDir,
       methodCorrections: [
@@ -2021,7 +2021,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
     },
   );
 
-  const parsed = await readLegacyStatementBatches({
+  const parsed = await readLegacyStatementBatches({ companyDisplayName: 'Acme',
     statementsDir: stmtDir,
     sentDir,
     methodCorrections: corrections,
@@ -2100,6 +2100,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
       assert.notEqual(l.sourceEntity, 'FILE_ROUNDING', 'rounding lines must not rely on a FILE_ROUNDING entity name');
       if (isRoundingLine(l)) {
         assert.equal(l.revenueType, 'rounding_adjustment');
+        assert.equal(l.sourceEntity, 'Acme', 'a rounding line on the upline statement comes from the company itself, never a made-up Upline');
       }
     }
   }
@@ -2127,7 +2128,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
       plxRow('2026-06-15', 'F2', '5AB2CD3EF87', 'Beacon', '40.00', '10.004', '50.004', 'f2'),
     ].join('\n') + '\n',
   });
-  const edgeParsed = await readLegacyStatementBatches({
+  const edgeParsed = await readLegacyStatementBatches({ companyDisplayName: 'Acme',
     statementsDir: edgeDir,
     methodCorrections: [{
       kind: 'upline_takeback',
@@ -2154,6 +2155,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   // to $0.00 across both batch totals and per-record_id balances, and stays idempotent on re-import.
   const manifest = await buildImportManifest({
     companySlug: 'acme',
+    displayName: 'Acme',
     sources: {
       preCoherenceStatementsDir: stmtDir,
       preCoherenceSentDir: sentDir,
@@ -2239,6 +2241,28 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   });
   assert.equal(rep2.preCoherenceBatchesImported, 0);
   assert.equal(rep2.methodCorrectionBatchesImported, 0);
+  const tenantOrgId = (await env.pool.query('SELECT tenant_org_id FROM iam.database_context WHERE singleton = true')).rows[0].tenant_org_id;
+  const roundingOwners = (await env.pool.query(
+    "SELECT DISTINCT source_entity, organization_id FROM coherence.statement_upline_lines WHERE src_type = 'rounding_adjustment'",
+  )).rows;
+  assert.deepEqual(roundingOwners, [{ source_entity: 'Acme', organization_id: tenantOrgId }], 'every rounding line belongs to the company root');
+
+  // Both sides of the bridge refuse to read without the company's name.
+  for (const companyDisplayName of [undefined, '   ']) {
+    await assert.rejects(
+      () => readLegacyStatementBatches({ companyDisplayName, statementsDir: stmtDir, pythonPath: 'python3', coherenceRepo: mockRepo, tempBaseDir: env.tempDir }),
+      (err) => err?.code === 'LEGACY_READER_CONFIG_REQUIRED' && /company display name/.test(err.message),
+    );
+  }
+  const bareSpecDir = await mkdtemp(join(env.tempDir, 'bare-spec-'));
+  await writeFile(join(bareSpecDir, 'spec.json'), JSON.stringify({ statementsDir: stmtDir, sentDir: null, agentsCsvPath: null, methodCorrections: [] }));
+  await assert.rejects(
+    () => execFileAsync('python3', [join(dirname(fileURLToPath(import.meta.url)), '..', 'python', 'coherence_legacy_statements.py'), '--spec', join(bareSpecDir, 'spec.json'), '--out', join(bareSpecDir, 'out.json')], {
+      cwd: mockRepo,
+      env: { ...process.env, PYTHONPATH: mockRepo, PYTHONDONTWRITEBYTECODE: '1' },
+    }),
+    (err) => /companyDisplayName/.test(String(err?.stderr || '')),
+  );
 
   // Full PostgreSQL Emit conservation check (trg_run_materializations_verify_deferred + v_entity_statement_reconciliation)
   // proving that sub-cent plxSpark historical upline + 8/31 take-back (including rounding lines) tie out at $0.00 variance
@@ -2246,7 +2270,6 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   const envMat = await createTestEnv({
     companySlug: 'acme',
     displayName: 'Acme',
-    extraAgencies: [{ slug: 'upline', displayName: 'Upline' }],
   });
   t.after(() => envMat.cleanup());
   const { engineVersionId } = await seedEngineVersion(envMat);
@@ -2263,7 +2286,7 @@ test('Layer 4 [Plx ULTotal Per-File Rounding]: sums exact sub-cent ULTotal value
   ].join('\n') + '\n';
   await writeTree(matStmtDir, { 'plxSpark20260429.csv': matPlxCsv });
 
-  const matParsed = await readLegacyStatementBatches({
+  const matParsed = await readLegacyStatementBatches({ companyDisplayName: 'Acme',
     statementsDir: matStmtDir,
     methodCorrections: [{
       kind: 'upline_takeback',

@@ -112,6 +112,8 @@ node scripts/import-history.mjs \
   --readonly-user <readonly-iam-user>
 ```
 
+The manifest's `displayName` must be the provisioned company's name exactly (`COMPANY_DISPLAY_NAME_MISMATCH` otherwise): a pre-Coherence upline statement is the company's own, so the legacy bridge's per-file rounding line on it names the company, never an invented entity (Release P2.1).
+
 The history import resolves every statement's organizations and writing NPNs to the company's own people, so the Agent Register's people go in first, from one approved register version (`scripts/import-agent-register.mjs`, Release P2; `--plan` reads the file only and touches no database):
 
 ```sh

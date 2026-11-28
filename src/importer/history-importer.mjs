@@ -568,6 +568,7 @@ function verifyMethodCorrectionBatches(specs, batches) {
  */
 export async function readLegacyStatementBatches({
   statementsDir,
+  companyDisplayName,
   pythonPath,
   coherenceRepo,
   bridgePath = DEFAULT_LEGACY_STATEMENTS_BRIDGE,
@@ -583,6 +584,9 @@ export async function readLegacyStatementBatches({
       'LEGACY_READER_CONFIG_REQUIRED',
     );
   }
+  if (typeof companyDisplayName !== 'string' || !companyDisplayName.trim()) {
+    throw new AppError('Reading pre-Coherence statement batches requires the company display name (the upline statement is the company\'s own).', 400, 'LEGACY_READER_CONFIG_REQUIRED');
+  }
   validateMethodCorrectionSpecs(methodCorrections);
   const outDir = await mkdtemp(join(tempBaseDir, 'coherence-legacy-stmt-'));
   const outJson = join(outDir, 'batches.json');
@@ -590,6 +594,7 @@ export async function readLegacyStatementBatches({
   try {
     await writeFile(specPath, JSON.stringify({
       statementsDir,
+      companyDisplayName: companyDisplayName.trim(),
       sentDir: sentDir || null,
       agentsCsvPath: agentsCsvPath || null,
       methodCorrections: Array.isArray(methodCorrections) ? methodCorrections : [],
@@ -3839,6 +3844,7 @@ export async function executeHistoryImport({
     validateMethodCorrectionSpecs(preSpec.methodCorrections);
     const bridgeResult = await readLegacyStatements({
       statementsDir: preSpec.statementsDir,
+      companyDisplayName: manifest.displayName,
       sentDir: preSpec.sentDir,
       agentsCsvPath: preSpec.agentsCsvPath,
       methodCorrections: preSpec.methodCorrections,

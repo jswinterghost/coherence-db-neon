@@ -224,7 +224,7 @@ async function snapshotTreeHashes(dir, base = dir, out = {}) {
   return out;
 }
 
-async function buildHistoryFixtures(work, { plantedMember = 'Zelda Q. Plantedname' } = {}) {
+async function buildHistoryFixtures(work, { plantedMember = 'Zelda Q. Plantedname', displayName = 'Acme' } = {}) {
   const mockRepo = join(work, 'mock-coherence');
   await createStdlibMockCoherenceRepo(mockRepo);
   const row0 = sampleApprovalRow({ record_id: 'policy:carrier_a:P1#effective:2026-01-01', note: 'base' });
@@ -282,7 +282,7 @@ async function buildHistoryFixtures(work, { plantedMember = 'Zelda Q. Plantednam
   const manifestPath = join(work, 'manifest.json');
   await writeFile(manifestPath, JSON.stringify({
     companySlug: 'acme',
-    displayName: 'Acme',
+    displayName,
     defaultEmitMode: 'coherence',
     coherenceRepo: mockRepo,
     pythonPath: 'python3',
@@ -1503,7 +1503,7 @@ test('Provisioning [Real Cloud SQL Non-Superuser Ephemeral PG17 Cluster]: clouds
     assert.equal(personRes.idempotent, false);
 
     // 2. Full read-only history import strictly as platform_app + platform_readonly on non-superuser DB.
-    const { manifestPath } = await buildHistoryFixtures(work);
+    const { manifestPath } = await buildHistoryFixtures(work, { displayName: 'Acme Cloud Dev' });
     await mkdir(join(storesDir, 'code'), { recursive: true, mode: 0o700 });
     await mkdir(join(storesDir, 'data'), { recursive: true, mode: 0o700 });
     const stores = createStorePair({

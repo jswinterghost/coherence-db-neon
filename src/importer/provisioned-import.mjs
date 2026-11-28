@@ -98,6 +98,19 @@ export async function importHistoryIntoDatabase({
         'COMPANY_SLUG_MISMATCH',
       );
     }
+    // the upline statement's own lines name the company, so the manifest must name it exactly as the database does
+    const companyNameRes = await readPool.query(
+      'SELECT ov.display_name FROM iam.organization_versions ov WHERE ov.organization_id = $1 AND ov.superseded_by_id IS NULL',
+      [dbContext.tenant_org_id],
+    );
+    const companyDisplayName = companyNameRes.rows[0]?.display_name ?? null;
+    if (!companyDisplayName || manifest.displayName !== companyDisplayName) {
+      throw new AppError(
+        `Manifest displayName "${manifest.displayName}" does not match the provisioned company's name "${companyDisplayName}".`,
+        409,
+        'COMPANY_DISPLAY_NAME_MISMATCH',
+      );
+    }
 
     let effectiveToken = dbToken;
     if (!effectiveToken) {

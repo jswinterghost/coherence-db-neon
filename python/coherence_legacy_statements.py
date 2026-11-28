@@ -131,6 +131,7 @@ def make_line_common(rec, rid: str, filename: str, sheet_name: str | None, row_n
 
 
 def make_upline_rounding_line(
+    company: str,
     line_no: int,
     stmt_date: str,
     filename: str,
@@ -175,7 +176,8 @@ def make_upline_rounding_line(
         "lineNo": line_no,
         "entryKind": "historical_upline_derived",
         "runAction": "SENT",
-        "sourceEntity": "Upline",
+        # the upline statement is the company's own, so its per-file adjustment comes from the company itself
+        "sourceEntity": company,
         "markedSent": False,
         "grossComm": fmt_money(rounding_diff),
         "amount": fmt_money(rounding_diff),
@@ -190,6 +192,10 @@ def main() -> None:
 
     try:
         spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+        company = spec.get("companyDisplayName")
+        if not isinstance(company, str) or not company.strip():
+            raise LegacyStatementError("The spec must name the company whose statements these are (companyDisplayName).")
+        company = company.strip()
         statements_dir = Path(spec["statementsDir"]).resolve()
         if not statements_dir.is_dir():
             raise LegacyStatementError("Configured pre-Coherence statements directory does not exist.")
@@ -345,7 +351,7 @@ def main() -> None:
                     if ul_rounding_diff != Decimal("0.00"):
                         up_line_no += 1
                         rounding_line = make_upline_rounding_line(
-                            up_line_no, stmt_date, sf.filename, sheet_name, ul_rounding_diff, up_net, up_lines_sum
+                            company, up_line_no, stmt_date, sf.filename, sheet_name, ul_rounding_diff, up_net, up_lines_sum
                         )
                         upline_lines.append(rounding_line)
                         parsed_upline_records.append({
